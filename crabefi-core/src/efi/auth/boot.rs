@@ -593,9 +593,7 @@ pub fn get_enrollment_summary() -> (usize, usize, usize, usize) {
 }
 
 /// Recovery must remain available even when a stored database cannot be parsed.
-// ponytail: first caller is the setup UI, which lands later in this stack.
 #[cfg(feature = "ui")]
-#[allow(dead_code)]
 pub(crate) fn has_stored_keys() -> bool {
     [
         SecureBootVariable::PK,

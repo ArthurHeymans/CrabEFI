@@ -210,6 +210,11 @@ impl crabefi::PlatformHooks for CorebootHooks {
         crabefi::cfr_menu::show_cfr_menu();
         true
     }
+
+    #[cfg(feature = "ui")]
+    fn show_graphical_firmware_settings(&self) -> crabefi::ui::ScreenNav {
+        crabefi::cfr_menu::show_graphical_firmware_settings()
+    }
 }
 
 impl crabefi::ResetHandler for CorebootReset {

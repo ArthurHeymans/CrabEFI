@@ -115,8 +115,7 @@ pub struct DbxEnrollmentResult {
 
 /// Verified preview of the exact owned update the user may choose to import.
 /// Text-only builds consume `entries` but do not display the identity metadata.
-// ponytail: allow is unconditional until the setup UI lands later in this stack.
-#[allow(dead_code)]
+#[cfg_attr(not(feature = "ui"), allow(dead_code))]
 pub(crate) struct DbxPreview {
     pub entries: DbxEnrollmentResult,
     pub timestamp: Option<EfiTime>,
@@ -125,7 +124,6 @@ pub(crate) struct DbxPreview {
 }
 
 #[cfg(feature = "ui")]
-#[allow(dead_code)]
 pub(crate) fn preview_dbx_update(data: &[u8], source: DbxSource) -> Result<DbxPreview, AuthError> {
     match source {
         DbxSource::Authenticated(src) => inspect_authenticated_dbx_update(data, src),

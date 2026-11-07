@@ -1,11 +1,12 @@
-//! Kinetic Command graphical UI.
-//!
-//! Implements the "Ethereal Machine" design system from the reference mockups:
-//! left sidebar navigation, tonal surface hierarchy, electric-cyan accents,
-//! hero cards, and a divider-free layout.  Multi-size anti-aliased Noto Sans
-//! Mono font for modern typography hierarchy.
+//! Keyboard-first, native firmware setup UI ("Ledger" design). Shared focus and
+//! physical geometry; domain state and authentication remain owned by their
+//! existing backends.
 
+pub mod controls;
+pub mod dialog;
 pub mod firmware_settings;
+pub mod kit;
+pub mod layout;
 pub mod render;
 #[cfg(feature = "secure-boot")]
 pub mod secure_boot;
@@ -14,16 +15,18 @@ pub mod theme;
 use crate::FramebufferConfig as FramebufferInfo;
 use crate::cursor::CursorRenderer;
 use crate::drivers::mouse_cursor;
-use crate::menu::{BootCategory, BootMenu};
+use crate::menu::{BootEntry, BootEntryKind, BootMenu};
 use crate::menu_common::{self, KeyPress};
 use crate::time::{Timeout, delay_ms};
-use render::{FontSize, Rgb};
+use alloc::string::String;
+use alloc::vec::Vec;
+use controls::{ButtonKind, Control, Focus, FocusEvent, Group, Role};
+use core::sync::atomic::{AtomicBool, Ordering};
+use kit::{Fact, StripButton, Tone};
+use layout::Metrics;
 
-// ═══════════════════════════════════════════════════════════════════════
-//  Navigation types
-// ═══════════════════════════════════════════════════════════════════════
+type Rect = dialog::Rect;
 
-/// Which nav item is active.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum NavItem {
     Boot,
@@ -31,896 +34,1336 @@ pub enum NavItem {
     Security,
     Firmware,
 }
-
-/// Navigation result from any sub-screen.
 pub enum ScreenNav {
-    /// Go back (Esc or "Back" action).
     Back,
-    /// Navigate to a different screen.
     Nav(NavItem),
 }
-
-/// Result from the boot selection screen.
 enum BootResult {
-    /// User selected a boot entry.
     Selected(usize),
-    /// Navigate to a different screen.
     Nav(NavItem),
 }
-
 const NAV_ITEMS: &[(NavItem, &str)] = &[
-    (NavItem::Boot, "BOOT"),
+    (NavItem::Boot, "Boot"),
     #[cfg(feature = "secure-boot")]
-    (NavItem::Security, "SECURITY"),
-    (NavItem::Firmware, "FIRMWARE"),
+    (NavItem::Security, "Security"),
+    (NavItem::Firmware, "Firmware"),
 ];
 
-fn nav_item_index(item: NavItem) -> usize {
-    match item {
-        NavItem::Boot => 0,
-        #[cfg(feature = "secure-boot")]
-        NavItem::Security => 1,
-        NavItem::Firmware => 1 + cfg!(feature = "secure-boot") as usize,
-    }
+/// Firmware settings hold unsaved drafts; shown as "Firmware *" on every page.
+#[cfg(not(test))]
+static FIRMWARE_DIRTY: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+std::thread_local! {
+    static FIRMWARE_DIRTY: AtomicBool = const { AtomicBool::new(false) };
+}
+fn firmware_dirty() -> bool {
+    #[cfg(not(test))]
+    return FIRMWARE_DIRTY.load(Ordering::Relaxed);
+    #[cfg(test)]
+    FIRMWARE_DIRTY.with(|d| d.load(Ordering::Relaxed))
+}
+pub fn set_firmware_dirty(dirty: bool) {
+    #[cfg(not(test))]
+    FIRMWARE_DIRTY.store(dirty, Ordering::Relaxed);
+    #[cfg(test)]
+    FIRMWARE_DIRTY.with(|d| d.store(dirty, Ordering::Relaxed));
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-//  Shared chrome (sidebar, header, footer) — used by every screen
-// ═══════════════════════════════════════════════════════════════════════
-
+pub(crate) fn nav_item_index(item: NavItem) -> usize {
+    NAV_ITEMS
+        .iter()
+        .position(|(nav, _)| *nav == item)
+        .unwrap_or(0)
+}
+pub fn supports_framebuffer(fb: &FramebufferInfo) -> bool {
+    fb.width >= 640 && fb.height >= 400
+}
 pub fn clear(fb: &FramebufferInfo) {
-    unsafe { fb.clear(theme::BG.r, theme::BG.g, theme::BG.b) };
+    render::fill_rect(fb, 0, 0, fb.width, fb.height, theme::SHEET);
 }
 
-/// Draw the top header bar (branding + version).
+/// Header band with brand and the Secure Boot state chip.
 pub fn draw_header(fb: &FramebufferInfo) {
-    let w = fb.width;
-    render::fill_gradient_v(
-        fb,
-        0,
-        0,
-        w,
-        theme::HEADER_H,
-        Rgb::new(0x14, 0x17, 0x1c),
-        theme::BG,
-    );
-
-    let brand_y = (theme::HEADER_H as i32 - render::font_height(FontSize::Heading) as i32) / 2;
-    render::draw_text(
-        fb,
-        14,
-        brand_y,
-        "CRABEFI",
-        FontSize::Heading,
-        theme::PRIMARY,
-        None,
-    );
-    let vx = 14 + render::text_width("CRABEFI", FontSize::Heading) as i32 + 12;
-    let vy = (theme::HEADER_H as i32 - render::font_height(FontSize::Small) as i32) / 2;
-    render::draw_text(fb, vx, vy, "v0.1.0", FontSize::Small, theme::OUTLINE, None);
-}
-
-/// Draw the left sidebar with navigation items.
-pub fn draw_sidebar(fb: &FramebufferInfo, active: NavItem, hovered: Option<NavItem>) {
-    let sw = theme::SIDEBAR_W;
-    let sy = theme::HEADER_H;
-    let sh = fb.height - theme::HEADER_H - theme::FOOTER_H;
-
-    render::fill_rect(fb, 0, sy as i32, sw, sh, theme::SIDE);
-
-    // Title with letter-spacing
-    let title_y = (sy + 14) as i32;
-    render::draw_text_spaced(
-        fb,
-        14,
-        title_y,
-        "MAIN MENU",
-        FontSize::Small,
-        2,
-        theme::TEXT,
-        Some(theme::SIDE),
-    );
-
-    // Nav items
-    for (i, (item, label)) in NAV_ITEMS.iter().enumerate() {
-        paint_sidebar_item(fb, i, *item, label, active, hovered == Some(*item));
+    let tabs_end = nav_rects(fb).last().map_or(0, |r| r.0 + r.2 as i32);
+    #[cfg(feature = "secure-boot")]
+    {
+        let state = crate::efi::auth::secure_boot_state();
+        let chip = if state.enforcing {
+            ("Secure Boot on", theme::ACCENT)
+        } else if state.setup_mode {
+            ("Setup Mode", theme::WARN)
+        } else {
+            ("Secure Boot off", theme::WARN)
+        };
+        kit::draw_header(fb, Some(chip), tabs_end);
     }
+    #[cfg(not(feature = "secure-boot"))]
+    kit::draw_header(fb, None, tabs_end);
 }
-
-fn paint_sidebar_item(
+fn nav_rects(fb: &FramebufferInfo) -> Vec<Rect> {
+    let labels: Vec<&str> = NAV_ITEMS.iter().map(|(_, l)| *l).collect();
+    kit::tab_rects(fb, &labels)
+}
+pub(crate) fn draw_navigation(
     fb: &FramebufferInfo,
-    idx: usize,
-    item: NavItem,
-    label: &str,
     active: NavItem,
-    is_hov: bool,
+    focus: Option<usize>,
+    hovered: Option<NavItem>,
 ) {
-    let y = sidebar_item_y(idx);
-    let is_active = item == active;
-
-    let bg = if is_active {
-        theme::CONTAINER
-    } else if is_hov {
-        theme::CONT_HIGH
-    } else {
-        theme::SIDE
-    };
-    let fg = if is_active {
-        theme::PRIMARY
-    } else if is_hov {
-        theme::TEXT
-    } else {
-        theme::TEXT_DIM
-    };
-
-    render::fill_rect(fb, 0, y, theme::SIDEBAR_W, theme::NAV_ITEM_H, bg);
-    let text_y =
-        y + ((theme::NAV_ITEM_H as i32 - render::font_height(FontSize::Normal) as i32) / 2);
-    render::draw_text(fb, 16, text_y, label, FontSize::Normal, fg, Some(bg));
-
-    // Active indicator — right-edge accent bar
-    if is_active {
-        render::fill_rect(
-            fb,
-            (theme::SIDEBAR_W - theme::ACCENT_BAR) as i32,
-            y,
-            theme::ACCENT_BAR,
-            theme::NAV_ITEM_H,
-            theme::PRIMARY,
-        );
-    }
+    let dirty = firmware_dirty();
+    let tabs: Vec<kit::Tab<'_>> = NAV_ITEMS
+        .iter()
+        .enumerate()
+        .map(|(i, (nav, label))| kit::Tab {
+            label,
+            active: *nav == active,
+            focused: focus == Some(i),
+            hovered: hovered == Some(*nav) && *nav != active,
+            dirty: dirty && *nav == NavItem::Firmware,
+        })
+        .collect();
+    kit::draw_tabs(fb, &tabs);
 }
-
-/// Draw the bottom footer bar.
-pub fn draw_footer(fb: &FramebufferInfo, hint: &str) {
-    let w = fb.width;
-    let fy = fb.height - theme::FOOTER_H;
-    render::fill_rect(fb, 0, fy as i32, w, theme::FOOTER_H, theme::BG);
-    let text_y =
-        (fy as i32) + ((theme::FOOTER_H as i32 - render::font_height(FontSize::Small) as i32) / 2);
-    render::draw_text_centered(
+/// Compatibility name for platform integrations; navigation is the tab row.
+pub fn draw_sidebar(fb: &FramebufferInfo, active: NavItem, hovered: Option<NavItem>) {
+    draw_navigation(fb, active, None, hovered);
+}
+pub(crate) fn draw_shell(
+    fb: &FramebufferInfo,
+    active: NavItem,
+    focus: &Focus,
+    hovered: Option<NavItem>,
+) {
+    controls::clear_buttons();
+    clear(fb);
+    draw_header(fb);
+    draw_navigation(
         fb,
-        0,
-        text_y,
-        w,
-        hint,
-        FontSize::Small,
-        theme::OUTLINE,
-        None,
+        active,
+        (focus.group == Group::Navigation).then_some(focus.navigation),
+        hovered,
     );
 }
-
-pub fn poll_and_render_cursor(fb: &FramebufferInfo, cursor: &mut CursorRenderer) {
-    mouse_cursor::poll();
-    let (mx, my) = mouse_cursor::position();
-    cursor.update(fb, mx, my);
+pub(crate) fn navigation_hit(fb: &FramebufferInfo, x: i32, y: i32) -> Option<NavItem> {
+    nav_rects(fb)
+        .into_iter()
+        .zip(NAV_ITEMS)
+        .find(|(rect, _)| dialog::contains(*rect, x, y))
+        .map(|(_, (nav, _))| *nav)
 }
-
-/// Main canvas origin (x, y) and size (w, h) — right of sidebar, below header, above footer.
-fn canvas(fb: &FramebufferInfo) -> (i32, i32, u32, u32) {
-    let x = theme::SIDEBAR_W as i32 + theme::PAD as i32;
-    let y = (theme::HEADER_H + theme::PAD) as i32;
-    let w = fb.width - theme::SIDEBAR_W - theme::PAD * 2;
-    let h = fb.height - theme::HEADER_H - theme::FOOTER_H - theme::PAD * 2;
-    (x, y, w, h)
-}
-
-/// Y coordinate of the i-th sidebar nav item (0-indexed).
-fn sidebar_item_y(i: usize) -> i32 {
-    (theme::HEADER_H + theme::NAV_TOP_PAD) as i32
-        + (i as i32 * (theme::NAV_ITEM_H + theme::NAV_ITEM_STRIDE) as i32)
-}
-
-/// Update sidebar hover state.  Repaints only the changed items.
-/// Returns `true` if the hover state changed.
 pub fn update_sidebar_hover(
     fb: &FramebufferInfo,
     cursor: &mut CursorRenderer,
-    sidebar_hov: &mut Option<NavItem>,
+    hovered: &mut Option<NavItem>,
     active: NavItem,
 ) -> bool {
-    let new = sidebar_hit();
-    if new == *sidebar_hov {
+    let (x, y) = mouse_cursor::position();
+    let next = navigation_hit(fb, x, y);
+    if next == *hovered {
         return false;
     }
-    let old = *sidebar_hov;
-    *sidebar_hov = new;
-    cursor.while_hidden(fb, || {
-        if let Some(o) = old {
-            let idx = nav_item_index(o);
-            paint_sidebar_item(fb, idx, o, NAV_ITEMS[idx].1, active, false);
-        }
-        if let Some(n) = new {
-            let idx = nav_item_index(n);
-            paint_sidebar_item(fb, idx, n, NAV_ITEMS[idx].1, active, true);
-        }
-    });
+    *hovered = next;
+    cursor.while_hidden(fb, || draw_navigation(fb, active, None, next));
     true
 }
 
-/// Hit-test sidebar: which nav item is the mouse over?
-fn sidebar_hit() -> Option<NavItem> {
-    let (mx, my) = mouse_cursor::position();
-    if mx < 0 || mx >= theme::SIDEBAR_W as i32 {
-        return None;
-    }
-    for (i, (item, _)) in NAV_ITEMS.iter().enumerate() {
-        let iy = sidebar_item_y(i);
-        if my >= iy && my < iy + theme::NAV_ITEM_H as i32 {
-            return Some(*item);
-        }
-    }
-    None
+/// Pointer hover shared by every page: tabs and buttons highlight the same
+/// way everywhere. Rows are highlighted by each page's own list painter.
+#[derive(Default)]
+pub(crate) struct Hover {
+    tab: Option<NavItem>,
+    button: Option<usize>,
 }
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Public entry points (state machine for screen navigation)
-// ═══════════════════════════════════════════════════════════════════════
-
-pub fn show_graphical_menu(menu: &mut BootMenu) -> Option<usize> {
-    let fb = crate::handoff::framebuffer()?;
-    let mut screen = NavItem::Boot;
-
-    loop {
-        match screen {
-            NavItem::Boot => match run_boot(&fb, menu) {
-                BootResult::Selected(idx) => return Some(idx),
-                BootResult::Nav(nav) => screen = nav,
-            },
-            #[cfg(feature = "secure-boot")]
-            NavItem::Security => match secure_boot::show(&fb) {
-                ScreenNav::Nav(nav) => screen = nav,
-                ScreenNav::Back => screen = NavItem::Boot,
-            },
-            NavItem::Firmware => match firmware_settings::show(&fb) {
-                ScreenNav::Nav(nav) => screen = nav,
-                ScreenNav::Back => screen = NavItem::Boot,
-            },
-        }
+impl Hover {
+    /// A full repaint drew everything unhighlighted.
+    pub(crate) fn reset(&mut self) {
+        *self = Self::default();
     }
 }
 
-pub fn show_no_media_screen() {
-    let fb = match crate::handoff::framebuffer() {
-        Some(f) => f,
-        None => return,
-    };
-    let mut screen = NavItem::Boot;
-
-    loop {
-        match screen {
-            NavItem::Boot => match run_no_media(&fb) {
-                ScreenNav::Nav(nav) => screen = nav,
-                ScreenNav::Back => return,
-            },
-            #[cfg(feature = "secure-boot")]
-            NavItem::Security => match secure_boot::show(&fb) {
-                ScreenNav::Nav(nav) => screen = nav,
-                ScreenNav::Back => screen = NavItem::Boot,
-            },
-            NavItem::Firmware => match firmware_settings::show(&fb) {
-                ScreenNav::Nav(nav) => screen = nav,
-                ScreenNav::Back => screen = NavItem::Boot,
-            },
+/// Call once per poll. `tabs` is the active page and focus when the tab row
+/// is live; dialogs and editors pass `None`.
+pub(crate) fn track_hover(
+    fb: &FramebufferInfo,
+    cursor: &mut CursorRenderer,
+    hover: &mut Hover,
+    tabs: Option<(NavItem, &Focus)>,
+) {
+    let (x, y) = mouse_cursor::position();
+    if let Some((active, focus)) = tabs {
+        let tab = navigation_hit(fb, x, y).filter(|t| *t != active);
+        if tab != hover.tab {
+            hover.tab = tab;
+            cursor.while_hidden(fb, || {
+                draw_navigation(
+                    fb,
+                    active,
+                    (focus.group == Group::Navigation).then_some(focus.navigation),
+                    tab,
+                )
+            });
         }
+    }
+    let button = controls::button_at(x, y);
+    if button != hover.button {
+        let previous = core::mem::replace(&mut hover.button, button);
+        cursor.while_hidden(fb, || {
+            if let Some(i) = previous {
+                controls::repaint_button(fb, i, false);
+            }
+            if let Some(i) = button {
+                controls::repaint_button(fb, i, true);
+            }
+        });
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-//  Boot Selection screen
-// ═══════════════════════════════════════════════════════════════════════
+/// Handle common focus/navigation only. Callers still gate leaving unsaved forms.
+pub(crate) fn chrome_key(
+    fb: &FramebufferInfo,
+    key: KeyPress,
+    focus: &mut Focus,
+    active: NavItem,
+    actions: usize,
+) -> Option<FocusEvent> {
+    if key == KeyPress::F8 {
+        layout::toggle_text_size(fb);
+        return Some(FocusEvent::Moved);
+    }
+    if let Some(event) = focus.handle(key, NAV_ITEMS.len(), actions) {
+        return Some(match event {
+            FocusEvent::Navigate(i) if nav_at(i) == active => FocusEvent::Moved,
+            event => event,
+        });
+    }
+    let destination = match key {
+        KeyPress::Char('b' | 'B') => Some(NavItem::Boot),
+        #[cfg(feature = "secure-boot")]
+        KeyPress::Char('s' | 'S') => Some(NavItem::Security),
+        KeyPress::Char('f' | 'F') => Some(NavItem::Firmware),
+        KeyPress::MouseClick { x, y } => navigation_hit(fb, x as i32, y as i32),
+        _ => None,
+    }?;
+    focus.navigation = nav_item_index(destination);
+    if destination == active {
+        Some(FocusEvent::Moved)
+    } else {
+        Some(FocusEvent::Navigate(focus.navigation))
+    }
+}
+pub(crate) fn nav_at(index: usize) -> NavItem {
+    NAV_ITEMS[index.min(NAV_ITEMS.len() - 1)].0
+}
 
-struct BState {
-    sel: usize,
-    hovered: Option<usize>,
-    sidebar_hov: Option<NavItem>,
-    scroll_offset: usize,
-    countdown: u32,
-    init_timeout: u32,
-    tick: Timeout,
+/// Compatibility: a plain-text hint in the key legend band.
+pub fn draw_footer(fb: &FramebufferInfo, hint: &str) {
+    let m = Metrics::for_fb(fb);
+    let y = fb.height.saturating_sub(m.footer) as i32;
+    let (x, _, w, _) = m.canvas(fb);
+    render::fill_rect(fb, 0, y, fb.width, m.footer, theme::BAND);
+    render::fill_rect(fb, 0, y, fb.width, 1, theme::RULE_STRONG);
+    render::draw_text(
+        fb,
+        x,
+        y + ((m.footer - render::font_height(m.small)) / 2) as i32,
+        &render::ellipsize(hint, w, m.small),
+        m.small,
+        theme::INK2,
+        Some(theme::BAND),
+    );
+}
+pub(crate) fn canvas(fb: &FramebufferInfo) -> Rect {
+    Metrics::for_fb(fb).canvas(fb)
+}
+pub(crate) fn page_selection(
+    key: KeyPress,
+    current: usize,
     count: usize,
+    page: usize,
+) -> Option<usize> {
+    let last = count.checked_sub(1)?;
+    Some(match key {
+        KeyPress::Home => 0,
+        KeyPress::End => last,
+        KeyPress::PageUp => current.saturating_sub(page.max(1)),
+        KeyPress::PageDown => current.saturating_add(page.max(1)).min(last),
+        _ => return None,
+    })
 }
-
-impl BState {
-    fn new(count: usize, sel: usize, timeout: u32) -> Self {
-        Self {
-            sel,
-            hovered: None,
-            sidebar_hov: None,
-            scroll_offset: 0,
-            countdown: timeout,
-            init_timeout: timeout,
-            tick: Timeout::from_ms(1000),
-            count,
-        }
-    }
-    fn sel_next(&mut self) {
-        if self.count > 0 && self.sel < self.count - 1 {
-            self.sel += 1;
-        }
-    }
-    fn sel_prev(&mut self) {
-        if self.sel > 0 {
-            self.sel -= 1;
-        }
+pub(crate) fn confirm_reset(fb: &FramebufferInfo, backdrop: dialog::Backdrop<'_>) {
+    if dialog::modal(
+        fb,
+        backdrop,
+        Tone::Warn,
+        "Restart the computer?",
+        &[dialog::Block::text(
+            "The computer restarts now. Connect any new boot devices first.",
+        )],
+        &[
+            dialog::Choice::new("Cancel", Some("Esc"), ButtonKind::Neutral),
+            dialog::Choice::new("Restart", None, ButtonKind::Primary),
+        ],
+    ) == 1
+    {
+        crate::reset_system();
     }
 }
-
+pub fn poll_and_render_cursor(fb: &FramebufferInfo, cursor: &mut CursorRenderer) {
+    mouse_cursor::poll();
+    let (x, y) = mouse_cursor::position();
+    cursor.update(fb, x, y);
+}
 pub fn draw_scrollbar(
     fb: &FramebufferInfo,
     x: i32,
     y: i32,
     h: u32,
-    total_items: usize,
-    scroll_offset: usize,
-    visible_items: usize,
+    total: usize,
+    offset: usize,
+    visible: usize,
 ) {
-    if total_items <= visible_items || visible_items == 0 || h == 0 {
+    controls::scrollbar(fb, (x - 8, y, 16, h), total, offset, visible);
+}
+
+pub fn show_graphical_menu(menu: &mut BootMenu) -> Option<usize> {
+    let fb = crate::handoff::framebuffer()?;
+    if !supports_framebuffer(&fb) {
+        return crate::menu::show_menu(menu);
+    }
+    let default = menu.selected;
+    let mut screen = NavItem::Boot;
+    loop {
+        let next = match screen {
+            NavItem::Boot => match run_boot(&fb, menu, default) {
+                BootResult::Selected(i) => return Some(i),
+                BootResult::Nav(nav) => ScreenNav::Nav(nav),
+            },
+            #[cfg(feature = "secure-boot")]
+            NavItem::Security => secure_boot::show(&fb),
+            NavItem::Firmware => firmware_settings::show(&fb),
+        };
+        screen = match next {
+            ScreenNav::Back => NavItem::Boot,
+            ScreenNav::Nav(nav) => nav,
+        };
+    }
+}
+pub fn show_no_media_screen() {
+    let Some(fb) = crate::handoff::framebuffer() else {
+        return;
+    };
+    if !supports_framebuffer(&fb) {
+        no_media_text(&fb);
         return;
     }
-
-    let track_w = 4;
-    render::fill_rounded_rect(fb, x, y, track_w, h, 2, theme::SIDE);
-
-    let thumb_h = ((h as usize * visible_items) / total_items)
-        .max(24)
-        .min(h as usize) as u32;
-    let max_offset = total_items.saturating_sub(visible_items).max(1);
-    let thumb_y = y + ((h - thumb_h) as usize * scroll_offset / max_offset) as i32;
-    render::fill_rounded_rect(fb, x, thumb_y, track_w, thumb_h, 2, theme::PRIMARY);
+    let mut nav = NavItem::Boot;
+    loop {
+        let next = match nav {
+            NavItem::Boot => empty_screen(
+                &fb,
+                NavItem::Boot,
+                "No bootable media",
+                "Connect a boot device, then restart. Security and Firmware settings remain available.",
+            ),
+            #[cfg(feature = "secure-boot")]
+            NavItem::Security => secure_boot::show(&fb),
+            NavItem::Firmware => firmware_settings::show(&fb),
+        };
+        match no_media_destination(nav, next) {
+            Some(next) => nav = next,
+            None => return,
+        }
+    }
 }
 
-fn run_boot(fb: &FramebufferInfo, menu: &mut BootMenu) -> BootResult {
-    let mut cursor = CursorRenderer::new();
-    let mut st = BState::new(menu.entry_count(), menu.selected, menu.timeout_seconds);
-    keep_boot_selection_visible(fb, &mut st);
+fn no_media_destination(current: NavItem, result: ScreenNav) -> Option<NavItem> {
+    match result {
+        ScreenNav::Back if current == NavItem::Boot => None,
+        ScreenNav::Back => Some(NavItem::Boot),
+        ScreenNav::Nav(next) => Some(next),
+    }
+}
 
-    paint_boot(fb, menu, &st);
-
+fn no_media_text(fb: &FramebufferInfo) {
+    let mut console = Some(crate::framebuffer_console::FramebufferConsole::new(fb));
+    let mut redraw = true;
     loop {
-        poll_and_render_cursor(fb, &mut cursor);
-
-        update_sidebar_hover(fb, &mut cursor, &mut st.sidebar_hov, NavItem::Boot);
-
-        // ── Card hover ──
-        let hov = boot_hit(fb, menu, &st);
-        if hov != st.hovered {
-            let prev = st.hovered;
-            st.hovered = hov;
-            cursor.while_hidden(fb, || {
-                prev.into_iter()
-                    .chain(hov)
-                    .for_each(|i| paint_boot_card(fb, menu, &st, i));
-                paint_boot_scrollbar(fb, menu, &st);
-            });
+        if redraw {
+            menu_common::clear_screen(&mut console);
+            menu_common::draw_header("No bootable media", &mut console, 80);
+            menu_common::draw_help(
+                5,
+                if cfg!(feature = "secure-boot") {
+                    "R Restart   F Settings   S Security   Esc Halt"
+                } else {
+                    "R Restart   F Settings   Esc Halt"
+                },
+                &mut console,
+                80,
+            );
+            redraw = false;
         }
-
-        if let Some(key) = menu_common::read_key() {
-            if st.countdown > 0 {
-                st.countdown = 0;
-                cursor.while_hidden(fb, || paint_boot_footer(fb, &st));
+        match menu_common::read_key() {
+            Some(KeyPress::Escape) => return,
+            Some(KeyPress::Char('r' | 'R')) => crate::reset_system(),
+            #[cfg(feature = "secure-boot")]
+            Some(KeyPress::Char('s' | 'S')) => {
+                crate::secure_boot_menu::show_secure_boot_menu();
+                redraw = true;
             }
+            Some(KeyPress::Char('f' | 'F')) => {
+                if let Some(hooks) = crate::handoff::callbacks().hooks {
+                    hooks.show_firmware_settings();
+                }
+                redraw = true;
+            }
+            _ => {}
+        }
+        delay_ms(10);
+    }
+}
 
-            match key {
-                KeyPress::Up | KeyPress::Char('k') => {
-                    let before = (st.sel, st.scroll_offset);
-                    st.sel_prev();
-                    select_boot(fb, menu, &mut st, &mut cursor, before);
-                }
-                KeyPress::Down | KeyPress::Char('j') => {
-                    let before = (st.sel, st.scroll_offset);
-                    st.sel_next();
-                    select_boot(fb, menu, &mut st, &mut cursor, before);
-                }
-                KeyPress::Enter => {
-                    cursor.hide(fb);
-                    return BootResult::Selected(st.sel);
-                }
-                #[cfg(feature = "secure-boot")]
-                KeyPress::Char('s') | KeyPress::Char('S') => {
-                    cursor.hide(fb);
-                    return BootResult::Nav(NavItem::Security);
-                }
-                KeyPress::Char('f') | KeyPress::Char('F') => {
-                    cursor.hide(fb);
-                    return BootResult::Nav(NavItem::Firmware);
-                }
-                KeyPress::Char('r') | KeyPress::Char('R') => {
-                    crate::reset_system();
-                }
-                #[cfg(feature = "ui")]
-                KeyPress::MouseClick { .. } => {
-                    // Check sidebar clicks first
-                    if let Some(nav) = st.sidebar_hov
-                        && nav != NavItem::Boot
-                    {
+fn empty_screen_paint(
+    fb: &FramebufferInfo,
+    nav: NavItem,
+    focus: &Focus,
+    title: &str,
+    message: &str,
+) -> Rect {
+    draw_shell(fb, nav, focus, None);
+    let m = Metrics::for_fb(fb);
+    let (x, y, w, _) = canvas(fb);
+    kit::strip(
+        fb,
+        (x, y, w, kit::strip_height(fb)),
+        Tone::Warn,
+        title,
+        "",
+        &[],
+        None,
+    );
+    let mut ty = y + (kit::strip_height(fb) + m.gap) as i32;
+    ty = kit::prose(fb, x, ty, w.min(900), message, m.body, theme::INK2, 4) + m.gap as i32;
+    let restart = (
+        x,
+        ty,
+        controls::button_width(fb, "Restart", Some("R")).max(220),
+        m.button,
+    );
+    let mut c = Control::new(100, Role::Button, "Restart");
+    c.focused = focus.group == Group::Actions;
+    controls::button_with_key(fb, restart, &c, ButtonKind::Primary, Some("R"));
+    kit::draw_keys(
+        fb,
+        &[("Tab", "Next"), ("Enter", "Activate"), ("Esc", "Back")],
+        true,
+    );
+    restart
+}
+
+pub(crate) fn empty_screen(
+    fb: &FramebufferInfo,
+    nav: NavItem,
+    title: &str,
+    message: &str,
+) -> ScreenNav {
+    let mut cursor = CursorRenderer::new();
+    let mut focus = Focus::new(nav_item_index(nav));
+    focus.group = Group::Actions;
+    let mut hover = Hover::default();
+    loop {
+        cursor.hide(fb);
+        let restart = empty_screen_paint(fb, nav, &focus, title, message);
+        hover.reset();
+        loop {
+            poll_and_render_cursor(fb, &mut cursor);
+            track_hover(fb, &mut cursor, &mut hover, Some((nav, &focus)));
+            if let Some(key) = menu_common::read_key() {
+                let snapshot = focus;
+                let backdrop = || {
+                    empty_screen_paint(fb, nav, &snapshot, title, message);
+                };
+                match chrome_key(fb, key, &mut focus, nav, 1) {
+                    Some(FocusEvent::Navigate(i)) => {
                         cursor.hide(fb);
-                        return BootResult::Nav(nav);
+                        return ScreenNav::Nav(nav_at(i));
                     }
-                    // Then card clicks
-                    if let Some(idx) = st.hovered {
-                        if idx == st.sel {
-                            cursor.hide(fb);
-                            return BootResult::Selected(idx);
+                    Some(FocusEvent::Action(_)) => {
+                        cursor.hide(fb);
+                        confirm_reset(fb, &backdrop);
+                        break;
+                    }
+                    Some(FocusEvent::Moved) => {
+                        // Static explanatory text is not a keyboard stop.
+                        if focus.group == Group::Content {
+                            focus.group = if key == KeyPress::BackTab {
+                                Group::Navigation
+                            } else {
+                                Group::Actions
+                            };
                         }
-                        let before = (st.sel, st.scroll_offset);
-                        st.sel = idx;
-                        select_boot(fb, menu, &mut st, &mut cursor, before);
+                        break;
                     }
+                    None => match key {
+                        KeyPress::Escape => return ScreenNav::Back,
+                        KeyPress::Char('r' | 'R') => {
+                            cursor.hide(fb);
+                            confirm_reset(fb, &backdrop);
+                            break;
+                        }
+                        KeyPress::MouseClick { x, y }
+                            if dialog::contains(restart, x as i32, y as i32) =>
+                        {
+                            cursor.hide(fb);
+                            confirm_reset(fb, &backdrop);
+                            break;
+                        }
+                        _ => {}
+                    },
                 }
-                #[cfg(feature = "ui")]
-                KeyPress::MouseScroll(dz) => {
-                    let before = (st.sel, st.scroll_offset);
-                    if dz > 0 {
-                        st.sel_next();
-                    } else {
-                        st.sel_prev();
-                    }
-                    select_boot(fb, menu, &mut st, &mut cursor, before);
-                }
-                _ => {}
             }
+            delay_ms(8);
         }
-
-        if st.countdown > 0 && st.tick.is_expired() {
-            st.countdown -= 1;
-            st.tick = Timeout::from_ms(1000);
-            cursor.while_hidden(fb, || paint_boot_footer(fb, &st));
-            if st.countdown == 0 {
-                cursor.hide(fb);
-                return BootResult::Selected(st.sel);
-            }
-        }
-        delay_ms(8);
     }
 }
 
-fn run_no_media(fb: &FramebufferInfo) -> ScreenNav {
-    let mut cursor = CursorRenderer::new();
-    let mut sidebar_hov: Option<NavItem> = None;
+// ─── Boot page ──────────────────────────────────────────────────────────
 
-    clear(fb);
-    draw_header(fb);
-    draw_sidebar(fb, NavItem::Boot, None);
+struct BState {
+    sel: usize,
+    hovered: Option<usize>,
+    scroll_offset: usize,
+    countdown: u32,
+    init_timeout: u32,
+    tick: Timeout,
+    count: usize,
+    focus: Focus,
+    default: usize,
+    /// One-shot command line editor, owned by the details pane.
+    edit: Option<dialog::Editor>,
+}
+impl BState {
+    fn new(count: usize, sel: usize, timeout: u32) -> Self {
+        Self {
+            sel,
+            hovered: None,
+            scroll_offset: 0,
+            countdown: timeout,
+            init_timeout: timeout,
+            tick: Timeout::from_ms(1000),
+            count,
+            focus: Focus::new(0),
+            default: sel,
+            edit: None,
+        }
+    }
+    fn sel_next(&mut self) {
+        self.sel = (self.sel + 1).min(self.count.saturating_sub(1));
+    }
+    fn sel_prev(&mut self) {
+        self.sel = self.sel.saturating_sub(1);
+    }
+}
+fn deliberate_pointer_motion(origin: (i32, i32), current: (i32, i32)) -> bool {
+    origin.0.abs_diff(current.0) >= 8 || origin.1.abs_diff(current.1) >= 8
+}
+fn cancel_boot_countdown(menu: &mut BootMenu, state: &mut BState) -> bool {
+    let was_running = state.countdown > 0;
+    state.countdown = 0;
+    menu.timeout_seconds = 0;
+    was_running
+}
 
+fn kind_label(entry: &BootEntry) -> &'static str {
+    match entry.kind {
+        BootEntryKind::Uefi => "UEFI app",
+        BootEntryKind::BlsLinux { .. } => "Linux",
+        BootEntryKind::BlsUki => "Linux UKI",
+        BootEntryKind::GrubLinux { .. } => "GRUB",
+        BootEntryKind::Payload { .. } => "Payload",
+    }
+}
+fn kind_detail(entry: &BootEntry) -> &'static str {
+    match entry.kind {
+        BootEntryKind::Uefi => "UEFI application",
+        BootEntryKind::BlsLinux { .. } => "Linux (Boot Loader Spec)",
+        BootEntryKind::BlsUki => "Unified kernel image",
+        BootEntryKind::GrubLinux { .. } => "Linux (GRUB entry)",
+        BootEntryKind::Payload { .. } => "coreboot payload",
+    }
+}
+fn disk_name(entry: &BootEntry) -> String {
+    use crate::drivers::storage::StorageId;
+    let n = match entry.storage {
+        StorageId::Nvme { controller_id, .. } => controller_id,
+        StorageId::Ahci { port, .. } => port,
+        StorageId::Usb { device_addr, .. } => device_addr as usize,
+        StorageId::Sdhci { controller_id } => controller_id,
+        StorageId::Platform { index } => index,
+    };
+    alloc::format!("{} {n}", entry.storage.description())
+}
+fn disk_short(entry: &BootEntry) -> String {
+    if entry.is_payload() {
+        return String::from("CBFS");
+    }
+    alloc::format!("{} p{}", disk_name(entry), entry.partition_num)
+}
+fn disk_long(entry: &BootEntry) -> String {
+    if entry.is_payload() {
+        return String::from("Firmware flash (CBFS)");
+    }
+    alloc::format!("{}, partition {}", disk_name(entry), entry.partition_num)
+}
+fn disk_count(menu: &BootMenu) -> usize {
+    let mut seen: Vec<crate::drivers::storage::StorageId> = Vec::new();
+    for e in &menu.entries {
+        if !e.is_payload() && !seen.contains(&e.storage) {
+            seen.push(e.storage);
+        }
+    }
+    seen.len()
+}
+
+/// Boot page geometry, shared by painting, hit-testing and tests.
+struct BootLayout {
+    strip: Option<Rect>,
+    list: Rect,
+    rows_y: i32,
+    slots: usize,
+    side: Option<Rect>,
+    /// Narrow screens: action buttons under the list.
+    bar: Option<Rect>,
+    kind_x: i32,
+    disk_x: Option<i32>,
+}
+fn boot_layout(fb: &FramebufferInfo, countdown: bool) -> BootLayout {
+    let m = Metrics::for_fb(fb);
     let (cx, cy, cw, ch) = canvas(fb);
-
-    // Section label
-    let mut y = cy;
-    render::draw_text_spaced(
-        fb,
-        cx,
-        y,
-        "PRIORITY SEQUENCE",
-        FontSize::Small,
-        3,
-        theme::PRIMARY.darken(80),
-        None,
-    );
-    y += render::font_height(FontSize::Small) as i32 + 4;
-    render::draw_text(
-        fb,
-        cx,
-        y,
-        "Boot Selection",
-        FontSize::Display,
-        theme::TEXT,
-        None,
-    );
-
-    let mid_y = cy + ch as i32 / 2 - 30;
-    render::draw_dot(fb, cx + cw as i32 / 2, mid_y - 16, 6, theme::ERROR);
-    render::draw_text_centered(
-        fb,
-        cx,
-        mid_y + 4,
-        cw,
-        "No bootable media found",
-        FontSize::Normal,
-        theme::TEXT,
-        None,
-    );
-    render::draw_text_centered(
-        fb,
-        cx,
-        mid_y + 28,
-        cw,
-        "Connect a USB drive, then press R to restart",
-        FontSize::Small,
-        theme::TEXT_DIM,
-        None,
-    );
-    render::draw_separator(fb, cx + 40, mid_y + 56, cw - 80, theme::GHOST, theme::BG);
-    render::draw_text_centered(
-        fb,
-        cx,
-        mid_y + 72,
-        cw,
-        "Mouse active -- move to test tracking",
-        FontSize::Small,
-        theme::OUTLINE,
-        None,
-    );
-
-    draw_footer(
-        fb,
-        if cfg!(feature = "secure-boot") {
-            "S: Security  F: Firmware  R: Reset  Esc: Halt"
-        } else {
-            "F: Firmware  R: Reset  Esc: Halt"
-        },
-    );
-
-    loop {
-        poll_and_render_cursor(fb, &mut cursor);
-
-        update_sidebar_hover(fb, &mut cursor, &mut sidebar_hov, NavItem::Boot);
-
-        if let Some(key) = menu_common::read_key() {
-            match key {
-                KeyPress::Char('r') | KeyPress::Char('R') => {
-                    crate::reset_system();
-                }
-                #[cfg(feature = "secure-boot")]
-                KeyPress::Char('s') | KeyPress::Char('S') => {
-                    cursor.hide(fb);
-                    return ScreenNav::Nav(NavItem::Security);
-                }
-                KeyPress::Char('f') | KeyPress::Char('F') => {
-                    cursor.hide(fb);
-                    return ScreenNav::Nav(NavItem::Firmware);
-                }
-                KeyPress::Escape => return ScreenNav::Back,
-                #[cfg(feature = "ui")]
-                KeyPress::MouseClick { .. } => {
-                    if let Some(nav) = sidebar_hov
-                        && nav != NavItem::Boot
-                    {
-                        cursor.hide(fb);
-                        return ScreenNav::Nav(nav);
-                    }
-                }
-                _ => {}
-            }
-        }
-        delay_ms(8);
+    let bottom = cy + ch as i32;
+    let mut top = cy;
+    let strip = countdown.then(|| {
+        let r = (cx, cy, cw, kit::strip_height(fb));
+        top += (r.3 + m.gap) as i32;
+        r
+    });
+    let side_w = m.side_width(cw);
+    let list_w = side_w.map_or(cw, |s| cw - s - m.gap);
+    let bar = side_w
+        .is_none()
+        .then(|| (cx, bottom - m.button as i32, cw, m.button));
+    let list_bottom = bar.map_or(bottom, |b| b.1 - m.gap as i32);
+    let title_h = render::font_height(m.title) + 8;
+    let head_h = render::font_height(m.small) + 12;
+    let rows_y = top + (title_h + head_h) as i32;
+    let slots = (((list_bottom - rows_y).max(0) as u32) / m.row).max(1) as usize;
+    let disk_w = if m.large { 170 } else { 110 };
+    let kind_w: i32 = if m.large { 140 } else { 96 };
+    let inner = list_w - controls::SCROLL_GUTTER;
+    let disk_x = (inner >= 520).then_some(cx + (inner - disk_w) as i32);
+    let kind_x = disk_x.unwrap_or(cx + inner as i32) - kind_w;
+    BootLayout {
+        strip,
+        list: (cx, top, list_w, (list_bottom - top).max(0) as u32),
+        rows_y,
+        slots,
+        side: side_w.map(|s| (cx + (list_w + m.gap) as i32, top, s, (bottom - top) as u32)),
+        bar,
+        kind_x,
+        disk_x,
     }
 }
-
-// ── Boot internals ──────────────────────────────────────────────────────
-
-fn boot_list_area(fb: &FramebufferInfo) -> (i32, i32, u32, u32) {
-    let (cx, cy, cw, ch) = canvas(fb);
-    let header_h =
-        render::font_height(FontSize::Small) + 4 + render::font_height(FontSize::Display) + 12;
-    let y = cy + header_h as i32;
-    (cx, y, cw, ch.saturating_sub(header_h))
+fn boot_visible_slots(fb: &FramebufferInfo, state: &BState) -> usize {
+    boot_layout(fb, state.countdown > 0).slots
 }
-
-fn boot_visible_slots(fb: &FramebufferInfo) -> usize {
-    let (_, _, _, h) = boot_list_area(fb);
-    if h < theme::CARD_H {
-        1
-    } else {
-        ((h + theme::GAP) / (theme::CARD_H + theme::GAP)).max(1) as usize
-    }
+fn keep_boot_selection_visible(fb: &FramebufferInfo, state: &mut BState) {
+    let slots = boot_visible_slots(fb, state);
+    controls::ensure_visible(&mut state.scroll_offset, state.sel, state.count, slots);
 }
-
-fn keep_boot_selection_visible(fb: &FramebufferInfo, st: &mut BState) {
-    let slots = boot_visible_slots(fb);
-    if st.sel < st.scroll_offset {
-        st.scroll_offset = st.sel;
-    } else if st.sel >= st.scroll_offset + slots {
-        st.scroll_offset = st.sel - slots + 1;
-    }
-}
-
-fn card_rect(fb: &FramebufferInfo, st: &BState, idx: usize) -> Option<(i32, i32, u32, u32)> {
-    if idx < st.scroll_offset || idx >= st.scroll_offset + boot_visible_slots(fb) {
+fn row_rect(fb: &FramebufferInfo, state: &BState, index: usize) -> Option<Rect> {
+    let l = boot_layout(fb, state.countdown > 0);
+    if index < state.scroll_offset || index >= state.scroll_offset + l.slots {
         return None;
     }
-    let (cx, list_y, cw, _) = boot_list_area(fb);
-    let slot = idx - st.scroll_offset;
-    let y = list_y + (slot as i32 * (theme::CARD_H + theme::GAP) as i32);
-    Some((cx, y, cw, theme::CARD_H))
-}
-
-fn boot_hit(fb: &FramebufferInfo, menu: &BootMenu, st: &BState) -> Option<usize> {
-    let (mx, my) = mouse_cursor::position();
-    let end = (st.scroll_offset + boot_visible_slots(fb)).min(menu.entry_count());
-    for i in st.scroll_offset..end {
-        let Some((cx, cy, cw, ch)) = card_rect(fb, st, i) else {
-            continue;
-        };
-        if mx >= cx && mx < cx + cw as i32 && my >= cy && my < cy + ch as i32 {
-            return Some(i);
-        }
-    }
-    None
-}
-
-fn paint_boot(fb: &FramebufferInfo, menu: &BootMenu, st: &BState) {
-    clear(fb);
-    draw_header(fb);
-    draw_sidebar(fb, NavItem::Boot, st.sidebar_hov);
-
-    let (cx, cy, _cw, _) = canvas(fb);
-
-    // Section label with letter-spacing
-    let mut y = cy;
-    render::draw_text_spaced(
-        fb,
-        cx,
-        y,
-        "PRIORITY SEQUENCE",
-        FontSize::Small,
-        3,
-        theme::PRIMARY.darken(80),
-        None,
-    );
-    y += render::font_height(FontSize::Small) as i32 + 4;
-    render::draw_text(
-        fb,
-        cx,
-        y,
-        "Boot Selection",
-        FontSize::Display,
-        theme::TEXT,
-        None,
-    );
-
-    let end = (st.scroll_offset + boot_visible_slots(fb)).min(menu.entry_count());
-    for i in st.scroll_offset..end {
-        paint_boot_card(fb, menu, st, i);
-    }
-
-    paint_boot_scrollbar(fb, menu, st);
-
-    paint_boot_footer(fb, st);
-}
-
-/// Repaint the boot list after `st.sel` changed from `before` (selection, scroll offset).
-///
-/// Only the two cards whose look changed are redrawn, or the visible cards when the list
-/// scrolled; header, sidebar and footer are left alone.
-fn select_boot(
-    fb: &FramebufferInfo,
-    menu: &mut BootMenu,
-    st: &mut BState,
-    cursor: &mut CursorRenderer,
-    before: (usize, usize),
-) {
-    let (old_sel, old_scroll) = before;
-    menu.selected = st.sel;
-    keep_boot_selection_visible(fb, st);
-    if (st.sel, st.scroll_offset) == before {
-        return;
-    }
-    cursor.while_hidden(fb, || {
-        if st.scroll_offset == old_scroll {
-            [old_sel, st.sel]
-                .into_iter()
-                .for_each(|i| paint_boot_card(fb, menu, st, i));
-        } else {
-            let end = (st.scroll_offset + boot_visible_slots(fb)).min(menu.entry_count());
-            (st.scroll_offset..end).for_each(|i| paint_boot_card(fb, menu, st, i));
-        }
-        paint_boot_scrollbar(fb, menu, st);
-    });
-}
-
-fn paint_boot_scrollbar(fb: &FramebufferInfo, menu: &BootMenu, st: &BState) {
-    let (list_x, list_y, list_w, list_h) = boot_list_area(fb);
-    draw_scrollbar(
-        fb,
-        list_x + list_w as i32 - 4,
-        list_y,
-        list_h,
-        menu.entry_count(),
-        st.scroll_offset,
-        boot_visible_slots(fb),
-    );
-}
-
-fn paint_boot_card(fb: &FramebufferInfo, menu: &BootMenu, st: &BState, idx: usize) {
-    let Some((cx, cy, cw, ch)) = card_rect(fb, st, idx) else {
-        return;
-    };
-    let is_sel = idx == st.sel;
-    let is_hov = st.hovered == Some(idx);
-
-    // Background: tonal shift per design ("No-Line" rule)
-    let bg = if is_sel {
-        theme::SURFACE_HI
-    } else if is_hov {
-        theme::CONT_HIGH
+    let m = Metrics::for_fb(fb);
+    let gutter = if state.count > l.slots {
+        controls::SCROLL_GUTTER
     } else {
-        theme::CONT_LOW
+        0
     };
+    Some((
+        l.list.0,
+        l.rows_y + ((index - state.scroll_offset) as u32 * m.row) as i32,
+        l.list.2 - gutter,
+        m.row,
+    ))
+}
+fn boot_hit(fb: &FramebufferInfo, menu: &BootMenu, state: &BState) -> Option<usize> {
+    let (x, y) = mouse_cursor::position();
+    (state.scroll_offset
+        ..(state.scroll_offset + boot_visible_slots(fb, state)).min(menu.entry_count()))
+        .find(|i| row_rect(fb, state, *i).is_some_and(|r| dialog::contains(r, x, y)))
+}
 
-    // Erase the glow ring around the card, including the corners of the card rect that the
-    // rounded body does not cover.  The rest of the body is overpainted below, and leaving
-    // it alone avoids flashing the card blank between repaints.
-    let gm = theme::GLOW_SPREAD + 1;
-    let (gx, gy) = (cx - gm as i32, cy - gm as i32);
-    let full_w = cw + gm * 2;
-    let (right, bottom) = (cx + cw as i32, cy + ch as i32);
-    let r = theme::RADIUS;
-    [
-        (gx, gy, full_w, gm),
-        (gx, bottom, full_w, gm),
-        (gx, cy, gm, ch),
-        (right, cy, gm, ch),
-        (cx, cy, r, r),
-        (right - r as i32, cy, r, r),
-        (cx, bottom - r as i32, r, r),
-        (right - r as i32, bottom - r as i32, r, r),
-    ]
-    .into_iter()
-    .for_each(|(x, y, w, h)| render::fill_rect(fb, x, y, w, h, theme::BG));
+fn boot_actions(menu: &BootMenu, state: &BState) -> usize {
+    if state.edit.is_some()
+        || menu
+            .entries
+            .get(state.sel)
+            .is_some_and(BootEntry::has_cmdline)
+    {
+        2
+    } else {
+        1
+    }
+}
 
-    if is_sel {
-        render::draw_glow(
+fn paint_boot(fb: &FramebufferInfo, menu: &BootMenu, state: &BState) -> Vec<Rect> {
+    draw_shell(fb, NavItem::Boot, &state.focus, None);
+    let m = Metrics::for_fb(fb);
+    let l = boot_layout(fb, state.countdown > 0);
+    paint_boot_strip(fb, menu, state);
+    let disks = disk_count(menu);
+    let note = alloc::format!(
+        "{} {} on {} {}",
+        menu.entry_count(),
+        if menu.entry_count() == 1 {
+            "entry"
+        } else {
+            "entries"
+        },
+        disks,
+        if disks == 1 { "disk" } else { "disks" }
+    );
+    let (lx, ly, lw, _) = l.list;
+    let title_h = kit::pane_title(fb, lx, ly, lw, "Boot entries", &note, true);
+    let mut cols = alloc::vec![("Name", 14), ("Kind", l.kind_x - lx + 10)];
+    if let Some(dx) = l.disk_x {
+        cols.push(("Disk", dx - lx + 10));
+    }
+    kit::table_head(fb, lx, ly + title_h as i32, lw, &cols);
+    for i in state.scroll_offset..(state.scroll_offset + l.slots).min(menu.entry_count()) {
+        paint_boot_row(fb, menu, state, i);
+    }
+    let scroll_area = (lx, l.rows_y, lw, l.slots as u32 * m.row);
+    controls::scrollbar(
+        fb,
+        scroll_area,
+        menu.entry_count(),
+        state.scroll_offset,
+        l.slots,
+    );
+    controls::viewport_focus(
+        fb,
+        scroll_area,
+        state.focus.group == Group::Content,
+        state.sel,
+        state.scroll_offset,
+        l.slots,
+    );
+    let buttons = paint_boot_details(fb, menu, state, &l);
+    if state.edit.is_some() {
+        kit::draw_keys(
             fb,
-            cx,
-            cy,
-            cw,
-            ch,
-            theme::RADIUS,
-            theme::GLOW_SPREAD,
-            theme::PRIMARY.darken(180),
-            theme::BG,
+            &[
+                ("Left Right", "Move"),
+                ("Home End", "Jump"),
+                ("Tab", "Buttons"),
+                ("Enter", "Boot"),
+                ("Esc", "Cancel"),
+            ],
+            false,
         );
+    } else {
+        let has_cmdline = menu
+            .entries
+            .get(state.sel)
+            .is_some_and(BootEntry::has_cmdline);
+        let mut keys = alloc::vec![("Up Down", "Select"), ("Enter", "Boot")];
+        if has_cmdline {
+            keys.push(("E", "Edit command line"));
+        }
+        keys.push(("Tab", "Next pane"));
+        kit::draw_keys(fb, &keys, true);
     }
+    buttons
+}
 
-    render::fill_rounded_rect(fb, cx, cy, cw, ch, theme::RADIUS, bg);
-
-    // Left accent bar for selected
-    if is_sel {
-        render::fill_rect(fb, cx, cy + 2, theme::ACCENT_BAR, ch - 4, theme::PRIMARY);
-    }
-
-    let Some(entry) = menu.entries.get(idx) else {
+fn paint_boot_strip(fb: &FramebufferInfo, menu: &BootMenu, state: &BState) {
+    let Some(rect) = boot_layout(fb, state.countdown > 0).strip else {
         return;
     };
-    let tx = cx
-        + theme::CARD_PAD_X as i32
-        + if is_sel {
-            theme::ACCENT_BAR as i32 + 4
-        } else {
-            0
-        };
-    let ty = cy + theme::CARD_PAD_Y as i32;
-
-    // Entry name
-    render::draw_text(
+    let m = Metrics::for_fb(fb);
+    let name = menu.entries.get(state.sel).map_or("", |e| e.name.as_str());
+    let long = alloc::format!("Booting \"{name}\" in {} s.", state.countdown);
+    let short = alloc::format!("Booting the selected entry in {} s.", state.countdown);
+    let fits =
+        render::text_width(&long, m.body) + render::text_width("Any key cancels.", m.body) + 60
+            < rect.2;
+    kit::strip(
         fb,
-        tx,
-        ty,
-        &entry.name,
-        FontSize::Normal,
-        theme::TEXT,
-        Some(bg),
+        rect,
+        Tone::Warn,
+        if fits { &long } else { &short },
+        "Any key cancels.",
+        &[],
+        Some((
+            state.init_timeout.saturating_sub(state.countdown) + 1,
+            state.init_timeout.max(1),
+        )),
     );
+}
 
-    // Second row: badge + path
-    let row2 = ty + render::font_height(FontSize::Normal) as i32 + 4;
-    let (badge_label, badge_bg) = match entry.category {
-        BootCategory::Uefi => ("UEFI", theme::BADGE_UEFI),
-        BootCategory::Bls => ("LINUX", theme::BADGE_LINUX),
-        BootCategory::Grub => ("GRUB", theme::BADGE_GRUB),
-        BootCategory::Payload => ("PAYLOAD", theme::BADGE_PAYLOAD),
+fn paint_boot_row(fb: &FramebufferInfo, menu: &BootMenu, state: &BState, index: usize) {
+    let Some(rect) = row_rect(fb, state, index) else {
+        return;
     };
-    render::draw_pill(fb, tx, row2, badge_label, theme::TEXT, badge_bg);
-
-    let info_x = tx + (render::text_width(badge_label, FontSize::Small) + 24) as i32;
-    render::draw_text(
+    let Some(entry) = menu.entries.get(index) else {
+        return;
+    };
+    let m = Metrics::for_fb(fb);
+    let l = boot_layout(fb, state.countdown > 0);
+    let mut c = Control::new(index as u64, Role::Option, &entry.name);
+    c.focused = state.focus.group == Group::Content && state.sel == index;
+    c.selected = state.sel == index;
+    let bg = controls::row(fb, rect, &c, state.hovered == Some(index));
+    let ty = rect.1 + (rect.3.saturating_sub(render::font_height(m.body)) / 2) as i32;
+    let tag = (index == state.default).then_some("default");
+    let tag_w = tag.map_or(0, |t| render::text_width(t, m.small) + 22);
+    let name_w = (l.kind_x - rect.0 - 28).max(0) as u32;
+    let name = render::ellipsize(&entry.name, name_w.saturating_sub(tag_w), m.body);
+    let w = render::draw_text_weight(
         fb,
-        info_x,
-        row2 + 3,
-        &entry.path,
-        FontSize::Small,
-        theme::TEXT_DIM,
+        rect.0 + 14,
+        ty,
+        &name,
+        m.body,
+        c.selected,
+        theme::INK,
         Some(bg),
     );
-
-    // Right side hint for selected
-    if is_sel {
-        let label = "SELECT >";
-        let lw = render::text_width(label, FontSize::Small);
+    if let Some(t) = tag {
+        let tx = rect.0 + 14 + w as i32 + 10;
+        let th = render::font_height(m.small) + 2;
+        let tw = render::text_width(t, m.small) + 10;
+        let tyy = rect.1 + ((rect.3 - th) / 2) as i32;
+        render::draw_border(fb, tx, tyy, tw, th, theme::ACCENT);
+        render::draw_text_bold(fb, tx + 5, tyy + 1, t, m.small, theme::ACCENT, Some(bg));
+    }
+    render::draw_text(
+        fb,
+        l.kind_x + 10,
+        ty,
+        kind_label(entry),
+        m.body,
+        theme::INK2,
+        Some(bg),
+    );
+    if let Some(dx) = l.disk_x {
         render::draw_text(
             fb,
-            cx + cw as i32 - lw as i32 - theme::PAD as i32,
-            ty + 4,
-            label,
-            FontSize::Small,
-            theme::PRIMARY,
+            dx + 10,
+            ty,
+            &render::ellipsize(
+                &disk_short(entry),
+                rect.0 as u32 + rect.2 - dx as u32 - 14,
+                m.body,
+            ),
+            m.body,
+            theme::INK2,
             Some(bg),
         );
     }
+    controls::viewport_focus(
+        fb,
+        (l.list.0, l.rows_y, l.list.2, l.slots as u32 * m.row),
+        state.focus.group == Group::Content,
+        state.sel,
+        state.scroll_offset,
+        l.slots,
+    );
 }
 
-fn paint_boot_footer(fb: &FramebufferInfo, st: &BState) {
-    let w = fb.width;
-    let fy = fb.height - theme::FOOTER_H;
-    render::fill_rect(fb, 0, fy as i32, w, theme::FOOTER_H, theme::BG);
-
-    if st.countdown > 0 && st.init_timeout > 0 {
-        let bar_x = (theme::SIDEBAR_W + theme::PAD) as i32;
-        let bar_w = w - theme::SIDEBAR_W - theme::PAD * 2 - 120;
-        let frac = st.countdown as f32 / st.init_timeout as f32;
-        let bar_y = fy as i32 + (theme::FOOTER_H as i32 - theme::PROGRESS_H as i32) / 2;
-        render::draw_progress_bar(
+/// Details pane (or narrow action bar). Returns action button rectangles in
+/// focus order.
+fn paint_boot_details(
+    fb: &FramebufferInfo,
+    menu: &BootMenu,
+    state: &BState,
+    l: &BootLayout,
+) -> Vec<Rect> {
+    let m = Metrics::for_fb(fb);
+    let Some(entry) = menu.entries.get(state.sel) else {
+        return Vec::new();
+    };
+    let action_focus = |i: usize| state.focus.group == Group::Actions && state.focus.action == i;
+    let has_cmdline = entry.has_cmdline();
+    let Some(side) = l.side else {
+        // Narrow screens: actions below the list; details stay in the editor.
+        let (bx, by, bw, bh) = l.bar.unwrap_or((0, 0, 0, 0));
+        let half = (bw - 12) / 2;
+        let mut rects = Vec::new();
+        let mut c = Control::new(1, Role::Button, "Boot this entry");
+        c.focused = action_focus(0);
+        controls::button_with_key(
             fb,
-            bar_x,
-            bar_y,
-            bar_w,
-            theme::PROGRESS_H,
-            frac,
-            theme::PRIMARY,
-            theme::CONT_HIGH,
-            theme::PROGRESS_RADIUS,
+            (bx, by, half, bh),
+            &c,
+            ButtonKind::Primary,
+            Some("Enter"),
         );
-
-        let mut buf = [0u8; 16];
-        let s = fmt_cd(st.countdown, &mut buf);
-        let text_y =
-            fy as i32 + (theme::FOOTER_H as i32 - render::font_height(FontSize::Small) as i32) / 2;
+        rects.push((bx, by, half, bh));
+        if has_cmdline {
+            let r = (bx + half as i32 + 12, by, half, bh);
+            let mut c = Control::new(2, Role::Button, "Edit command line once");
+            c.focused = action_focus(1);
+            controls::button_with_key(fb, r, &c, ButtonKind::Neutral, Some("E"));
+            rects.push(r);
+        }
+        return rects;
+    };
+    kit::side(fb, side);
+    let (sx, sy, sw, sh) = side;
+    let x = sx + m.pad as i32;
+    let w = sw - m.pad * 2;
+    let max_y = sy + sh as i32 - m.pad as i32;
+    let mut y = kit::caption_title(fb, x, sy + m.pad as i32, w, "Selected entry", &entry.name);
+    let kind = kind_detail(entry);
+    let disk = disk_long(entry);
+    let mut facts = alloc::vec![Fact::new("Kind", kind), Fact::new("Disk", &disk)];
+    let initrd;
+    match &entry.kind {
+        BootEntryKind::BlsLinux {
+            linux_path,
+            initrd_paths,
+            ..
+        }
+        | BootEntryKind::GrubLinux {
+            linux_path,
+            initrd_paths,
+            ..
+        } => {
+            facts.push(Fact::new("Kernel", linux_path.as_str()));
+            initrd = match initrd_paths.len() {
+                0 => String::from("none"),
+                1 => String::from(initrd_paths[0].as_str()),
+                n => alloc::format!("{} (+{} more)", initrd_paths[0], n - 1),
+            };
+            facts.push(Fact::new("Initrd", &initrd));
+        }
+        BootEntryKind::Payload { path, .. } => facts.push(Fact::new("File", path.as_str())),
+        _ => facts.push(Fact::new("Path", entry.path.as_str())),
+    }
+    y = kit::facts(fb, x, y, w, &facts, max_y) + m.gap as i32 / 2;
+    let mut buttons: Vec<StripButton<'_>> = Vec::new();
+    if let Some(edit) = &state.edit {
         render::draw_text(
             fb,
-            bar_x + bar_w as i32 + 12,
-            text_y,
-            s,
-            FontSize::Small,
-            theme::PRIMARY,
+            x,
+            y,
+            "Command line (this boot only)",
+            m.small,
+            theme::INK3,
             None,
         );
-    } else {
-        draw_footer(
+        y += m.small_line as i32 + 2;
+        y = paint_cmdline_editor(fb, (x, y, w), edit, max_y) + 6;
+        render::draw_text(
             fb,
-            if cfg!(feature = "secure-boot") {
-                "Up/Down Navigate  Enter Boot  S Security  F Firmware  R Reset"
-            } else {
-                "Up/Down Navigate  Enter Boot  F Firmware  R Reset"
-            },
+            x,
+            y,
+            &render::ellipsize("Not saved. The entry file is unchanged.", w, m.small),
+            m.small,
+            theme::INK2,
+            None,
+        );
+        y += m.small_line as i32 + m.gap as i32 / 2;
+        buttons.push(StripButton {
+            label: "Boot with this command line",
+            key: Some("Enter"),
+            kind: ButtonKind::Primary,
+            focused: edit.focus == 2,
+        });
+        buttons.push(StripButton {
+            label: "Cancel",
+            key: Some("Esc"),
+            kind: ButtonKind::Neutral,
+            focused: edit.focus == 1,
+        });
+    } else {
+        if let Some(cmdline) = entry.get_cmdline() {
+            render::draw_text(fb, x, y, "Command line", m.small, theme::INK3, None);
+            y += m.small_line as i32 + 2;
+            y = paint_code_box(fb, (x, y, w), cmdline, max_y) + m.gap as i32 / 2;
+        }
+        buttons.push(StripButton {
+            label: "Boot this entry",
+            key: Some("Enter"),
+            kind: ButtonKind::Primary,
+            focused: action_focus(0),
+        });
+        if has_cmdline {
+            buttons.push(StripButton {
+                label: "Edit command line once",
+                key: Some("E"),
+                kind: ButtonKind::Neutral,
+                focused: action_focus(1),
+            });
+        }
+    }
+    let needed = buttons.len() as i32 * (m.button as i32 + 10);
+    let y = y.min(max_y - needed).max(sy + m.pad as i32);
+    kit::button_stack(fb, x, y + 4, w, &buttons)
+}
+
+fn paint_code_box(fb: &FramebufferInfo, area: (i32, i32, u32), text: &str, max_y: i32) -> i32 {
+    let m = Metrics::for_fb(fb);
+    let (x, y, w) = area;
+    let cols = ((w - 20) / render::font_width(m.body)).max(1) as usize;
+    let lines = dialog::wrap_lines(text, cols);
+    let room =
+        ((max_y - y - (m.button as i32 + 10) * 2 - 20).max(m.line as i32) as u32 / m.line) as usize;
+    let shown = lines.len().clamp(1, room.clamp(1, 5));
+    let h = shown as u32 * m.line + 16;
+    render::fill_rect(fb, x, y, w, h, theme::PAPER);
+    render::draw_border(fb, x, y, w, h, theme::RULE);
+    for (i, line) in lines.iter().take(shown).enumerate() {
+        let line = if i + 1 == shown && lines.len() > shown {
+            // Character columns, never byte offsets: BLS options are arbitrary UTF-8.
+            let kept: String = line.chars().take(cols.saturating_sub(3)).collect();
+            alloc::format!("{kept}...")
+        } else {
+            line.clone()
+        };
+        render::draw_text(
+            fb,
+            x + 10,
+            y + 8 + (i as u32 * m.line) as i32,
+            &line,
+            m.body,
+            theme::INK,
+            Some(theme::PAPER),
         );
     }
+    y + h as i32
 }
 
-fn fmt_cd(secs: u32, buf: &mut [u8; 16]) -> &str {
-    let mut p = 0;
-    for &b in b"Boot " {
-        buf[p] = b;
-        p += 1;
+/// Character-wrapped editor with a block caret; the caret line stays visible.
+fn paint_cmdline_editor(
+    fb: &FramebufferInfo,
+    area: (i32, i32, u32),
+    edit: &dialog::Editor,
+    max_y: i32,
+) -> i32 {
+    let m = Metrics::for_fb(fb);
+    let (x, y, w) = area;
+    let cols = ((w - 20) / render::font_width(m.body)).max(1) as usize;
+    let chars: Vec<char> = edit.value.chars().collect();
+    let caret = edit.value[..edit.caret].chars().count();
+    let total_lines = chars.len() / cols + 1;
+    let room =
+        ((max_y - y - (m.button as i32 + 10) * 2 - 40).max(m.line as i32) as u32 / m.line) as usize;
+    let shown = total_lines.clamp(1, room.clamp(1, 6));
+    let caret_line = caret / cols;
+    let first = caret_line
+        .saturating_sub(shown - 1)
+        .min(total_lines.saturating_sub(shown));
+    let h = shown as u32 * m.line + 16;
+    render::fill_rect(fb, x, y, w, h, theme::SHEET);
+    render::draw_thick_border(
+        fb,
+        x,
+        y,
+        w,
+        h,
+        2,
+        if edit.focus == 0 {
+            theme::INK
+        } else {
+            theme::RULE_STRONG
+        },
+    );
+    for line in 0..shown {
+        let start = (first + line) * cols;
+        let text: String = chars.iter().skip(start).take(cols).collect();
+        let ly = y + 8 + (line as u32 * m.line) as i32;
+        render::draw_text(
+            fb,
+            x + 10,
+            ly,
+            &text,
+            m.body,
+            theme::INK,
+            Some(theme::SHEET),
+        );
     }
-    p += fmt_u32(secs, &mut buf[p..]);
-    buf[p] = b's';
-    p += 1;
-    core::str::from_utf8(&buf[..p]).unwrap_or("??")
+    if edit.focus == 0 && caret_line >= first && caret_line < first + shown {
+        let cx = x + 10 + ((caret % cols) as u32 * render::font_width(m.body)) as i32;
+        let cy = y + 8 + ((caret_line - first) as u32 * m.line) as i32;
+        let fw = render::font_width(m.body);
+        render::fill_rect(fb, cx, cy, fw, render::font_height(m.body), theme::INK);
+        if let Some(ch) = chars.get(caret) {
+            render::draw_char(fb, cx, cy, *ch, m.body, theme::SHEET, Some(theme::INK));
+        }
+    }
+    y + h as i32
 }
 
-/// Write decimal digits of `n` into `out`, returning the number of bytes written.
-pub(super) fn fmt_u32(n: u32, out: &mut [u8]) -> usize {
-    if n == 0 {
-        out[0] = b'0';
-        return 1;
+fn run_boot(fb: &FramebufferInfo, menu: &mut BootMenu, default: usize) -> BootResult {
+    let mut cursor = CursorRenderer::new();
+    let mut state = BState::new(menu.entry_count(), menu.selected, menu.timeout_seconds);
+    state.default = default;
+    keep_boot_selection_visible(fb, &mut state);
+    let mut buttons = paint_boot(fb, menu, &state);
+    let mut hover = Hover::default();
+    let origin = mouse_cursor::position();
+    loop {
+        poll_and_render_cursor(fb, &mut cursor);
+        // Tabs are not live while the command-line editor owns the keys.
+        let tabs = state
+            .edit
+            .is_none()
+            .then_some((NavItem::Boot, &state.focus));
+        track_hover(fb, &mut cursor, &mut hover, tabs);
+        if deliberate_pointer_motion(origin, mouse_cursor::position())
+            && cancel_boot_countdown(menu, &mut state)
+        {
+            keep_boot_selection_visible(fb, &mut state);
+            buttons = cursor.while_hidden(fb, || paint_boot(fb, menu, &state));
+            hover.reset();
+        }
+        let hovered = boot_hit(fb, menu, &state);
+        if hovered != state.hovered {
+            let previous = core::mem::replace(&mut state.hovered, hovered);
+            cursor.while_hidden(fb, || {
+                for i in previous.into_iter().chain(hovered) {
+                    paint_boot_row(fb, menu, &state, i);
+                }
+            });
+        }
+        if let Some(key) = menu_common::read_key() {
+            let mut viewport_only = matches!(key, KeyPress::MouseScroll(_));
+            cancel_boot_countdown(menu, &mut state);
+            if state.edit.is_some() {
+                match boot_edit_key(fb, menu, &mut state, key, &buttons) {
+                    Some(result) => {
+                        cursor.hide(fb);
+                        return result;
+                    }
+                    None => {
+                        buttons = cursor.while_hidden(fb, || paint_boot(fb, menu, &state));
+                        hover.reset();
+                        delay_ms(8);
+                        continue;
+                    }
+                }
+            }
+            let actions = boot_actions(menu, &state);
+            let mut activate: Option<usize> = None;
+            match chrome_key(fb, key, &mut state.focus, NavItem::Boot, actions) {
+                Some(FocusEvent::Navigate(i)) => {
+                    cursor.hide(fb);
+                    return BootResult::Nav(nav_at(i));
+                }
+                // Space activates buttons, but never the one that boots.
+                Some(FocusEvent::Action(i)) if !(i == 0 && key == KeyPress::Char(' ')) => {
+                    activate = Some(i)
+                }
+                Some(FocusEvent::Action(_)) => {}
+                Some(FocusEvent::Moved) => {}
+                None => match key {
+                    KeyPress::Enter if state.focus.group == Group::Content => activate = Some(0),
+                    KeyPress::Char('e' | 'E') => activate = Some(1),
+                    KeyPress::Up | KeyPress::Char('k') if state.focus.group == Group::Content => {
+                        state.sel_prev()
+                    }
+                    KeyPress::Down | KeyPress::Char('j') if state.focus.group == Group::Content => {
+                        state.sel_next()
+                    }
+                    KeyPress::Home | KeyPress::End | KeyPress::PageUp | KeyPress::PageDown
+                        if state.focus.group == Group::Content =>
+                    {
+                        state.sel = page_selection(
+                            key,
+                            state.sel,
+                            state.count,
+                            boot_visible_slots(fb, &state),
+                        )
+                        .unwrap_or(state.sel);
+                    }
+                    KeyPress::Char('r' | 'R') => {
+                        cursor.hide(fb);
+                        let backdrop = || {
+                            paint_boot(fb, menu, &state);
+                        };
+                        confirm_reset(fb, &backdrop);
+                    }
+                    KeyPress::MouseScroll(delta) => {
+                        let slots = boot_visible_slots(fb, &state);
+                        controls::scroll(&mut state.scroll_offset, delta, state.count, slots);
+                    }
+                    KeyPress::MouseClick { x, y } => {
+                        let l = boot_layout(fb, state.countdown > 0);
+                        let m = Metrics::for_fb(fb);
+                        if controls::scroll_track(
+                            &mut state.scroll_offset,
+                            (l.list.0, l.rows_y, l.list.2, l.slots as u32 * m.row),
+                            (x as i32, y as i32),
+                            state.count,
+                            l.slots,
+                        ) {
+                            viewport_only = true;
+                        } else if let Some(i) = buttons
+                            .iter()
+                            .position(|r| dialog::contains(*r, x as i32, y as i32))
+                        {
+                            state.focus.group = Group::Actions;
+                            state.focus.action = i;
+                            activate = Some(i);
+                        } else if let Some(i) = state.hovered {
+                            state.sel = i;
+                            state.focus.group = Group::Content;
+                        }
+                    }
+                    _ => {}
+                },
+            }
+            match activate {
+                Some(0) => {
+                    cursor.hide(fb);
+                    return BootResult::Selected(state.sel);
+                }
+                Some(_) => {
+                    if let Some(entry) = menu.entries.get(state.sel)
+                        && let Some(cmdline) = entry.get_cmdline()
+                    {
+                        if boot_layout(fb, false).side.is_some() {
+                            let mut editor = dialog::Editor::with_limit(cmdline, 511);
+                            editor.space_commits = false;
+                            state.edit = Some(editor);
+                        } else {
+                            cursor.hide(fb);
+                            let edited = {
+                                let backdrop = || {
+                                    paint_boot(fb, menu, &state);
+                                };
+                                dialog::input_with(
+                                    fb,
+                                    &backdrop,
+                                    None,
+                                    "Command line (this boot only)",
+                                    "Not saved. Enter boots with this command line.",
+                                    cmdline,
+                                    511,
+                                    false,
+                                    |_| Ok(()),
+                                )
+                            };
+                            if let Some(text) = edited {
+                                return apply_cmdline_and_boot(menu, state.sel, &text);
+                            }
+                        }
+                    }
+                }
+                None => {}
+            }
+            if !viewport_only && state.focus.group == Group::Content {
+                keep_boot_selection_visible(fb, &mut state);
+            }
+            menu.selected = state.sel;
+            buttons = cursor.while_hidden(fb, || paint_boot(fb, menu, &state));
+            hover.reset();
+        }
+        if state.countdown > 0 && state.tick.is_expired() {
+            state.countdown -= 1;
+            state.tick = Timeout::from_ms(1000);
+            if state.countdown == 0 {
+                cursor.hide(fb);
+                return BootResult::Selected(state.sel);
+            }
+            cursor.while_hidden(fb, || paint_boot_strip(fb, menu, &state));
+        }
+        delay_ms(8);
     }
-    // Find digit count (max 10 for u32)
-    let mut digits = 0u32;
-    let mut tmp = n;
-    while tmp > 0 {
-        digits += 1;
-        tmp /= 10;
+}
+
+fn apply_cmdline_and_boot(menu: &mut BootMenu, index: usize, text: &str) -> BootResult {
+    if let Some(cmdline) = menu
+        .entries
+        .get_mut(index)
+        .and_then(|e| e.get_cmdline_mut())
+    {
+        cmdline.clear();
+        for ch in text.chars() {
+            if cmdline.push(ch).is_err() {
+                break;
+            }
+        }
     }
-    let len = digits as usize;
-    let mut i = len;
-    let mut v = n;
-    while v > 0 {
-        i -= 1;
-        out[i] = b'0' + (v % 10) as u8;
-        v /= 10;
+    BootResult::Selected(index)
+}
+
+/// Keys while the details pane owns the one-shot command-line editor.
+fn boot_edit_key(
+    fb: &FramebufferInfo,
+    menu: &mut BootMenu,
+    state: &mut BState,
+    key: KeyPress,
+    buttons: &[Rect],
+) -> Option<BootResult> {
+    let edit = state.edit.as_mut()?;
+    let event = match key {
+        KeyPress::F8 => {
+            layout::toggle_text_size(fb);
+            return None;
+        }
+        KeyPress::MouseClick { x, y } => {
+            if buttons
+                .first()
+                .is_some_and(|r| dialog::contains(*r, x as i32, y as i32))
+            {
+                dialog::EditEvent::Apply
+            } else if buttons
+                .get(1)
+                .is_some_and(|r| dialog::contains(*r, x as i32, y as i32))
+            {
+                dialog::EditEvent::Cancel
+            } else {
+                dialog::EditEvent::Changed
+            }
+        }
+        // Buttons are drawn Boot-then-Cancel; the editor's stops are field,
+        // Cancel, Apply. Map Tab order to the visual order.
+        KeyPress::Tab => {
+            edit.focus = match edit.focus {
+                0 => 2,
+                2 => 1,
+                _ => 0,
+            };
+            dialog::EditEvent::Changed
+        }
+        KeyPress::BackTab => {
+            edit.focus = match edit.focus {
+                0 => 1,
+                1 => 2,
+                _ => 0,
+            };
+            dialog::EditEvent::Changed
+        }
+        key => edit.key(key),
+    };
+    match event {
+        dialog::EditEvent::Apply => {
+            let text = state.edit.take()?.value;
+            Some(apply_cmdline_and_boot(menu, state.sel, &text))
+        }
+        dialog::EditEvent::Cancel => {
+            state.edit = None;
+            state.focus.group = Group::Content;
+            None
+        }
+        dialog::EditEvent::Changed => None,
     }
-    len
 }
 
 #[cfg(test)]
@@ -929,18 +1372,12 @@ mod tests {
     use crate::drivers::storage::StorageId;
     use crate::fs::gpt::Partition;
     use crate::menu::{BootCategory, BootEntry, BootEntryKind};
-    use std::vec::Vec;
-
-    const W: u32 = 1024;
-    const H: u32 = 768;
-
-    /// A 32bpp framebuffer backed by host memory.
-    fn framebuffer(mem: &mut [u32]) -> FramebufferInfo {
+    fn framebuffer(mem: &mut [u32], width: u32, height: u32) -> FramebufferInfo {
         FramebufferInfo {
             physical_address: mem.as_mut_ptr() as u64,
-            width: W,
-            height: H,
-            stride: W,
+            width,
+            height,
+            stride: width,
             bits_per_pixel: 32,
             red_mask_pos: 16,
             red_mask_size: 8,
@@ -950,40 +1387,10 @@ mod tests {
             blue_mask_size: 8,
         }
     }
-
-    fn pixels(fb: &FramebufferInfo) -> Vec<u32> {
-        // SAFETY: `fb` points at a live `W * H` buffer of u32.
-        unsafe { core::slice::from_raw_parts(fb.as_ptr() as *const u32, (W * H) as usize) }.to_vec()
-    }
-
-    /// Assert equality, reporting the bounding box of the differing pixels instead of a dump.
-    fn assert_same(got: &[u32], want: &[u32], sel: usize) {
-        let diff: Vec<(u32, u32)> = got
-            .iter()
-            .zip(want)
-            .enumerate()
-            .filter(|(_, (g, w))| g != w)
-            .map(|(i, _)| (i as u32 % W, i as u32 / W))
-            .collect();
-        let bbox = |f: fn(&(u32, u32)) -> u32| {
-            (
-                diff.iter().map(f).min().unwrap_or(0),
-                diff.iter().map(f).max().unwrap_or(0),
-            )
-        };
-        assert!(
-            diff.is_empty(),
-            "sel={sel}: {} pixels differ, x {:?} y {:?}",
-            diff.len(),
-            bbox(|p| p.0),
-            bbox(|p| p.1)
-        );
-    }
-
     fn boot_menu(count: usize) -> BootMenu {
         let mut menu = BootMenu::new();
-        (0..count).for_each(|i| {
-            let mut name = heapless::String::<64>::new();
+        for i in 0..count {
+            let mut name = heapless::String::new();
             let _ = core::fmt::write(&mut name, format_args!("Entry {i}"));
             menu.add_entry(BootEntry {
                 name,
@@ -1006,45 +1413,167 @@ mod tests {
                 kind: BootEntryKind::Uefi,
                 category: BootCategory::Uefi,
             });
-        });
+        }
         menu
     }
-
-    /// Stepping through the boot list with partial repaints, with the mouse cursor sitting
-    /// on top of the cards, must leave exactly the pixels of a full repaint and no cursor
-    /// residue.
     #[test]
-    fn boot_selection_repaint_matches_full_repaint() {
-        const COUNT: usize = 12;
-        let mut menu = boot_menu(COUNT);
-        let mut inc_mem = std::vec![0u32; (W * H) as usize];
-        let mut ref_mem = std::vec![0u32; (W * H) as usize];
-        let (inc, full) = (framebuffer(&mut inc_mem), framebuffer(&mut ref_mem));
+    fn page_navigation_is_bounded_and_handles_empty_lists() {
+        assert_eq!(page_selection(KeyPress::End, 0, 40, 6), Some(39));
+        assert_eq!(page_selection(KeyPress::Home, 30, 40, 6), Some(0));
+        assert_eq!(page_selection(KeyPress::PageDown, 38, 40, 6), Some(39));
+        assert_eq!(page_selection(KeyPress::PageUp, 2, 40, 6), Some(0));
+        assert_eq!(page_selection(KeyPress::PageDown, 0, 0, 6), None);
+    }
+    #[test]
+    fn activating_the_current_navigation_tab_does_not_leave_the_screen() {
+        let fb = framebuffer(&mut [], 640, 480);
+        let mut focus = Focus::new(nav_item_index(NavItem::Firmware));
+        focus.group = Group::Navigation;
+        assert_eq!(
+            chrome_key(&fb, KeyPress::Enter, &mut focus, NavItem::Firmware, 4),
+            Some(FocusEvent::Moved)
+        );
+        focus.group = Group::Content;
+        assert_eq!(
+            chrome_key(&fb, KeyPress::Char(' '), &mut focus, NavItem::Boot, 2),
+            None
+        );
+    }
 
-        let mut st = BState::new(COUNT, 0, 0);
-        keep_boot_selection_visible(&inc, &mut st);
-        paint_boot(&inc, &menu, &st);
-        let mut cursor = CursorRenderer::new();
-        let (cx, cy) = (300, 200);
-        cursor.update(&inc, cx, cy);
+    #[test]
+    fn backing_out_of_no_media_subscreens_returns_to_the_restart_screen() {
+        assert_eq!(
+            no_media_destination(NavItem::Firmware, ScreenNav::Back),
+            Some(NavItem::Boot)
+        );
+        #[cfg(feature = "secure-boot")]
+        assert_eq!(
+            no_media_destination(NavItem::Security, ScreenNav::Back),
+            Some(NavItem::Boot)
+        );
+        assert_eq!(no_media_destination(NavItem::Boot, ScreenNav::Back), None);
+    }
 
-        let scrolled = (0..COUNT - 1)
-            .map(|_| {
-                let before = (st.sel, st.scroll_offset);
-                st.sel_next();
-                select_boot(&inc, &mut menu, &mut st, &mut cursor, before);
+    #[test]
+    fn mouse_jitter_does_not_cancel_unattended_boot() {
+        for x in 393..408 {
+            assert!(!deliberate_pointer_motion((400, 300), (x, 301)));
+        }
+        assert!(deliberate_pointer_motion((400, 300), (408, 300)));
+        assert!(deliberate_pointer_motion((400, 300), (400, 292)));
+    }
+    #[test]
+    fn short_boot_framebuffer_requires_text_fallback() {
+        let mut mem = std::vec![0; 800 * 240];
+        assert!(!supports_framebuffer(&framebuffer(&mut mem, 800, 240)));
+    }
+    #[test]
+    fn countdown_cancellation_survives_returning_from_settings() {
+        let mut menu = boot_menu(1);
+        menu.timeout_seconds = 5;
+        let mut state = BState::new(1, 0, 5);
+        assert!(cancel_boot_countdown(&mut menu, &mut state));
+        let returned = BState::new(1, menu.selected, menu.timeout_seconds);
+        assert_eq!(returned.countdown, 0);
+        assert!(!cancel_boot_countdown(&mut menu, &mut state));
+    }
+    #[test]
+    fn hover_cannot_erase_the_offscreen_selections_region_focus() {
+        let menu = boot_menu(20);
+        let mut pixels = std::vec![0; 640 * 400];
+        let fb = framebuffer(&mut pixels, 640, 400);
+        let mut state = BState::new(20, 0, 0);
+        state.scroll_offset = 2;
+        paint_boot(&fb, &menu, &state);
+        state.hovered = Some(2);
+        paint_boot_row(&fb, &menu, &state, 2);
+        let mut expected = std::vec![0; pixels.len()];
+        paint_boot(&framebuffer(&mut expected, 640, 400), &menu, &state);
+        assert!(
+            pixels == expected,
+            "hover must preserve the complete region outline"
+        );
+    }
 
-                let mut expected = BState::new(COUNT, st.sel, 0);
-                expected.scroll_offset = st.scroll_offset;
-                paint_boot(&full, &menu, &expected);
+    #[test]
+    fn hover_repaint_and_focus_geometry_match_full_repaint() {
+        let menu = boot_menu(20);
+        for (width, height) in [(640, 400), (800, 600), (1024, 768), (1920, 1080)] {
+            let mut pixels = std::vec![0; width as usize * height as usize];
+            let fb = framebuffer(&mut pixels, width, height);
+            let mut state = BState::new(20, 0, 0);
+            paint_boot(&fb, &menu, &state);
+            let mut cursor = CursorRenderer::new();
+            for i in 0..20 {
+                state.sel = i;
+                state.hovered = None;
+                keep_boot_selection_visible(&fb, &mut state);
+                paint_boot(&fb, &menu, &state);
+                let row = row_rect(&fb, &state, i).unwrap();
+                cursor.update(&fb, row.0 + 30, row.1 + 10);
+                state.hovered = Some(i);
+                cursor.while_hidden(&fb, || paint_boot_row(&fb, &menu, &state, i));
+                cursor.hide(&fb);
+                let mut expected = std::vec![0; pixels.len()];
+                paint_boot(&framebuffer(&mut expected, width, height), &menu, &state);
+                assert!(
+                    pixels == expected,
+                    "hover repaint differs at {width}x{height}, row {i}"
+                );
+                state.hovered = None;
+                paint_boot_row(&fb, &menu, &state, i);
+                paint_boot(&framebuffer(&mut expected, width, height), &menu, &state);
+                assert!(
+                    pixels == expected,
+                    "hover removal differs at {width}x{height}, row {i}"
+                );
+                let (_, y, _, h) = row_rect(&fb, &state, i).unwrap();
+                let (_, cy, _, ch) = canvas(&fb);
+                assert!(y + h as i32 <= cy + ch as i32);
+            }
+        }
+    }
 
-                cursor.hide(&inc);
-                assert_same(&pixels(&inc), &pixels(&full), st.sel);
-                cursor.update(&inc, cx, cy);
-                st.scroll_offset != before.1
-            })
-            .filter(|&scrolled| scrolled)
-            .count();
-        assert!(scrolled > 0, "test never exercised the scrolling path");
+    #[test]
+    fn countdown_strip_repaint_matches_full_repaint() {
+        let menu = boot_menu(3);
+        let (width, height) = (1024, 768);
+        let mut pixels = std::vec![0; width as usize * height as usize];
+        let fb = framebuffer(&mut pixels, width, height);
+        let mut state = BState::new(3, 0, 5);
+        paint_boot(&fb, &menu, &state);
+        state.countdown = 3;
+        paint_boot_strip(&fb, &menu, &state);
+        let mut expected = std::vec![0; pixels.len()];
+        paint_boot(&framebuffer(&mut expected, width, height), &menu, &state);
+        assert!(pixels == expected);
+    }
+
+    #[test]
+    fn long_multibyte_command_lines_paint_without_splitting_characters() {
+        let (width, height) = (1024, 768);
+        let mut pixels = std::vec![0; width as usize * height as usize];
+        let fb = framebuffer(&mut pixels, width, height);
+        let mut menu = boot_menu(1);
+        let mut cmdline = heapless::String::<512>::new();
+        while cmdline.push_str("é ünïcødé ").is_ok() {}
+        menu.entries[0].kind = BootEntryKind::BlsLinux {
+            linux_path: heapless::String::new(),
+            initrd_paths: heapless::Vec::new(),
+            cmdline,
+        };
+        let state = BState::new(1, 0, 0);
+        paint_boot(&fb, &menu, &state);
+    }
+
+    #[test]
+    fn x61_layout_has_details_pane_and_room_for_rows() {
+        let fb = framebuffer(&mut [], 1024, 768);
+        let l = boot_layout(&fb, true);
+        assert!(l.side.is_some() && l.bar.is_none() && l.disk_x.is_some());
+        assert!(l.slots >= 10, "{}", l.slots);
+        let narrow = framebuffer(&mut [], 640, 480);
+        let l = boot_layout(&narrow, false);
+        assert!(l.side.is_none() && l.bar.is_some());
     }
 }
