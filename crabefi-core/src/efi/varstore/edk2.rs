@@ -207,11 +207,41 @@ pub struct FvVariable {
 /// `data_size` is the size of the variable data area (from `FvValidation`).
 ///
 /// Returns all parsed variables (including deleted ones — caller filters).
+/// The walk is tolerant: it stops at the first record it cannot parse.
 pub fn walk_variables<F>(read_fn: &mut F, auth_format: bool, data_size: u32) -> Vec<FvVariable>
 where
     F: FnMut(u32, &mut [u8]) -> bool,
 {
+    walk_variables_inner(read_fn, auth_format, data_size).0
+}
+
+/// Checked variant of [`walk_variables`] for callers that must fail closed:
+/// returns `None` when the walk stopped at a malformed or truncated record
+/// (unreadable bytes, out-of-bounds sizes, non-blank garbage) rather than at
+/// the clean end of the record area. A truncated list must never be mistaken
+/// for the complete authentication history.
+pub fn walk_variables_checked<F>(
+    read_fn: &mut F,
+    auth_format: bool,
+    data_size: u32,
+) -> Option<Vec<FvVariable>>
+where
+    F: FnMut(u32, &mut [u8]) -> bool,
+{
+    let (vars, complete) = walk_variables_inner(read_fn, auth_format, data_size);
+    complete.then_some(vars)
+}
+
+fn walk_variables_inner<F>(
+    read_fn: &mut F,
+    auth_format: bool,
+    data_size: u32,
+) -> (Vec<FvVariable>, bool)
+where
+    F: FnMut(u32, &mut [u8]) -> bool,
+{
     let mut vars = Vec::new();
+    let mut malformed = false;
     let hdr_size = if auth_format {
         AUTH_VAR_HEADER_SIZE
     } else {
@@ -220,25 +250,30 @@ where
 
     let mut offset = VARIABLE_DATA_OFFSET;
     let Some(end) = VARIABLE_DATA_OFFSET.checked_add(data_size) else {
-        return vars;
+        return (vars, false);
     };
 
     while offset + hdr_size <= end {
         // Read the variable header
         let mut hdr_buf = vec![0u8; hdr_size as usize];
         if !read_fn(offset, &mut hdr_buf) {
-            break;
+            return (vars, false);
         }
 
-        // Check StartId
+        // Check StartId. Records are append-only, so the walk ends cleanly
+        // only on blank (uniformly erased or zeroed) space; any other
+        // non-record bytes are corruption, not free space.
         let start_id = u16::from_le_bytes([hdr_buf[0], hdr_buf[1]]);
         if start_id != VARIABLE_DATA {
-            break; // End of variable records (free space)
+            let blank = hdr_buf.iter().all(|&b| b == 0xFF) || hdr_buf.iter().all(|&b| b == 0);
+            return (vars, blank && !malformed);
         }
 
         let state = hdr_buf[2];
 
-        // Check for erased/corrupt entry
+        // A record torn before its state byte was committed sits at the
+        // append point and is reused by the next write, so nothing valid
+        // can follow it: this is a clean end, not corruption.
         if state == 0xFF {
             break;
         }
@@ -286,7 +321,9 @@ where
 
         // Sanity check sizes — 0xFFFFFFFF means uninitialized
         if name_size == 0xFFFFFFFF || data_size_field == 0xFFFFFFFF || attributes == 0xFFFFFFFF {
-            // Corrupt/uninitialized — skip with zero sizes
+            // Corrupt/uninitialized — skip with zero sizes, but the walk is
+            // no longer known-complete for checked callers.
+            malformed = true;
             let var_size = align_up(hdr_size, HEADER_ALIGNMENT);
             offset += var_size;
             continue;
@@ -301,17 +338,17 @@ where
         // pass the bounds check and go on to allocate and read out of the
         // variable region.
         let Some(name_offset) = offset.checked_add(hdr_size) else {
-            break;
+            return (vars, false);
         };
         let Some(name_end) = name_offset.checked_add(name_size) else {
-            break;
+            return (vars, false);
         };
         if name_end > end {
-            break;
+            return (vars, false);
         }
         let mut name_bytes = vec![0u8; name_size as usize];
         if !read_fn(name_offset, &mut name_bytes) {
-            break;
+            return (vars, false);
         }
         // Convert to Vec<u16>
         let name: Vec<u16> = name_bytes
@@ -324,16 +361,16 @@ where
         // Read data
         let data_offset = name_end;
         let Some(data_end) = data_offset.checked_add(data_size_field) else {
-            break;
+            return (vars, false);
         };
         if data_end > end {
-            break;
+            return (vars, false);
         }
         let mut data = vec![0u8; data_size_field as usize];
         // Authenticated deletion records have no payload. Some flash backends
         // reject even an empty read at the exclusive end of their mapping.
         if !data.is_empty() && !read_fn(data_offset, &mut data) {
-            break;
+            return (vars, false);
         }
 
         // State byte offset (relative to storage region base)
@@ -354,18 +391,18 @@ where
             .checked_add(name_size)
             .and_then(|size| size.checked_add(data_size_field))
         else {
-            break;
+            return (vars, false);
         };
         let Some(aligned) = checked_align_up(total_size, HEADER_ALIGNMENT) else {
-            break;
+            return (vars, false);
         };
         let Some(next) = offset.checked_add(aligned) else {
-            break;
+            return (vars, false);
         };
         offset = next;
     }
 
-    vars
+    (vars, !malformed)
 }
 
 /// Find the write offset (first free byte) in the variable data area.
@@ -775,6 +812,52 @@ mod tests {
         assert_eq!(variables.len(), 1);
         assert!(variables[0].data.is_empty());
         assert_eq!(variables[0].timestamp, Some(timestamp()));
+    }
+
+    #[test]
+    fn checked_walk_fails_closed_on_corruption_before_a_tombstone() {
+        fn checked(region: &[u8], data_size: u32) -> Option<Vec<FvVariable>> {
+            let mut read = |offset: u32, output: &mut [u8]| {
+                let start = offset as usize;
+                let Some(source) = region.get(start..start + output.len()) else {
+                    return false;
+                };
+                output.copy_from_slice(source);
+                true
+            };
+            walk_variables_checked(&mut read, true, data_size)
+        }
+
+        let guid = [0x5a; 16];
+        let name = [b'd' as u16, b'b' as u16, b'x' as u16, 0];
+        let mut tombstone =
+            build_variable_record(&guid, &name, 0x27, &[], Some(timestamp())).unwrap();
+        tombstone[2] = VAR_ADDED;
+
+        // Blank space and a walk ending in blank space are complete.
+        let blank = vec![0xff; VARIABLE_DATA_OFFSET as usize + 256];
+        assert!(matches!(checked(&blank, 256), Some(found) if found.is_empty()));
+        let mut region = vec![0xff; VARIABLE_DATA_OFFSET as usize];
+        region.extend_from_slice(&tombstone);
+        region.extend_from_slice(&[0xff; 256]);
+        let found = checked(&region, (tombstone.len() + 256) as u32).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].timestamp, Some(timestamp()));
+
+        // A record with an out-of-bounds payload size truncates the walk:
+        // the tombstone after it must not be reported as absent history.
+        let mut corrupt =
+            build_variable_record(&guid, &name, 0x27, b"x", Some(timestamp())).unwrap();
+        corrupt[2] = VAR_ADDED;
+        corrupt[0x28..0x2c].copy_from_slice(&0x7fff_ffffu32.to_le_bytes());
+        let mut region = vec![0xff; VARIABLE_DATA_OFFSET as usize];
+        region.extend_from_slice(&corrupt);
+        region.extend_from_slice(&tombstone);
+        assert!(checked(&region, (corrupt.len() + tombstone.len()) as u32).is_none());
+
+        // Non-blank garbage where free space is expected is corruption too.
+        let garbage = vec![0xab; VARIABLE_DATA_OFFSET as usize + 256];
+        assert!(checked(&garbage, 256).is_none());
     }
 
     #[test]
