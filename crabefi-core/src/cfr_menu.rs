@@ -84,25 +84,6 @@ fn has_changes(items: &[MenuItem]) -> bool {
     })
 }
 
-/// Treat the current in-menu values as saved after a successful explicit save.
-#[cfg(feature = "ui")]
-fn mark_changes_saved(items: &mut [MenuItem]) {
-    for item in items {
-        match item {
-            MenuItem::CrabLogLevel {
-                current_level,
-                original_level,
-            } => *original_level = *current_level,
-            MenuItem::Option {
-                current_value,
-                original_value,
-                ..
-            } => *original_value = current_value.clone(),
-            _ => {}
-        }
-    }
-}
-
 /// Show the CFR firmware settings menu
 ///
 /// Displays the menu and handles user interaction.
@@ -204,8 +185,11 @@ pub fn show_cfr_menu() {
                     }
                     KeyPress::Escape | KeyPress::Char('q') | KeyPress::Char('Q') => {
                         if has_changes(&items) && confirm_save(&mut fb_console) {
-                            let (saved, failed) = save_all_changes(cfr_info, &items);
+                            let (saved, failed) = save_all_changes(cfr_info, &mut items);
                             show_save_result(saved, failed, &mut fb_console);
+                            if failed > 0 {
+                                break; // Keep failed drafts available for retry or discard.
+                            }
                         }
                         return;
                     }
@@ -480,15 +464,35 @@ fn toggle_value(option: &CfrOption, value: &mut CfrValue) -> bool {
             false
         }
         (CfrOptionType::Number { min, max, step, .. }, CfrValue::Number(n)) => {
-            let new_val = (*n).saturating_add(*step);
-            if new_val <= *max {
-                *n = new_val;
-            } else {
-                *n = *min; // Wrap around
+            if min > max {
+                return false;
             }
+            *n = stepped_number(*n, *min, *max, *step, true).unwrap_or(*min);
             true
         }
         _ => false,
+    }
+}
+
+/// Move to the next representable value on the minimum-relative step grid.
+/// Never clamp to an unaligned maximum or overflow at either u32 boundary.
+fn stepped_number(current: u32, min: u32, max: u32, step: u32, forward: bool) -> Option<u32> {
+    if min > max {
+        return None;
+    }
+    let step = step.max(1);
+    if forward {
+        if current < min {
+            return Some(min);
+        }
+        let offset = (current - min) / step;
+        min.checked_add(offset.checked_add(1)?.checked_mul(step)?)
+            .filter(|next| *next <= max)
+    } else if current > min {
+        let bound = current.saturating_sub(1).min(max);
+        Some(min + (bound - min) / step * step)
+    } else {
+        None
     }
 }
 
@@ -537,14 +541,9 @@ fn increment_option(cfr: &CfrInfo, items: &mut [MenuItem], index: usize) -> bool
                 false
             }
         }
-        (CfrOptionType::Number { max, step, .. }, CfrValue::Number(n)) => {
-            let new_val = (*n).saturating_add(*step);
-            if new_val <= *max {
-                *n = new_val;
-                true
-            } else if *n < *max {
-                // Unaligned: clamp to max
-                *n = *max;
+        (CfrOptionType::Number { min, max, step, .. }, CfrValue::Number(n)) => {
+            if let Some(next) = stepped_number(*n, *min, *max, *step, true) {
+                *n = next;
                 true
             } else {
                 false
@@ -607,13 +606,9 @@ fn decrement_option(cfr: &CfrInfo, items: &mut [MenuItem], index: usize) -> bool
                 false
             }
         }
-        (CfrOptionType::Number { min, step, .. }, CfrValue::Number(n)) => {
-            if *n >= *min + *step {
-                *n -= *step;
-                true
-            } else if *n > *min {
-                // Unaligned: clamp to min
-                *n = *min;
+        (CfrOptionType::Number { min, max, step, .. }, CfrValue::Number(n)) => {
+            if let Some(next) = stepped_number(*n, *min, *max, *step, false) {
+                *n = next;
                 true
             } else {
                 false
@@ -627,7 +622,7 @@ fn decrement_option(cfr: &CfrInfo, items: &mut [MenuItem], index: usize) -> bool
 ///
 /// Only writes options that were actually changed by the user, reducing
 /// unnecessary SPI flash wear. Returns `(saved, failed)` counts.
-fn save_all_changes(cfr: &CfrInfo, items: &[MenuItem]) -> (usize, usize) {
+fn save_all_changes(cfr: &CfrInfo, items: &mut [MenuItem]) -> (usize, usize) {
     let mut saved = 0usize;
     let mut failed = 0usize;
     for item in items {
@@ -637,7 +632,10 @@ fn save_all_changes(cfr: &CfrInfo, items: &[MenuItem]) -> (usize, usize) {
                 original_level,
             } if current_level != original_level => {
                 match crate::logger::set_configured_level(*current_level) {
-                    Ok(()) => saved += 1,
+                    Ok(()) => {
+                        *original_level = *current_level;
+                        saved += 1;
+                    }
                     Err(e) => {
                         log::warn!("Failed to save CrabEFI log level: {:?}", e);
                         failed += 1;
@@ -652,7 +650,10 @@ fn save_all_changes(cfr: &CfrInfo, items: &[MenuItem]) -> (usize, usize) {
             } if current_value != original_value => {
                 if let Some(option) = get_option(cfr, *form_idx, *option_idx) {
                     match cfr::write_option_value(option, current_value) {
-                        Ok(()) => saved += 1,
+                        Ok(()) => {
+                            *original_value = current_value.clone();
+                            saved += 1;
+                        }
                         Err(e) => {
                             log::warn!("Failed to save '{}': {}", option.opt_name, e);
                             failed += 1;
@@ -907,11 +908,8 @@ fn show_cfr_menu_graphical(cfr_info: &CfrInfo, fb: &FramebufferInfo) {
                 KeyPress::Char('s') | KeyPress::Char('S') => {
                     if has_changes(&items) {
                         cursor.hide(fb);
-                        let (saved, failed) = save_all_changes(cfr_info, &items);
+                        let (saved, failed) = save_all_changes(cfr_info, &mut items);
                         show_save_result_graphical(fb, saved, failed);
-                        if failed == 0 {
-                            mark_changes_saved(&mut items);
-                        }
                     } else {
                         state.status_message = Some(("No changes to save", true));
                     }
@@ -925,7 +923,7 @@ fn show_cfr_menu_graphical(cfr_info: &CfrInfo, fb: &FramebufferInfo) {
                 KeyPress::Escape | KeyPress::Char('q') | KeyPress::Char('Q') => {
                     cursor.hide(fb);
                     if has_changes(&items) && confirm_save_graphical(fb) {
-                        let (saved, failed) = save_all_changes(cfr_info, &items);
+                        let (saved, failed) = save_all_changes(cfr_info, &mut items);
                         show_save_result_graphical(fb, saved, failed);
                     }
                     return;
