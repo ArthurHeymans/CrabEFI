@@ -31,12 +31,15 @@ use crate::time::{Timeout, wait_for};
 use alloc::boxed::Box;
 use core::ptr;
 use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
+use tock_registers::{LocalRegisterCopy, registers::ReadOnly};
 
 // Import register definitions from ehci_regs module
 use super::ehci_regs::{
     // Bitfield types for typed register access
     CAPLENGTH_HCIVERSION,
     CONFIGFLAG,
+    DEBUG_CAPABILITY,
+    DEBUG_CONTROL,
     // Register struct types
     EhciCapRegs,
     EhciOpRegs,
@@ -328,11 +331,60 @@ impl Qh {
 // EHCI Controller
 // ============================================================================
 
+#[cfg(test)]
+#[path = "ehci_debug_tests.rs"]
+mod debug_port_tests;
+
 /// Maximum number of devices
 const MAX_DEVICES: usize = 16;
 
 /// Maximum number of ports
 const MAX_PORTS: usize = 15;
+
+/// Decode the one-based debug BAR number and its MMIO-relative offset.
+fn debug_port_address(capability: u32, bars: &[pci::PciBar; 6]) -> Option<u64> {
+    let capability = LocalRegisterCopy::<u32, DEBUG_CAPABILITY::Register>::new(capability);
+    let index = capability.read(DEBUG_CAPABILITY::BAR).checked_sub(1)? as usize;
+    let bar = bars.get(index)?;
+    if !matches!(
+        bar.bar_type,
+        pci::BarType::Memory32 | pci::BarType::Memory64
+    ) || bar.address == 0
+    {
+        return None;
+    }
+    let offset = u64::from(capability.read(DEBUG_CAPABILITY::OFFSET));
+    if offset & 3 != 0 {
+        return None;
+    }
+    bar.address.checked_add(offset)
+}
+
+/// A firmware-owned EHCI debug port must survive driver discovery. Resetting
+/// its controller destroys the host's DebugOutput, potentially from inside a
+/// log call. Use the standard capability, not board IDs or a fixed BAR offset.
+pub(crate) fn debug_port_in_use(device: &PciDevice) -> bool {
+    let Ok(Some(capability)) = pci::find_capability(device.address, 0x0a) else {
+        return false;
+    };
+    if pci::read_config_u16(device.address, 0x04) & pci::CommandRegister::MEMORY_ENABLE.bits() == 0
+    {
+        return false;
+    }
+    let Some(address) = debug_port_address(
+        pci::read_config_u32(device.address, u16::from(capability)),
+        &device.bars,
+    ) else {
+        return false;
+    };
+    // SAFETY: the device has a decoded memory BAR and advertises this debug
+    // register within it. No writes or ownership changes are performed here.
+    let control = unsafe { &*(address as *const ReadOnly<u32, DEBUG_CONTROL::Register>) };
+    control.get() != u32::MAX
+        && control.matches_all(
+            DEBUG_CONTROL::OWNER::SET + DEBUG_CONTROL::ENABLED::SET + DEBUG_CONTROL::IN_USE::SET,
+        )
+}
 
 /// EHCI Host Controller
 pub struct EhciController {
@@ -381,6 +433,9 @@ impl EhciController {
 
     /// Create a new EHCI controller from a PCI device
     pub async fn new(pci_dev: &PciDevice) -> Result<Self, UsbError> {
+        if debug_port_in_use(pci_dev) {
+            return Err(UsbError::NotReady);
+        }
         // EHCI uses MMIO from BAR0
         let mmio_base = pci_dev.mmio_base().ok_or(UsbError::NotReady)?;
 

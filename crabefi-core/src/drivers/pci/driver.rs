@@ -223,6 +223,13 @@ impl PciDriver for UsbPciDriver {
     }
 
     fn probe(&self, device: &PciDevice) -> bool {
+        if device.prog_if == 0x20 && usb::ehci::debug_port_in_use(device) {
+            log::info!(
+                "PCI {}: preserving active EHCI debug console",
+                device.address
+            );
+            return false;
+        }
         // Do not claim a controller whose implementation was not selected.
         matches!(device.prog_if, 0x10 | 0x20)
             || (cfg!(target_arch = "x86_64") && device.prog_if == 0x00)

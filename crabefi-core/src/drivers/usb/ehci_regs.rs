@@ -15,6 +15,19 @@ use tock_registers::registers::{ReadOnly, ReadWrite};
 
 register_bitfields! [
     u32,
+    /// PCI Debug Port capability (EHCI C.2.1), capability ID 0x0a.
+    pub DEBUG_CAPABILITY [
+        OFFSET OFFSET(16) NUMBITS(13) [],
+        BAR OFFSET(29) NUMBITS(3) []
+    ],
+
+    /// Debug Port control/status (EHCI C.3.1).
+    pub DEBUG_CONTROL [
+        IN_USE OFFSET(10) NUMBITS(1) [],
+        ENABLED OFFSET(28) NUMBITS(1) [],
+        OWNER OFFSET(30) NUMBITS(1) []
+    ],
+
     /// Capability Register Length and Interface Version (offset 0x00)
     /// Lower byte is CAPLENGTH, upper word is HCIVERSION
     pub CAPLENGTH_HCIVERSION [
