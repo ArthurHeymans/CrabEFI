@@ -853,6 +853,14 @@ fn prepare_import(idx: usize) -> Result<Option<Prepared>, &'static str> {
                         preview.entries.x509_count
                     ),
                 ),
+                Block::fact(
+                    "Applies as",
+                    if preview.append {
+                        "Adds to the current revocations"
+                    } else {
+                        "Replaces the current revocations"
+                    },
+                ),
             ];
             if let Some(t) = preview.timestamp {
                 let (year, month, day, hour, minute, second) =
