@@ -511,6 +511,12 @@ pub trait PlatformHooks {
     /// Boot Services pointer is cleared.
     fn on_exit_boot_services(&self) {}
 
+    /// Stop DMA of platform-owned devices CrabEFI does not drive (for example
+    /// a storage controller behind a platform block device) before every OS
+    /// handoff: `ExitBootServices()` and direct Linux boot. Runs before
+    /// CrabEFI shuts its own drivers down and clears PCI bus mastering.
+    fn quiesce_dma(&self) {}
+
     /// Return whether the platform exposes a firmware settings UI.
     fn firmware_settings_available(&self) -> bool {
         false

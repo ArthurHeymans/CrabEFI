@@ -169,10 +169,14 @@ pub mod usb;
 
 /// Stop firmware-owned DMA before transferring control to an operating system.
 ///
+/// The platform first stops the devices it owns ([`crate::PlatformHooks::quiesce_dma`]).
 /// Driver shutdown handles controller-specific teardown. Clearing bus mastering
 /// afterwards is the final safety net for devices without complete shutdown
 /// coverage or for controllers that failed to quiesce cleanly.
 pub fn quiesce_dma_for_os_handoff() {
+    if let Some(hooks) = crate::handoff::callbacks().hooks {
+        hooks.quiesce_dma();
+    }
     pci::shutdown_drivers();
     pci::disable_all_bus_mastering_for_handoff();
 }
