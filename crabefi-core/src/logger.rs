@@ -70,6 +70,32 @@ pub fn get_us_since_boot() -> u64 {
     ((delta as u128 * 1_000_000) / freq as u128) as u64
 }
 
+// DebugOutput may itself use drivers which log (e.g. an SPI flash console).
+// Never re-enter the serial/framebuffer callbacks while formatting a record.
+static LOG_ACTIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+struct LogEntry<'a>(&'a core::sync::atomic::AtomicBool);
+
+impl<'a> LogEntry<'a> {
+    fn try_enter(active: &'a core::sync::atomic::AtomicBool) -> Option<Self> {
+        active
+            .compare_exchange(
+                false,
+                true,
+                core::sync::atomic::Ordering::Acquire,
+                core::sync::atomic::Ordering::Relaxed,
+            )
+            .ok()
+            .map(|_| Self(active))
+    }
+}
+
+impl Drop for LogEntry<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, core::sync::atomic::Ordering::Release);
+    }
+}
+
 /// Combined serial + framebuffer logger
 struct CombinedLogger;
 
@@ -80,6 +106,9 @@ impl log::Log for CombinedLogger {
 
     fn log(&self, record: &Record) {
         if self.enabled(record.metadata()) {
+            let Some(_entry) = LogEntry::try_enter(&LOG_ACTIVE) else {
+                return;
+            };
             // Level strings for serial (with ANSI colors)
             let level_str_serial = match record.level() {
                 Level::Error => "\x1b[31mERROR\x1b[0m",
@@ -246,4 +275,16 @@ fn read_persisted_level() -> Option<LevelFilter> {
         LOG_LEVEL_VARIABLE_NAME,
     )
     .and_then(|(_, data)| level_from_data(&data))
+}
+
+#[cfg(test)]
+mod reentry_tests {
+    #[test]
+    fn backend_logging_cannot_reenter_output_and_next_record_still_works() {
+        let active = core::sync::atomic::AtomicBool::new(false);
+        let entry = super::LogEntry::try_enter(&active).unwrap();
+        assert!(super::LogEntry::try_enter(&active).is_none());
+        drop(entry);
+        assert!(super::LogEntry::try_enter(&active).is_some());
+    }
 }
