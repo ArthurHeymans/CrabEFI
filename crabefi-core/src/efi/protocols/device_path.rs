@@ -1054,6 +1054,61 @@ pub enum DevicePathInfo {
     Platform { index: usize },
 }
 
+/// Hardware Vendor device path subtype (UEFI 10.3.2.4).
+const SUBTYPE_VENDOR: u8 = 0x04;
+
+/// Vendor GUID naming a platform-provided block device, the node's data its
+/// index in `PlatformConfig::block_devices`.
+pub const PLATFORM_BLOCK_DEVICE_GUID: Guid = Guid::from_fields(
+    0x4d83e520,
+    0x577e,
+    0x44e1,
+    0xad,
+    0x3e,
+    &[0x95, 0xdc, 0x7e, 0x45, 0x38, 0xca],
+);
+
+/// `VenHw(PLATFORM_BLOCK_DEVICE_GUID, index)`: a platform block device has
+/// no PCI topology CrabEFI knows, so it gets a vendor-defined hardware node.
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+pub struct PlatformBlockNode {
+    pub r#type: u8,
+    pub sub_type: u8,
+    pub length: [u8; 2],
+    pub guid: [u8; 16],
+    pub index: u32,
+}
+
+impl PlatformBlockNode {
+    fn new(index: usize) -> Self {
+        Self {
+            r#type: TYPE_HARDWARE,
+            sub_type: SUBTYPE_VENDOR,
+            length: (core::mem::size_of::<Self>() as u16).to_le_bytes(),
+            guid: *PLATFORM_BLOCK_DEVICE_GUID.as_bytes(),
+            index: index as u32,
+        }
+    }
+}
+
+/// `VenHw(...)/End` for a whole platform block device.
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+pub struct PlatformBlockDevicePath {
+    pub device: PlatformBlockNode,
+    pub end: End,
+}
+
+/// `VenHw(...)/HD(...)/End` for a partition on a platform block device.
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+pub struct PlatformBlockPartitionDevicePath {
+    pub device: PlatformBlockNode,
+    pub hard_drive: HardDriveMedia,
+    pub end: End,
+}
+
 /// Create a whole-disk device path from a DevicePathInfo
 ///
 /// # Arguments
@@ -1088,12 +1143,13 @@ pub fn create_disk_device_path(info: &DevicePathInfo) -> *mut Protocol {
             pci_device,
             pci_function,
         } => create_usb_device_path(pci_device, pci_function, 0),
-        DevicePathInfo::Platform { .. } => {
-            // A proper vendor-defined node can be added later.
-            // Returning null causes the caller to skip device path installation,
-            // which is safe — the device is still bootable via BlockIO.
-            core::ptr::null_mut()
-        }
+        // Loaders build file paths from their device's path (systemd-boot:
+        // "Error making file device path" without one), so every platform
+        // disk needs one.
+        DevicePathInfo::Platform { index } => allocate_device_path(PlatformBlockDevicePath {
+            device: PlatformBlockNode::new(index),
+            end: create_end_node(),
+        }),
     }
 }
 
@@ -1182,6 +1238,35 @@ pub fn create_partition_device_path(
             partition_size,
             partition_guid,
         ),
-        DevicePathInfo::Platform { .. } => core::ptr::null_mut(),
+        DevicePathInfo::Platform { index } => {
+            allocate_device_path(PlatformBlockPartitionDevicePath {
+                device: PlatformBlockNode::new(index),
+                hard_drive: create_hard_drive_node(
+                    partition_number,
+                    partition_start,
+                    partition_size,
+                    partition_guid,
+                ),
+                end: create_end_node(),
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+mod platform_tests {
+    use super::*;
+
+    #[test]
+    fn platform_nodes_are_vendor_hardware_with_the_index() {
+        let node = PlatformBlockNode::new(3);
+        let bytes: [u8; 24] = unsafe { core::mem::transmute(node) };
+        assert_eq!(bytes[..4], [TYPE_HARDWARE, SUBTYPE_VENDOR, 24, 0]);
+        assert_eq!(bytes[4..20], *PLATFORM_BLOCK_DEVICE_GUID.as_bytes());
+        assert_eq!(bytes[20..], 3u32.to_le_bytes());
+        assert_eq!(
+            core::mem::size_of::<PlatformBlockPartitionDevicePath>(),
+            24 + core::mem::size_of::<HardDriveMedia>() + core::mem::size_of::<End>()
+        );
     }
 }
