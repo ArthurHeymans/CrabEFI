@@ -35,13 +35,11 @@ use crate::cell::Local;
 use crate::efi::dma::DmaDomain;
 use crate::platform::PciEcamRegion;
 
-/// Maximum number of PCI devices
-pub const MAX_PCI_DEVICES: usize = 64;
-
 /// PCI bus subsystem state
 struct PciState {
-    /// Enumerated PCI device list
-    devices: heapless::Vec<PciDevice, MAX_PCI_DEVICES>,
+    /// Enumerated PCI device list, on the heap: one server socket alone
+    /// exposes well over a hundred functions across its root complexes.
+    devices: alloc::vec::Vec<PciDevice>,
     /// Validated PCIe ECAM allocations (from platform, ACPI MCFG, or FDT).
     ecam_regions: heapless::Vec<PciEcamRegion, { crate::fdt::MAX_ECAM_REGIONS }>,
     /// Whether firmware explicitly supplied ECAM configuration.
@@ -53,7 +51,7 @@ struct PciState {
 impl PciState {
     const fn new() -> Self {
         Self {
-            devices: heapless::Vec::new(),
+            devices: alloc::vec::Vec::new(),
             ecam_regions: heapless::Vec::new(),
             ecam_configured: false,
             #[cfg(target_arch = "x86_64")]
@@ -423,9 +421,6 @@ pub fn init() {
                         region.bus_start,
                         region.bus_end,
                     );
-                    if pci.devices.is_full() {
-                        break;
-                    }
                 }
             }
         }
@@ -439,7 +434,7 @@ pub fn init() {
 /// Enumerate one declared PCI segment/bus range.
 fn enumerate_region(
     access: &AnyPciAccess,
-    devices: &mut heapless::Vec<PciDevice, MAX_PCI_DEVICES>,
+    devices: &mut alloc::vec::Vec<PciDevice>,
     segment: u16,
     bus_start: u8,
     bus_end: u8,
@@ -459,10 +454,7 @@ fn enumerate_region(
                     dev.subclass
                 );
 
-                if devices.push(dev).is_err() {
-                    log::warn!("PCI device list full!");
-                    return;
-                }
+                devices.push(dev);
 
                 // Check other functions if multi-function
                 if is_multi_function {
@@ -477,10 +469,7 @@ fn enumerate_region(
                                 dev.subclass
                             );
 
-                            if devices.push(dev).is_err() {
-                                log::warn!("PCI device list full!");
-                                return;
-                            }
+                            devices.push(dev);
                         }
                     }
                 }
@@ -614,7 +603,7 @@ pub fn find_sdhci_controllers() -> heapless::Vec<PciDevice, 8> {
 }
 
 /// Get all enumerated PCI devices
-pub fn get_all_devices() -> heapless::Vec<PciDevice, MAX_PCI_DEVICES> {
+pub fn get_all_devices() -> alloc::vec::Vec<PciDevice> {
     PCI.borrow().devices.clone()
 }
 

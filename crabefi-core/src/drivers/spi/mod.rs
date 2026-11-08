@@ -416,9 +416,6 @@ fn map_core_error(error: rflasher_core::error::Error) -> SpiError {
     }
 }
 
-type RflasherPciDevices =
-    heapless::Vec<rflasher_internal::PciDevice, { crate::drivers::pci::MAX_PCI_DEVICES }>;
-
 fn rflasher_pci_device(dev: &pci::PciDevice) -> rflasher_internal::PciDevice {
     let class =
         ((dev.class_code as u32) << 16) | ((dev.subclass as u32) << 8) | (dev.prog_if as u32);
@@ -437,18 +434,11 @@ fn rflasher_pci_device(dev: &pci::PciDevice) -> rflasher_internal::PciDevice {
     }
 }
 
-fn rflasher_pci_devices() -> RflasherPciDevices {
-    let devices = pci::get_all_devices();
-    let mut result = heapless::Vec::new();
-
-    for rdev in devices.iter().map(rflasher_pci_device) {
-        if result.push(rdev).is_err() {
-            log::warn!("rflasher PCI device list full");
-            break;
-        }
-    }
-
-    result
+fn rflasher_pci_devices() -> alloc::vec::Vec<rflasher_internal::PciDevice> {
+    pci::get_all_devices()
+        .iter()
+        .map(rflasher_pci_device)
+        .collect()
 }
 
 /// Detect and initialize the SPI controller.
