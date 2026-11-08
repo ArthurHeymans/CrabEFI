@@ -370,6 +370,9 @@ pub(crate) fn dbx_error(error: auth::AuthError) -> &'static str {
         auth::AuthError::BufferTooSmall => {
             "Not enough variable storage for dbx; free space before retrying"
         }
+        auth::AuthError::InputTooLarge => {
+            "dbx input exceeds the supported file, certificate or variable size limit"
+        }
         auth::AuthError::InvalidHeader => "Invalid dbx file format",
         _ => "Failed to import dbx update",
     }

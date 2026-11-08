@@ -121,6 +121,10 @@ pub(crate) struct DbxPreview {
     pub timestamp: Option<EfiTime>,
     /// SHA-256 of the cryptographically verified signer, not an arbitrary CMS cert.
     pub signer_sha256: Option<[u8; 32]>,
+    /// The signature binds APPEND_WRITE: applying the update merges its
+    /// entries into the existing dbx instead of replacing it. Microsoft's
+    /// published updates are signed this way.
+    pub append: bool,
 }
 
 #[cfg(feature = "ui")]
@@ -131,6 +135,7 @@ pub(crate) fn preview_dbx_update(data: &[u8], source: DbxSource) -> Result<DbxPr
             entries: apply_raw_dbx_update(data, src)?,
             timestamp: None,
             signer_sha256: None,
+            append: false,
         }),
         DbxSource::Raw(_) => Err(AuthError::SignatureVerificationFailed),
     }
@@ -247,8 +252,11 @@ pub(crate) fn enroll_dbx_data(
     let source_str = source.as_str();
     log::info!("Found dbx update ({} bytes) on {}", data.len(), source_str);
 
-    let result = match source {
-        DbxSource::Authenticated(src) => apply_authenticated_dbx_update(&data, src)?,
+    let (result, append) = match source {
+        DbxSource::Authenticated(src) => {
+            let preview = inspect_authenticated_dbx_update(&data, src)?;
+            (preview.entries, preview.append)
+        }
         DbxSource::Raw(src) => {
             if !is_setup_mode() {
                 log::error!("Raw dbx files require Setup Mode");
@@ -267,10 +275,13 @@ pub(crate) fn enroll_dbx_data(
         }
     };
 
+    // Submit with exactly the attributes the signature binds: the runtime
+    // hashes them into its own verification, and APPEND_WRITE selects
+    // merge-instead-of-replace semantics for the signature lists.
     let status = crate::efi::runtime_image::client::variables::set(
         &r_efi::efi::Guid::from_bytes(&EFI_IMAGE_SECURITY_DATABASE_GUID),
         DBX_NAME,
-        super::attributes::SECURE_BOOT_ATTRS,
+        dbx_attributes(append),
         &data,
     );
     if status != r_efi::efi::Status::SUCCESS {
@@ -295,18 +306,14 @@ pub(crate) fn enroll_dbx_data(
     Ok(result)
 }
 
-/// Apply an authenticated dbx update (EFI_VARIABLE_AUTHENTICATION_2 format)
-///
-/// This function:
-/// 1. Parses the EFI_VARIABLE_AUTHENTICATION_2 header
-/// 2. Verifies the PKCS#7 signature against KEK or PK
-/// 3. Checks the timestamp is newer than current dbx timestamp
-/// 4. Applies the signature list entries to dbx
-fn apply_authenticated_dbx_update(
-    data: &[u8],
-    source: &'static str,
-) -> Result<DbxEnrollmentResult, AuthError> {
-    inspect_authenticated_dbx_update(data, source).map(|preview| preview.entries)
+/// Attributes a dbx write is submitted (and was signed) with.
+fn dbx_attributes(append: bool) -> u32 {
+    super::attributes::SECURE_BOOT_ATTRS
+        | if append {
+            super::attributes::APPEND_WRITE
+        } else {
+            0
+        }
 }
 
 fn inspect_authenticated_dbx_update(
@@ -315,7 +322,7 @@ fn inspect_authenticated_dbx_update(
 ) -> Result<DbxPreview, AuthError> {
     // Runtime authentication has a tighter envelope bound than ESP loading.
     if data.len() > 48 * 1024 {
-        return Err(AuthError::BufferTooSmall);
+        return Err(AuthError::InputTooLarge);
     }
     // Parse the EFI_VARIABLE_AUTHENTICATION_2 header
     let auth_header = EfiVariableAuthentication2::from_bytes(data).ok_or_else(|| {
@@ -331,6 +338,13 @@ fn inspect_authenticated_dbx_update(
         log::error!("dbx update certificate type is not PKCS#7");
         return Err(AuthError::InvalidHeader);
     }
+
+    // Input bounds are independent of free space: even an empty runtime
+    // store cannot hold a larger variable. Reject before asking for consent.
+    let sig_list_data = auth_header
+        .variable_data(data)
+        .ok_or(AuthError::InvalidHeader)?;
+    validate_payload_size(sig_list_data)?;
 
     // Get the timestamp from the header
     let update_timestamp = auth_header.time_stamp;
@@ -361,21 +375,15 @@ fn inspect_authenticated_dbx_update(
         AuthError::InvalidHeader
     })?;
 
-    // Get the variable data (signature lists)
-    let sig_list_data = auth_header.variable_data(data).ok_or_else(|| {
-        log::error!("Failed to extract signature list data from dbx update");
-        AuthError::InvalidHeader
-    })?;
-
-    // Build the data that was signed (for UEFI authenticated variables)
-    // This is: variable_name + vendor_guid + attributes + timestamp + content
-    let signed_data = build_dbx_signed_data(&update_timestamp, sig_list_data);
-
-    // Verify signature against KEK or PK
-    let signer_sha256 = verify_dbx_signer(pkcs7_data, &signed_data)?.ok_or_else(|| {
-        log::error!("dbx update signature verification failed");
-        AuthError::SignatureVerificationFailed
-    })?;
+    // Verify signature against KEK or PK. The signed attributes are not
+    // recorded in the envelope, so verification determines whether the
+    // signer bound APPEND_WRITE (Microsoft's updates do) or a plain
+    // replace; the write is then submitted with the matching attributes.
+    let (signer_sha256, append) = verify_dbx_signer(pkcs7_data, &update_timestamp, sig_list_data)?
+        .ok_or_else(|| {
+            log::error!("dbx update signature verification failed");
+            AuthError::SignatureVerificationFailed
+        })?;
 
     log::info!("dbx update signature verified successfully");
 
@@ -383,6 +391,7 @@ fn inspect_authenticated_dbx_update(
         entries: apply_signature_list_entries(sig_list_data, source)?,
         timestamp: Some(update_timestamp),
         signer_sha256: Some(signer_sha256),
+        append,
     })
 }
 
@@ -394,7 +403,16 @@ fn apply_raw_dbx_update(
     data: &[u8],
     source: &'static str,
 ) -> Result<DbxEnrollmentResult, AuthError> {
+    validate_payload_size(data)?;
     apply_signature_list_entries(data, source)
+}
+
+fn validate_payload_size(data: &[u8]) -> Result<(), AuthError> {
+    if data.len() > crabefi_runtime_abi::MAX_VARIABLE_DATA_SIZE {
+        Err(AuthError::InputTooLarge)
+    } else {
+        Ok(())
+    }
 }
 
 /// Build the signed data blob for dbx variable authentication
@@ -405,9 +423,7 @@ fn apply_raw_dbx_update(
 /// - Attributes
 /// - Timestamp
 /// - Variable content
-fn build_dbx_signed_data(timestamp: &EfiTime, content: &[u8]) -> Vec<u8> {
-    use super::attributes;
-
+fn build_dbx_signed_data(timestamp: &EfiTime, content: &[u8], attributes: u32) -> Vec<u8> {
     let mut data = Vec::new();
 
     // Variable name "dbx" in UCS-2 (without null terminator for signing)
@@ -417,8 +433,7 @@ fn build_dbx_signed_data(timestamp: &EfiTime, content: &[u8]) -> Vec<u8> {
     data.extend_from_slice(&EFI_IMAGE_SECURITY_DATABASE_GUID);
 
     // Attributes (4 bytes, little-endian)
-    let attrs = attributes::SECURE_BOOT_ATTRS;
-    data.extend_from_slice(&attrs.to_le_bytes());
+    data.extend_from_slice(&attributes.to_le_bytes());
 
     // Timestamp (16 bytes)
     // Copy the EfiTime fields directly
@@ -440,12 +455,67 @@ fn build_dbx_signed_data(timestamp: &EfiTime, content: &[u8]) -> Vec<u8> {
     data
 }
 
-/// Verify the dbx update signature against KEK or PK
-fn verify_dbx_signer(pkcs7_data: &[u8], signed_data: &[u8]) -> Result<Option<[u8; 32]>, AuthError> {
+/// Verify the dbx update signature against KEK or PK, returning the signer
+/// fingerprint and whether the signature binds APPEND_WRITE.
+fn verify_dbx_signer(
+    pkcs7_data: &[u8],
+    timestamp: &EfiTime,
+    content: &[u8],
+) -> Result<Option<([u8; 32], bool)>, AuthError> {
     // Boot image verification supports larger RSA keys than authenticated
     // runtime variables. Do not ask for consent to a signer runtime cannot use.
     let signed =
         crabefi_pkcs7::cms::SignedData::parse(pkcs7_data).map_err(|_| AuthError::InvalidHeader)?;
+    validate_cms_certificates(&signed)?;
+
+    // Try to verify against KEK certificates, then PK.
+    {
+        let kek = kek_database();
+        let trusted: Vec<&[u8]> = kek.x509_certificates().collect();
+        if let Some(verified) = verify_signer_variants(pkcs7_data, timestamp, content, &trusted)? {
+            log::info!("dbx update verified with KEK certificate");
+            return Ok(Some(verified));
+        }
+    }
+    {
+        let pk = pk_database();
+        let trusted: Vec<&[u8]> = pk.x509_certificates().collect();
+        if let Some(verified) = verify_signer_variants(pkcs7_data, timestamp, content, &trusted)? {
+            log::info!("dbx update verified with PK certificate");
+            return Ok(Some(verified));
+        }
+    }
+
+    log::warn!("dbx update signature did not verify against any KEK or PK certificate");
+    Ok(None)
+}
+
+/// Try both attribute variants the signer could have bound (append first:
+/// published revocation updates merge into dbx rather than replacing it).
+/// The variant that verifies is the one the write must be submitted with,
+/// because the runtime hashes the submitted attributes the same way.
+fn verify_signer_variants(
+    pkcs7_data: &[u8],
+    timestamp: &EfiTime,
+    content: &[u8],
+    trusted: &[&[u8]],
+) -> Result<Option<([u8; 32], bool)>, AuthError> {
+    for append in [true, false] {
+        let signed_data = build_dbx_signed_data(timestamp, content, dbx_attributes(append));
+        if let Some(signer) =
+            verify_with_trusted(pkcs7_data, &signed_data, trusted.iter().copied())?
+        {
+            return Ok(Some((signer, append)));
+        }
+    }
+    Ok(None)
+}
+
+/// Every certificate embedded in the CMS blob must satisfy the runtime RSA
+/// policy, matching the limits the runtime authenticated-variable verifier
+/// enforces on the certificates it consumes (16 certificates, 16 KiB each,
+/// SHA-256-with-RSA, at most 4096-bit keys; at most 8 signers).
+fn validate_cms_certificates(signed: &crabefi_pkcs7::cms::SignedData) -> Result<(), AuthError> {
     for (i, certificate) in signed.certificates().enumerate() {
         if i >= 16 || certificate.tag != crabefi_pkcs7::der::tag::SEQUENCE {
             return Err(AuthError::InvalidHeader);
@@ -455,49 +525,29 @@ fn verify_dbx_signer(pkcs7_data: &[u8], signed_data: &[u8]) -> Result<Option<[u8
     if signed.signers().count() > 8 {
         return Err(AuthError::InvalidHeader);
     }
-    // Try to verify against KEK certificates
-    {
-        let kek = kek_database();
-        for cert_data in kek.x509_certificates() {
-            if validate_dbx_certificate(cert_data).is_err() {
+    Ok(())
+}
+
+/// Return the SHA-256 of the signing certificate if the CMS signature
+/// verifies (through its embedded chain) against any trusted certificate.
+fn verify_with_trusted<'a>(
+    pkcs7_data: &[u8],
+    signed_data: &[u8],
+    trusted: impl IntoIterator<Item = &'a [u8]>,
+) -> Result<Option<[u8; 32]>, AuthError> {
+    for cert_data in trusted {
+        if validate_dbx_certificate(cert_data).is_err() {
+            continue;
+        }
+        match verify_pkcs7_signature_chain(pkcs7_data, signed_data, cert_data, true) {
+            Ok(Some(chain)) => return Ok(chain.end_entity().map(sha256)),
+            Ok(None) => continue,
+            Err(e) => {
+                log::debug!("dbx verification error: {e:?}");
                 continue;
-            }
-            match verify_pkcs7_signature_chain(pkcs7_data, signed_data, cert_data, true) {
-                Ok(Some(chain)) => {
-                    log::info!("dbx update verified with KEK certificate");
-                    return Ok(chain.end_entity().map(sha256));
-                }
-                Ok(None) => continue,
-                Err(e) => {
-                    log::debug!("KEK verification error: {:?}", e);
-                    continue;
-                }
             }
         }
     }
-
-    // Try to verify against PK
-    {
-        let pk = pk_database();
-        for cert_data in pk.x509_certificates() {
-            if validate_dbx_certificate(cert_data).is_err() {
-                continue;
-            }
-            match verify_pkcs7_signature_chain(pkcs7_data, signed_data, cert_data, true) {
-                Ok(Some(chain)) => {
-                    log::info!("dbx update verified with PK certificate");
-                    return Ok(chain.end_entity().map(sha256));
-                }
-                Ok(None) => continue,
-                Err(e) => {
-                    log::debug!("PK verification error: {:?}", e);
-                    continue;
-                }
-            }
-        }
-    }
-
-    log::warn!("dbx update signature did not verify against any KEK or PK certificate");
     Ok(None)
 }
 
@@ -506,7 +556,7 @@ fn verify_dbx_signer(pkcs7_data: &[u8], signed_data: &[u8]) -> Result<Option<[u8
 fn validate_dbx_certificate(der: &[u8]) -> Result<(), AuthError> {
     use crabefi_pkcs7::x509::{AlgorithmIdentifier, Certificate};
     if der.len() > 16 * 1024 {
-        return Err(AuthError::BufferTooSmall);
+        return Err(AuthError::InputTooLarge);
     }
     let cert = Certificate::parse(der).map_err(|_| AuthError::CertificateParseError)?;
     let algorithm = AlgorithmIdentifier::parse(cert.signature_algorithm)
@@ -600,6 +650,96 @@ mod tests {
         ));
         data.extend_from_slice(&signature_list());
         assert!(apply_raw_dbx_update(&data, "test").is_err());
+    }
+
+    /// Genuine Microsoft revocation update (amd64), from
+    /// microsoft/secureboot_objects `PostSignedObjects/DBX/amd64/DBXUpdate.bin`
+    /// (git blob f6ccec74a078267d56222b44d31ad30757ee8717;
+    /// sha256 2089e3125e611376cb44326b5765674255443b2484f88de97251939d18055f68).
+    /// If a future Microsoft signer fails the preflight policy while the
+    /// runtime would accept it, this is the test that should turn red first.
+    #[test]
+    fn microsoft_dbxupdate_cms_policy_and_signature_verify() {
+        let data = include_bytes!("testdata/microsoft_dbxupdate_x64.bin");
+        assert!(data.len() <= 48 * 1024, "fits the runtime envelope bound");
+        let header = EfiVariableAuthentication2::from_bytes(data).expect("auth header parses");
+        assert!(header.time_stamp.is_valid());
+        let pkcs7 = header.cert_data(data).expect("pkcs7 present");
+        let sig_lists = header.variable_data(data).expect("signature lists present");
+        // Interoperable CMS does not imply the variable fits this profile.
+        // The shipping fixture has a 21,292-byte payload; runtime currently
+        // limits an individual variable to 16 KiB. Never obtain consent only
+        // to reject it at SetVariable even with an empty store.
+        assert_eq!(sig_lists.len(), 21_292);
+        assert!(matches!(
+            inspect_authenticated_dbx_update(data, "fixture"),
+            Err(AuthError::InputTooLarge)
+        ));
+
+        let entries =
+            apply_signature_list_entries(sig_lists, "fixture").expect("signature lists parse");
+        assert_eq!((entries.sha256_count, entries.x509_count), (443, 0));
+
+        let signed = crabefi_pkcs7::cms::SignedData::parse(pkcs7).expect("CMS parses");
+        validate_cms_certificates(&signed)
+            .expect("embedded certificates pass the runtime RSA policy");
+        let certs: Vec<&[u8]> = signed
+            .certificates()
+            .map(|certificate| certificate.encoded)
+            .collect();
+        // [0] Microsoft Windows UEFI Key Exchange Key (the signer),
+        // [1] Microsoft Corporation KEK CA 2011 (its issuer, the enrolled KEK).
+        assert_eq!(certs.len(), 2);
+
+        // Microsoft binds APPEND_WRITE into the signature: the update merges
+        // into dbx instead of replacing it, and only verifies as such.
+        let (signer, append) =
+            verify_signer_variants(pkcs7, &header.time_stamp, sig_lists, &[certs[1]])
+                .expect("verification runs")
+                .expect("verifies through the KEK CA chain");
+        assert_eq!(signer, sha256(certs[0]));
+        assert!(append, "Microsoft's update is signed for append writes");
+        // The same signature must not verify as a plain replace write: the
+        // variant is bound by the signature, not chosen by the importer.
+        let replace_signed_data =
+            build_dbx_signed_data(&header.time_stamp, sig_lists, dbx_attributes(false));
+        assert_eq!(
+            verify_with_trusted(pkcs7, &replace_signed_data, [certs[1]]).unwrap(),
+            None
+        );
+
+        let unrelated = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../crabefi-pkcs7/testdata/ca.der"
+        ));
+        assert_eq!(
+            verify_signer_variants(
+                pkcs7,
+                &header.time_stamp,
+                sig_lists,
+                &[unrelated.as_slice()]
+            )
+            .unwrap(),
+            None,
+            "must not verify against an unrelated trust anchor"
+        );
+    }
+
+    #[test]
+    fn preview_rejects_oversized_inputs_before_review() {
+        let data = alloc::vec![0; crabefi_runtime_abi::MAX_VARIABLE_DATA_SIZE + 1];
+        assert!(matches!(
+            apply_raw_dbx_update(&data, "test"),
+            Err(AuthError::InputTooLarge)
+        ));
+        assert!(matches!(
+            inspect_authenticated_dbx_update(&alloc::vec![0; 48 * 1024 + 1], "test"),
+            Err(AuthError::InputTooLarge)
+        ));
+        assert_eq!(
+            validate_dbx_certificate(&alloc::vec![0; 16 * 1024 + 1]),
+            Err(AuthError::InputTooLarge)
+        );
     }
 
     #[test]

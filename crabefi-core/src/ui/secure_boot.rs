@@ -73,7 +73,7 @@ fn action_text(idx: usize) -> ActionText {
             row: "Review a signed .auth revocation file first",
             row_short: "Reviews signed .auth file first",
             detail: "Reads a dbx update from EFI\\keys\\ and shows its signer, timestamp and contents before importing. In User Mode only updates signed by an enrolled KEK or PK are accepted.",
-            changes: "Replaces dbx",
+            changes: "Adds to or replaces dbx; mode shown in review",
             button: "Review update...",
         },
         TOGGLE if on => ActionText {
@@ -754,7 +754,27 @@ fn certificate_lines(section: ReviewSection, der: &[u8], note: &str) -> ReviewSe
     }
 }
 
+fn dbx_effect(append: bool) -> &'static str {
+    if append {
+        "Adds revocations to the existing dbx. Existing revocations are kept."
+    } else {
+        "This replaces the existing dbx. Revocations absent from this file are removed, so previously revoked boot software may start again."
+    }
+}
+
 type Prepared = (PendingImport, Vec<Block>, Vec<ReviewSection>, Vec<Block>);
+
+#[cfg(test)]
+mod dbx_review_tests {
+    use super::*;
+
+    #[test]
+    fn warnings_match_the_write_mode() {
+        assert!(dbx_effect(true).contains("kept"));
+        assert!(!dbx_effect(true).contains("removed"));
+        assert!(dbx_effect(false).contains("removed"));
+    }
+}
 
 fn prepare_import(idx: usize) -> Result<Option<Prepared>, &'static str> {
     use crate::efi::auth::{self, dbx_update, key_files, sha256};
@@ -853,6 +873,14 @@ fn prepare_import(idx: usize) -> Result<Option<Prepared>, &'static str> {
                         preview.entries.x509_count
                     ),
                 ),
+                Block::fact(
+                    "Applies as",
+                    if preview.append {
+                        "Adds to the current revocations"
+                    } else {
+                        "Replaces the current revocations"
+                    },
+                ),
             ];
             if let Some(t) = preview.timestamp {
                 let (year, month, day, hour, minute, second) =
@@ -887,9 +915,7 @@ fn prepare_import(idx: usize) -> Result<Option<Prepared>, &'static str> {
                         &alloc::format!("SHA-256 {}", fingerprint(&sha256(&data))),
                     ),
             );
-            let outro = alloc::vec![Block::text(
-                "This replaces the existing dbx. Revocations absent from this file are removed, so previously revoked boot software may start again."
-            )];
+            let outro = alloc::vec![Block::text(dbx_effect(preview.append))];
             Ok(Some((
                 PendingImport::Dbx(data, source),
                 intro,

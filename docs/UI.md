@@ -77,6 +77,13 @@ verified before review; changing the ESP file while a review is open does not
 change what is enrolled. This UI does not replace runtime authentication,
 persistence or replay enforcement.
 
+Dbx preflight also enforces the runtime's input limits: a 48 KiB authenticated
+envelope, 16 KiB certificates, and a 16 KiB variable payload. Exceeding an input
+limit is distinct from running out of free variable storage. In particular,
+the checked-in Microsoft amd64 fixture has a 21,292-byte payload: its CMS and
+signature are supported, but importing the full update requires a runtime
+profile with a larger variable limit.
+
 ## Layout and implementation
 
 - `ui/theme.rs` owns the palette and the dimmed backdrop mapping.
