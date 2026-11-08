@@ -243,11 +243,13 @@ fn show_boot_menu(timeout_seconds: u32, firmware_ui_requested: bool) {
 
     if let Some(selected_index) = selected {
         log::info!("Selected index: {}", selected_index);
-        if let Some(entry) = boot_menu.get_entry(selected_index) {
+        // Boot a clone so a one-shot command-line edit applies to this
+        // attempt only and never sticks to the menu's entry.
+        if let Some(entry) = boot_menu.entry_for_boot(selected_index) {
             log::info!("Booting: {} from {}", entry.name, entry.path);
             log::info!("Entry kind: {:?}", entry.kind);
             log::info!("Storage: {:?}", entry.storage);
-            boot_selected_entry(entry);
+            boot_selected_entry(&entry);
             log::warn!("boot_selected_entry returned - boot failed!");
         } else {
             log::error!("Failed to get entry at index {}", selected_index);

@@ -267,6 +267,11 @@ pub struct BootMenu {
     pub(crate) timeout_seconds: u32,
     /// `selected` is a `loader.conf` default, which the first one sets
     default_chosen: bool,
+    /// One-shot command-line edit for the next boot attempt of one entry.
+    /// The entry itself keeps its discovered command line; the edit is
+    /// applied only to the clone handed to the boot path, and each menu
+    /// showing starts by clearing any leftover edit.
+    edited_cmdline: Option<(usize, String<512>)>,
 }
 
 impl Default for BootMenu {
@@ -283,6 +288,7 @@ impl BootMenu {
             selected: 0,
             timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
             default_chosen: false,
+            edited_cmdline: None,
         }
     }
 
@@ -296,14 +302,60 @@ impl BootMenu {
         self.entries.len()
     }
 
-    /// Get a reference to an entry
+    /// Get a reference to an entry as discovered. To boot a selection, use
+    /// [`entry_for_boot`](Self::entry_for_boot) instead: one-shot
+    /// command-line edits are not applied to the entries returned here.
     pub fn get_entry(&self, index: usize) -> Option<&BootEntry> {
         self.entries.get(index)
     }
 
-    /// Get the selected entry
+    /// Get the selected entry as discovered (see [`get_entry`](Self::get_entry))
     pub fn selected_entry(&self) -> Option<&BootEntry> {
         self.entries.get(self.selected)
+    }
+
+    /// Record a one-shot command-line edit for `index` (see `edited_cmdline`).
+    pub(crate) fn set_edited_cmdline(&mut self, index: usize, cmdline: String<512>) {
+        self.edited_cmdline = Some((index, cmdline));
+    }
+
+    /// The pending one-shot edit for `index`, if the user edited it.
+    pub fn edited_cmdline(&self, index: usize) -> Option<&str> {
+        self.edited_cmdline
+            .as_ref()
+            .filter(|(edited, _)| *edited == index)
+            .map(|(_, cmdline)| cmdline.as_str())
+    }
+
+    /// Command line an editor should start from: the pending edit if any,
+    /// otherwise the entry's discovered command line.
+    pub(crate) fn effective_cmdline(&self, index: usize) -> Option<&str> {
+        self.edited_cmdline(index).or_else(|| {
+            self.entries
+                .get(index)
+                .and_then(|entry| entry.get_cmdline())
+                .map(|cmdline| cmdline.as_str())
+        })
+    }
+
+    /// Drop any pending one-shot edit; called when a menu showing begins so
+    /// an edit can never outlive the boot attempt it was made for.
+    pub(crate) fn clear_edited_cmdline(&mut self) {
+        self.edited_cmdline = None;
+    }
+
+    /// The entry to actually boot: a clone with any one-shot command-line
+    /// edit applied. The menu's own entry is left as discovered, so a
+    /// failed boot followed by a re-shown menu cannot silently reuse it.
+    pub fn entry_for_boot(&self, index: usize) -> Option<BootEntry> {
+        let mut entry = self.entries.get(index)?.clone();
+        if let Some(edited) = self.edited_cmdline(index)
+            && let Some(cmdline) = entry.get_cmdline_mut()
+        {
+            cmdline.clear();
+            let _ = cmdline.push_str(edited);
+        }
+        Some(entry)
     }
 
     /// Move selection up
@@ -691,7 +743,10 @@ fn scan_partition_for_entries(
 /// # Returns
 ///
 /// The index of the selected boot entry, or `None` if no selection was made.
+/// Boot [`BootMenu::entry_for_boot`] for that index so a one-shot
+/// command-line edit made in the menu applies to this boot attempt.
 pub fn show_menu(menu: &mut BootMenu) -> Option<usize> {
+    menu.clear_edited_cmdline();
     // An empty, indefinite menu still provides firmware/security settings.
     // The boot manager uses this for explicit setup requests without media.
     if menu.entry_count() == 0 {
@@ -812,30 +867,40 @@ pub fn show_menu(menu: &mut BootMenu) -> Option<usize> {
                     crate::reset_system();
                 }
                 KeyPress::Char('c') | KeyPress::Char('C') => {
-                    // Edit kernel command line
-                    if let Some(entry) = menu.entries.get_mut(menu.selected) {
-                        if entry.has_cmdline() {
-                            match edit_cmdline(entry, &mut fb_console) {
-                                EditResult::Boot => {
-                                    // Boot immediately with the edited command line
-                                    let mut msg: String<64> = String::new();
-                                    let _ = msg.push_str("Booting ");
-                                    let _ = msg.push_str(&entry.name);
-                                    let _ = msg.push_str("...");
-                                    menu_common::clear_screen(&mut fb_console);
-                                    draw_status(&msg, &mut fb_console);
-                                    return Some(menu.selected);
-                                }
-                                EditResult::Confirmed => {
-                                    draw_status("Command line updated", &mut fb_console);
-                                }
-                                EditResult::Cancelled => {
-                                    draw_status("Edit cancelled", &mut fb_console);
-                                }
+                    // Edit kernel command line (one-shot: recorded on the
+                    // menu, never written into the entry itself)
+                    let selected = menu.selected;
+                    let editing = menu
+                        .entries
+                        .get(selected)
+                        .filter(|entry| entry.has_cmdline())
+                        .and_then(|entry| {
+                            menu.effective_cmdline(selected)
+                                .map(|initial| (entry.name.clone(), initial))
+                        });
+                    if let Some((name, initial)) = editing {
+                        match edit_cmdline(&name, initial, &mut fb_console) {
+                            (EditResult::Boot, edited) => {
+                                menu.set_edited_cmdline(selected, edited);
+                                // Boot immediately with the edited command line
+                                let mut msg: String<64> = String::new();
+                                let _ = msg.push_str("Booting ");
+                                let _ = msg.push_str(&name);
+                                let _ = msg.push_str("...");
+                                menu_common::clear_screen(&mut fb_console);
+                                draw_status(&msg, &mut fb_console);
+                                return Some(selected);
                             }
-                        } else {
-                            draw_status("This entry has no editable command line", &mut fb_console);
+                            (EditResult::Confirmed, edited) => {
+                                menu.set_edited_cmdline(selected, edited);
+                                draw_status("Command line updated", &mut fb_console);
+                            }
+                            (EditResult::Cancelled, _) => {
+                                draw_status("Edit cancelled", &mut fb_console);
+                            }
                         }
+                    } else {
+                        draw_status("This entry has no editable command line", &mut fb_console);
                     }
                     // Redraw menu after editing (unless we're booting)
                     delay_ms(500);
@@ -1222,11 +1287,11 @@ fn draw_status(message: &str, fb_console: &mut Option<FramebufferConsole>) {
 /// Result of command line editing
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EditResult {
-    /// Edit cancelled (Escape) - don't modify cmdline
+    /// Edit cancelled (Escape) - drop the edited buffer
     Cancelled,
-    /// Edit confirmed (Enter) - update cmdline and return to menu
+    /// Edit confirmed (Enter) - keep the edited buffer, return to menu
     Confirmed,
-    /// Boot now (Ctrl+X) - update cmdline and boot immediately
+    /// Boot now (Ctrl+X) - keep the edited buffer and boot immediately
     Boot,
 }
 
@@ -1236,30 +1301,27 @@ enum EditResult {
 ///
 /// # Arguments
 ///
-/// * `entry` - The boot entry to edit
+/// * `entry_name` - Display name of the entry being edited
+/// * `initial` - Command line to start editing from
 /// * `fb_console` - Optional framebuffer console for display
 ///
 /// # Returns
 ///
-/// `EditResult::Cancelled` if the user pressed Escape (cmdline unchanged)
-/// `EditResult::Confirmed` if the user pressed Enter (cmdline updated, return to menu)
-/// `EditResult::Boot` if the user pressed Ctrl+X (cmdline updated, boot immediately)
-fn edit_cmdline(entry: &mut BootEntry, fb_console: &mut Option<FramebufferConsole>) -> EditResult {
-    // Check if entry has cmdline and extract initial value
-    let initial_cmdline = match entry.get_cmdline() {
-        Some(c) => c.clone(),
-        None => {
-            draw_status("This entry has no command line to edit", fb_console);
-            delay_ms(1500);
-            return EditResult::Cancelled;
-        }
-    };
-
-    // Copy entry name for display (to avoid borrow issues)
-    let entry_name: String<64> = entry.name.clone();
-
+/// The returned buffer is the edited text; the caller records it as the
+/// menu's one-shot override for `Confirmed`/`Boot` and drops it otherwise.
+/// Nothing is written into the entry here.
+///
+/// `EditResult::Cancelled` if the user pressed Escape
+/// `EditResult::Confirmed` if the user pressed Enter (return to menu)
+/// `EditResult::Boot` if the user pressed Ctrl+X (boot immediately)
+fn edit_cmdline(
+    entry_name: &str,
+    initial: &str,
+    fb_console: &mut Option<FramebufferConsole>,
+) -> (EditResult, String<512>) {
     // Create a working buffer for editing
-    let mut buffer: String<512> = initial_cmdline;
+    let mut buffer: String<512> = String::new();
+    let _ = buffer.push_str(initial);
     let mut cursor_pos = buffer.len();
 
     // Calculate scroll offset for long command lines
@@ -1267,7 +1329,7 @@ fn edit_cmdline(entry: &mut BootEntry, fb_console: &mut Option<FramebufferConsol
     let edit_width = cols.saturating_sub(4); // Leave margin for decoration
 
     // Draw static parts once
-    draw_cmdline_editor_static(&entry_name, fb_console, cols);
+    draw_cmdline_editor_static(entry_name, fb_console, cols);
 
     // Track if display needs updating
     let mut needs_redraw = true;
@@ -1283,27 +1345,18 @@ fn edit_cmdline(entry: &mut BootEntry, fb_console: &mut Option<FramebufferConsol
         if let Some(key) = menu_common::read_key() {
             match key {
                 KeyPress::Enter => {
-                    // Confirm - update the cmdline
-                    if let Some(cmdline) = entry.get_cmdline_mut() {
-                        cmdline.clear();
-                        let _ = cmdline.push_str(&buffer);
-                    }
-                    return EditResult::Confirmed;
+                    return (EditResult::Confirmed, buffer);
                 }
                 KeyPress::Escape => {
-                    // Cancel - don't modify
-                    return EditResult::Cancelled;
+                    // Cancel - caller drops the buffer
+                    return (EditResult::Cancelled, buffer);
                 }
                 KeyPress::Char(c) => {
                     // Handle special characters
                     match c {
                         '\x18' => {
                             // Ctrl+X - boot immediately
-                            if let Some(cmdline) = entry.get_cmdline_mut() {
-                                cmdline.clear();
-                                let _ = cmdline.push_str(&buffer);
-                            }
-                            return EditResult::Boot;
+                            return (EditResult::Boot, buffer);
                         }
                         '\x08' | '\x7f' if cursor_pos > 0 => {
                             // Backspace - remove character before cursor
@@ -1633,5 +1686,72 @@ fn draw_cmdline_editor_line(
         let _ = write!(len_str, "Length: {}/512    ", buffer_len); // Extra spaces to clear old longer values
         let _ = console.write_str(&len_str);
         console.reset_colors();
+    }
+}
+
+#[cfg(test)]
+mod one_shot_cmdline_tests {
+    use super::*;
+
+    fn linux_menu() -> BootMenu {
+        let mut menu = BootMenu::new();
+        let mut name: String<64> = String::new();
+        let _ = name.push_str("Linux");
+        let mut cmdline: String<512> = String::new();
+        let _ = cmdline.push_str("quiet");
+        assert!(menu.add_entry(BootEntry {
+            name,
+            path: String::new(),
+            storage: StorageId::Nvme {
+                controller_id: 0,
+                nsid: 1,
+            },
+            pci: None,
+            partition_num: 1,
+            partition: gpt::Partition {
+                type_guid: [0; 16],
+                partition_guid: [0; 16],
+                first_lba: 0,
+                last_lba: 0,
+                attributes: 0,
+                is_esp: true,
+                block_size: 512,
+            },
+            kind: BootEntryKind::BlsLinux {
+                linux_path: String::new(),
+                initrd_paths: crate::bls::Initrds::new(),
+                cmdline,
+            },
+            category: BootCategory::Bls,
+        }));
+        menu
+    }
+
+    fn discovered(menu: &BootMenu) -> Option<&str> {
+        menu.get_entry(0)?
+            .get_cmdline()
+            .map(|cmdline| cmdline.as_str())
+    }
+
+    #[test]
+    fn edited_cmdline_applies_only_to_the_boot_clone() {
+        let mut menu = linux_menu();
+        let mut edited: String<512> = String::new();
+        let _ = edited.push_str("quiet debug");
+        menu.set_edited_cmdline(0, edited);
+        assert_eq!(discovered(&menu), Some("quiet"));
+        assert_eq!(menu.effective_cmdline(0), Some("quiet debug"));
+        let boot_entry = menu.entry_for_boot(0).expect("entry 0 exists");
+        assert_eq!(
+            boot_entry.get_cmdline().map(|cmdline| cmdline.as_str()),
+            Some("quiet debug")
+        );
+        // The boot attempt consumed the clone, not the edit's target: after
+        // it, and after the next showing clears the edit, only the
+        // discovered command line remains.
+        assert_eq!(discovered(&menu), Some("quiet"));
+        menu.clear_edited_cmdline();
+        assert_eq!(menu.edited_cmdline(0), None);
+        assert_eq!(menu.effective_cmdline(0), Some("quiet"));
     }
 }

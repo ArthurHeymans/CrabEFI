@@ -325,7 +325,11 @@ pub fn draw_scrollbar(
     controls::scrollbar(fb, (x - 8, y, 16, h), total, offset, visible);
 }
 
+/// Show the graphical boot menu; returns the selected entry index. Boot
+/// [`BootMenu::entry_for_boot`] for that index so a one-shot command-line
+/// edit made in the menu applies to this boot attempt.
 pub fn show_graphical_menu(menu: &mut BootMenu) -> Option<usize> {
+    menu.clear_edited_cmdline();
     let fb = crate::handoff::framebuffer()?;
     if !supports_framebuffer(&fb) {
         return crate::menu::show_menu(menu);
@@ -1288,17 +1292,16 @@ fn run_boot(fb: &FramebufferInfo, menu: &mut BootMenu, default: usize) -> BootRe
 }
 
 fn apply_cmdline_and_boot(menu: &mut BootMenu, index: usize, text: &str) -> BootResult {
-    if let Some(cmdline) = menu
-        .entries
-        .get_mut(index)
-        .and_then(|e| e.get_cmdline_mut())
-    {
-        cmdline.clear();
+    // Record the edit as the menu's one-shot override; the entry keeps its
+    // discovered command line and the boot path applies this to a clone.
+    if menu.entries.get(index).is_some_and(|e| e.has_cmdline()) {
+        let mut edited: heapless::String<512> = heapless::String::new();
         for ch in text.chars() {
-            if cmdline.push(ch).is_err() {
+            if edited.push(ch).is_err() {
                 break;
             }
         }
+        menu.set_edited_cmdline(index, edited);
     }
     BootResult::Selected(index)
 }
