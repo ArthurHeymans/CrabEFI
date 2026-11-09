@@ -29,7 +29,7 @@ use crate::efi;
 use crate::exec::{self, BoxFuture};
 use crate::time::{Timeout, wait_for};
 use alloc::boxed::Box;
-use core::ptr;
+use core::{mem, ptr};
 use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
 use tock_registers::{LocalRegisterCopy, registers::ReadOnly};
 
@@ -40,6 +40,7 @@ use super::ehci_regs::{
     CONFIGFLAG,
     DEBUG_CAPABILITY,
     DEBUG_CONTROL,
+    DEBUG_PORT_CAP_ID,
     // Register struct types
     EhciCapRegs,
     EhciOpRegs,
@@ -354,36 +355,66 @@ fn debug_port_address(capability: u32, bars: &[pci::PciBar; 6]) -> Option<u64> {
         return None;
     }
     let offset = u64::from(capability.read(DEBUG_CAPABILITY::OFFSET));
-    if offset & 3 != 0 {
+    let end = offset.checked_add(mem::size_of::<u32>() as u64)?;
+    // Enumeration is read-only and leaves size zero when the extent is unknown.
+    // Honor a supplied extent without destructively sizing a live BAR.
+    if bar.size != 0 && end > bar.size {
         return None;
     }
-    bar.address.checked_add(offset)
+    let address = bar.address.checked_add(offset)?;
+    if !offset.is_multiple_of(mem::align_of::<u32>() as u64)
+        || !address.is_multiple_of(mem::align_of::<u32>() as u64)
+    {
+        return None;
+    }
+    let last = bar.address.checked_add(end.checked_sub(1)?)?;
+    if bar.bar_type == pci::BarType::Memory32 && last > u64::from(u32::MAX) {
+        return None;
+    }
+    Some(address)
+}
+
+/// Check decode and ownership using exactly one control-register snapshot.
+fn debug_port_active(
+    command: pci::CommandRegister,
+    capability: u32,
+    bars: &[pci::PciBar; 6],
+    read_control: impl FnOnce(u64) -> u32,
+) -> bool {
+    if !command.contains(pci::CommandRegister::MEMORY_ENABLE) {
+        return false;
+    }
+    let Some(address) = debug_port_address(capability, bars) else {
+        return false;
+    };
+    let control = LocalRegisterCopy::<u32, DEBUG_CONTROL::Register>::new(read_control(address));
+    control.get() != u32::MAX
+        && control.matches_all(
+            DEBUG_CONTROL::OWNER::SET + DEBUG_CONTROL::ENABLED::SET + DEBUG_CONTROL::IN_USE::SET,
+        )
 }
 
 /// A firmware-owned EHCI debug port must survive driver discovery. Resetting
 /// its controller destroys the host's DebugOutput, potentially from inside a
 /// log call. Use the standard capability, not board IDs or a fixed BAR offset.
 pub(crate) fn debug_port_in_use(device: &PciDevice) -> bool {
-    let Ok(Some(capability)) = pci::find_capability(device.address, 0x0a) else {
+    let Ok(Some(capability)) = pci::find_capability(device.address, DEBUG_PORT_CAP_ID) else {
         return false;
     };
-    if pci::read_config_u16(device.address, 0x04) & pci::CommandRegister::MEMORY_ENABLE.bits() == 0
-    {
-        return false;
-    }
-    let Some(address) = debug_port_address(
+    debug_port_active(
+        pci::command_register(device.address),
         pci::read_config_u32(device.address, u16::from(capability)),
         &device.bars,
-    ) else {
-        return false;
-    };
-    // SAFETY: the device has a decoded memory BAR and advertises this debug
-    // register within it. No writes or ownership changes are performed here.
-    let control = unsafe { &*(address as *const ReadOnly<u32, DEBUG_CONTROL::Register>) };
-    control.get() != u32::MAX
-        && control.matches_all(
-            DEBUG_CONTROL::OWNER::SET + DEBUG_CONTROL::ENABLED::SET + DEBUG_CONTROL::IN_USE::SET,
-        )
+        |address| {
+            // SAFETY: as with the controller's other MMIO accesses, the platform
+            // must provide CPU-accessible assigned PCI resources and the device
+            // must advertise a valid register offset. The helper checks decode,
+            // alignment, overflow and any known BAR extent, but cannot establish
+            // the platform's CPU mapping or an unknown (zero-sized) BAR extent.
+            // This is one read; no writes or ownership changes are performed.
+            unsafe { &*(address as *const ReadOnly<u32, DEBUG_CONTROL::Register>) }.get()
+        },
+    )
 }
 
 /// EHCI Host Controller

@@ -223,7 +223,10 @@ impl PciDriver for UsbPciDriver {
     }
 
     fn probe(&self, device: &PciDevice) -> bool {
-        if device.prog_if == 0x20 && usb::ehci::debug_port_in_use(device) {
+        let Ok(controller_type) = super::UsbType::try_from(device.prog_if) else {
+            return false;
+        };
+        if controller_type == super::UsbType::Ehci && usb::ehci::debug_port_in_use(device) {
             log::info!(
                 "PCI {}: preserving active EHCI debug console",
                 device.address
@@ -231,9 +234,9 @@ impl PciDriver for UsbPciDriver {
             return false;
         }
         // Do not claim a controller whose implementation was not selected.
-        matches!(device.prog_if, 0x10 | 0x20)
-            || (cfg!(target_arch = "x86_64") && device.prog_if == 0x00)
-            || (cfg!(feature = "xhci") && device.prog_if == 0x30)
+        matches!(controller_type, super::UsbType::Ohci | super::UsbType::Ehci)
+            || (cfg!(target_arch = "x86_64") && controller_type == super::UsbType::Uhci)
+            || (cfg!(feature = "xhci") && controller_type == super::UsbType::Xhci)
     }
 
     fn init<'a>(
