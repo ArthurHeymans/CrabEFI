@@ -1638,7 +1638,17 @@ mod tests {
             },
             cmdline: heapless::String::try_from("console=ttyS0 root=/dev/sda1").unwrap(),
         };
-        for (width, height) in [(900, 600), (1024, 600), (1024, 768)] {
+        menu.entries[0].name =
+            heapless::String::try_from("Long entry name with enough text to wrap on a narrow pane")
+                .unwrap();
+        for (width, height) in [
+            (640, 400),
+            (640, 480),
+            (800, 600),
+            (900, 600),
+            (1024, 600),
+            (1024, 768),
+        ] {
             let mut pixels = std::vec![0; width as usize * height as usize];
             let fb = framebuffer(&mut pixels, width, height);
             let mut state = BState::new(1, 0, 0);

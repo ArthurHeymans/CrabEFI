@@ -278,22 +278,14 @@ pub(crate) fn enroll_dbx_data(
     // Submit with exactly the attributes the signature binds: the runtime
     // hashes them into its own verification, and APPEND_WRITE selects
     // merge-instead-of-replace semantics for the signature lists.
-    let status = crate::efi::runtime_image::client::variables::set(
-        &r_efi::efi::Guid::from_bytes(&EFI_IMAGE_SECURITY_DATABASE_GUID),
-        DBX_NAME,
-        dbx_attributes(append),
-        &data,
-    );
-    if status != r_efi::efi::Status::SUCCESS {
-        log::error!("Runtime Services rejected dbx update: {:?}", status);
-        return Err(if status == r_efi::efi::Status::OUT_OF_RESOURCES {
-            AuthError::BufferTooSmall
-        } else {
-            // Signature and replay checks already succeeded above. A runtime
-            // policy/storage refusal is not evidence of a bad signing key.
-            AuthError::AccessDenied
-        });
-    }
+    submit_dbx_update(&data, append, |attributes, bytes| {
+        crate::efi::runtime_image::client::variables::set(
+            &r_efi::efi::Guid::from_bytes(&EFI_IMAGE_SECURITY_DATABASE_GUID),
+            DBX_NAME,
+            attributes,
+            bytes,
+        )
+    })?;
     super::boot::refresh_key_databases();
 
     log::info!(
@@ -304,6 +296,26 @@ pub(crate) fn enroll_dbx_data(
     );
 
     Ok(result)
+}
+
+/// Single submission boundary, kept injectable so tests can assert the exact
+/// attributes and owned bytes passed to Runtime Services, not just verification.
+fn submit_dbx_update(
+    data: &[u8],
+    append: bool,
+    set: impl FnOnce(u32, &[u8]) -> r_efi::efi::Status,
+) -> Result<(), AuthError> {
+    let status = set(dbx_attributes(append), data);
+    if status == r_efi::efi::Status::SUCCESS {
+        Ok(())
+    } else {
+        log::error!("Runtime Services rejected dbx update: {status:?}");
+        Err(if status == r_efi::efi::Status::OUT_OF_RESOURCES {
+            AuthError::BufferTooSmall
+        } else {
+            AuthError::AccessDenied
+        })
+    }
 }
 
 /// Attributes a dbx write is submitted (and was signed) with.
@@ -339,6 +351,13 @@ fn inspect_authenticated_dbx_update(
         return Err(AuthError::InvalidHeader);
     }
 
+    // Input bounds are independent of free space: even an empty runtime
+    // store cannot hold a larger variable. Reject before asking for consent.
+    let sig_list_data = auth_header
+        .variable_data(data)
+        .ok_or(AuthError::InvalidHeader)?;
+    validate_payload_size(sig_list_data)?;
+
     // Get the timestamp from the header
     let update_timestamp = auth_header.time_stamp;
 
@@ -365,12 +384,6 @@ fn inspect_authenticated_dbx_update(
     // Get the PKCS#7 signature data
     let pkcs7_data = auth_header.cert_data(data).ok_or_else(|| {
         log::error!("Failed to extract PKCS#7 data from dbx update");
-        AuthError::InvalidHeader
-    })?;
-
-    // Get the variable data (signature lists)
-    let sig_list_data = auth_header.variable_data(data).ok_or_else(|| {
-        log::error!("Failed to extract signature list data from dbx update");
         AuthError::InvalidHeader
     })?;
 
@@ -402,10 +415,16 @@ fn apply_raw_dbx_update(
     data: &[u8],
     source: &'static str,
 ) -> Result<DbxEnrollmentResult, AuthError> {
-    if data.len() > crabefi_runtime_abi::MAX_VARIABLE_DATA_SIZE {
-        return Err(AuthError::InputTooLarge);
-    }
+    validate_payload_size(data)?;
     apply_signature_list_entries(data, source)
+}
+
+fn validate_payload_size(data: &[u8]) -> Result<(), AuthError> {
+    if data.len() > crabefi_runtime_abi::MAX_VARIABLE_DATA_SIZE {
+        Err(AuthError::InputTooLarge)
+    } else {
+        Ok(())
+    }
 }
 
 /// Build the signed data blob for dbx variable authentication
@@ -677,13 +696,22 @@ mod tests {
     /// If a future Microsoft signer fails the preflight policy while the
     /// runtime would accept it, this is the test that should turn red first.
     #[test]
-    fn microsoft_dbxupdate_passes_preflight_policy_and_verifies() {
+    fn microsoft_dbxupdate_cms_policy_and_signature_verify() {
         let data = include_bytes!("testdata/microsoft_dbxupdate_x64.bin");
         assert!(data.len() <= 48 * 1024, "fits the runtime envelope bound");
         let header = EfiVariableAuthentication2::from_bytes(data).expect("auth header parses");
         assert!(header.time_stamp.is_valid());
         let pkcs7 = header.cert_data(data).expect("pkcs7 present");
         let sig_lists = header.variable_data(data).expect("signature lists present");
+        // Interoperable CMS does not imply the variable fits this profile.
+        // The shipping fixture has a 21,292-byte payload; runtime currently
+        // limits an individual variable to 16 KiB. Never obtain consent only
+        // to reject it at SetVariable even with an empty store.
+        assert_eq!(sig_lists.len(), 21_292);
+        assert!(matches!(
+            inspect_authenticated_dbx_update(data, "fixture"),
+            Err(AuthError::InputTooLarge)
+        ));
 
         let entries =
             apply_signature_list_entries(sig_lists, "fixture").expect("signature lists parse");
@@ -708,6 +736,18 @@ mod tests {
                 .expect("verifies through the KEK CA chain");
         assert_eq!(signer, sha256(certs[0]));
         assert!(append, "Microsoft's update is signed for append writes");
+        // Exercise the enrollment submission boundary with a recording setter.
+        // This is not a claim that the fixture fits the runtime payload limit.
+        submit_dbx_update(data, append, |attributes, submitted| {
+            assert_eq!(
+                attributes,
+                super::super::attributes::SECURE_BOOT_ATTRS
+                    | super::super::attributes::APPEND_WRITE
+            );
+            assert_eq!(submitted, data);
+            r_efi::efi::Status::SUCCESS
+        })
+        .unwrap();
         // The same signature must not verify as a plain replace write: the
         // variant is bound by the signature, not chosen by the importer.
         let replace_signed_data =
@@ -731,6 +771,22 @@ mod tests {
             .unwrap(),
             None,
             "must not verify against an unrelated trust anchor"
+        );
+    }
+
+    #[test]
+    fn replace_submission_and_storage_errors_are_not_confused_with_append_or_bad_signatures() {
+        assert_eq!(
+            submit_dbx_update(&[1, 2], false, |attributes, bytes| {
+                assert_eq!(attributes, super::super::attributes::SECURE_BOOT_ATTRS);
+                assert_eq!(bytes, [1, 2]);
+                r_efi::efi::Status::OUT_OF_RESOURCES
+            }),
+            Err(AuthError::BufferTooSmall)
+        );
+        assert_eq!(
+            submit_dbx_update(&[], true, |_, _| r_efi::efi::Status::ACCESS_DENIED),
+            Err(AuthError::AccessDenied)
         );
     }
 
