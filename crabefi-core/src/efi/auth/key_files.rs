@@ -176,7 +176,8 @@ pub(crate) fn enroll_key_files(result: KeyFileSearchResult) -> Result<&'static s
 
     // Snapshot the durable databases so a failure after some writes landed
     // can be reported as the partial enrollment it is, not as "nothing
-    // happened". The caches currently mirror the store.
+    // happened". Read the authoritative store, not possibly stale or normalized
+    // verification caches left by an EFI application or a previous enrollment.
     let stored_before = key_database_bytes();
 
     // Always reconcile disposable drafts with the authoritative store, including
@@ -245,20 +246,30 @@ pub(crate) fn enroll_key_files(result: KeyFileSearchResult) -> Result<&'static s
     Ok(result.source)
 }
 
-/// Serialized (PK, KEK, db) signature lists as currently cached from the store.
-fn key_database_bytes() -> [alloc::vec::Vec<u8>; 3] {
+/// Exact runtime-store payloads, including dbx which persistence can rewrite
+/// before a later PK failure. Do not normalize them through verification caches.
+fn key_database_bytes() -> [alloc::vec::Vec<u8>; 4] {
+    use crabefi_efi_types::secure_boot::SecureBootVariable;
     [
-        super::variables::pk_database().to_signature_lists(),
-        super::variables::kek_database().to_signature_lists(),
-        super::variables::db_database().to_signature_lists(),
+        SecureBootVariable::PK,
+        SecureBootVariable::Kek,
+        SecureBootVariable::Db,
+        SecureBootVariable::Dbx,
     ]
+    .map(|variable| {
+        super::boot::get_variable_data(
+            &r_efi::efi::Guid::from_bytes(variable.guid()),
+            variable.name(),
+        )
+        .unwrap_or_default()
+    })
 }
 
 fn changed_databases(
-    before: &[alloc::vec::Vec<u8>; 3],
-    after: &[alloc::vec::Vec<u8>; 3],
+    before: &[alloc::vec::Vec<u8>; 4],
+    after: &[alloc::vec::Vec<u8>; 4],
 ) -> alloc::vec::Vec<&'static str> {
-    ["PK", "KEK", "db"]
+    ["PK", "KEK", "db", "dbx"]
         .into_iter()
         .zip(before.iter().zip(after))
         .filter(|(_, (before, after))| before != after)
@@ -326,9 +337,22 @@ mod tests {
 
     #[test]
     fn changed_databases_reports_only_databases_that_differ() {
-        let before = [alloc::vec![1], alloc::vec![2], alloc::vec![3]];
+        let before = [
+            alloc::vec![1],
+            alloc::vec![2],
+            alloc::vec![3],
+            alloc::vec![4],
+        ];
         assert!(changed_databases(&before, &before.clone()).is_empty());
-        let after = [alloc::vec![1], alloc::vec![9], alloc::vec![8]];
+        let after = [
+            alloc::vec![1],
+            alloc::vec![9],
+            alloc::vec![8],
+            alloc::vec![4],
+        ];
         assert_eq!(changed_databases(&before, &after), ["KEK", "db"]);
+        let mut dbx_only = before.clone();
+        dbx_only[3].push(5);
+        assert_eq!(changed_databases(&before, &dbx_only), ["dbx"]);
     }
 }
