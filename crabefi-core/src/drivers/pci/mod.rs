@@ -40,6 +40,8 @@ struct PciState {
     /// Enumerated PCI device list, on the heap: one server socket alone
     /// exposes well over a hundred functions across its root complexes.
     devices: alloc::vec::Vec<PciDevice>,
+    /// Whether the inventory covers every function in the selected backend.
+    enumeration_complete: bool,
     /// Validated PCIe ECAM allocations (from platform, ACPI MCFG, or FDT).
     ecam_regions: heapless::Vec<PciEcamRegion, { crate::fdt::MAX_ECAM_REGIONS }>,
     /// Whether firmware explicitly supplied ECAM configuration.
@@ -52,6 +54,7 @@ impl PciState {
     const fn new() -> Self {
         Self {
             devices: alloc::vec::Vec::new(),
+            enumeration_complete: true,
             ecam_regions: heapless::Vec::new(),
             ecam_configured: false,
             #[cfg(target_arch = "x86_64")]
@@ -427,6 +430,7 @@ pub fn init() {
                 })
             }
         };
+        pci.enumeration_complete = result.is_ok();
         if let Err(error) = result {
             // Keep the inventory collected so far usable, as with the old
             // fixed-capacity list, but never abort firmware on heap exhaustion.
@@ -437,7 +441,12 @@ pub fn init() {
             );
         }
         log::info!(
-            "PCI enumeration complete: {} devices found",
+            "PCI enumeration {}: {} devices found",
+            if pci.enumeration_complete {
+                "complete"
+            } else {
+                "incomplete"
+            },
             pci.devices.len()
         );
     });
@@ -515,7 +524,7 @@ pub fn shutdown_drivers() {
     driver::shutdown_all();
 }
 
-/// Clear PCI Bus Master Enable on all enumerated devices.
+/// Clear PCI Bus Master Enable, rescanning all functions if inventory is partial.
 ///
 /// This is a conservative OS-handoff safety net: once ExitBootServices has
 /// succeeded, firmware-owned DMA rings and bounce buffers are no longer owned
@@ -524,35 +533,81 @@ pub fn shutdown_drivers() {
 pub fn disable_all_bus_mastering_for_handoff() {
     // Handoff must not allocate: the boot heap may already be exhausted.
     let pci = PCI.borrow();
-    let devices = &pci.devices;
-    if devices.is_empty() {
-        return;
-    }
-
-    let mut changed = 0usize;
-    with_access(|access| {
-        for dev in devices.iter() {
-            let mut header = PciHeader::new(dev.address);
-            let command = header.command(access);
-            if !command.contains(CommandRegister::BUS_MASTER_ENABLE) {
-                continue;
-            }
-            let new_command = command - CommandRegister::BUS_MASTER_ENABLE;
-            header.update_command(access, |_| new_command);
-            changed += 1;
-            log::debug!(
-                "PCI {}: bus master disabled for OS handoff ({:#06x} -> {:#06x})",
-                dev.address,
-                command.bits(),
-                new_command.bits()
-            );
+    let changed = if pci.enumeration_complete {
+        pci.devices
+            .iter()
+            .filter(|dev| disable_bus_mastering(&pci.access, dev.address))
+            .count()
+    } else {
+        // Earlier firmware may have enabled DMA on functions omitted after an
+        // allocation failure. Rescan the backend, not the partial inventory.
+        // Read only IDs and command registers: do not probe or resize BARs.
+        log::warn!("PCI: rescanning incomplete inventory to disable all bus mastering");
+        match &pci.access {
+            AnyPciAccess::Unavailable => 0,
+            AnyPciAccess::IoCam(_) => disable_region_bus_mastering(&pci.access, 0, 0, u8::MAX),
+            AnyPciAccess::Ecam(ecam) => ecam
+                .regions()
+                .iter()
+                .map(|region| {
+                    disable_region_bus_mastering(
+                        &pci.access,
+                        region.segment,
+                        region.bus_start,
+                        region.bus_end,
+                    )
+                })
+                .sum(),
         }
-    });
+    };
 
     log::info!(
         "PCI: disabled bus mastering on {} device(s) for OS handoff",
         changed
     );
+}
+
+/// Clear BME without changing decode enables or probing BARs.
+fn disable_bus_mastering(access: &AnyPciAccess, address: PciAddress) -> bool {
+    let mut header = PciHeader::new(address);
+    let command = header.command(access);
+    if !command.contains(CommandRegister::BUS_MASTER_ENABLE) {
+        return false;
+    }
+    let new_command = command - CommandRegister::BUS_MASTER_ENABLE;
+    header.update_command(access, |_| new_command);
+    log::debug!(
+        "PCI {}: bus master disabled for OS handoff ({:#06x} -> {:#06x})",
+        address,
+        command.bits(),
+        new_command.bits()
+    );
+    true
+}
+
+/// Quiesce every present function in a backend range without allocating.
+fn disable_region_bus_mastering(
+    access: &AnyPciAccess,
+    segment: u16,
+    bus_start: u8,
+    bus_end: u8,
+) -> usize {
+    let mut changed = 0;
+    for bus in bus_start..=bus_end {
+        for device in 0..32 {
+            // Include all functions even when function zero is absent or its
+            // multifunction flag is unreliable. This is a safety-only sweep.
+            for function in 0..8 {
+                let address = PciAddress::new(segment, bus, device, function);
+                let (vendor, device_id) = PciHeader::new(address).id(access);
+                let id = u32::from(vendor) | (u32::from(device_id) << 16);
+                if access_rules::valid_device_id(id) && disable_bus_mastering(access, address) {
+                    changed += 1;
+                }
+            }
+        }
+    }
+    changed
 }
 
 // ============================================================================

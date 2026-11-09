@@ -12,6 +12,7 @@ thread_local! {
     static ALLOCATIONS_LEFT: Cell<Option<usize>> = const { Cell::new(None) };
 }
 
+/// Consume one thread-local allocation allowance, or report exhaustion.
 fn denied() -> bool {
     ALLOCATIONS_LEFT
         .try_with(|left| match left.get() {
@@ -58,6 +59,7 @@ unsafe impl GlobalAlloc for FailingAllocator {
 #[global_allocator]
 static ALLOCATOR: FailingAllocator = FailingAllocator;
 
+/// Limit allocations for one callback and restore the allocator on unwind.
 fn with_budget<R>(allocations: usize, f: impl FnOnce() -> R) -> R {
     struct Reset;
     impl Drop for Reset {
@@ -77,6 +79,7 @@ struct FakeEcam {
 }
 
 impl FakeEcam {
+    /// Describe three buses of multifunction bridge headers in aligned RAM.
     fn new(segment: u16, bus_start: u8) -> Self {
         let layout = Layout::from_size_align(3 << 20, 1 << 20).unwrap();
         // SAFETY: the nonzero layout is valid; the allocation is owned until Drop.
@@ -109,6 +112,7 @@ impl FakeEcam {
         ecam
     }
 
+    /// Return an aligned DWORD in one function's configuration space.
     fn register(&self, bus: usize, device: usize, function: usize, offset: usize) -> *mut u32 {
         let index = (bus << 20) | (device << 15) | (function << 12) | offset;
         assert!(bus < 3 && device < 32 && function < 8 && offset < 4096);
@@ -117,6 +121,7 @@ impl FakeEcam {
         unsafe { self.memory.as_ptr().add(index).cast() }
     }
 
+    /// Update emulated configuration space without going through the driver.
     fn write(&self, bus: usize, device: usize, function: usize, offset: usize, value: u32) {
         // SAFETY: register validates alignment and bounds; accesses are serialized.
         unsafe {
@@ -125,6 +130,19 @@ impl FakeEcam {
         };
     }
 
+    /// Model a previous firmware leaving every function DMA-enabled again.
+    fn reset_bus_mastering(&self) {
+        for bus in 0..3 {
+            for device in 0..32 {
+                let functions = if device == 0 { 8 } else { 1 };
+                for function in 0..functions {
+                    self.write(bus, device, function, 0x04, 0x0000_0007);
+                }
+            }
+        }
+    }
+
+    /// Check all functions, not just the entries retained in the PCI inventory.
     fn assert_bus_mastering_disabled(&self) {
         for bus in 0..3 {
             for device in 0..32 {
@@ -148,6 +166,14 @@ impl Drop for FakeEcam {
     }
 }
 
+/// Require even an empty or truncated inventory to quiesce every ECAM function.
+fn assert_handoff_without_allocations(first: &FakeEcam, later: &FakeEcam) {
+    with_budget(0, crabefi::drivers::quiesce_dma_for_os_handoff);
+    first.assert_bus_mastering_disabled();
+    later.assert_bus_mastering_disabled();
+}
+
+/// Exercise allocation failure, cross-segment discovery and allocation-free readers.
 #[test]
 fn enumeration_is_fallible_and_handoff_needs_no_heap() {
     let first = FakeEcam::new(0, 0);
@@ -157,6 +183,9 @@ fn enumeration_is_fallible_and_handoff_needs_no_heap() {
     // Initial allocation failure must leave an empty, usable inventory.
     with_budget(0, pci::init);
     assert_eq!(pci::with_devices(|devices| devices.len()), 0);
+    assert_handoff_without_allocations(&first, &later);
+    first.reset_bus_mastering();
+    later.reset_bus_mastering();
 
     // Fail growth in the middle of the first multifunction device.
     with_budget(1, pci::init);
@@ -164,6 +193,9 @@ fn enumeration_is_fallible_and_handoff_needs_no_heap() {
     pci::with_devices(|devices| {
         assert_eq!(devices[3].address, PciAddress::new(0, 0, 0, 3));
     });
+    assert_handoff_without_allocations(&first, &later);
+    first.reset_bus_mastering();
+    later.reset_bus_mastering();
 
     // Fail later growth after crossing into another segment. Earlier devices
     // stay usable, and enumeration does not retry allocation for every root.
@@ -172,6 +204,9 @@ fn enumeration_is_fallible_and_handoff_needs_no_heap() {
     pci::with_devices(|devices| {
         assert_eq!(devices[117].address, PciAddress::new(7, 64, 0, 0));
     });
+    assert_handoff_without_allocations(&first, &later);
+    first.reset_bus_mastering();
+    later.reset_bus_mastering();
 
     // Retrying without pressure finds every function, not just the first 64.
     pci::init();
@@ -192,4 +227,32 @@ fn enumeration_is_fallible_and_handoff_needs_no_heap() {
     });
     first.assert_bus_mastering_disabled();
     later.assert_bus_mastering_disabled();
+
+    #[cfg(feature = "spi-flash")]
+    {
+        // A supported Intel chipset beyond entry 64, on segment 7. Match it
+        // using the production adapter, without touching real SPI hardware.
+        later.write(2, 31, 0, 0x00, 0x0f1c_8086);
+        pci::init();
+        with_budget(0, || {
+            pci::with_devices(|devices| {
+                assert_eq!(devices.len(), 234);
+                let chipset = rflasher_internal::find_intel_chipset_in_iter(
+                    devices.iter().map(rflasher_internal::PciDevice::from),
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(chipset.enable.device_id, 0x0f1c);
+                assert_eq!(
+                    (
+                        chipset.domain,
+                        chipset.bus,
+                        chipset.device,
+                        chipset.function
+                    ),
+                    (7, 66, 31, 0)
+                );
+            });
+        });
+    }
 }
