@@ -424,6 +424,11 @@ pub fn enroll_microsoft_windows_production_db() -> Result<(), AuthError> {
 /// Enroll Microsoft Corporation UEFI CA 2011 into the db database
 ///
 /// This certificate is required for third-party UEFI drivers and shim.
+/// The bundled certificate custom-key enrollment adds to db, for review.
+pub fn microsoft_uefi_ca_db_certificate() -> &'static [u8] {
+    MICROSOFT_UEFI_CA_2011
+}
+
 pub fn enroll_microsoft_uefi_ca_db() -> Result<(), AuthError> {
     log::info!("Enrolling Microsoft Corporation UEFI CA 2011");
     let mut db = db_database();

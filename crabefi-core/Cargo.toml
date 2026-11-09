@@ -70,6 +70,7 @@ atomic_refcell = "0.1"
 spin = "0.12"
 noto-sans-mono-bitmap = { optional = true, version = "0.3", default-features = false, features = [
   "regular",
+  "bold",
   "size_16",
   "size_20",
   "size_24",

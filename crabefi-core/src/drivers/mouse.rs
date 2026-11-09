@@ -128,6 +128,16 @@ struct MouseState {
     rel_y: i32,
     rel_z: i32,
     buttons: u32,
+    /// Presses seen since the last report: a quick click between two polls
+    /// must not vanish because only the final (released) level is sampled.
+    pressed: u32,
+    /// Synaptics pass-through (TrackPoint) and touchpad buttons, kept apart so
+    /// one device's packets cannot release the other's held button.
+    stick_buttons: u32,
+    pad_buttons: u32,
+    /// Synaptics ClickPad (ext. capability 0x0c bit 20): the pad itself is
+    /// the primary button and reports through the "middle" bit.
+    clickpad: bool,
     data_port: PortReadWrite8<()>,
     status_port: PortAliased8<Status::Register, ()>,
     // Synaptics absolute → relative state
@@ -171,6 +181,10 @@ impl MouseState {
             rel_y: 0,
             rel_z: 0,
             buttons: 0,
+            pressed: 0,
+            stick_buttons: 0,
+            pad_buttons: 0,
+            clickpad: false,
             data_port: PortReadWrite8::new(ports::DATA),
             status_port: PortAliased8::new(ports::STATUS_CMD),
             syn_prev_x: 0,
@@ -254,7 +268,7 @@ impl MouseState {
     /// Capability query (`SYN_QUE_CAPABILITIES = 0x02`):
     ///   sliced_cmd(0x02)  +  STATUS_REQUEST → read 3 bytes.
     ///   Byte[0] bit 5 = pass-through port present.
-    fn detect_synaptics(&self) -> Option<bool> {
+    fn detect_synaptics(&mut self) -> Option<bool> {
         // ── Identify ──────────────────────────────────────────────────────────
         if !self.synaptics_sliced_cmd(0x00) {
             return None;
@@ -282,11 +296,23 @@ impl MouseState {
         }
         let cap = self.read_aux_bytes::<3>()?;
         let has_pt = (cap[0] & SYN_CAP_PASS_THROUGH_BIT) != 0;
+        // Extended capability 0x0c, when at least four extended queries are
+        // supported (SYN_EXT_CAP_REQUESTS >= 4): bit 20 = 1-button ClickPad.
+        // Reference: `synaptics_capability()` and SYN_CAP_CLICKPAD in Linux.
+        self.clickpad = false;
+        if (cap[0] & 0x70) >> 4 >= 4
+            && self.synaptics_sliced_cmd(0x0c)
+            && self.send_mouse_byte(mouse_cmd::STATUS_REQUEST)
+            && let Some(ext) = self.read_aux_bytes::<3>()
+        {
+            self.clickpad = ext[0] & 0x10 != 0;
+        }
         log::info!(
-            "Synaptics caps={:#010b} ext={:#x} pass-through={}",
+            "Synaptics caps={:#010b} ext={:#x} pass-through={} clickpad={}",
             cap[0],
             cap[1],
-            has_pt
+            has_pt,
+            self.clickpad
         );
         Some(has_pt)
     }
@@ -406,6 +432,17 @@ impl MouseState {
         }
     }
 
+    fn set_buttons(&mut self, level: u32) {
+        self.pressed |= level & !self.buttons;
+        self.buttons = level;
+    }
+
+    fn take_buttons(&mut self) -> u32 {
+        let level = self.buttons | self.pressed;
+        self.pressed = 0;
+        level
+    }
+
     /// Decode a standard 3-byte PS/2 relative-motion packet.
     fn decode_standard_packet(&mut self) {
         let b0 = self.packet_buf[0];
@@ -418,7 +455,7 @@ impl MouseState {
         let dy = b2 as i32 - (((b0 as i32) << 3) & 0x100);
         self.rel_y -= dy; // PS/2 Y-up → screen Y-down
 
-        self.buttons = (b0 & 0x07) as u32;
+        self.set_buttons((b0 & 0x07) as u32);
     }
 
     /// Decode a 6-byte Synaptics absolute-mode packet.
@@ -459,7 +496,8 @@ impl MouseState {
             let dy = tp2 as i32 - (((tp0 as i32) << 3) & 0x100);
             self.rel_y -= dy;
 
-            self.buttons = (tp0 & 0x07) as u32;
+            self.stick_buttons = (tp0 & 0x07) as u32;
+            self.set_buttons(self.stick_buttons | self.pad_buttons);
             return;
         }
 
@@ -472,8 +510,13 @@ impl MouseState {
             (((buf[3] as u32 & 0x20) << 7) | ((buf[1] as u32 & 0xf0) << 4) | buf[5] as u32) as i32;
         let z = buf[2] as i32;
 
-        // Buttons (left = bit 0, right = bit 1 of byte 0)
-        self.buttons = (buf[0] & 0x03) as u32;
+        // Buttons (left = bit 0, right = bit 1 of byte 0). Byte 0 and byte 3
+        // disagreeing in bit 0 is the "middle" button; on a ClickPad that is
+        // the pad's primary button, so it is reported as left (as Linux does).
+        let middle = ((buf[0] ^ buf[3]) & 0x01) as u32;
+        let extra = if self.clickpad { middle } else { middle << 2 };
+        self.pad_buttons = (buf[0] & 0x03) as u32 | extra;
+        self.set_buttons(self.stick_buttons | self.pad_buttons);
 
         if z > SYN_Z_THRESHOLD && self.syn_prev_z > SYN_Z_THRESHOLD {
             // Only count motion when there was continuous contact.
@@ -606,8 +649,9 @@ pub fn get_relative_motion() -> (i32, i32, i32) {
 }
 
 /// Get current button state bitmask (bit 0=left, 1=right, 2=middle).
+/// Includes presses released since the previous call, reported once.
 pub fn get_buttons() -> u32 {
-    MOUSE.lock().buttons
+    MOUSE.lock().take_buttons()
 }
 
 /// Returns `true` if the PS/2 mouse (or Synaptics+TrackPoint) is ready.
@@ -635,5 +679,59 @@ impl super::pointer::PointerDevice for Ps2Mouse {
             dz,
             buttons: get_buttons(),
         })
+    }
+}
+
+#[cfg(test)]
+mod click_tests {
+    use super::*;
+
+    fn feed(mouse: &mut MouseState, packet: &[u8]) {
+        mouse.packet_buf[..packet.len()].copy_from_slice(packet);
+        mouse.decode_packet();
+    }
+
+    #[test]
+    fn a_click_between_two_polls_is_reported_once() {
+        let mut mouse = MouseState::new();
+        feed(&mut mouse, &[0x09, 0, 0]); // left down
+        feed(&mut mouse, &[0x08, 0, 0]); // left up before the next poll
+        assert_eq!(mouse.take_buttons(), 1, "press survives until reported");
+        assert_eq!(mouse.take_buttons(), 0, "and is reported only once");
+        feed(&mut mouse, &[0x09, 0, 0]);
+        assert_eq!(mouse.take_buttons(), 1);
+        assert_eq!(mouse.take_buttons(), 1, "a held button stays down");
+    }
+
+    #[test]
+    fn trackpoint_and_touchpad_buttons_do_not_release_each_other() {
+        let mut mouse = MouseState::new();
+        mouse.protocol = MouseProtocol::SynapticsAbsolute;
+        // TrackPoint pass-through packet with the left button held.
+        feed(&mut mouse, &[0x84, 0x09, 0, 0xc4, 0, 0]);
+        // Touchpad packet without buttons (finger resting on the pad).
+        feed(&mut mouse, &[0x80, 0, 0, 0xc0, 0, 0]);
+        assert_eq!(mouse.take_buttons() & 1, 1);
+        assert_eq!(mouse.take_buttons() & 1, 1, "stick button still held");
+    }
+
+    #[test]
+    fn clickpad_press_is_a_left_click() {
+        let mut mouse = MouseState::new();
+        mouse.protocol = MouseProtocol::SynapticsAbsolute;
+        mouse.clickpad = true;
+        // ClickPad: bit 0 of byte 0 and byte 3 differ while pressed.
+        feed(&mut mouse, &[0x81, 0, 0, 0xc0, 0, 0]);
+        assert_eq!(mouse.take_buttons() & 1, 1);
+        feed(&mut mouse, &[0x80, 0, 0, 0xc0, 0, 0]);
+        assert_eq!(mouse.take_buttons() & 1, 0);
+    }
+
+    #[test]
+    fn middle_button_on_other_touchpads_is_not_a_left_click() {
+        let mut mouse = MouseState::new();
+        mouse.protocol = MouseProtocol::SynapticsAbsolute;
+        feed(&mut mouse, &[0x80, 0, 0, 0xc1, 0, 0]);
+        assert_eq!(mouse.take_buttons(), 4, "reported as middle, not left");
     }
 }

@@ -104,6 +104,17 @@ pub fn try_read_key() -> Option<(u16, u16)> {
         .map(|key| (key.scancode, key.unicode_char))
 }
 
+/// Read a UI key and sample modifiers from that same device at dequeue time.
+/// Keep the legacy tuple API unchanged for EFI console consumers.
+pub fn try_read_key_with_state() -> Option<(Key, KeyState)> {
+    with_devices(|devices| {
+        devices.iter_mut().find_map(|device| {
+            let key = device.read_key()?;
+            Some((key, device.key_state()))
+        })
+    })
+}
+
 /// Combined EFI shift and toggle state of every keyboard, with VALID bits.
 pub fn get_efi_key_state() -> (u32, u8) {
     let state = with_devices(|devices| {

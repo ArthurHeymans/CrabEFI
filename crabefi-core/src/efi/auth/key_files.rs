@@ -141,6 +141,28 @@ pub fn enroll_pk_from_file() -> Result<&'static str, AuthError> {
         AuthError::NoSuitableKey
     })?;
 
+    enroll_key_files(result)
+}
+
+/// Validate every supplied certificate before changing any enrolled key cache.
+/// The graphical caller also uses this before showing trust identities.
+pub(crate) fn validate_key_files(result: &KeyFileSearchResult) -> Result<(), AuthError> {
+    validate_certificate(result.pk.as_deref().ok_or(AuthError::NoSuitableKey)?)?;
+    if let Some(kek) = &result.kek {
+        validate_certificate(kek)?;
+    }
+    if let Some(db) = &result.db {
+        validate_certificate(db)?;
+    }
+    Ok(())
+}
+
+/// Enroll exactly the owned bytes previewed by the user, without reopening ESP files.
+pub(crate) fn enroll_key_files(result: KeyFileSearchResult) -> Result<&'static str, AuthError> {
+    if !super::is_setup_mode() {
+        return Err(AuthError::AccessDenied);
+    }
+    validate_key_files(&result)?;
     let pk_data = result.pk.ok_or_else(|| {
         log::warn!("No PK certificate found (looked for EFI\\keys\\PK.cer)");
         AuthError::NoSuitableKey
@@ -152,55 +174,96 @@ pub fn enroll_pk_from_file() -> Result<&'static str, AuthError> {
         result.source
     );
 
-    // Validate it's a valid X.509 certificate
-    validate_certificate(&pk_data)?;
+    // Snapshot the durable databases so a failure after some writes landed
+    // can be reported as the partial enrollment it is, not as "nothing
+    // happened". The caches currently mirror the store.
+    let stored_before = key_database_bytes();
 
-    // Clear existing keys first
-    {
-        let mut pk_db = super::variables::pk_database();
-        pk_db.clear();
+    // Always reconcile disposable drafts with the authoritative store, including
+    // after a partial enrollment or an allocation/persistence failure.
+    let enrollment = (|| {
+        // All supplied certificates were validated before any cache mutation.
+        // Clear existing keys first
+        {
+            let mut pk_db = super::variables::pk_database();
+            pk_db.clear();
+        }
+        {
+            let mut kek_db = super::variables::kek_database();
+            kek_db.clear();
+        }
+        {
+            let mut db_db = super::variables::db_database();
+            db_db.clear();
+        }
+
+        // Enroll Microsoft db certificates for shim/GRUB compatibility
+        enrollment::enroll_microsoft_uefi_ca_db()?;
+        log::info!("Enrolled Microsoft UEFI CA for shim/GRUB compatibility");
+
+        // Enroll custom KEK if found, otherwise use the custom PK as KEK too
+        if let Some(kek_data) = result.kek {
+            log::info!("Found custom KEK certificate ({} bytes)", kek_data.len());
+            enrollment::enroll_kek(&kek_data, &USER_OWNER_GUID)?;
+        } else {
+            // Use the PK as KEK (common for self-managed systems)
+            enrollment::enroll_kek(&pk_data, &USER_OWNER_GUID)?;
+            log::info!("Using custom PK as KEK");
+        }
+
+        // Enroll custom db certificate if found
+        if let Some(db_data) = result.db {
+            log::info!("Found custom db certificate ({} bytes)", db_data.len());
+            enrollment::enroll_db_certificate(&db_data, &USER_OWNER_GUID)?;
+        }
+
+        // Enroll the custom PK
+        enrollment::enroll_pk(&pk_data, &USER_OWNER_GUID)?;
+
+        // Enter User Mode
+        enter_user_mode();
+
+        // Persist all key databases
+        super::boot::persist_key_databases()?;
+        super::boot::update_status_variables()?;
+        Ok::<(), AuthError>(())
+    })();
+    super::boot::force_refresh_key_databases();
+    if let Err(error) = enrollment {
+        let changed = changed_databases(&stored_before, &key_database_bytes());
+        if changed.is_empty() {
+            return Err(error);
+        }
+        log::error!(
+            "Enrollment failed after durable changes to {}; stored keys match neither the previous nor the reviewed set",
+            changed.join(", ")
+        );
+        return Err(AuthError::PartialEnrollment);
     }
-    {
-        let mut kek_db = super::variables::kek_database();
-        kek_db.clear();
-    }
-    {
-        let mut db_db = super::variables::db_database();
-        db_db.clear();
-    }
-
-    // Enroll Microsoft db certificates for shim/GRUB compatibility
-    enrollment::enroll_microsoft_uefi_ca_db()?;
-    log::info!("Enrolled Microsoft UEFI CA for shim/GRUB compatibility");
-
-    // Enroll custom KEK if found, otherwise use the custom PK as KEK too
-    if let Some(kek_data) = result.kek {
-        log::info!("Found custom KEK certificate ({} bytes)", kek_data.len());
-        enrollment::enroll_kek(&kek_data, &USER_OWNER_GUID)?;
-    } else {
-        // Use the PK as KEK (common for self-managed systems)
-        enrollment::enroll_kek(&pk_data, &USER_OWNER_GUID)?;
-        log::info!("Using custom PK as KEK");
-    }
-
-    // Enroll custom db certificate if found
-    if let Some(db_data) = result.db {
-        log::info!("Found custom db certificate ({} bytes)", db_data.len());
-        enrollment::enroll_db_certificate(&db_data, &USER_OWNER_GUID)?;
-    }
-
-    // Enroll the custom PK
-    enrollment::enroll_pk(&pk_data, &USER_OWNER_GUID)?;
-
-    // Enter User Mode
-    enter_user_mode();
-
-    // Persist all key databases
-    super::boot::persist_key_databases()?;
-    super::boot::update_status_variables()?;
 
     log::info!("Custom PK enrolled successfully from {}", result.source);
     Ok(result.source)
+}
+
+/// Serialized (PK, KEK, db) signature lists as currently cached from the store.
+fn key_database_bytes() -> [alloc::vec::Vec<u8>; 3] {
+    [
+        super::variables::pk_database().to_signature_lists(),
+        super::variables::kek_database().to_signature_lists(),
+        super::variables::db_database().to_signature_lists(),
+    ]
+}
+
+fn changed_databases(
+    before: &[alloc::vec::Vec<u8>; 3],
+    after: &[alloc::vec::Vec<u8>; 3],
+) -> alloc::vec::Vec<&'static str> {
+    ["PK", "KEK", "db"]
+        .into_iter()
+        .zip(before.iter().zip(after))
+        .filter(|(_, (before, after))| before != after)
+        .map(|(name, _)| name)
+        .collect()
 }
 
 /// Validate that data is a valid X.509 certificate
@@ -221,5 +284,51 @@ fn validate_certificate(data: &[u8]) -> Result<(), AuthError> {
             log::error!("Certificate validation failed: {:?}", e);
             Err(AuthError::CertificateParseError)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_all_previewed_certificates_before_enrollment() {
+        let cert = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../crabefi-pkcs7/testdata/ca.der"
+        ));
+        let mut files = KeyFileSearchResult {
+            pk: Some(cert.to_vec()),
+            kek: None,
+            db: None,
+            source: "test",
+        };
+        assert!(validate_key_files(&files).is_ok());
+        files.kek = Some(alloc::vec![0, 1, 2]);
+        assert!(matches!(
+            validate_key_files(&files),
+            Err(AuthError::CertificateParseError)
+        ));
+        files.kek = Some(cert.to_vec());
+        files.db = Some(alloc::vec![0]);
+        assert!(matches!(
+            validate_key_files(&files),
+            Err(AuthError::CertificateParseError)
+        ));
+        files.db = Some(cert.to_vec());
+        assert!(validate_key_files(&files).is_ok());
+        files.pk = None;
+        assert!(matches!(
+            validate_key_files(&files),
+            Err(AuthError::NoSuitableKey)
+        ));
+    }
+
+    #[test]
+    fn changed_databases_reports_only_databases_that_differ() {
+        let before = [alloc::vec![1], alloc::vec![2], alloc::vec![3]];
+        assert!(changed_databases(&before, &before.clone()).is_empty());
+        let after = [alloc::vec![1], alloc::vec![9], alloc::vec![8]];
+        assert_eq!(changed_databases(&before, &after), ["KEK", "db"]);
     }
 }

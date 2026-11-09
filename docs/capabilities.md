@@ -36,6 +36,16 @@ may remain readable in the basic profile; it does not enable enforcement or
 change the reported `SecureBoot=0`/`SetupMode=1`. Protected key/auth-history writes
 remain denied. This is not an authenticated-variable implementation.
 
+Authenticated `dbx` imports additionally require a durable replay floor: the
+anti-downgrade check compares the update timestamp against the persisted
+authenticated-variable history (including deletion records), so builds without
+`variable-store` (or with an unreadable or malformed store) reject `dbx`
+updates instead of falling back to an in-memory timestamp that a key deletion
+could reset. This
+is deliberate: without persisted auth history there is nothing trustworthy to
+compare against. Enable `variable-store` (directly, or via `spi-flash` or
+`capsule-update`) on platforms that must import `dbx` updates.
+
 Storage drivers are currently retained: AHCI, NVMe, SDHCI and USB 1/2 storage;
 PS/2 and serial console also remain. There is **no IDE/ATA driver** in CrabEFI.
 A platform that exposes an IDE-class controller needs a host `BlockDevice` or a
