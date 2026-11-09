@@ -11,6 +11,9 @@ CrabEFI implements enough UEFI to boot Linux via shim/GRUB2 or systemd-boot on r
 autoboot countdown. Captured with QEMU `screendump` and converted from PNG to
 JPEG using ImageMagick. See [docs/UI.md](docs/UI.md) for the design.*
 
+[Try the UI in your browser](https://arthurheymans.github.io/CrabEFI/) — the same
+Rust screens compiled to WebAssembly, with simulated boot devices and settings.
+
 ## Documentation
 
 See the [docs/](docs/README.md) directory:

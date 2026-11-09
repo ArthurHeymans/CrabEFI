@@ -21,6 +21,9 @@ use std::{
     rc::Rc,
     task::{Context, Poll, Waker},
 };
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::prelude::*;
+
 type Task = Pin<Box<dyn Future<Output = Outcome>>>;
 
 struct Simulation {
@@ -228,8 +231,21 @@ fn boot_menu(scenario: &str) -> BootMenu<DiskEntry> {
     menu
 }
 
+/// Every fixture, with the label a host shows for it.
+pub const SCENARIOS: [(&str, &str); 8] = [
+    ("normal", "Mixed boot entries"),
+    ("cfr", "Firmware settings (CFR)"),
+    ("many", "16 entries, scrolling"),
+    ("empty", "No boot media"),
+    ("countdown", "5-second auto-boot"),
+    ("secure", "Enforcing Secure Boot"),
+    ("write-error", "Variable write failures"),
+    ("no-settings", "No platform settings"),
+];
+
 /// A host-owned framebuffer, UI future and simulated firmware services.
 /// Dropping/replacing the future always happens before its framebuffer is freed.
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 pub struct Playground {
     task: Option<Task>,
     pixels: Box<[u32]>,
@@ -275,25 +291,18 @@ struct Snapshot<'a> {
     configured_log_level: &'static str,
 }
 
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 impl Playground {
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen(constructor))]
     pub fn new(width: u32, height: u32, scenario: &str) -> Result<Playground, String> {
         if !(640..=1920).contains(&width) || !(400..=1080).contains(&height) {
             return Err("Resolution must be between 640x400 and 1920x1080".into());
         }
-        if ![
-            "normal",
-            "cfr",
-            "no-settings",
-            "many",
-            "empty",
-            "countdown",
-            "secure",
-            "write-error",
-        ]
-        .contains(&scenario)
-        {
+        if !SCENARIOS.iter().any(|(name, _)| *name == scenario) {
             return Err(format!("Unknown scenario: {scenario}"));
         }
+        #[cfg(target_arch = "wasm32")]
+        console_error_panic_hook::set_once();
         let secure = scenario == "secure";
         let sim = Rc::new(RefCell::new(Simulation {
             now_ms: 0,
@@ -351,6 +360,11 @@ impl Playground {
         Ok(host)
     }
 
+    /// [`SCENARIOS`] as `[[name, label], ...]`, for hosts that cannot read it.
+    pub fn scenarios() -> String {
+        serde_json::to_string(&SCENARIOS).unwrap()
+    }
+
     /// Inject or repair persistence errors without discarding the active draft.
     pub fn set_write_failures(&mut self, enabled: bool) {
         self.sim.borrow_mut().fail_writes = enabled;
@@ -382,6 +396,10 @@ impl Playground {
             "Delete" => KeyPress::Delete,
             "F8" => KeyPress::F8,
             "F10" => KeyPress::F10,
+            // The line editor's start, end and clear shortcuts.
+            "Ctrl+a" => KeyPress::Char('\x01'),
+            "Ctrl+e" => KeyPress::Char('\x05'),
+            "Ctrl+u" => KeyPress::Char('\x15'),
             _ => {
                 let mut chars = key.chars();
                 let c = chars.next().ok_or("Empty key")?;
@@ -392,6 +410,22 @@ impl Playground {
             }
         };
         self.enqueue(event)
+    }
+
+    /// A DOM `KeyboardEvent.key` and its modifiers. False leaves the key to
+    /// the page: the UI has no such key, or the session has ended.
+    pub fn dom_key(&mut self, key: &str, ctrl: bool, shift: bool) -> bool {
+        let name = match (ctrl, shift, key) {
+            (true, _, _) => format!("Ctrl+{}", key.to_lowercase()),
+            (false, true, "Tab") => "BackTab".into(),
+            _ => key.into(),
+        };
+        self.key(&name).is_ok()
+    }
+
+    /// The UI returned (booted or exited); only a new `Playground` continues.
+    pub fn ended(&self) -> bool {
+        self.task.is_none()
     }
 
     pub fn click(&mut self, x: u32, y: u32) -> Result<(), String> {
@@ -435,7 +469,15 @@ impl Playground {
         }
     }
 
-    /// Copy RGBA8 pixels, for screenshots and pixel tests.
+    /// Packed 0x00RRGGBB pixels. JS must recreate its view after Wasm growth.
+    pub fn pixels_ptr(&self) -> *const u32 {
+        self.pixels.as_ptr()
+    }
+    pub fn pixels_len(&self) -> usize {
+        self.pixels.len()
+    }
+
+    /// Copy RGBA8 pixels, useful for screenshots and browser-independent tests.
     pub fn rgba(&self) -> Vec<u8> {
         self.pixels
             .iter()
@@ -502,7 +544,9 @@ impl Playground {
         })
         .unwrap()
     }
+}
 
+impl Playground {
     fn enqueue(&mut self, event: KeyPress) -> Result<(), String> {
         let mut sim = self.sim.borrow_mut();
         if sim.input.len() >= 128 {

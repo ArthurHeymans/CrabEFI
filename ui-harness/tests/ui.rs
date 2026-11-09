@@ -248,3 +248,36 @@ fn invalid_inputs_and_dimensions_are_rejected_without_panics() {
     }
     assert!(host.key("ArrowDown").is_err());
 }
+
+#[test]
+fn dom_keys_carry_modifiers_and_leave_other_keys_to_the_page() {
+    let mut host = Playground::new(800, 600, "normal").unwrap();
+    let press = |host: &mut Playground, key: &str, ctrl: bool, shift: bool| {
+        let taken = host.dom_key(key, ctrl, shift);
+        host.advance(0);
+        taken
+    };
+    // Shift alone, browser shortcuts and reload stay with the browser.
+    for (key, ctrl) in [("Shift", false), ("F5", false), ("r", true), ("Tab", true)] {
+        assert!(!press(&mut host, key, ctrl, false), "{key}");
+    }
+    assert!(press(&mut host, "ArrowDown", false, false));
+    assert!(press(&mut host, "e", false, false));
+    assert!(press(&mut host, "U", true, false)); // Ctrl+U clears the editor
+    assert!(press(&mut host, "x", false, false));
+    assert!(press(&mut host, "Tab", false, true)); // Shift+Tab is BackTab
+    assert!(press(&mut host, "Tab", false, false));
+    assert!(press(&mut host, "Enter", false, false));
+    assert_eq!(state(&host)["commandLine"], "x");
+    assert!(host.ended());
+    assert!(!press(&mut host, "Enter", false, false));
+}
+
+#[test]
+fn every_listed_scenario_starts() {
+    let listed: Vec<(String, String)> = serde_json::from_str(&Playground::scenarios()).unwrap();
+    assert_eq!(listed.len(), crabefi_ui_harness::SCENARIOS.len());
+    for (name, _) in listed {
+        Playground::new(800, 600, &name).unwrap();
+    }
+}

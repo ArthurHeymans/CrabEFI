@@ -1,6 +1,7 @@
 # Build artifacts
 /target/
 **/target/
+**/node_modules/
 crabefi-coreboot/rust_out
 /firmware/coreboot.rom
 /sct-assets/
