@@ -46,6 +46,7 @@ const SECURE_BOOT_KEY_ATTRS: u32 = super::attributes::NON_VOLATILE
 
 struct DatabaseSnapshot {
     initialized: bool,
+    #[cfg(feature = "ui")]
     complete: bool,
     data: Option<Vec<u8>>,
 }
@@ -54,6 +55,7 @@ impl DatabaseSnapshot {
     const fn new() -> Self {
         Self {
             initialized: false,
+            #[cfg(feature = "ui")]
             complete: false,
             data: None,
         }
@@ -214,12 +216,16 @@ fn refresh_key_database(
 
     let mut database = key_database(variable);
     database.clear();
+    #[cfg(feature = "ui")]
     let mut complete = true;
     if let Some(value) = data.as_deref()
         && !value.is_empty()
     {
         if let Err(error) = database.load_from_signature_lists(value) {
-            complete = false;
+            #[cfg(feature = "ui")]
+            {
+                complete = false;
+            }
             log::warn!("Failed to parse {:?} variable: {:?}", variable, error);
         } else {
             log::debug!("Loaded {} {:?} entries", database.len(), variable);
@@ -242,6 +248,7 @@ fn refresh_key_database(
     let mut snapshots = KEY_DATABASE_SNAPSHOTS.lock();
     snapshots[variable.index()] = DatabaseSnapshot {
         initialized: true,
+        #[cfg(feature = "ui")]
         complete,
         data,
     };
