@@ -762,6 +762,23 @@ fn dbx_effect(append: bool) -> &'static str {
     }
 }
 
+fn timestamp_text(t: crabefi_efi_types::authentication::EfiTime) -> String {
+    let (year, month, day, hour, minute, second, timezone) = (
+        t.year, t.month, t.day, t.hour, t.minute, t.second, t.timezone,
+    );
+    let zone = match timezone {
+        0 => String::from("UTC"),
+        0x7ff => String::from("timezone unspecified"),
+        offset => alloc::format!(
+            "UTC{}{h:02}:{m:02}",
+            if offset < 0 { '-' } else { '+' },
+            h = offset.unsigned_abs() / 60,
+            m = offset.unsigned_abs() % 60
+        ),
+    };
+    alloc::format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} {zone}")
+}
+
 type Prepared = (PendingImport, Vec<Block>, Vec<ReviewSection>, Vec<Block>);
 
 #[cfg(test)]
@@ -773,6 +790,19 @@ mod dbx_review_tests {
         assert!(dbx_effect(true).contains("kept"));
         assert!(!dbx_effect(true).contains("removed"));
         assert!(dbx_effect(false).contains("removed"));
+    }
+
+    #[test]
+    fn timestamps_do_not_claim_an_unconverted_utc_time() {
+        let mut time = crabefi_efi_types::authentication::EfiTime::zero();
+        time.timezone = 90;
+        assert!(timestamp_text(time).ends_with("UTC+01:30"));
+        time.timezone = -330;
+        assert!(timestamp_text(time).ends_with("UTC-05:30"));
+        time.timezone = 0x7ff;
+        assert!(timestamp_text(time).ends_with("timezone unspecified"));
+        time.timezone = 0;
+        assert!(timestamp_text(time).ends_with(" UTC"));
     }
 }
 
@@ -883,14 +913,7 @@ fn prepare_import(idx: usize) -> Result<Option<Prepared>, &'static str> {
                 ),
             ];
             if let Some(t) = preview.timestamp {
-                let (year, month, day, hour, minute, second) =
-                    (t.year, t.month, t.day, t.hour, t.minute, t.second);
-                intro.push(Block::fact(
-                    "Timestamp",
-                    &alloc::format!(
-                        "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} UTC"
-                    ),
-                ));
+                intro.push(Block::fact("Timestamp", &timestamp_text(t)));
             }
             let mut sections = Vec::new();
             sections.push(match preview.signer_sha256 {

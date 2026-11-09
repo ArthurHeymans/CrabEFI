@@ -278,22 +278,14 @@ pub(crate) fn enroll_dbx_data(
     // Submit with exactly the attributes the signature binds: the runtime
     // hashes them into its own verification, and APPEND_WRITE selects
     // merge-instead-of-replace semantics for the signature lists.
-    let status = crate::efi::runtime_image::client::variables::set(
-        &r_efi::efi::Guid::from_bytes(&EFI_IMAGE_SECURITY_DATABASE_GUID),
-        DBX_NAME,
-        dbx_attributes(append),
-        &data,
-    );
-    if status != r_efi::efi::Status::SUCCESS {
-        log::error!("Runtime Services rejected dbx update: {:?}", status);
-        return Err(if status == r_efi::efi::Status::OUT_OF_RESOURCES {
-            AuthError::BufferTooSmall
-        } else {
-            // Signature and replay checks already succeeded above. A runtime
-            // policy/storage refusal is not evidence of a bad signing key.
-            AuthError::AccessDenied
-        });
-    }
+    submit_dbx_update(&data, append, |attributes, bytes| {
+        crate::efi::runtime_image::client::variables::set(
+            &r_efi::efi::Guid::from_bytes(&EFI_IMAGE_SECURITY_DATABASE_GUID),
+            DBX_NAME,
+            attributes,
+            bytes,
+        )
+    })?;
     super::boot::refresh_key_databases();
 
     log::info!(
@@ -304,6 +296,26 @@ pub(crate) fn enroll_dbx_data(
     );
 
     Ok(result)
+}
+
+/// Single submission boundary, kept injectable so tests can assert the exact
+/// attributes and owned bytes passed to Runtime Services, not just verification.
+fn submit_dbx_update(
+    data: &[u8],
+    append: bool,
+    set: impl FnOnce(u32, &[u8]) -> r_efi::efi::Status,
+) -> Result<(), AuthError> {
+    let status = set(dbx_attributes(append), data);
+    if status == r_efi::efi::Status::SUCCESS {
+        Ok(())
+    } else {
+        log::error!("Runtime Services rejected dbx update: {status:?}");
+        Err(if status == r_efi::efi::Status::OUT_OF_RESOURCES {
+            AuthError::BufferTooSmall
+        } else {
+            AuthError::AccessDenied
+        })
+    }
 }
 
 /// Attributes a dbx write is submitted (and was signed) with.
@@ -515,6 +527,23 @@ fn verify_signer_variants(
 /// enforces on the certificates it consumes (16 certificates, 16 KiB each,
 /// SHA-256-with-RSA, at most 4096-bit keys; at most 8 signers).
 fn validate_cms_certificates(signed: &crabefi_pkcs7::cms::SignedData) -> Result<(), AuthError> {
+    // Match the runtime's detached CMS and digest policy before asking for
+    // consent; the boot-image verifier deliberately has a different policy.
+    validate_digest_algorithm(signed.digest_algorithms.inner()?)?;
+    if signed.encapsulated_content.content_type != crabefi_pkcs7::oid::DATA
+        || signed.encapsulated_content.content.is_some()
+    {
+        return Err(AuthError::InvalidHeader);
+    }
+    for signer in signed.signers() {
+        let signer = signer?;
+        validate_digest_algorithm(signer.digest_algorithm)?;
+        if let Some(attributes) = signer.signed_attributes
+            && attributes.content_type()? != crabefi_pkcs7::oid::DATA
+        {
+            return Err(AuthError::InvalidHeader);
+        }
+    }
     for (i, certificate) in signed.certificates().enumerate() {
         if i >= 16 || certificate.tag != crabefi_pkcs7::der::tag::SEQUENCE {
             return Err(AuthError::InvalidHeader);
@@ -523,6 +552,14 @@ fn validate_cms_certificates(signed: &crabefi_pkcs7::cms::SignedData) -> Result<
     }
     if signed.signers().count() > 8 {
         return Err(AuthError::InvalidHeader);
+    }
+    Ok(())
+}
+
+fn validate_digest_algorithm(algorithm: crabefi_pkcs7::der::Tlv<'_>) -> Result<(), AuthError> {
+    let algorithm = crabefi_pkcs7::x509::AlgorithmIdentifier::parse(algorithm)?;
+    if !algorithm.is(crabefi_pkcs7::oid::SHA256) {
+        return Err(AuthError::CryptoError);
     }
     Ok(())
 }
@@ -691,6 +728,17 @@ mod tests {
                 .expect("verifies through the KEK CA chain");
         assert_eq!(signer, sha256(certs[0]));
         assert!(append, "Microsoft's update is signed for append writes");
+        // Exercise the enrollment submission boundary with a recording setter.
+        submit_dbx_update(data, append, |attributes, submitted| {
+            assert_eq!(
+                attributes,
+                super::super::attributes::SECURE_BOOT_ATTRS
+                    | super::super::attributes::APPEND_WRITE
+            );
+            assert_eq!(submitted, data);
+            r_efi::efi::Status::SUCCESS
+        })
+        .unwrap();
         // The same signature must not verify as a plain replace write: the
         // variant is bound by the signature, not chosen by the importer.
         let replace_signed_data =
@@ -718,6 +766,22 @@ mod tests {
     }
 
     #[test]
+    fn replace_submission_and_storage_errors_are_not_confused_with_append_or_bad_signatures() {
+        assert_eq!(
+            submit_dbx_update(&[1, 2], false, |attributes, bytes| {
+                assert_eq!(attributes, super::super::attributes::SECURE_BOOT_ATTRS);
+                assert_eq!(bytes, [1, 2]);
+                r_efi::efi::Status::OUT_OF_RESOURCES
+            }),
+            Err(AuthError::BufferTooSmall)
+        );
+        assert_eq!(
+            submit_dbx_update(&[], true, |_, _| r_efi::efi::Status::ACCESS_DENIED),
+            Err(AuthError::AccessDenied)
+        );
+    }
+
+    #[test]
     fn preview_rejects_oversized_inputs_before_review() {
         let data = alloc::vec![0; crabefi_runtime_abi::MAX_VARIABLE_DATA_SIZE + 1];
         assert!(matches!(
@@ -732,6 +796,31 @@ mod tests {
             validate_dbx_certificate(&alloc::vec![0; 16 * 1024 + 1]),
             Err(AuthError::InputTooLarge)
         );
+    }
+
+    #[test]
+    fn cms_preflight_rejects_unsupported_digest_declarations() {
+        let data = include_bytes!("testdata/microsoft_dbxupdate_x64.bin");
+        let header = EfiVariableAuthentication2::from_bytes(data).unwrap();
+        let cms = header.cert_data(data).unwrap();
+        let signed = crabefi_pkcs7::cms::SignedData::parse(cms).unwrap();
+        // Algorithm declarations are not themselves covered by the RSA
+        // signature. Change each SHA-256 OID without changing the signature.
+        for algorithm in [
+            signed.digest_algorithms.inner().unwrap(),
+            signed.signers().next().unwrap().unwrap().digest_algorithm,
+        ] {
+            let oid = algorithm
+                .contents(crabefi_pkcs7::der::tag::SEQUENCE)
+                .unwrap()
+                .read()
+                .unwrap();
+            let last = oid.value.as_ptr() as usize - cms.as_ptr() as usize + oid.value.len() - 1;
+            let mut changed = cms.to_vec();
+            changed[last] ^= 1;
+            let signed = crabefi_pkcs7::cms::SignedData::parse(&changed).unwrap();
+            assert!(validate_cms_certificates(&signed).is_err());
+        }
     }
 
     #[test]
