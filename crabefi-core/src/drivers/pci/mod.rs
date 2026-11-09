@@ -40,8 +40,6 @@ struct PciState {
     /// Enumerated PCI device list, on the heap: one server socket alone
     /// exposes well over a hundred functions across its root complexes.
     devices: alloc::vec::Vec<PciDevice>,
-    /// Whether the inventory covers every function in the selected backend.
-    enumeration_complete: bool,
     /// Validated PCIe ECAM allocations (from platform, ACPI MCFG, or FDT).
     ecam_regions: heapless::Vec<PciEcamRegion, { crate::fdt::MAX_ECAM_REGIONS }>,
     /// Whether firmware explicitly supplied ECAM configuration.
@@ -54,7 +52,6 @@ impl PciState {
     const fn new() -> Self {
         Self {
             devices: alloc::vec::Vec::new(),
-            enumeration_complete: true,
             ecam_regions: heapless::Vec::new(),
             ecam_configured: false,
             #[cfg(target_arch = "x86_64")]
@@ -435,7 +432,7 @@ pub fn init() {
                 })
             }
         };
-        pci.enumeration_complete = result.is_ok();
+        let enumeration_complete = result.is_ok();
         if let Err(error) = result {
             // Keep the inventory collected so far usable, as with the old
             // fixed-capacity list, but never abort firmware on heap exhaustion.
@@ -447,7 +444,7 @@ pub fn init() {
         }
         log::info!(
             "PCI enumeration {}: {} devices found",
-            if pci.enumeration_complete {
+            if enumeration_complete {
                 "complete"
             } else {
                 "incomplete"
@@ -529,7 +526,7 @@ pub fn shutdown_drivers() {
     driver::shutdown_all();
 }
 
-/// Clear PCI Bus Master Enable, rescanning all functions if inventory is partial.
+/// Clear PCI Bus Master Enable on every present function in the selected backend.
 ///
 /// This is a conservative OS-handoff safety net: once ExitBootServices has
 /// succeeded, firmware-owned DMA rings and bounce buffers are no longer owned
@@ -538,32 +535,25 @@ pub fn shutdown_drivers() {
 pub fn disable_all_bus_mastering_for_handoff() {
     // Handoff must not allocate: the boot heap may already be exhausted.
     let pci = PCI.borrow();
-    let changed = if pci.enumeration_complete {
-        pci.devices
+    // Even successful enumeration can omit a function if function zero is
+    // absent or its multifunction flag is wrong. Earlier firmware may have
+    // left DMA active there, so never limit this safety sweep to the inventory.
+    // Read only IDs and command registers: do not probe or resize BARs.
+    let changed = match &pci.access {
+        AnyPciAccess::Unavailable => 0,
+        AnyPciAccess::IoCam(_) => disable_region_bus_mastering(&pci.access, 0, 0, u8::MAX),
+        AnyPciAccess::Ecam(ecam) => ecam
+            .regions()
             .iter()
-            .filter(|dev| disable_bus_mastering(&pci.access, dev.address))
-            .count()
-    } else {
-        // Earlier firmware may have enabled DMA on functions omitted after an
-        // allocation failure. Rescan the backend, not the partial inventory.
-        // Read only IDs and command registers: do not probe or resize BARs.
-        log::warn!("PCI: rescanning incomplete inventory to disable all bus mastering");
-        match &pci.access {
-            AnyPciAccess::Unavailable => 0,
-            AnyPciAccess::IoCam(_) => disable_region_bus_mastering(&pci.access, 0, 0, u8::MAX),
-            AnyPciAccess::Ecam(ecam) => ecam
-                .regions()
-                .iter()
-                .map(|region| {
-                    disable_region_bus_mastering(
-                        &pci.access,
-                        region.segment,
-                        region.bus_start,
-                        region.bus_end,
-                    )
-                })
-                .sum(),
-        }
+            .map(|region| {
+                disable_region_bus_mastering(
+                    &pci.access,
+                    region.segment,
+                    region.bus_start,
+                    region.bus_end,
+                )
+            })
+            .sum(),
     };
 
     log::info!(

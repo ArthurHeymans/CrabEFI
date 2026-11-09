@@ -255,4 +255,32 @@ fn enumeration_is_fallible_and_handoff_needs_no_heap() {
             });
         });
     }
+
+    // Successful enumeration is not proof that the inventory covers every
+    // function: model missing function zero and a clear multifunction flag.
+    first.reset_bus_mastering();
+    later.reset_bus_mastering();
+    first.write(0, 31, 0, 0x00, u32::MAX);
+    later.write(1, 31, 0, 0x0c, 0x0001_0000);
+    for (ecam, bus, function) in [(&first, 0, 3), (&later, 1, 7)] {
+        ecam.write(bus, 31, function, 0x00, 0x5678_1234);
+        ecam.write(bus, 31, function, 0x04, 0x0000_0007);
+        ecam.write(bus, 31, function, 0x08, 0x0604_0000);
+        ecam.write(bus, 31, function, 0x0c, 0x0001_0000);
+    }
+    // The retained capacity permits the whole enumeration to succeed
+    // without allocation; neither hidden function enters the inventory.
+    with_budget(0, pci::init);
+    let hidden = [PciAddress::new(0, 0, 31, 3), PciAddress::new(7, 65, 31, 7)];
+    pci::with_devices(|devices| {
+        assert_eq!(devices.len(), 233);
+        for address in hidden {
+            assert!(!devices.iter().any(|device| device.address == address));
+        }
+    });
+    let commands = with_budget(0, || {
+        crabefi::drivers::quiesce_dma_for_os_handoff();
+        hidden.map(|address| pci::read_config16(address, 0x04))
+    });
+    assert_eq!(commands, [0x0003; 2], "hidden functions must lose BME");
 }
