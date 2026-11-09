@@ -306,8 +306,10 @@ pub enum AuthError {
     InvalidSignatureList,
     /// Cryptographic operation failed
     CryptoError,
-    /// Buffer too small
+    /// Buffer too small or variable storage exhausted
     BufferTooSmall,
+    /// Input exceeds the runtime authentication or variable payload limit
+    InputTooLarge,
     /// Certificate has been revoked
     CertificateRevoked,
     /// Certificate chain too deep (exceeded maximum allowed depth)
@@ -350,6 +352,7 @@ impl From<AuthError> for r_efi::efi::Status {
             AuthError::InvalidSignatureList => r_efi::efi::Status::INVALID_PARAMETER,
             AuthError::CryptoError => r_efi::efi::Status::DEVICE_ERROR,
             AuthError::BufferTooSmall => r_efi::efi::Status::BUFFER_TOO_SMALL,
+            AuthError::InputTooLarge => r_efi::efi::Status::BAD_BUFFER_SIZE,
             AuthError::CertificateRevoked => r_efi::efi::Status::SECURITY_VIOLATION,
             AuthError::ChainTooDeep => r_efi::efi::Status::SECURITY_VIOLATION,
             AuthError::ChainBuildingFailed => r_efi::efi::Status::SECURITY_VIOLATION,
