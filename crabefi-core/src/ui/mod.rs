@@ -617,7 +617,37 @@ fn disk_long(entry: &BootEntry) -> String {
     if entry.is_payload() {
         return String::from("Firmware flash (CBFS)");
     }
-    alloc::format!("{}, partition {}", disk_name(entry), entry.partition_num)
+    alloc::format!(
+        "{}, partition {}",
+        storage_identity(entry.storage),
+        entry.partition_num
+    )
+}
+fn storage_identity(id: crate::drivers::storage::StorageId) -> String {
+    use crate::drivers::storage::StorageId;
+    match id {
+        StorageId::Nvme {
+            controller_id,
+            nsid,
+        } => alloc::format!("NVMe controller {controller_id}, namespace {nsid}"),
+        StorageId::Ahci {
+            controller_id,
+            port,
+        } => alloc::format!("SATA controller {controller_id}, port {port}"),
+        StorageId::Usb {
+            controller_id,
+            device_addr,
+        } => alloc::format!("USB controller {controller_id}, device {device_addr}"),
+        _ => alloc::format!(
+            "{} {}",
+            id.description(),
+            match id {
+                StorageId::Sdhci { controller_id } => controller_id,
+                StorageId::Platform { index } => index,
+                _ => unreachable!(),
+            }
+        ),
+    }
 }
 fn disk_count(menu: &BootMenu) -> usize {
     let mut seen: Vec<crate::drivers::storage::StorageId> = Vec::new();
@@ -725,7 +755,13 @@ fn boot_actions(menu: &BootMenu, state: &BState) -> usize {
 fn paint_boot(fb: &FramebufferInfo, menu: &BootMenu, state: &BState) -> Vec<Rect> {
     draw_shell(fb, NavItem::Boot, &state.focus, None);
     let m = Metrics::for_fb(fb);
-    let l = boot_layout(fb, state.countdown > 0);
+    let mut l = boot_layout(fb, state.countdown > 0);
+    // F8 can remove the side pane mid-edit. Keep the same editor and action
+    // order visible in a full-canvas details pane instead of hiding the draft.
+    if state.edit.is_some() && l.side.is_none() {
+        l.side = Some(canvas(fb));
+        return paint_boot_details(fb, menu, state, &l);
+    }
     paint_boot_strip(fb, menu, state);
     let disks = disk_count(menu);
     let note = alloc::format!(
@@ -958,7 +994,18 @@ fn paint_boot_details(
         BootEntryKind::Payload { path, .. } => facts.push(Fact::new("File", path.as_str())),
         _ => facts.push(Fact::new("Path", entry.path.as_str())),
     }
-    y = kit::facts(fb, x, y, w, &facts, max_y) + m.gap as i32 / 2;
+    // Reserve a visible field, its labels and the entire action stack before
+    // metadata wraps. Long paths must not push the editor under its buttons.
+    let field = if state.edit.is_some() {
+        m.line + 16 + m.small_line * 2 + 8 + m.gap / 2
+    } else if has_cmdline {
+        m.line + 16 + m.small_line + 2
+    } else {
+        0
+    };
+    let actions = if has_cmdline { 2 } else { 1 };
+    let reserved = field + actions * (m.button + 10) + m.gap + 12;
+    y = kit::facts(fb, x, y, w, &facts, max_y - reserved as i32) + m.gap as i32 / 2;
     let mut buttons: Vec<StripButton<'_>> = Vec::new();
     if let Some(edit) = &state.edit {
         render::draw_text(
@@ -971,7 +1018,8 @@ fn paint_boot_details(
             None,
         );
         y += m.small_line as i32 + 2;
-        y = paint_cmdline_editor(fb, (x, y, w), edit, max_y) + 6;
+        let field_bottom = max_y - (2 * (m.button + 10) + m.small_line + m.gap / 2 + 14) as i32;
+        y = paint_cmdline_editor(fb, (x, y, w), edit, field_bottom) + 6;
         render::draw_text(
             fb,
             x,
@@ -998,7 +1046,8 @@ fn paint_boot_details(
         if let Some(cmdline) = entry.get_cmdline() {
             render::draw_text(fb, x, y, "Command line", m.small, theme::INK3, None);
             y += m.small_line as i32 + 2;
-            y = paint_code_box(fb, (x, y, w), cmdline, max_y) + m.gap as i32 / 2;
+            let field_bottom = max_y - (2 * (m.button + 10) + m.gap / 2 + 8) as i32;
+            y = paint_code_box(fb, (x, y, w), cmdline, field_bottom) + m.gap as i32 / 2;
         }
         buttons.push(StripButton {
             label: "Boot this entry",
@@ -1016,6 +1065,10 @@ fn paint_boot_details(
         }
     }
     let needed = buttons.len() as i32 * (m.button as i32 + 10);
+    debug_assert!(
+        y + needed + 4 <= max_y,
+        "entry details must leave room for their actions"
+    );
     let y = y.min(max_y - needed).max(sy + m.pad as i32);
     kit::button_stack(fb, x, y + 4, w, &buttons)
 }
@@ -1025,8 +1078,7 @@ fn paint_code_box(fb: &FramebufferInfo, area: (i32, i32, u32), text: &str, max_y
     let (x, y, w) = area;
     let cols = ((w - 20) / render::font_width(m.body)).max(1) as usize;
     let lines = dialog::wrap_lines(text, cols);
-    let room =
-        ((max_y - y - (m.button as i32 + 10) * 2 - 20).max(m.line as i32) as u32 / m.line) as usize;
+    let room = ((max_y - y - 16).max(m.line as i32) as u32 / m.line) as usize;
     let shown = lines.len().clamp(1, room.clamp(1, 5));
     let h = shown as u32 * m.line + 16;
     render::fill_rect(fb, x, y, w, h, theme::PAPER);
@@ -1065,8 +1117,7 @@ fn paint_cmdline_editor(
     let chars: Vec<char> = edit.value.chars().collect();
     let caret = edit.value[..edit.caret].chars().count();
     let total_lines = chars.len() / cols + 1;
-    let room =
-        ((max_y - y - (m.button as i32 + 10) * 2 - 40).max(m.line as i32) as u32 / m.line) as usize;
+    let room = ((max_y - y - 16).max(m.line as i32) as u32 / m.line) as usize;
     let shown = total_lines.clamp(1, room.clamp(1, 6));
     let caret_line = caret / cols;
     let first = caret_line
@@ -1567,6 +1618,70 @@ mod tests {
         };
         let state = BState::new(1, 0, 0);
         paint_boot(&fb, &menu, &state);
+    }
+
+    #[test]
+    fn editor_and_actions_remain_visible_with_long_paths_and_without_a_side_pane() {
+        let mut menu = boot_menu(1);
+        menu.entries[0].kind = BootEntryKind::BlsLinux {
+            linux_path: heapless::String::try_from("/very-long-kernel-path/".repeat(5).as_str())
+                .unwrap(),
+            initrd_paths: {
+                let mut paths = heapless::Vec::new();
+                paths
+                    .push(
+                        heapless::String::try_from("/very-long-initrd-path/".repeat(5).as_str())
+                            .unwrap(),
+                    )
+                    .unwrap();
+                paths
+            },
+            cmdline: heapless::String::try_from("console=ttyS0 root=/dev/sda1").unwrap(),
+        };
+        for (width, height) in [(900, 600), (1024, 600), (1024, 768)] {
+            let mut pixels = std::vec![0; width as usize * height as usize];
+            let fb = framebuffer(&mut pixels, width, height);
+            let mut state = BState::new(1, 0, 0);
+            state.edit = Some(dialog::Editor::new("one-shot draft"));
+            let buttons = paint_boot(&fb, &menu, &state);
+            assert_eq!(buttons.len(), 2);
+            assert!(
+                buttons[1].1 > buttons[0].1,
+                "Boot then Cancel, not the narrow non-edit actions"
+            );
+            assert_eq!(state.edit.as_ref().unwrap().value, "one-shot draft");
+            let (_, cy, _, ch) = canvas(&fb);
+            assert!(buttons[1].1 + buttons[1].3 as i32 <= cy + ch as i32);
+        }
+    }
+
+    #[test]
+    fn disk_details_distinguish_controllers_and_namespaces() {
+        use crate::drivers::storage::StorageId;
+        assert_ne!(
+            storage_identity(StorageId::Ahci {
+                controller_id: 0,
+                port: 1
+            }),
+            storage_identity(StorageId::Ahci {
+                controller_id: 1,
+                port: 1
+            })
+        );
+        assert!(
+            storage_identity(StorageId::Nvme {
+                controller_id: 2,
+                nsid: 3
+            })
+            .contains("namespace 3")
+        );
+        assert!(
+            storage_identity(StorageId::Usb {
+                controller_id: 4,
+                device_addr: 5
+            })
+            .contains("controller 4")
+        );
     }
 
     #[test]

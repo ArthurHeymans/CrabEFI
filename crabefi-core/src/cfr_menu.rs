@@ -231,7 +231,7 @@ pub fn show_cfr_menu() {
 /// Dependencies are evaluated dynamically at draw/interaction time so that
 /// toggling a "parent" option immediately shows or hides dependent items.
 fn build_menu_items(cfr: &CfrInfo) -> Vec<MenuItem> {
-    STORED_DEPENDENCIES.lock().clear();
+    stored_dependencies(Vec::clear);
     let mut items = Vec::new();
 
     let mut crabefi_name = String::new();
@@ -316,17 +316,29 @@ fn find_live_numeric_value(cfr: &CfrInfo, items: &[MenuItem], object_id: u64) ->
     // Options outside the menu (for example suppressed ones) cannot change
     // while it is open. Read each once per session: a variable-store read on
     // every pointer poll made the graphical loop too slow to see clicks.
-    let mut cache = STORED_DEPENDENCIES.lock();
-    if let Some((_, value)) = cache.iter().find(|(id, _)| *id == object_id) {
-        return *value;
-    }
-    let value = cfr.find_numeric_value(object_id);
-    cache.push((object_id, value));
-    value
+    stored_dependencies(|cache| {
+        if let Some((_, value)) = cache.iter().find(|(id, _)| *id == object_id) {
+            return *value;
+        }
+        let value = cfr.find_numeric_value(object_id);
+        cache.push((object_id, value));
+        value
+    })
 }
 
 /// Stored values of dependencies that are not menu items, for one session.
+#[cfg(not(test))]
 static STORED_DEPENDENCIES: spin::Mutex<Vec<(u64, Option<u32>)>> = spin::Mutex::new(Vec::new());
+#[cfg(test)]
+std::thread_local! {
+    static STORED_DEPENDENCIES: core::cell::RefCell<Vec<(u64, Option<u32>)>> = const { core::cell::RefCell::new(Vec::new()) };
+}
+fn stored_dependencies<R>(f: impl FnOnce(&mut Vec<(u64, Option<u32>)>) -> R) -> R {
+    #[cfg(not(test))]
+    return f(&mut STORED_DEPENDENCIES.lock());
+    #[cfg(test)]
+    STORED_DEPENDENCIES.with(|cache| f(&mut cache.borrow_mut()))
+}
 
 /// Evaluate whether a dependency is met using live (in-flight) menu values.
 fn is_dep_met_live(
@@ -685,6 +697,9 @@ fn save_all_changes(cfr: &CfrInfo, items: &mut [MenuItem]) -> (usize, usize) {
             _ => {}
         }
     }
+    // Platform writes can change suppressed dependencies as a side effect,
+    // even when only a prefix of the save succeeded.
+    stored_dependencies(Vec::clear);
     (saved, failed)
 }
 

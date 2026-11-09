@@ -720,11 +720,13 @@ mod click_tests {
         let mut mouse = MouseState::new();
         mouse.protocol = MouseProtocol::SynapticsAbsolute;
         mouse.clickpad = true;
-        // ClickPad: bit 0 of byte 0 and byte 3 differ while pressed.
-        feed(&mut mouse, &[0x81, 0, 0, 0xc0, 0, 0]);
-        assert_eq!(mouse.take_buttons() & 1, 1);
-        feed(&mut mouse, &[0x80, 0, 0, 0xc0, 0, 0]);
-        assert_eq!(mouse.take_buttons() & 1, 0);
+        // Both ClickPad encodings; the second has no ordinary left bit.
+        for packet in [[0x81, 0, 0, 0xc0, 0, 0], [0x80, 0, 0, 0xc1, 0, 0]] {
+            feed(&mut mouse, &packet);
+            assert_eq!(mouse.take_buttons() & 1, 1);
+            feed(&mut mouse, &[0x80, 0, 0, 0xc0, 0, 0]);
+            assert_eq!(mouse.take_buttons() & 1, 0);
+        }
     }
 
     #[test]

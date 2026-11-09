@@ -47,7 +47,12 @@ pub struct Metrics {
 const LARGE_MIN_CANVAS_H: u32 = 372;
 
 fn effective_large(requested: bool, fb: &FramebufferConfig) -> bool {
-    requested && Metrics::new(true).canvas(fb).3 >= LARGE_MIN_CANVAS_H
+    let metrics = Metrics::new(true);
+    let (_, _, width, height) = metrics.canvas(fb);
+    requested
+        && height >= LARGE_MIN_CANVAS_H
+        && super::kit::header_width(metrics, super::NAV_ITEMS.iter().map(|(_, label)| *label))
+            <= width
 }
 
 impl Metrics {
@@ -57,6 +62,10 @@ impl Metrics {
             2 => false,
             _ => fb.height >= 900 && fb.width >= 1400,
         };
+        Self::for_request(fb, large)
+    }
+
+    pub(super) fn for_request(fb: &FramebufferConfig, large: bool) -> Self {
         Self::new(effective_large(large, fb))
     }
 
@@ -156,6 +165,35 @@ pub fn toggle_text_size(fb: &FramebufferConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn large_text_requires_room_for_the_actual_navigation_tabs() {
+        let mut fb = FramebufferConfig {
+            physical_address: 0,
+            width: 640,
+            height: 600,
+            stride: 640,
+            bits_per_pixel: 32,
+            red_mask_pos: 16,
+            red_mask_size: 8,
+            green_mask_pos: 8,
+            green_mask_size: 8,
+            blue_mask_pos: 0,
+            blue_mask_size: 8,
+        };
+        #[cfg(feature = "secure-boot")]
+        assert!(!effective_large(true, &fb));
+        let required = super::super::kit::header_width(
+            Metrics::new(true),
+            super::super::NAV_ITEMS.iter().map(|(_, label)| *label),
+        );
+        fb.width = required + Metrics::new(true).pad * 2 - 1;
+        assert!(!effective_large(true, &fb));
+        fb.width += 1;
+        assert!(effective_large(true, &fb));
+        fb.width = 1024;
+        assert!(effective_large(true, &fb));
+    }
+
     #[test]
     fn both_typography_modes_fit_small_and_native_large_displays() {
         for (width, height) in [
