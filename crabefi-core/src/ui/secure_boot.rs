@@ -140,8 +140,11 @@ struct SecLayout {
 }
 
 fn sec_layout(fb: &FramebufferInfo, status: bool) -> SecLayout {
-    let m = Metrics::for_fb(fb);
-    let (cx, cy, cw, ch) = canvas(fb);
+    sec_layout_with_metrics(fb, status, Metrics::for_fb(fb))
+}
+
+fn sec_layout_with_metrics(fb: &FramebufferInfo, status: bool, m: Metrics) -> SecLayout {
+    let (cx, cy, cw, ch) = m.canvas(fb);
     let bottom = cy + ch as i32;
     let side_w = m.side_width(cw);
     // Narrow screens report status beside the action button instead.
@@ -154,7 +157,7 @@ fn sec_layout(fb: &FramebufferInfo, status: bool) -> SecLayout {
             .max(render::font_height(m.big) + m.line * 3 + 8)
             + m.pad * 2
     };
-    let strip_h = kit::strip_height(fb);
+    let strip_h = m.row + 8;
     let title_h = render::font_height(m.title) + 8;
     let group_h = m.small_line + 10;
     let bar_h = if side_w.is_none() {
@@ -1247,19 +1250,22 @@ mod tests {
             (1920, 1080),
         ] {
             let f = fb(&mut [], width, height);
-            for status in [false, true] {
-                let l = sec_layout(&f, status);
-                let (_, cy, _, ch) = canvas(&f);
-                for r in l.rows {
-                    assert!(
-                        r.1 + r.3 as i32 <= cy + ch as i32,
-                        "{width}x{height} status={status}"
-                    );
-                }
-                if let Some(bar) = l.bar {
-                    assert!(
-                        l.rows[ACTION_COUNT - 1].1 + l.rows[ACTION_COUNT - 1].3 as i32 <= bar.1
-                    );
+            for large in [false, true] {
+                let m = Metrics::for_request(&f, large);
+                for status in [false, true] {
+                    let l = sec_layout_with_metrics(&f, status, m);
+                    let (_, cy, _, ch) = m.canvas(&f);
+                    for r in l.rows {
+                        assert!(
+                            r.1 + r.3 as i32 <= cy + ch as i32,
+                            "{width}x{height} status={status} large={large}"
+                        );
+                    }
+                    if let Some(bar) = l.bar {
+                        assert!(
+                            l.rows[ACTION_COUNT - 1].1 + l.rows[ACTION_COUNT - 1].3 as i32 <= bar.1
+                        );
+                    }
                 }
             }
             if (width, height) == (1024, 768) {

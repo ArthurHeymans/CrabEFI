@@ -265,7 +265,7 @@ mod serial_tests {
                 parser.feed(byte);
             }
             let mut deadline = Some(Timeout::from_ms(0));
-            let mut input = [b'A'].into_iter();
+            let mut input = b"A".iter().copied();
             assert_eq!(
                 poll_serial_key(&mut parser, &mut deadline, || input.next()),
                 Some(KeyPress::Char('A'))
@@ -274,7 +274,7 @@ mod serial_tests {
         let mut parser = SerialKeyParser::new();
         parser.feed(0x1b);
         let mut deadline = Some(Timeout::from_ms(0));
-        let mut input = [b'A'].into_iter();
+        let mut input = b"A".iter().copied();
         assert_eq!(
             poll_serial_key(&mut parser, &mut deadline, || input.next()),
             Some(KeyPress::Escape)

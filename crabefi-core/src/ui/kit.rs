@@ -62,23 +62,34 @@ pub fn crab(fb: &FramebufferConfig, x: i32, y: i32, px: u32) -> (u32, u32) {
 
 // ─── Header with folder tabs ────────────────────────────────────────────
 
-fn brand_width(fb: &FramebufferConfig) -> u32 {
-    let m = Metrics::for_fb(fb);
+fn brand_width(m: Metrics) -> u32 {
     11 * m.crab + m.pad / 2 + render::text_width("CrabEFI", m.big) + m.pad + m.pad / 2
+}
+
+fn tab_width(m: Metrics, label: &str) -> u32 {
+    render::text_width(label, m.title) + render::text_width(" *", m.title) + (m.pad * 4 / 5) * 2
+}
+
+/// Required width from the brand through the last tab, using the same
+/// measurements as painting without consulting the session text preference.
+pub(super) fn header_width<'a>(m: Metrics, labels: impl Iterator<Item = &'a str>) -> u32 {
+    let mut total = brand_width(m);
+    for (i, label) in labels.enumerate() {
+        total += tab_width(m, label) + if i > 0 { 6 } else { 0 };
+    }
+    total
 }
 
 /// Tab rectangles in header coordinates.
 pub fn tab_rects(fb: &FramebufferConfig, labels: &[&str]) -> Vec<Rect> {
     let m = Metrics::for_fb(fb);
     let (cx, _, _, _) = m.canvas(fb);
-    let mut x = cx + brand_width(fb) as i32;
-    let pad = m.pad * 4 / 5;
+    let mut x = cx + brand_width(m) as i32;
     labels
         .iter()
         .map(|label| {
             // Reserve room for an unsaved marker so tabs never shift.
-            let w =
-                render::text_width(label, m.title) + render::text_width(" *", m.title) + pad * 2;
+            let w = tab_width(m, label);
             let rect = (x, (m.header - m.tab) as i32, w, m.tab);
             x += w as i32 + 6;
             rect

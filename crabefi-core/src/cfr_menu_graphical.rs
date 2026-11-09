@@ -1061,6 +1061,7 @@ pub fn show_graphical_firmware_settings() -> ui::ScreenNav {
 /// F10) is page-wide and never dispatched inside an editor.
 fn graphical_key_allowed(group: Group, key: KeyPress) -> bool {
     group == Group::Content
+        || (group == Group::Sections && matches!(key, KeyPress::Right | KeyPress::Char('j' | 'k')))
         || !matches!(
             key,
             KeyPress::Home
@@ -1954,17 +1955,30 @@ fn edit_graphical_item(
     let Some(result) = result else {
         return;
     };
-    match (items.get_mut(state.selected), result) {
+    apply_graphical_edit(items, state, result);
+}
+
+fn apply_graphical_edit(items: &mut [MenuItem], state: &mut GraphicalState, result: EditResult) {
+    fn replace<T: PartialEq>(old: &mut T, new: T) -> bool {
+        let changed = *old != new;
+        *old = new;
+        changed
+    }
+    let changed = match (items.get_mut(state.selected), result) {
         (Some(MenuItem::CrabLogLevel { current_level, .. }), EditResult::Level(i)) => {
-            *current_level = crate::logger::LEVEL_CHOICES[i];
+            replace(current_level, crate::logger::LEVEL_CHOICES[i])
         }
         (Some(MenuItem::Option { current_value, .. }), result) => match (current_value, result) {
-            (CfrValue::Bool(v), EditResult::Bool(n)) => *v = n,
-            (CfrValue::Number(v), EditResult::Number(n)) => *v = n,
-            (CfrValue::Varchar(v), EditResult::Text(t)) => *v = t,
-            _ => {}
+            (CfrValue::Bool(v), EditResult::Bool(n)) => replace(v, n),
+            (CfrValue::Number(v), EditResult::Number(n)) => replace(v, n),
+            (CfrValue::Varchar(v), EditResult::Text(t)) => replace(v, t),
+            _ => false,
         },
-        _ => {}
+        _ => false,
+    };
+    if changed {
+        state.save_result = None;
+        state.status_message = None;
     }
 }
 
@@ -2084,6 +2098,26 @@ mod graphical_tests {
             assert!(graphical_key_allowed(group, KeyPress::Char('w')));
             assert!(graphical_key_allowed(group, KeyPress::F10));
         }
+    }
+
+    #[test]
+    fn section_keys_and_keyboard_edits_keep_feedback_consistent() {
+        for key in [KeyPress::Right, KeyPress::Char('j'), KeyPress::Char('k')] {
+            assert!(graphical_key_allowed(Group::Sections, key));
+            assert!(!graphical_key_allowed(Group::Navigation, key));
+        }
+        let mut items = [MenuItem::Option {
+            form_idx: 0,
+            option_idx: 0,
+            current_value: CfrValue::Bool(false),
+            original_value: CfrValue::Bool(false),
+        }];
+        let mut state = GraphicalState::new(0);
+        state.save_result = Some((1, 0));
+        apply_graphical_edit(&mut items, &mut state, EditResult::Bool(false));
+        assert_eq!(state.save_result, Some((1, 0)));
+        apply_graphical_edit(&mut items, &mut state, EditResult::Bool(true));
+        assert_eq!(state.save_result, None);
     }
 
     #[test]
@@ -2452,10 +2486,17 @@ mod graphical_tests {
                 original_value: CfrValue::Bool(false),
             })
             .collect();
+        stored_dependencies(|cache| cache.push((900, Some(0))));
         assert_eq!(save_all_changes(&cfr, &mut items), (1, 1));
+        assert!(
+            stored_dependencies(|cache| cache.is_empty()),
+            "partial saves invalidate dependencies too"
+        );
         assert!(has_changes(&items));
         STORE.fail.store(false, Ordering::SeqCst);
+        stored_dependencies(|cache| cache.push((900, Some(0))));
         assert_eq!(save_all_changes(&cfr, &mut items), (1, 0));
+        assert!(stored_dependencies(|cache| cache.is_empty()));
         assert!(!has_changes(&items));
         assert_eq!(STORE.first_writes.load(Ordering::SeqCst), 1);
         assert_eq!(STORE.second_writes.load(Ordering::SeqCst), 2);
