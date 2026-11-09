@@ -16,6 +16,17 @@ heap: the old in-payload Runtime Services design could otherwise carry a boot
 heap pointer across EBS or SetVirtualAddressMap, after the backing pages became
 conventional memory or were no longer reachable at their physical address.
 
+The PCI inventory grows on this boot heap after allocator initialization;
+large systems are not limited to a fixed number of enumerated functions.
+Growth is fallible: on allocation failure enumeration stops with a warning
+and preserves the devices already found. Internal readers borrow the inventory
+instead of cloning it, and SPI matching uses mapped iterators. The final PCI
+bus-master disable pass runs without allocating, before EBS commits. If the
+inventory is incomplete, that pass scans every function in the selected PCI
+backend's bus ranges so omitted devices cannot retain bus mastering. This
+fallback reads IDs and command registers without probing BARs. Runtime Services
+never retain the inventory or its backing allocation.
+
 The separate runtime image performs RSA verification on fixed stack
 buffers instead of an allocation arena. Operands are `[u64; 64]` arrays
 (4096-bit maximum) always processed at full width, combined by a
