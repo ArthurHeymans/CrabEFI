@@ -654,6 +654,18 @@ pub fn show(fb: &FramebufferInfo) -> ScreenNav {
                     draw_screen(fb, selected, &snapshot_focus, None);
                 };
                 status = handle_action(fb, selected, &backdrop);
+                if let Some((message, Tone::Bad)) = status {
+                    // Never truncate recovery instructions in the narrow
+                    // action bar. The modal wraps the complete result.
+                    dialog::modal(
+                        fb,
+                        &backdrop,
+                        Tone::Bad,
+                        "Operation failed",
+                        &[Block::text(message)],
+                        &[Choice::new("Close", Some("Esc"), ButtonKind::Neutral)],
+                    );
+                }
             }
             cursor.hide(fb);
             button = draw_screen(fb, selected, &focus, status);
@@ -952,7 +964,11 @@ fn prepare_import(idx: usize) -> Result<Option<Prepared>, &'static str> {
 
 fn enrolled_key_sections() -> Vec<ReviewSection> {
     use crate::efi::auth;
+    let complete = auth::boot::key_inventory_complete();
     let mut sections = Vec::new();
+    if !complete {
+        sections.push(ReviewSection::labelled("Warning").line(LineKind::Warn, "Stored key data is malformed or could not be fully loaded. The identities and counts below are incomplete."));
+    }
     for (label, db) in [
         ("PK", auth::pk_database()),
         ("KEK", auth::kek_database()),
@@ -1075,7 +1091,7 @@ fn handle_action(
         });
     }
     let e = auth::enrollment::get_enrollment_status();
-    let (title, tone, content, confirm, kind) = match idx {
+    let (title, tone, mut content, confirm, kind) = match idx {
         TOGGLE if auth::is_secure_boot_requested() => (
             "Disable Secure Boot?",
             Tone::Warn,
@@ -1136,6 +1152,9 @@ fn handle_action(
             ButtonKind::Danger,
         ),
     };
+    if idx == CLEAR && !auth::boot::key_inventory_complete() {
+        content.insert(0, Block::text("Warning: the key inventory is incomplete. These counts may omit malformed stored entries; clearing deletes those entries too."));
+    }
     let choice = dialog::modal(
         fb,
         backdrop,
@@ -1161,7 +1180,7 @@ fn handle_action(
             .map_err(|_| "Failed to enroll keys; check variable storage."),
         _ => auth::boot::clear_all_keys()
             .map(|_| "All keys cleared; Setup Mode restored.")
-            .map_err(|_| "Failed to clear keys; check variable storage."),
+            .map_err(crate::secure_boot_menu::clear_keys_error),
     };
     Some(match result {
         Ok(message) => (message, Tone::Ok),

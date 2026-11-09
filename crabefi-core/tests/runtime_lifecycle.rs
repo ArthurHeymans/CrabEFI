@@ -573,6 +573,18 @@ fn actual_loader_seal_svam_and_runtime_services_with_and_without_retained_stagin
                 efi::Status::SECURITY_VIOLATION
             );
             let media_before = media.lock().unwrap().clone();
+            // History must be readable before the clear intent or PK deletion
+            // commits. A read failure must leave enforcement and every key intact.
+            let writes_before = writes.load(Ordering::Relaxed);
+            failure.store(5, Ordering::Relaxed);
+            assert_eq!(
+                auth::boot::clear_all_keys(),
+                Err(auth::AuthError::AccessDenied)
+            );
+            assert!(!auth::is_setup_mode());
+            assert!(auth::is_secure_boot_enabled());
+            assert_eq!(writes.load(Ordering::Relaxed), writes_before);
+            assert_eq!(*media.lock().unwrap(), media_before);
             failure.store(1, Ordering::Relaxed);
             assert!(auth::boot::clear_all_keys().is_err());
             assert!(!auth::is_setup_mode());
