@@ -133,8 +133,9 @@ fn active_debug_port_requires_all_ownership_bits_and_one_snapshot() {
     ));
 }
 
+/// Invalid command responses and addresses must never reach the MMIO callback.
 #[test]
-fn disabled_decode_and_invalid_addresses_do_not_read_mmio() {
+fn invalid_command_decode_and_addresses_do_not_read_mmio() {
     let mut bars = [pci::PciBar::default(); 6];
     bars[0] = pci::PciBar {
         bar_type: pci::BarType::Memory32,
@@ -148,6 +149,12 @@ fn disabled_decode_and_invalid_addresses_do_not_read_mmio() {
         cap.value,
         &bars,
         |_| panic!("disabled memory decode must not read MMIO"),
+    ));
+    assert!(!debug_port_active(
+        pci::CommandRegister::from_bits_retain(u16::MAX),
+        cap.value,
+        &bars,
+        |_| panic!("an all-ones command response must not read MMIO"),
     ));
     let outside_bar = cap + DEBUG_CAPABILITY::OFFSET.val(0x100);
     assert!(!debug_port_active(

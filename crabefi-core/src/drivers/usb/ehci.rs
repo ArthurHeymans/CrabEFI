@@ -381,7 +381,8 @@ fn debug_port_active(
     bars: &[pci::PciBar; 6],
     read_control: impl FnOnce(u64) -> u32,
 ) -> bool {
-    if !command.contains(pci::CommandRegister::MEMORY_ENABLE) {
+    // All ones is PCI's absent/error response, not valid memory decode.
+    if command.bits() == u16::MAX || !command.contains(pci::CommandRegister::MEMORY_ENABLE) {
         return false;
     }
     let Some(address) = debug_port_address(capability, bars) else {
