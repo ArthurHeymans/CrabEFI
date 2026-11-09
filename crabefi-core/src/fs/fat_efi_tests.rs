@@ -93,6 +93,7 @@ fn efi_file_identity_metadata_and_durability() {
     filesystem_info_uses_the_flexible_label_offset();
     volume_label_rejects_changed_media();
     opens_are_relative_to_the_source_location_not_its_access_mode();
+    many_aliases_keep_identity_and_cursors_across_pool_growth();
     exhausted_handle_pool_does_not_create_a_file();
 }
 
@@ -144,9 +145,33 @@ fn volume_label_rejects_changed_media() {
 fn exhausted_handle_pool_does_not_create_a_file() {
     let root = mount();
     let mut aliases = Vec::from([open(root, "A", true)]);
-    for _ in 0..30 {
-        aliases.push(open(root, "A", false));
+    // Exhaust the actual fallible byte budget, not an obsolete fixed 32-slot
+    // implementation detail. Keep the no-on-disk-creation-on-failure control.
+    let mut exhausted = false;
+    for _ in 0..2048 {
+        let mut name: Vec<_> = "A".encode_utf16().chain([0]).collect();
+        let mut handle = core::ptr::null_mut();
+        let status = unsafe {
+            ((*root).open)(
+                root,
+                &mut handle,
+                name.as_mut_ptr(),
+                ef::MODE_READ | ef::MODE_WRITE,
+                0,
+            )
+        };
+        if status == Status::OUT_OF_RESOURCES {
+            exhausted = true;
+            break;
+        }
+        assert_eq!(status, Status::SUCCESS);
+        aliases.push(handle);
     }
+    assert!(exhausted, "file-handle allocation must remain bounded");
+    assert!(
+        aliases.len() > 32,
+        "available memory must service demand past the old slot limit"
+    );
     let mut name: Vec<_> = "NEW".encode_utf16().chain([0]).collect();
     let mut result = core::ptr::null_mut();
     assert_eq!(
@@ -169,6 +194,61 @@ fn exhausted_handle_pool_does_not_create_a_file() {
     );
     let created = open(root, "NEW", true);
     assert_eq!(unsafe { ((*created).close)(created) }, Status::SUCCESS);
+    for alias in aliases {
+        assert_eq!(unsafe { ((*alias).close)(alias) }, Status::SUCCESS);
+    }
+    assert_eq!(unsafe { ((*root).close)(root) }, Status::SUCCESS);
+}
+
+fn many_aliases_keep_identity_and_cursors_across_pool_growth() {
+    let root = mount();
+    let writer = open(root, "Long Name.bin", true);
+    let initial: Vec<_> = (0..96u8).collect();
+    write(writer, &initial);
+    let mut aliases = Vec::new();
+    for index in 0..96 {
+        let alias = open(
+            root,
+            if index % 2 == 0 {
+                "Long Name.bin"
+            } else {
+                "LONGNA~1.BIN"
+            },
+            false,
+        );
+        seek(alias, index as u64);
+        aliases.push(alias);
+    }
+    // Actual vtable calls through every earlier pointer after later slabs grew.
+    // Seek cursors stay independent while both FAT names share one record.
+    for (index, alias) in aliases.iter().copied().enumerate() {
+        assert_eq!(read_byte(alias), (1, index as u8));
+    }
+    seek(writer, 0);
+    write(writer, &[0xdd]);
+    // Growth/truncation metadata must propagate to aliases in older slabs,
+    // not merely leave their pointers readable or expose shared sector bytes.
+    seek(writer, initial.len() as u64);
+    write(writer, &[0xee]);
+    for alias in aliases.iter().copied() {
+        seek(alias, initial.len() as u64);
+        assert_eq!(read_byte(alias), (1, 0xee));
+    }
+    truncate(writer, 32);
+    for alias in aliases.iter().copied() {
+        seek(alias, 32);
+        assert_eq!(read_byte(alias), (0, 0));
+        seek(alias, 0);
+        assert_eq!(read_byte(alias), (1, 0xdd));
+    }
+    assert_eq!(unsafe { ((*writer).close)(writer) }, Status::SUCCESS);
+    for alias in aliases {
+        assert_eq!(unsafe { ((*alias).close)(alias) }, Status::SUCCESS);
+    }
+    let reopened = open(root, "Long Name.bin", false);
+    assert_eq!(read_byte(reopened), (1, 0xdd));
+    assert_eq!(unsafe { ((*reopened).close)(reopened) }, Status::SUCCESS);
+    assert_eq!(unsafe { ((*root).close)(root) }, Status::SUCCESS);
 }
 
 fn truncate_regrow_invalidates_read_hint() {

@@ -2,14 +2,16 @@
 //! This pool performs no device I/O. Deleted records remain tombstoned until
 //! their last handle closes, even when FAT reuses the on-disk directory slot.
 
+use alloc::vec::Vec;
+use core::ops::{Index, IndexMut};
 use r_efi::efi::Status;
 use r_efi::protocols::file as efi_file;
 
 use super::path::path_str;
 use super::{
-    FILE_MODE_CREATE, MAX_FILE_HANDLES, MAX_PATH_LEN, file_close, file_delete, file_flush,
-    file_flush_ex, file_get_info, file_get_position, file_open, file_open_ex, file_read,
-    file_read_ex, file_set_info, file_set_position, file_write, file_write_ex,
+    FILE_MODE_CREATE, MAX_PATH_LEN, file_close, file_delete, file_flush, file_flush_ex,
+    file_get_info, file_get_position, file_open, file_open_ex, file_read, file_read_ex,
+    file_set_info, file_set_position, file_write, file_write_ex,
 };
 use crate::fs::fat::{FatFile, FileClusterHint};
 
@@ -92,16 +94,59 @@ pub(super) struct Snapshot {
     pub(super) path_len: usize,
 }
 
+const SLOTS_PER_SLAB: usize = 16;
+// Bound requested handle/record payload and slab headers, not a fixed number
+// of simultaneous opens. Allocator failure remains an honest EFI error.
+const POOL_BUDGET: usize = 1024 * 1024;
+const SLOT_COST: usize = core::mem::size_of::<FileHandle>()
+    + core::mem::size_of::<OpenFile>()
+    + core::mem::size_of::<Vec<FileHandle>>().div_ceil(SLOTS_PER_SLAB);
+
+/// Inner buffers never resize or move after insertion. Growing the outer Vec
+/// moves only Vec headers, never published EFI protocol objects. Closing/reset
+/// reuses slots; it does not deallocate their published addresses.
+struct StableHandles {
+    slabs: Vec<Vec<FileHandle>>,
+    len: usize,
+}
+impl StableHandles {
+    const fn new() -> Self {
+        Self {
+            slabs: Vec::new(),
+            len: 0,
+        }
+    }
+    fn len(&self) -> usize {
+        self.len
+    }
+    fn iter(&self) -> impl Iterator<Item = &FileHandle> {
+        self.slabs.iter().flat_map(|slab| slab.iter())
+    }
+}
+impl Index<usize> for StableHandles {
+    type Output = FileHandle;
+    fn index(&self, index: usize) -> &FileHandle {
+        &self.slabs[index / SLOTS_PER_SLAB][index % SLOTS_PER_SLAB]
+    }
+}
+impl IndexMut<usize> for StableHandles {
+    fn index_mut(&mut self, index: usize) -> &mut FileHandle {
+        &mut self.slabs[index / SLOTS_PER_SLAB][index % SLOTS_PER_SLAB]
+    }
+}
+
 pub(super) struct FilePool {
-    handles: [FileHandle; MAX_FILE_HANDLES],
-    nodes: [OpenFile; MAX_FILE_HANDLES],
+    handles: StableHandles,
+    nodes: Vec<OpenFile>,
+    budget: usize,
 }
 
 impl FilePool {
     pub(super) const fn new() -> Self {
         Self {
-            handles: [const { FileHandle::empty() }; MAX_FILE_HANDLES],
-            nodes: [OpenFile::empty(); MAX_FILE_HANDLES],
+            handles: StableHandles::new(),
+            nodes: Vec::new(),
+            budget: POOL_BUDGET,
         }
     }
 
@@ -114,12 +159,47 @@ impl FilePool {
             .map(HandleId)
     }
 
-    pub(super) fn reserve(&mut self) -> Result<HandleId, Status> {
-        let index = self
+    fn grow(&mut self) -> Result<(), Status> {
+        let count = self
             .handles
-            .iter()
-            .position(|handle| !handle.in_use)
+            .len()
+            .checked_add(SLOTS_PER_SLAB)
             .ok_or(Status::OUT_OF_RESOURCES)?;
+        if count
+            .checked_mul(SLOT_COST)
+            .is_none_or(|bytes| bytes > self.budget)
+        {
+            return Err(Status::OUT_OF_RESOURCES);
+        }
+        let mut slab = Vec::new();
+        slab.try_reserve_exact(SLOTS_PER_SLAB)
+            .map_err(|_| Status::OUT_OF_RESOURCES)?;
+        slab.resize_with(SLOTS_PER_SLAB, FileHandle::empty);
+        self.handles
+            .slabs
+            .try_reserve_exact(1)
+            .map_err(|_| Status::OUT_OF_RESOURCES)?;
+        self.nodes
+            .try_reserve_exact(SLOTS_PER_SLAB)
+            .map_err(|_| Status::OUT_OF_RESOURCES)?;
+        // No fallible work after this point: failure cannot publish a half
+        // slab, consume a reservation or retag a live record/address.
+        self.nodes.resize(count, OpenFile::empty());
+        self.handles.slabs.push(slab);
+        self.handles.len = count;
+        Ok(())
+    }
+
+    pub(super) fn reserve(&mut self) -> Result<HandleId, Status> {
+        let free = self.handles.iter().position(|handle| !handle.in_use);
+        let index = match free {
+            Some(index) => index,
+            None => {
+                let index = self.handles.len();
+                self.grow()?;
+                index
+            }
+        };
         self.handles[index].in_use = true;
         self.handles[index].open_mode = 0;
         Ok(HandleId(index))
@@ -165,7 +245,7 @@ impl FilePool {
     }
 
     pub(super) fn reset(&mut self) {
-        for index in 0..MAX_FILE_HANDLES {
+        for index in 0..self.handles.len() {
             if self.handles[index].in_use {
                 self.release(HandleId(index));
             }
@@ -254,3 +334,7 @@ impl FilePool {
         self.handles[index.0].position = position;
     }
 }
+
+#[cfg(test)]
+#[path = "handles_tests.rs"]
+mod tests;
