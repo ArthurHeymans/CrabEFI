@@ -400,14 +400,17 @@ pub fn init() {
     PCI.with_mut(|pci| {
         pci.access = new_access;
         pci.devices.clear();
-        match &pci.access {
-            AnyPciAccess::Unavailable => log::info!("PCI enumeration skipped: unavailable"),
+        let result = match &pci.access {
+            AnyPciAccess::Unavailable => {
+                log::info!("PCI enumeration skipped: unavailable");
+                Ok(())
+            }
             AnyPciAccess::IoCam(_) => {
                 enumerate_region(&pci.access, &mut pci.devices, 0, 0, u8::MAX)
             }
             AnyPciAccess::Ecam(ecam) => {
                 let regions = ecam.regions();
-                for region in regions {
+                regions.iter().try_for_each(|region| {
                     log::debug!(
                         "PCI: enumerating segment {} buses {:02x}-{:02x}",
                         region.segment,
@@ -420,9 +423,18 @@ pub fn init() {
                         region.segment,
                         region.bus_start,
                         region.bus_end,
-                    );
-                }
+                    )
+                })
             }
+        };
+        if let Err(error) = result {
+            // Keep the inventory collected so far usable, as with the old
+            // fixed-capacity list, but never abort firmware on heap exhaustion.
+            log::warn!(
+                "PCI enumeration truncated at {} devices: {}; remaining devices unavailable",
+                pci.devices.len(),
+                error,
+            );
         }
         log::info!(
             "PCI enumeration complete: {} devices found",
@@ -438,7 +450,7 @@ fn enumerate_region(
     segment: u16,
     bus_start: u8,
     bus_end: u8,
-) {
+) -> Result<(), alloc::collections::TryReserveError> {
     for bus in bus_start..=bus_end {
         for device in 0..32u8 {
             // First check function 0
@@ -454,6 +466,7 @@ fn enumerate_region(
                     dev.subclass
                 );
 
+                devices.try_reserve(1)?;
                 devices.push(dev);
 
                 // Check other functions if multi-function
@@ -469,6 +482,7 @@ fn enumerate_region(
                                 dev.subclass
                             );
 
+                            devices.try_reserve(1)?;
                             devices.push(dev);
                         }
                     }
@@ -476,6 +490,7 @@ fn enumerate_region(
             }
         }
     }
+    Ok(())
 }
 
 /// Bind drivers to all enumerated PCI devices
@@ -488,9 +503,7 @@ fn enumerate_region(
 pub fn bind_drivers() {
     log::info!("Binding PCI drivers to devices...");
 
-    let devices = PCI.borrow().devices.clone();
-
-    let bound_count = driver::bind_all(&devices);
+    let bound_count = with_devices(driver::bind_all);
 
     log::info!("PCI driver binding complete: {} devices bound", bound_count);
 }
@@ -509,7 +522,9 @@ pub fn shutdown_drivers() {
 /// by firmware.  Any device left bus-mastering can scribble over pages Linux
 /// has already repurposed for early stacks or metadata.
 pub fn disable_all_bus_mastering_for_handoff() {
-    let devices = PCI.borrow().devices.clone();
+    // Handoff must not allocate: the boot heap may already be exhausted.
+    let pci = PCI.borrow();
+    let devices = &pci.devices;
     if devices.is_empty() {
         return;
     }
@@ -602,7 +617,17 @@ pub fn find_sdhci_controllers() -> heapless::Vec<PciDevice, 8> {
     result
 }
 
-/// Get all enumerated PCI devices
+/// Borrow all enumerated PCI devices without allocating a snapshot.
+///
+/// PCI configuration access may be nested inside `f`, but the callback must
+/// not reinitialize PCI or mutate its ECAM configuration while borrowed.
+pub fn with_devices<R>(f: impl FnOnce(&[PciDevice]) -> R) -> R {
+    f(&PCI.borrow().devices)
+}
+
+/// Get an owned snapshot of all enumerated PCI devices.
+///
+/// Prefer [`with_devices`] when the caller does not need ownership.
 pub fn get_all_devices() -> alloc::vec::Vec<PciDevice> {
     PCI.borrow().devices.clone()
 }
