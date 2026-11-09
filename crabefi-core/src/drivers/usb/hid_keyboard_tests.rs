@@ -1,6 +1,24 @@
 use super::*;
 use crate::drivers::usb::controller::{desc_type, request};
 
+#[test]
+fn queued_tab_keeps_shift_after_a_release_report() {
+    let mut keys = BootKeys::default();
+    keys.process_report(&KeyboardReport {
+        modifiers: KeyboardReport::MOD_LEFT_SHIFT,
+        keys: [0x2b, 0, 0, 0, 0, 0],
+        ..KeyboardReport::default()
+    });
+    keys.process_report(&KeyboardReport::default());
+    assert_eq!(keys.efi_state().shift_state, 0);
+    let (key, state) = keys.read_key_with_state().unwrap();
+    assert_eq!(key.unicode_char, b'\t' as u16);
+    assert_ne!(
+        state.shift_state & crate::drivers::keyboard_common::efi_shift_state::LEFT_SHIFT_PRESSED,
+        0
+    );
+}
+
 struct Controller {
     report: [u8; 8],
     length: usize,

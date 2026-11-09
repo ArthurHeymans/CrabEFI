@@ -724,6 +724,14 @@ pub trait ConsoleInput {
     /// Try to read a key press. Returns `None` if no key is available.
     fn read_key(&mut self) -> Option<Key>;
 
+    /// A key with its modifier snapshot. Buffered providers should override
+    /// this; providers using the default must implement `key_state` for
+    /// Shift+Tab navigation. Existing unmodified input remains supported.
+    fn read_key_with_state(&mut self) -> Option<(Key, KeyState)> {
+        let key = self.read_key()?;
+        Some((key, self.key_state()))
+    }
+
     /// Check if a key press is available without consuming it.
     fn has_key(&self) -> bool;
 

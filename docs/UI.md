@@ -81,6 +81,10 @@ Dbx preflight also enforces the runtime's input limits: a 48 KiB authenticated
 envelope, 16 KiB certificates, and a 32 KiB variable payload. Exceeding an input
 limit is distinct from running out of free variable storage.
 
+Buffered keyboard drivers retain modifier state with each queued press. Platform
+`ConsoleInput` providers should implement `read_key_with_state` for atomic
+key/modifier snapshots, or at least `key_state` for Shift+Tab navigation.
+
 ## Layout and implementation
 
 - `ui/theme.rs` owns the palette and the dimmed backdrop mapping.
