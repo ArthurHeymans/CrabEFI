@@ -119,6 +119,7 @@ dependencies = [
  "crabefi-pkcs7",
  "crabefi-runtime-abi",
  "crabefi-runtime-bundle",
+ "crabefi-ui",
  "embassy-futures",
  "embedded-hal",
  "fdt",
@@ -127,7 +128,6 @@ dependencies = [
  "linked_list_allocator",
  "log",
  "mem-barrier",
- "noto-sans-mono-bitmap",
  "object",
  "pci_types",
  "r-efi",
@@ -194,6 +194,15 @@ version = "0.1.0"
 dependencies = [
  "crabefi-runtime-abi",
  "sha2 0.10.9",
+]
+
+[[package]]
+name = "crabefi-ui"
+version = "0.1.0"
+dependencies = [
+ "heapless 0.9.3",
+ "log",
+ "noto-sans-mono-bitmap",
 ]
 
 [[package]]

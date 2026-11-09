@@ -1,0 +1,45 @@
+name: UI
+on:
+  push:
+    branches: [main, master]
+  pull_request: {}
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: ui-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  native:
+    name: Setup UI tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+      - name: Tests and lint
+        run: |
+          cargo fmt --manifest-path ui-harness/Cargo.toml -- --check
+          cargo test --locked -p crabefi-ui --features screens,secure-boot,cfr
+          cargo test --locked --manifest-path ui-harness/Cargo.toml
+          cargo clippy --locked -p crabefi-ui \
+            --all-features --all-targets -- -D warnings
+          cargo clippy --locked --manifest-path ui-harness/Cargo.toml \
+            --all-targets -- -D warnings
+      - name: Screenshots
+        run: |
+          mkdir -p target/ui-shots
+          for scenario in normal cfr secure empty; do
+            cargo run --locked --manifest-path ui-harness/Cargo.toml \
+              --example shot -- --scenario "$scenario" \
+              "target/ui-shots/$scenario.png" > /dev/null
+          done
+      - name: Upload screenshots
+        # actions/upload-artifact v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: crabefi-ui-screenshots
+          path: target/ui-shots/
+          retention-days: 7

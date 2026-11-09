@@ -65,6 +65,9 @@ dependencies = [
  "crabefi-efi-types",
  "crabefi-runtime-abi",
  "crabefi-runtime-bundle",
+ "crabefi-ui",
+ "embassy-futures",
+ "embedded-hal",
  "fdt",
  "heapless",
  "linked_list_allocator",
@@ -104,6 +107,14 @@ name = "crabefi-runtime-bundle"
 version = "0.1.0"
 
 [[package]]
+name = "crabefi-ui"
+version = "0.1.0"
+dependencies = [
+ "heapless",
+ "log",
+]
+
+[[package]]
 name = "crypto-common"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -121,6 +132,18 @@ dependencies = [
  "block-buffer",
  "crypto-common",
 ]
+
+[[package]]
+name = "embassy-futures"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc2d050bdc5c21e0862a89256ed8029ae6c290a93aecefc73084b3002cdebb01"
+
+[[package]]
+name = "embedded-hal"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "361a90feb7004eca4019fb28352a9465666b24f840f5c3cddf0ff13920590b89"
 
 [[package]]
 name = "fdt"

@@ -8,7 +8,7 @@ use super::{
     render::{self, FontSize, Rgb},
     theme,
 };
-use crate::FramebufferConfig;
+use crate::Surface;
 use alloc::vec::Vec;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,7 +42,7 @@ const CRAB: [&[u8; 11]; 8] = [
     b".X.X...X.X.",
     b"X.........X",
 ];
-pub fn crab(fb: &FramebufferConfig, x: i32, y: i32, px: u32) -> (u32, u32) {
+pub fn crab(fb: &Surface, x: i32, y: i32, px: u32) -> (u32, u32) {
     for (row, bits) in CRAB.iter().enumerate() {
         for (col, bit) in bits.iter().enumerate() {
             if *bit == b'X' {
@@ -81,7 +81,7 @@ pub(super) fn header_width<'a>(m: Metrics, labels: impl Iterator<Item = &'a str>
 }
 
 /// Tab rectangles in header coordinates.
-pub fn tab_rects(fb: &FramebufferConfig, labels: &[&str]) -> Vec<Rect> {
+pub fn tab_rects(fb: &Surface, labels: &[&str]) -> Vec<Rect> {
     let m = Metrics::for_fb(fb);
     let (cx, _, _, _) = m.canvas(fb);
     let mut x = cx + brand_width(m) as i32;
@@ -105,7 +105,7 @@ pub struct Tab<'a> {
     pub dirty: bool,
 }
 
-pub fn draw_tabs(fb: &FramebufferConfig, tabs: &[Tab<'_>]) {
+pub fn draw_tabs(fb: &Surface, tabs: &[Tab<'_>]) {
     let m = Metrics::for_fb(fb);
     let labels: Vec<&str> = tabs.iter().map(|t| t.label).collect();
     let pad = m.pad * 4 / 5;
@@ -156,7 +156,7 @@ pub fn draw_tabs(fb: &FramebufferConfig, tabs: &[Tab<'_>]) {
 
 /// Header band, brand and an optional status chip at the right.
 /// The chip is omitted when it would collide with the tabs ending at `tabs_end`.
-pub fn draw_header(fb: &FramebufferConfig, chip: Option<(&str, Rgb)>, tabs_end: i32) {
+pub fn draw_header(fb: &Surface, chip: Option<(&str, Rgb)>, tabs_end: i32) {
     let m = Metrics::for_fb(fb);
     let (cx, _, cw, _) = m.canvas(fb);
     render::fill_rect(fb, 0, 0, fb.width, m.header, theme::BAND);
@@ -200,7 +200,7 @@ pub fn draw_header(fb: &FramebufferConfig, chip: Option<(&str, Rgb)>, tabs_end: 
 
 // ─── Key legend ─────────────────────────────────────────────────────────
 
-fn keys_width(fb: &FramebufferConfig, items: &[(&str, &str)]) -> u32 {
+fn keys_width(fb: &Surface, items: &[(&str, &str)]) -> u32 {
     let m = Metrics::for_fb(fb);
     let gap = m.pad * 3 / 4;
     items
@@ -215,7 +215,7 @@ fn keys_width(fb: &FramebufferConfig, items: &[(&str, &str)]) -> u32 {
         })
         .sum()
 }
-fn draw_key_items(fb: &FramebufferConfig, mut x: i32, y: i32, items: &[(&str, &str)]) {
+fn draw_key_items(fb: &Surface, mut x: i32, y: i32, items: &[(&str, &str)]) {
     let m = Metrics::for_fb(fb);
     let gap = m.pad * 3 / 4;
     for (keys, label) in items {
@@ -229,7 +229,7 @@ fn draw_key_items(fb: &FramebufferConfig, mut x: i32, y: i32, items: &[(&str, &s
 }
 
 /// Footer: local keys on the left, the fixed global group on the right.
-pub fn draw_keys(fb: &FramebufferConfig, local: &[(&str, &str)], global: bool) {
+pub fn draw_keys(fb: &Surface, local: &[(&str, &str)], global: bool) {
     let m = Metrics::for_fb(fb);
     let y = fb.height.saturating_sub(m.footer) as i32;
     let (cx, _, cw, _) = m.canvas(fb);
@@ -271,7 +271,7 @@ pub struct StripButton<'a> {
     pub focused: bool,
 }
 
-pub fn strip_height(fb: &FramebufferConfig) -> u32 {
+pub fn strip_height(fb: &Surface) -> u32 {
     Metrics::for_fb(fb).row + 8
 }
 
@@ -279,7 +279,7 @@ pub fn strip_height(fb: &FramebufferConfig) -> u32 {
 /// buttons and an optional progress rule. Returns the button rectangles.
 #[allow(clippy::too_many_arguments)]
 pub fn strip(
-    fb: &FramebufferConfig,
+    fb: &Surface,
     rect: Rect,
     tone: Tone,
     headline: &str,
@@ -341,7 +341,7 @@ pub fn strip(
 
 /// Bold pane title with a right-aligned note and a rule. Returns its height.
 pub fn pane_title(
-    fb: &FramebufferConfig,
+    fb: &Surface,
     x: i32,
     y: i32,
     w: u32,
@@ -390,7 +390,7 @@ pub fn pane_title(
 }
 
 /// Small column headings over a ledger table. Returns its height.
-pub fn table_head(fb: &FramebufferConfig, x: i32, y: i32, w: u32, cols: &[(&str, i32)]) -> u32 {
+pub fn table_head(fb: &Surface, x: i32, y: i32, w: u32, cols: &[(&str, i32)]) -> u32 {
     let m = Metrics::for_fb(fb);
     let h = render::font_height(m.small) + 12;
     for (label, dx) in cols {
@@ -401,20 +401,13 @@ pub fn table_head(fb: &FramebufferConfig, x: i32, y: i32, w: u32, cols: &[(&str,
 }
 
 /// Details pane surface.
-pub fn side(fb: &FramebufferConfig, rect: Rect) {
+pub fn side(fb: &Surface, rect: Rect) {
     render::fill_rect(fb, rect.0, rect.1, rect.2, rect.3, theme::SIDE);
     render::draw_border(fb, rect.0, rect.1, rect.2, rect.3, theme::RULE);
 }
 
 /// Small label above a bold title. Returns the next y.
-pub fn caption_title(
-    fb: &FramebufferConfig,
-    x: i32,
-    y: i32,
-    w: u32,
-    caption: &str,
-    title: &str,
-) -> i32 {
+pub fn caption_title(fb: &Surface, x: i32, y: i32, w: u32, caption: &str, title: &str) -> i32 {
     let m = Metrics::for_fb(fb);
     render::draw_text(fb, x, y, caption, m.small, theme::INK3, None);
     let y = y + m.small_line as i32;
@@ -432,7 +425,7 @@ pub fn caption_title(
 /// Wrapped prose. Returns the next y. A clipped paragraph ends in "...".
 #[allow(clippy::too_many_arguments)]
 pub fn prose(
-    fb: &FramebufferConfig,
+    fb: &Surface,
     x: i32,
     y: i32,
     w: u32,
@@ -495,7 +488,7 @@ impl<'a> Fact<'a> {
 }
 
 /// Key/value fact sheet; values wrap under themselves. Returns the next y.
-pub fn facts(fb: &FramebufferConfig, x: i32, y: i32, w: u32, rows: &[Fact<'_>], max_y: i32) -> i32 {
+pub fn facts(fb: &Surface, x: i32, y: i32, w: u32, rows: &[Fact<'_>], max_y: i32) -> i32 {
     let m = Metrics::for_fb(fb);
     let key_w = rows
         .iter()
@@ -535,7 +528,7 @@ pub fn facts(fb: &FramebufferConfig, x: i32, y: i32, w: u32, rows: &[Fact<'_>], 
 
 /// Vertical stack of full-width buttons. Returns their rectangles.
 pub fn button_stack(
-    fb: &FramebufferConfig,
+    fb: &Surface,
     x: i32,
     y: i32,
     w: u32,
@@ -558,7 +551,7 @@ pub fn button_stack(
 // ─── Modal frame ────────────────────────────────────────────────────────
 
 /// Panel with a 2px ink border and a tinted title band. Returns the body rect.
-pub fn modal_frame(fb: &FramebufferConfig, rect: Rect, tone: Tone, title: &str) -> Rect {
+pub fn modal_frame(fb: &Surface, rect: Rect, tone: Tone, title: &str) -> Rect {
     let m = Metrics::for_fb(fb);
     let (x, y, w, h) = rect;
     render::fill_rect(fb, x, y, w, h, theme::SHEET);
@@ -593,6 +586,6 @@ pub fn modal_frame(fb: &FramebufferConfig, rect: Rect, tone: Tone, title: &str) 
     )
 }
 
-pub fn modal_head_height(fb: &FramebufferConfig) -> u32 {
+pub fn modal_head_height(fb: &Surface) -> u32 {
     Metrics::for_fb(fb).row + 10
 }

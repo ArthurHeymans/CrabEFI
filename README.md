@@ -16,6 +16,7 @@ JPEG using ImageMagick. See [docs/UI.md](docs/UI.md) for the design.*
 See the [docs/](docs/README.md) directory:
 
 - [Building](docs/BUILDING.md) - How to build CrabEFI and run tests
+- [UI Testing](docs/UI_TESTING.md) - Test and screenshot the setup UI without firmware
 - [Architecture](docs/ARCHITECTURE.md) - Workspace layout and code organization
 - [Integration](docs/INTEGRATION.md) - Using CrabEFI as a library in external firmware
 - [Capabilities](docs/capabilities.md) - Minimal/full feature sets, runtime identity and bounded variable storage
@@ -66,6 +67,7 @@ Linux input-device identification, and CrabEFI's PS/2/USB initialization logs.
 |-------|-------------|
 | `crabefi-core` | Core library -- UEFI implementation and boot-time hardware drivers |
 | `crabefi-coreboot` | Coreboot payload binary (arch entry points, table parsing) |
+| `crabefi-ui` | Boot menu model, framebuffer, renderer and setup screens, shared by firmware and the UI test harness |
 | `crabefi-runtime-abi` | Pointer-free normalized image/handoff ABI |
 | `crabefi-runtime-image` | Separate EFI Runtime Services image with image-local bounded scratch allocation |
 

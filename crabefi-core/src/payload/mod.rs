@@ -50,17 +50,7 @@ const PAYLOAD_EXTENSIONS: &[(&str, PayloadFormat)] = &[
     ),
 ];
 
-/// Payload format type
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PayloadFormat {
-    /// Standard ELF executable
-    Elf,
-    /// Flat binary loaded to a fixed address
-    FlatBinary {
-        /// Address to load the binary
-        load_addr: u64,
-    },
-}
+pub use crabefi_ui::PayloadFormat;
 
 /// A discovered payload entry
 #[derive(Debug, Clone)]

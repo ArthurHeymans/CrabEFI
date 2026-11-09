@@ -3,7 +3,6 @@
 //! (outline, left bar plus bold, `*`, explicit wording).
 
 use super::render::Rgb;
-use core::sync::atomic::{AtomicBool, Ordering};
 
 /// Window and header band behind the working sheet.
 pub const PAPER: Rgb = Rgb::new(0xef, 0xea, 0xe0);
@@ -56,44 +55,16 @@ pub const BORDER: Rgb = RULE_STRONG;
 
 const DIM_TARGET: Rgb = Rgb::new(30, 32, 35);
 const DIM_AMOUNT: u8 = 107; // ~42%
-#[cfg(not(test))]
-static DIM: AtomicBool = AtomicBool::new(false);
-// Unit tests paint concurrently; firmware has one UI thread.
-#[cfg(test)]
-std::thread_local! {
-    static DIM: AtomicBool = const { AtomicBool::new(false) };
-}
-#[cfg(not(test))]
-fn dim_flag<R>(f: impl FnOnce(&AtomicBool) -> R) -> R {
-    f(&DIM)
-}
-#[cfg(test)]
-fn dim_flag<R>(f: impl FnOnce(&AtomicBool) -> R) -> R {
-    DIM.with(f)
-}
 
 /// Colours are mapped here, at the primitive level. A modal backdrop is the
 /// invoking screen repainted with a darker solid palette: no framebuffer
 /// read-back or per-pixel blending is involved.
-pub fn tone(c: Rgb) -> Rgb {
-    if dim_flag(|d| d.load(Ordering::Relaxed)) {
+pub fn tone(fb: &crate::Surface, c: Rgb) -> Rgb {
+    if fb.is_dimmed() {
         c.lerp(DIM_TARGET, DIM_AMOUNT)
     } else {
         c
     }
-}
-
-/// Whether painting currently targets a dimmed modal backdrop.
-pub fn is_dimmed() -> bool {
-    dim_flag(|d| d.load(Ordering::Relaxed))
-}
-
-/// Paint `f` with the dimmed palette.
-pub fn dimmed<R>(f: impl FnOnce() -> R) -> R {
-    let previous = dim_flag(|d| d.swap(true, Ordering::Relaxed));
-    let result = f();
-    dim_flag(|d| d.store(previous, Ordering::Relaxed));
-    result
 }
 
 #[cfg(test)]
@@ -137,10 +108,23 @@ mod tests {
 
     #[test]
     fn dimming_is_solid_scoped_and_restored() {
-        assert_eq!(tone(SHEET), SHEET);
-        let dim = dimmed(|| tone(SHEET));
+        let fb = crate::test_surface(crate::FramebufferConfig {
+            physical_address: 0,
+            width: 1,
+            height: 1,
+            stride: 1,
+            bits_per_pixel: 32,
+            red_mask_pos: 16,
+            red_mask_size: 8,
+            green_mask_pos: 8,
+            green_mask_size: 8,
+            blue_mask_pos: 0,
+            blue_mask_size: 8,
+        });
+        assert_eq!(tone(&fb, SHEET), SHEET);
+        let dim = fb.dimmed(|| tone(&fb, SHEET));
         assert_ne!(dim, SHEET);
         assert!(luminance(dim) < luminance(SHEET));
-        assert_eq!(tone(SHEET), SHEET);
+        assert_eq!(tone(&fb, SHEET), SHEET);
     }
 }

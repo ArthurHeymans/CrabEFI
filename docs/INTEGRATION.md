@@ -117,7 +117,9 @@ fn show_graphical_firmware_settings(&self) -> crabefi::ui::ScreenNav {
 ```
 
 The default graphical hook calls `show_firmware_settings()` and returns to Boot,
-so existing platform providers remain compatible. The graphical menu uses `B`,
+so existing platform providers remain compatible. A hook may return
+`ScreenNav::Reset` to have CrabEFI restart the machine; `ScreenNav` is
+`#[non_exhaustive]`, so match it with a wildcard arm. The graphical menu uses `B`,
 `S`, and `F` for navigation, `W` for Save, `?` for Help, and `D` for a draft default.
 Page Up/Down and Home/End navigate long lists. Changes remain drafts until saved;
 Escape cancels dialogs, and failed writes remain editable and retryable. A
