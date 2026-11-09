@@ -334,6 +334,11 @@ fn enabled_command(dev: &PciDevice, original: CommandRegister) -> CommandRegiste
     ))
 }
 
+/// Read the device's typed PCI command register without changing decode state.
+pub fn command_register(address: PciAddress) -> CommandRegister {
+    with_access(|access| PciHeader::new(address).command(access))
+}
+
 /// Enable only assigned decode types and bus mastering for a DMA driver.
 pub fn enable_device(dev: &PciDevice) {
     with_access(|access| {
