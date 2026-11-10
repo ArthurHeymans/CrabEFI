@@ -666,15 +666,8 @@ mod tests {
         assert!(header.time_stamp.is_valid());
         let pkcs7 = header.cert_data(data).expect("pkcs7 present");
         let sig_lists = header.variable_data(data).expect("signature lists present");
-        // Interoperable CMS does not imply the variable fits this profile.
-        // The shipping fixture has a 21,292-byte payload; runtime currently
-        // limits an individual variable to 16 KiB. Never obtain consent only
-        // to reject it at SetVariable even with an empty store.
         assert_eq!(sig_lists.len(), 21_292);
-        assert!(matches!(
-            inspect_authenticated_dbx_update(data, "fixture"),
-            Err(AuthError::InputTooLarge)
-        ));
+        validate_payload_size(sig_lists).expect("fits the runtime variable limit");
 
         let entries =
             apply_signature_list_entries(sig_lists, "fixture").expect("signature lists parse");

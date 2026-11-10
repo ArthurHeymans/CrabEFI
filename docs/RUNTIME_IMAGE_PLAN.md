@@ -25,7 +25,7 @@ Runtime/System Tables, configuration storage, Runtime Properties, Memory
 Attributes Table (MAT), ESRT storage, variable metadata/payload arena,
 transaction buffer, manifests, phase machine, and image-local time/reset
 code. The packed variable arena is 128 KiB; its
-per-variable limit remains 16 KiB. Large zero-initialized store state is
+per-variable limit is 32 KiB. Large zero-initialized store state is
 in `.bss`, not ROM data.
 
 RSA verification allocates nothing: operands live in fixed stack buffers

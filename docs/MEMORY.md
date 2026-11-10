@@ -51,17 +51,17 @@ data. The loader then copies/zeros sections and applies only normalized
 relocation slots. The image-owned MAT publishes the exact code/data protection
 domains even where the EFI memory map merges adjacent data descriptors.
 
-The audited release images currently reserve about 244 KiB of runtime address
+The audited release images currently reserve about 292 KiB of runtime address
 space on both x86_64 and AArch64:
 
 | Mapping | Size | Contents |
 | --- | ---: | --- |
 | RX | 60 KiB | runtime code plus leading page/alignment space |
 | RO/NX | 4 KiB | immutable data |
-| RW/NX | 180 KiB | variable store, runtime state, and padding |
+| RW/NX | 228 KiB | variable store, runtime state, and padding |
 
 Normalized on-disk images are currently about 64 KiB. The dominant resident
-allocation is roughly 170 KiB of variable-store state, plus under 5 KiB of
+allocation is roughly 186 KiB of variable-store state, plus under 5 KiB of
 runtime state. The remainder is code, immutable data,
 dynamic metadata, small synchronization globals, and page/alignment padding.
 
