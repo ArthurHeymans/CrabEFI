@@ -25,7 +25,7 @@ use crate::framebuffer_console::{
 use crate::fs::{fat::FatFilesystem, gpt, iso9660};
 use crate::time::{Timeout, delay_ms};
 use core::fmt::Write;
-use heapless::{String, Vec};
+use heapless::String;
 
 /// Update the mouse cursor on the framebuffer.
 ///
@@ -42,10 +42,6 @@ fn update_cursor(
         cursor_renderer.update(fb, x, y);
     }
 }
-
-/// Maximum number of boot entries
-/// Increased to accommodate BLS, GRUB, and payload entries
-const MAX_BOOT_ENTRIES: usize = 16;
 
 /// Default timeout in seconds for auto-boot
 const DEFAULT_TIMEOUT_SECONDS: u32 = 5;
@@ -68,89 +64,73 @@ const HELP_TEXT: &str = "Enter: Boot | F: Firmware | C: Cmdline | S: Secure Boot
 #[cfg(not(feature = "secure-boot"))]
 const HELP_TEXT: &str = "Enter: Boot | F: Firmware | C: Cmdline | R: Reset";
 
-/// Boot entry kind - how this entry should be booted
-#[derive(Debug, Clone, Default)]
-pub enum BootEntryKind {
-    /// UEFI executable (EFI\BOOT\BOOTxx.EFI)
-    #[default]
-    Uefi,
-
-    /// BLS Type #1 - direct Linux boot
-    BlsLinux {
-        /// Path to Linux kernel
-        linux_path: String<128>,
-        /// The initrds, in order
-        initrd_paths: crate::bls::Initrds,
-        /// Kernel command line
-        cmdline: String<512>,
-    },
-
-    /// BLS Type #2 - Unified Kernel Image (still EFI)
-    BlsUki,
-
-    /// GRUB menu entry - direct Linux boot
-    GrubLinux {
-        /// Path to Linux kernel
-        linux_path: String<128>,
-        /// The initrds, in order
-        initrd_paths: crate::bls::Initrds,
-        /// Kernel command line
-        cmdline: String<512>,
-    },
-
-    /// Coreboot payload (ELF or flat binary)
-    Payload {
-        /// Path to payload file
-        path: String<128>,
-        /// Payload format
-        format: crate::payload::PayloadFormat,
-    },
-}
-
-/// Category for menu grouping
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BootCategory {
-    /// UEFI boot entries
-    Uefi,
-    /// Boot Loader Specification entries
-    Bls,
-    /// GRUB configuration entries
-    Grub,
-    /// Coreboot payload entries
-    Payload,
-}
-
-impl BootCategory {
-    /// Get a display name for this category
-    pub fn display_name(&self) -> &'static str {
-        match self {
-            BootCategory::Uefi => "UEFI Boot",
-            BootCategory::Bls => "Boot Loader Spec",
-            BootCategory::Grub => "GRUB Entries",
-            BootCategory::Payload => "Coreboot Payloads",
-        }
-    }
-}
+pub use crabefi_ui::{BootCategory, BootEntryKind};
 
 /// A boot entry discovered on storage media
 #[derive(Debug, Clone)]
 pub struct BootEntry {
-    /// Display name for the menu
-    pub name: String<64>,
-    /// Path to the EFI application (for UEFI entries)
-    pub path: String<128>,
+    /// What the menu shows: name, path, kind and partition number
+    pub entry: crabefi_ui::BootEntry,
     /// Storage device holding the entry
     pub storage: StorageId,
     /// PCI address of the storage controller, if any
     pub pci: Option<PciAddress>,
-    /// Partition number (1-based)
-    pub partition_num: u32,
     /// Partition information
     pub partition: gpt::Partition,
-    /// Boot entry kind (how to boot this entry)
-    pub kind: BootEntryKind,
-    /// Boot category (for menu grouping)
-    pub category: BootCategory,
+}
+
+impl core::ops::Deref for BootEntry {
+    type Target = crabefi_ui::BootEntry;
+    fn deref(&self) -> &Self::Target {
+        &self.entry
+    }
+}
+
+impl core::ops::DerefMut for BootEntry {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.entry
+    }
+}
+
+impl crabefi_ui::MenuEntry for BootEntry {
+    fn disk_name(&self) -> alloc::string::String {
+        let n = match self.storage {
+            StorageId::Nvme { controller_id, .. } | StorageId::Sdhci { controller_id } => {
+                controller_id
+            }
+            StorageId::Ahci { port, .. } => port,
+            StorageId::Usb { device_addr, .. } => device_addr as usize,
+            StorageId::Platform { index } => index,
+        };
+        alloc::format!("{} {n}", self.storage.description())
+    }
+    fn disk_detail(&self) -> alloc::string::String {
+        storage_identity(self.storage)
+    }
+    fn same_disk(&self, other: &Self) -> bool {
+        self.storage == other.storage
+    }
+}
+
+fn storage_identity(id: StorageId) -> alloc::string::String {
+    match id {
+        StorageId::Nvme {
+            controller_id,
+            nsid,
+        } => alloc::format!("NVMe controller {controller_id}, namespace {nsid}"),
+        StorageId::Ahci {
+            controller_id,
+            port,
+        } => alloc::format!("SATA controller {controller_id}, port {port}"),
+        StorageId::Usb {
+            controller_id,
+            device_addr,
+        } => alloc::format!("USB controller {controller_id}, device {device_addr}"),
+        StorageId::Sdhci { controller_id } => {
+            alloc::format!("{} {controller_id}", id.description())
+        }
+        StorageId::Platform { index } => alloc::format!("{} {index}", id.description()),
+    }
 }
 
 impl BootEntry {
@@ -183,19 +163,12 @@ impl BootEntry {
         kind: BootEntryKind,
         category: BootCategory,
     ) -> Self {
-        let mut entry = BootEntry {
-            name: String::new(),
-            path: String::new(),
+        BootEntry {
+            entry: crabefi_ui::BootEntry::new(name, path, partition_num, kind, category),
             storage: device.id,
             pci: device.pci,
-            partition_num,
             partition,
-            kind,
-            category,
-        };
-        let _ = entry.name.push_str(name);
-        let _ = entry.path.push_str(path);
-        entry
+        }
     }
 
     /// Format a description for display
@@ -209,69 +182,27 @@ impl BootEntry {
             self.partition_num
         );
     }
-
-    /// Check if this is a direct Linux boot entry
-    pub fn is_linux_boot(&self) -> bool {
-        matches!(
-            self.kind,
-            BootEntryKind::BlsLinux { .. } | BootEntryKind::GrubLinux { .. }
-        )
-    }
-
-    /// Check if this is a UEFI entry
-    pub fn is_uefi(&self) -> bool {
-        matches!(self.kind, BootEntryKind::Uefi | BootEntryKind::BlsUki)
-    }
-
-    /// Check if this is a payload entry
-    pub fn is_payload(&self) -> bool {
-        matches!(self.kind, BootEntryKind::Payload { .. })
-    }
-
-    /// Check if this entry has an editable command line
-    pub fn has_cmdline(&self) -> bool {
-        matches!(
-            self.kind,
-            BootEntryKind::BlsLinux { .. } | BootEntryKind::GrubLinux { .. }
-        )
-    }
-
-    /// Get a reference to the command line, if any
-    pub fn get_cmdline(&self) -> Option<&String<512>> {
-        match &self.kind {
-            BootEntryKind::BlsLinux { cmdline, .. } | BootEntryKind::GrubLinux { cmdline, .. } => {
-                Some(cmdline)
-            }
-            _ => None,
-        }
-    }
-
-    /// Get a mutable reference to the command line, if any
-    pub fn get_cmdline_mut(&mut self) -> Option<&mut String<512>> {
-        match &mut self.kind {
-            BootEntryKind::BlsLinux { cmdline, .. } | BootEntryKind::GrubLinux { cmdline, .. } => {
-                Some(cmdline)
-            }
-            _ => None,
-        }
-    }
 }
 
 /// Boot menu state
 pub struct BootMenu {
-    /// Discovered boot entries
-    pub(crate) entries: Vec<BootEntry, MAX_BOOT_ENTRIES>,
-    /// Currently selected entry index
-    pub(crate) selected: usize,
-    /// Timeout in seconds (0 = no timeout)
-    pub(crate) timeout_seconds: u32,
+    /// Entries, selection and timeout, as the menus show them
+    pub(crate) menu: crabefi_ui::BootMenu<BootEntry>,
     /// `selected` is a `loader.conf` default, which the first one sets
     default_chosen: bool,
-    /// One-shot command-line edit for the next boot attempt of one entry.
-    /// The entry itself keeps its discovered command line; the edit is
-    /// applied only to the clone handed to the boot path, and each menu
-    /// showing starts by clearing any leftover edit.
-    edited_cmdline: Option<(usize, String<512>)>,
+}
+
+impl core::ops::Deref for BootMenu {
+    type Target = crabefi_ui::BootMenu<BootEntry>;
+    fn deref(&self) -> &Self::Target {
+        &self.menu
+    }
+}
+
+impl core::ops::DerefMut for BootMenu {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.menu
+    }
 }
 
 impl Default for BootMenu {
@@ -283,98 +214,12 @@ impl Default for BootMenu {
 impl BootMenu {
     /// Create a new boot menu
     pub fn new() -> Self {
+        let mut menu = crabefi_ui::BootMenu::new();
+        menu.timeout_seconds = DEFAULT_TIMEOUT_SECONDS;
         BootMenu {
-            entries: Vec::new(),
-            selected: 0,
-            timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+            menu,
             default_chosen: false,
-            edited_cmdline: None,
         }
-    }
-
-    /// Add a boot entry
-    pub fn add_entry(&mut self, entry: BootEntry) -> bool {
-        self.entries.push(entry).is_ok()
-    }
-
-    /// Get the number of entries
-    pub fn entry_count(&self) -> usize {
-        self.entries.len()
-    }
-
-    /// Get a reference to an entry as discovered. To boot a selection, use
-    /// [`entry_for_boot`](Self::entry_for_boot) instead: one-shot
-    /// command-line edits are not applied to the entries returned here.
-    pub fn get_entry(&self, index: usize) -> Option<&BootEntry> {
-        self.entries.get(index)
-    }
-
-    /// Get the selected entry as discovered (see [`get_entry`](Self::get_entry))
-    pub fn selected_entry(&self) -> Option<&BootEntry> {
-        self.entries.get(self.selected)
-    }
-
-    /// Record a one-shot command-line edit for `index` (see `edited_cmdline`).
-    pub(crate) fn set_edited_cmdline(&mut self, index: usize, cmdline: String<512>) {
-        self.edited_cmdline = Some((index, cmdline));
-    }
-
-    /// The pending one-shot edit for `index`, if the user edited it.
-    pub fn edited_cmdline(&self, index: usize) -> Option<&str> {
-        self.edited_cmdline
-            .as_ref()
-            .filter(|(edited, _)| *edited == index)
-            .map(|(_, cmdline)| cmdline.as_str())
-    }
-
-    /// Command line an editor should start from: the pending edit if any,
-    /// otherwise the entry's discovered command line.
-    pub(crate) fn effective_cmdline(&self, index: usize) -> Option<&str> {
-        self.edited_cmdline(index).or_else(|| {
-            self.entries
-                .get(index)
-                .and_then(|entry| entry.get_cmdline())
-                .map(|cmdline| cmdline.as_str())
-        })
-    }
-
-    /// Drop any pending one-shot edit; called when a menu showing begins so
-    /// an edit can never outlive the boot attempt it was made for.
-    pub(crate) fn clear_edited_cmdline(&mut self) {
-        self.edited_cmdline = None;
-    }
-
-    /// The entry to actually boot: a clone with any one-shot command-line
-    /// edit applied. The menu's own entry is left as discovered, so a
-    /// failed boot followed by a re-shown menu cannot silently reuse it.
-    pub fn entry_for_boot(&self, index: usize) -> Option<BootEntry> {
-        let mut entry = self.entries.get(index)?.clone();
-        if let Some(edited) = self.edited_cmdline(index)
-            && let Some(cmdline) = entry.get_cmdline_mut()
-        {
-            cmdline.clear();
-            let _ = cmdline.push_str(edited);
-        }
-        Some(entry)
-    }
-
-    /// Move selection up
-    pub fn select_previous(&mut self) {
-        if self.selected > 0 {
-            self.selected -= 1;
-        }
-    }
-
-    /// Move selection down
-    pub fn select_next(&mut self) {
-        if self.selected + 1 < self.entries.len() {
-            self.selected += 1;
-        }
-    }
-
-    /// Set the timeout
-    pub fn set_timeout(&mut self, seconds: u32) {
-        self.timeout_seconds = seconds;
     }
 }
 
@@ -1455,7 +1300,6 @@ fn edit_cmdline(
                 | KeyPress::F8
                 | KeyPress::F10 => {}
                 // Mouse events are ignored in the command line editor
-                #[cfg(feature = "ui")]
                 KeyPress::MouseClick { .. } | KeyPress::MouseScroll(_) => {}
             }
         }
@@ -1690,68 +1534,34 @@ fn draw_cmdline_editor_line(
 }
 
 #[cfg(test)]
-mod one_shot_cmdline_tests {
+mod disk_detail_tests {
     use super::*;
 
-    fn linux_menu() -> BootMenu {
-        let mut menu = BootMenu::new();
-        let mut name: String<64> = String::new();
-        let _ = name.push_str("Linux");
-        let mut cmdline: String<512> = String::new();
-        let _ = cmdline.push_str("quiet");
-        assert!(menu.add_entry(BootEntry {
-            name,
-            path: String::new(),
-            storage: StorageId::Nvme {
-                controller_id: 0,
-                nsid: 1,
-            },
-            pci: None,
-            partition_num: 1,
-            partition: gpt::Partition {
-                type_guid: [0; 16],
-                partition_guid: [0; 16],
-                first_lba: 0,
-                last_lba: 0,
-                attributes: 0,
-                is_esp: true,
-                block_size: 512,
-            },
-            kind: BootEntryKind::BlsLinux {
-                linux_path: String::new(),
-                initrd_paths: crate::bls::Initrds::new(),
-                cmdline,
-            },
-            category: BootCategory::Bls,
-        }));
-        menu
-    }
-
-    fn discovered(menu: &BootMenu) -> Option<&str> {
-        menu.get_entry(0)?
-            .get_cmdline()
-            .map(|cmdline| cmdline.as_str())
-    }
-
     #[test]
-    fn edited_cmdline_applies_only_to_the_boot_clone() {
-        let mut menu = linux_menu();
-        let mut edited: String<512> = String::new();
-        let _ = edited.push_str("quiet debug");
-        menu.set_edited_cmdline(0, edited);
-        assert_eq!(discovered(&menu), Some("quiet"));
-        assert_eq!(menu.effective_cmdline(0), Some("quiet debug"));
-        let boot_entry = menu.entry_for_boot(0).expect("entry 0 exists");
-        assert_eq!(
-            boot_entry.get_cmdline().map(|cmdline| cmdline.as_str()),
-            Some("quiet debug")
+    fn disk_details_distinguish_controllers_and_namespaces() {
+        assert_ne!(
+            storage_identity(StorageId::Ahci {
+                controller_id: 0,
+                port: 1
+            }),
+            storage_identity(StorageId::Ahci {
+                controller_id: 1,
+                port: 1
+            })
         );
-        // The boot attempt consumed the clone, not the edit's target: after
-        // it, and after the next showing clears the edit, only the
-        // discovered command line remains.
-        assert_eq!(discovered(&menu), Some("quiet"));
-        menu.clear_edited_cmdline();
-        assert_eq!(menu.edited_cmdline(0), None);
-        assert_eq!(menu.effective_cmdline(0), Some("quiet"));
+        assert!(
+            storage_identity(StorageId::Nvme {
+                controller_id: 2,
+                nsid: 3
+            })
+            .contains("namespace 3")
+        );
+        assert!(
+            storage_identity(StorageId::Usb {
+                controller_id: 4,
+                device_addr: 5
+            })
+            .contains("controller 4")
+        );
     }
 }

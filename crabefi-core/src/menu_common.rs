@@ -9,35 +9,7 @@ use crate::framebuffer_console::{Color, FramebufferConsole, TITLE_COLOR};
 use crate::time::{Timeout, delay_ms};
 use core::fmt::Write;
 
-/// Key press types for menu navigation
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KeyPress {
-    Up,
-    Down,
-    Left,
-    Right,
-    Home,
-    End,
-    PageUp,
-    PageDown,
-    Tab,
-    BackTab,
-    Delete,
-    F8,
-    F10,
-    Enter,
-    Escape,
-    Char(char),
-    /// Mouse click at pixel coordinates.
-    #[cfg(feature = "ui")]
-    MouseClick {
-        x: u32,
-        y: u32,
-    },
-    /// Mouse scroll (positive = down, negative = up)
-    #[cfg(feature = "ui")]
-    MouseScroll(i32),
-}
+pub use crabefi_ui::KeyPress;
 
 /// Read a key from any keyboard or serial
 pub fn read_key() -> Option<KeyPress> {

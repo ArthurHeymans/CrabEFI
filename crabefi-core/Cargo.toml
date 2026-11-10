@@ -15,7 +15,7 @@ xhci = ["dep:xhci"]
 # TPM devices, TCG protocols, event tables and measured boot.
 tpm = ["dep:sha1"]
 # UEFI image/key authentication, independent of a host firmware's signed FFS.
-secure-boot = ["pkcs7", "crabefi-runtime-bundle?/secure-boot"]
+secure-boot = ["pkcs7", "crabefi-runtime-bundle?/secure-boot", "crabefi-ui/secure-boot"]
 # Signed firmware capsule application requires durable result persistence.
 capsule-update = ["pkcs7", "variable-store"]
 # Shared verification implementation, not a runtime policy switch.
@@ -26,7 +26,7 @@ pkcs7 = ["dep:sha1", "dep:crabefi-pkcs7"]
 full = ["tpm", "xhci", "spi-flash", "secure-boot", "capsule-update", "cfr"]
 # CFR (coreboot form representation) firmware settings: the parser and the
 # menu. Values are EFI variables under the CFR GUID, through the runtime image.
-cfr = []
+cfr = ["crabefi-ui/cfr"]
 # Direct flash variable persistence; omitted when the host provides no flash store.
 variable-store = []
 spi-flash = ["variable-store", "dep:rflasher-core", "dep:rflasher-internal"]
@@ -43,13 +43,14 @@ global-allocator = []
 fb-log = []
 # Enable graphical UI with mouse support (PS/2 and USB HID mouse drivers,
 # cursor rendering, SimplePointerProtocol, and graphical setup utility)
-ui = ["dep:noto-sans-mono-bitmap"]
+ui = ["crabefi-ui/screens"]
 # Native ELAN I2C touchpads described by the platform as peripherals.
 elan-i2c = ["ui"]
 # HID-over-I2C touchpads, mice and keyboards described by the platform.
 hid-i2c = ["ui", "dep:hidreport"]
 
 [dependencies]
+crabefi-ui = { path = "../crabefi-ui" }
 embedded-hal = "1"
 hidreport = { version = "0.6", default-features = false, optional = true }
 crabefi-efi-types = { workspace = true }
@@ -68,15 +69,6 @@ bitflags = "2"
 embassy-futures = "0.1"
 atomic_refcell = "0.1"
 spin = "0.12"
-noto-sans-mono-bitmap = { optional = true, version = "0.3", default-features = false, features = [
-  "regular",
-  "bold",
-  "size_16",
-  "size_20",
-  "size_24",
-  "size_32",
-  "unicode-basic-latin",
-] }
 tock-registers = "0.10"
 zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
 rflasher-core = { optional = true, git = "https://github.com/ArthurHeymans/rflasher.git", rev = "4fb9d6270972d5ba04b5e22671b3416aaaaf6328", default-features = false }

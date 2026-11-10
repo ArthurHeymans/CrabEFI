@@ -9,8 +9,6 @@
 //! Dependency evaluation is supported: options whose dependencies are not
 //! met are hidden or shown as inactive according to their flags.
 
-#[cfg(feature = "ui")]
-use crate::FramebufferConfig as FramebufferInfo;
 use crate::cfr::{self, CfrInfo, CfrOption, CfrOptionType, CfrValue};
 use crate::drivers::serial as serial_driver;
 use crate::framebuffer_console::{
@@ -19,18 +17,20 @@ use crate::framebuffer_console::{
 use crate::menu_common::{self, KeyPress, SerialWriter};
 use crate::time::delay_ms;
 #[cfg(feature = "ui")]
-use crate::ui::{self, NavItem, dialog, render, theme};
+use crate::ui::{self, NavItem};
 use alloc::string::String;
-use alloc::vec::Vec;
 use core::fmt::Write;
 
+use crabefi_ui::cfr::SettingsModel;
+use crabefi_ui::settings::{
+    MenuItem, Session, build_menu_items, can_edit_item, decrement_option, find_first_selectable,
+    get_option, has_changes, increment_option, is_item_visible, is_selectable, push_truncated,
+    save_all_changes, stepped_number,
+};
 use heapless::String as StackString;
-#[cfg(feature = "ui")]
-use render::FontSize;
 
-/// A screen rectangle: x, y, width, height.
-#[cfg(feature = "ui")]
-type Rect = (i32, i32, u32, u32);
+/// The settings model one menu session reads.
+type Model<'a> = dyn SettingsModel + 'a;
 
 /// Menu title
 const MENU_TITLE: &str = "Firmware Settings";
@@ -38,51 +38,6 @@ const MENU_TITLE: &str = "Firmware Settings";
 /// Help text
 const HELP_TEXT: &str =
     "Up/Down: Navigate | Enter/Space: Edit | +/-: Inc/Dec | ?: Help | Esc: Exit";
-
-/// Menu item types
-#[derive(Debug, Clone)]
-enum MenuItem {
-    /// Form header (category separator)
-    FormHeader { name: String },
-    /// CrabEFI-owned log-level setting.
-    CrabLogLevel {
-        current_level: log::LevelFilter,
-        /// Snapshot of the value when the menu was opened, used to detect changes.
-        original_level: log::LevelFilter,
-    },
-    /// Editable option
-    Option {
-        form_idx: usize,
-        option_idx: usize,
-        current_value: CfrValue,
-        /// Snapshot of the value when the menu was opened, used to detect changes
-        original_value: CfrValue,
-    },
-    /// Informational comment
-    Comment { text: String },
-    /// Nested subform section header (indented)
-    SubformHeader { name: String },
-}
-
-/// Returns true if any option's current value differs from its original value
-fn has_changes(items: &[MenuItem]) -> bool {
-    items.iter().any(|item| {
-        matches!(
-            item,
-            MenuItem::Option {
-                current_value,
-                original_value,
-                ..
-            } if current_value != original_value
-        ) || matches!(
-            item,
-            MenuItem::CrabLogLevel {
-                current_level,
-                original_level,
-            } if current_level != original_level
-        )
-    })
-}
 
 /// Show the CFR firmware settings menu
 ///
@@ -116,6 +71,8 @@ pub fn show_cfr_menu() {
     let fb_info = crate::handoff::framebuffer();
     let mut fb_console = fb_info.as_ref().map(FramebufferConsole::new);
 
+    let session = Session::new(cfr_info);
+    let cfr_info: &Model<'_> = &session;
     let mut items = build_menu_items(cfr_info);
 
     if items.is_empty() {
@@ -225,201 +182,7 @@ pub fn show_cfr_menu() {
     }
 }
 
-/// Build menu items from CFR info.
-///
-/// All non-suppressed items are included regardless of dependency state.
-/// Dependencies are evaluated dynamically at draw/interaction time so that
-/// toggling a "parent" option immediately shows or hides dependent items.
-fn build_menu_items(cfr: &CfrInfo) -> Vec<MenuItem> {
-    stored_dependencies(Vec::clear);
-    let mut items = Vec::new();
-
-    let mut crabefi_name = String::new();
-    crabefi_name.push_str("CrabEFI");
-    items.push(MenuItem::FormHeader { name: crabefi_name });
-    let current_level = crate::logger::configured_level();
-    items.push(MenuItem::CrabLogLevel {
-        current_level,
-        original_level: current_level,
-    });
-
-    for (form_idx, form) in cfr.forms.iter().enumerate() {
-        if !form.is_visible() {
-            continue;
-        }
-
-        items.push(MenuItem::FormHeader {
-            name: form.ui_name.clone(),
-        });
-
-        for (option_idx, option) in form.options.iter().enumerate() {
-            if !option.is_visible() {
-                continue;
-            }
-
-            match &option.option_type {
-                CfrOptionType::Comment => {
-                    // Check if this is a flattened subform header (has object_id, no opt_name)
-                    let is_subform = option.opt_name.is_empty() && option.object_id != 0;
-                    if is_subform {
-                        items.push(MenuItem::SubformHeader {
-                            name: option.ui_name.clone(),
-                        });
-                    } else {
-                        items.push(MenuItem::Comment {
-                            text: option.ui_name.clone(),
-                        });
-                    }
-                }
-                _ => {
-                    let current_value = cfr::read_option_value(option);
-                    items.push(MenuItem::Option {
-                        form_idx,
-                        option_idx,
-                        original_value: current_value.clone(),
-                        current_value,
-                    });
-                }
-            }
-        }
-    }
-
-    items
-}
-
-/// Look up the current in-flight numeric value for an option identified by
-/// `object_id`, checking the menu items first (which reflect the user's
-/// uncommitted edits) and falling back to persistent storage via
-/// `CfrInfo::find_numeric_value`.
-fn find_live_numeric_value(cfr: &CfrInfo, items: &[MenuItem], object_id: u64) -> Option<u32> {
-    if object_id == 0 {
-        return None;
-    }
-    // Search menu items for an option whose CfrOption::object_id matches
-    for item in items {
-        if let MenuItem::Option {
-            form_idx,
-            option_idx,
-            current_value,
-            ..
-        } = item
-            && let Some(option) = get_option(cfr, *form_idx, *option_idx)
-            && option.object_id == object_id
-        {
-            return match current_value {
-                CfrValue::Bool(b) => Some(if *b { 1 } else { 0 }),
-                CfrValue::Number(n) => Some(*n),
-                _ => None,
-            };
-        }
-    }
-    // Options outside the menu (for example suppressed ones) cannot change
-    // while it is open. Read each once per session: a variable-store read on
-    // every pointer poll made the graphical loop too slow to see clicks.
-    stored_dependencies(|cache| {
-        if let Some((_, value)) = cache.iter().find(|(id, _)| *id == object_id) {
-            return *value;
-        }
-        let value = cfr.find_numeric_value(object_id);
-        cache.push((object_id, value));
-        value
-    })
-}
-
-/// Stored values of dependencies that are not menu items, for one session.
-#[cfg(not(test))]
-static STORED_DEPENDENCIES: spin::Mutex<Vec<(u64, Option<u32>)>> = spin::Mutex::new(Vec::new());
-#[cfg(test)]
-std::thread_local! {
-    static STORED_DEPENDENCIES: core::cell::RefCell<Vec<(u64, Option<u32>)>> = const { core::cell::RefCell::new(Vec::new()) };
-}
-fn stored_dependencies<R>(f: impl FnOnce(&mut Vec<(u64, Option<u32>)>) -> R) -> R {
-    #[cfg(not(test))]
-    return f(&mut STORED_DEPENDENCIES.lock());
-    #[cfg(test)]
-    STORED_DEPENDENCIES.with(|cache| f(&mut cache.borrow_mut()))
-}
-
-/// Evaluate whether a dependency is met using live (in-flight) menu values.
-fn is_dep_met_live(
-    cfr: &CfrInfo,
-    items: &[MenuItem],
-    dependency_id: u64,
-    dep_values: &[u32],
-) -> bool {
-    if dependency_id == 0 {
-        return true;
-    }
-    match find_live_numeric_value(cfr, items, dependency_id) {
-        Some(current) => {
-            if dep_values.is_empty() {
-                current != 0
-            } else {
-                dep_values.contains(&current)
-            }
-        }
-        None => true,
-    }
-}
-
-/// Check if a menu item is currently visible based on live dependency state.
-///
-/// Form headers are visible if the form's dependency is met. Options, comments,
-/// and subform headers are visible if the owning form's dependency AND the
-/// item's own dependency are both met.
-fn is_item_visible(cfr: &CfrInfo, items: &[MenuItem], item: &MenuItem) -> bool {
-    match item {
-        MenuItem::FormHeader { name } => {
-            // Find the form by name and check its dependency
-            cfr.forms
-                .iter()
-                .find(|f| f.ui_name == *name)
-                .is_none_or(|form| {
-                    is_dep_met_live(cfr, items, form.dependency_id, &form.dep_values)
-                })
-        }
-        MenuItem::Option {
-            form_idx,
-            option_idx,
-            ..
-        } => {
-            let form_ok = cfr.forms.get(*form_idx).is_none_or(|form| {
-                is_dep_met_live(cfr, items, form.dependency_id, &form.dep_values)
-            });
-            let opt_ok = get_option(cfr, *form_idx, *option_idx)
-                .is_none_or(|opt| is_dep_met_live(cfr, items, opt.dependency_id, &opt.dep_values));
-            form_ok && opt_ok
-        }
-        MenuItem::CrabLogLevel { .. } => true,
-        // Comments and subform headers don't carry their own indices, so
-        // they stay visible (their parent form header hides the section).
-        MenuItem::Comment { .. } | MenuItem::SubformHeader { .. } => true,
-    }
-}
-
-/// Get an option by form and option index
-fn get_option(cfr: &CfrInfo, form_idx: usize, option_idx: usize) -> Option<&CfrOption> {
-    cfr.forms
-        .get(form_idx)
-        .and_then(|f| f.options.get(option_idx))
-}
-
-/// Find the first selectable and visible item starting from index
-fn find_first_selectable(cfr: &CfrInfo, items: &[MenuItem], start: usize) -> usize {
-    for (i, item) in items.iter().enumerate().skip(start) {
-        if is_selectable(item) && is_item_visible(cfr, items, item) {
-            return i;
-        }
-    }
-    for (i, item) in items.iter().enumerate().take(start) {
-        if is_selectable(item) && is_item_visible(cfr, items, item) {
-            return i;
-        }
-    }
-    0
-}
-
-fn find_prev_selectable(cfr: &CfrInfo, items: &[MenuItem], current: usize) -> usize {
+fn find_prev_selectable(cfr: &Model<'_>, items: &[MenuItem], current: usize) -> usize {
     for i in (0..current).rev() {
         if is_selectable(&items[i]) && is_item_visible(cfr, items, &items[i]) {
             return i;
@@ -428,7 +191,7 @@ fn find_prev_selectable(cfr: &CfrInfo, items: &[MenuItem], current: usize) -> us
     current
 }
 
-fn find_next_selectable(cfr: &CfrInfo, items: &[MenuItem], current: usize) -> usize {
+fn find_next_selectable(cfr: &Model<'_>, items: &[MenuItem], current: usize) -> usize {
     for (i, item) in items.iter().enumerate().skip(current + 1) {
         if is_selectable(item) && is_item_visible(cfr, items, item) {
             return i;
@@ -437,36 +200,8 @@ fn find_next_selectable(cfr: &CfrInfo, items: &[MenuItem], current: usize) -> us
     current
 }
 
-fn is_selectable(item: &MenuItem) -> bool {
-    matches!(
-        item,
-        MenuItem::Option { .. } | MenuItem::CrabLogLevel { .. }
-    )
-}
-
 fn is_selectable_item(item: Option<&MenuItem>) -> bool {
     item.is_some_and(is_selectable)
-}
-
-/// Check if the item at `index` is an editable, visible option (immutable borrow).
-fn can_edit_item(cfr: &CfrInfo, items: &[MenuItem], index: usize) -> bool {
-    if matches!(items.get(index), Some(MenuItem::CrabLogLevel { .. })) {
-        return true;
-    }
-
-    if let Some(
-        item @ MenuItem::Option {
-            form_idx,
-            option_idx,
-            ..
-        },
-    ) = items.get(index)
-    {
-        is_item_visible(cfr, items, item)
-            && get_option(cfr, *form_idx, *option_idx).is_some_and(|o| o.is_editable())
-    } else {
-        false
-    }
 }
 
 fn get_visible_rows(fb_console: &Option<FramebufferConsole>) -> usize {
@@ -505,202 +240,6 @@ fn toggle_value(option: &CfrOption, value: &mut CfrValue) -> bool {
         }
         _ => false,
     }
-}
-
-/// Move to the next representable value on the minimum-relative step grid.
-/// Never clamp to an unaligned maximum or overflow at either u32 boundary.
-fn stepped_number(current: u32, min: u32, max: u32, step: u32, forward: bool) -> Option<u32> {
-    if min > max {
-        return None;
-    }
-    let step = step.max(1);
-    if forward {
-        if current < min {
-            return Some(min);
-        }
-        let offset = (current - min) / step;
-        min.checked_add(offset.checked_add(1)?.checked_mul(step)?)
-            .filter(|next| *next <= max)
-    } else if current > min {
-        let bound = current.saturating_sub(1).min(max);
-        Some(min + (bound - min) / step * step)
-    } else {
-        None
-    }
-}
-
-/// Increment a numeric/enum option in-place
-fn increment_option(cfr: &CfrInfo, items: &mut [MenuItem], index: usize) -> bool {
-    // Check editability with live dependencies before taking a mutable borrow
-    if !can_edit_item(cfr, items, index) {
-        return false;
-    }
-
-    if let Some(MenuItem::CrabLogLevel { current_level, .. }) = items.get_mut(index) {
-        let current_idx = crate::logger::level_index(*current_level);
-        let next_idx = (current_idx + 1) % crate::logger::LEVEL_CHOICES.len();
-        *current_level = crate::logger::LEVEL_CHOICES[next_idx];
-        return true;
-    }
-
-    let Some(MenuItem::Option {
-        form_idx,
-        option_idx,
-        current_value,
-        ..
-    }) = items.get_mut(index)
-    else {
-        return false;
-    };
-    let (fi, oi) = (*form_idx, *option_idx);
-    let Some(option) = get_option(cfr, fi, oi) else {
-        return false;
-    };
-    match (&option.option_type, current_value) {
-        (CfrOptionType::Bool { .. }, CfrValue::Bool(b)) => {
-            *b = !*b;
-            true
-        }
-        (CfrOptionType::Enum { choices, .. }, CfrValue::Number(n)) => {
-            if choices.is_empty() {
-                return false;
-            }
-            let current_idx = choices.iter().position(|c| c.value == *n).unwrap_or(0);
-            let next_idx = (current_idx + 1) % choices.len();
-            if let Some(choice) = choices.get(next_idx) {
-                *n = choice.value;
-                true
-            } else {
-                false
-            }
-        }
-        (CfrOptionType::Number { min, max, step, .. }, CfrValue::Number(n)) => {
-            if let Some(next) = stepped_number(*n, *min, *max, *step, true) {
-                *n = next;
-                true
-            } else {
-                false
-            }
-        }
-        _ => false,
-    }
-}
-
-/// Decrement a numeric/enum option in-place
-fn decrement_option(cfr: &CfrInfo, items: &mut [MenuItem], index: usize) -> bool {
-    // Check editability with live dependencies before taking a mutable borrow
-    if !can_edit_item(cfr, items, index) {
-        return false;
-    }
-
-    if let Some(MenuItem::CrabLogLevel { current_level, .. }) = items.get_mut(index) {
-        let current_idx = crate::logger::level_index(*current_level);
-        let prev_idx = if current_idx == 0 {
-            crate::logger::LEVEL_CHOICES.len().saturating_sub(1)
-        } else {
-            current_idx - 1
-        };
-        *current_level = crate::logger::LEVEL_CHOICES[prev_idx];
-        return true;
-    }
-
-    let Some(MenuItem::Option {
-        form_idx,
-        option_idx,
-        current_value,
-        ..
-    }) = items.get_mut(index)
-    else {
-        return false;
-    };
-    let (fi, oi) = (*form_idx, *option_idx);
-    let Some(option) = get_option(cfr, fi, oi) else {
-        return false;
-    };
-    match (&option.option_type, current_value) {
-        (CfrOptionType::Bool { .. }, CfrValue::Bool(b)) => {
-            *b = !*b;
-            true
-        }
-        (CfrOptionType::Enum { choices, .. }, CfrValue::Number(n)) => {
-            if choices.is_empty() {
-                return false;
-            }
-            let current_idx = choices.iter().position(|c| c.value == *n).unwrap_or(0);
-            let prev_idx = if current_idx == 0 {
-                choices.len().saturating_sub(1)
-            } else {
-                current_idx - 1
-            };
-            if let Some(choice) = choices.get(prev_idx) {
-                *n = choice.value;
-                true
-            } else {
-                false
-            }
-        }
-        (CfrOptionType::Number { min, max, step, .. }, CfrValue::Number(n)) => {
-            if let Some(next) = stepped_number(*n, *min, *max, *step, false) {
-                *n = next;
-                true
-            } else {
-                false
-            }
-        }
-        _ => false,
-    }
-}
-
-/// Save modified option values to persistent storage.
-///
-/// Only writes options that were actually changed by the user, reducing
-/// unnecessary SPI flash wear. Returns `(saved, failed)` counts.
-fn save_all_changes(cfr: &CfrInfo, items: &mut [MenuItem]) -> (usize, usize) {
-    let mut saved = 0usize;
-    let mut failed = 0usize;
-    for item in items {
-        match item {
-            MenuItem::CrabLogLevel {
-                current_level,
-                original_level,
-            } if current_level != original_level => {
-                match crate::logger::set_configured_level(*current_level) {
-                    Ok(()) => {
-                        *original_level = *current_level;
-                        saved += 1;
-                    }
-                    Err(e) => {
-                        log::warn!("Failed to save CrabEFI log level: {:?}", e);
-                        failed += 1;
-                    }
-                }
-            }
-            MenuItem::Option {
-                form_idx,
-                option_idx,
-                current_value,
-                original_value,
-            } if current_value != original_value => {
-                if let Some(option) = get_option(cfr, *form_idx, *option_idx) {
-                    match cfr::write_option_value(option, current_value) {
-                        Ok(()) => {
-                            *original_value = current_value.clone();
-                            saved += 1;
-                        }
-                        Err(e) => {
-                            log::warn!("Failed to save '{}': {}", option.opt_name, e);
-                            failed += 1;
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    // Platform writes can change suppressed dependencies as a side effect,
-    // even when only a prefix of the save succeeded.
-    stored_dependencies(Vec::clear);
-    (saved, failed)
 }
 
 /// Show confirmation dialog for saving on exit
@@ -858,33 +397,12 @@ use graphical::show_cfr_menu_graphical;
 #[cfg(feature = "ui")]
 pub use graphical::show_graphical_firmware_settings;
 
-fn push_truncated<const N: usize>(out: &mut StackString<N>, text: &str, max_chars: usize) {
-    if max_chars == 0 {
-        return;
-    }
-
-    let mut chars = text.chars();
-    for idx in 0..max_chars {
-        let Some(ch) = chars.next() else {
-            return;
-        };
-        if idx + 1 == max_chars && chars.next().is_some() {
-            let _ = out.push('~');
-            return;
-        }
-        if out.push(ch).is_err() {
-            let _ = out.push('~');
-            return;
-        }
-    }
-}
-
 // ============================================================================
 // Drawing
 // ============================================================================
 
 /// Count menu items that are currently visible (dependency-aware).
-fn visible_count(cfr: &CfrInfo, items: &[MenuItem]) -> usize {
+fn visible_count(cfr: &Model<'_>, items: &[MenuItem]) -> usize {
     items
         .iter()
         .filter(|item| is_item_visible(cfr, items, item))
@@ -892,7 +410,7 @@ fn visible_count(cfr: &CfrInfo, items: &[MenuItem]) -> usize {
 }
 
 /// Return the visible-list position of an item index without allocating.
-fn visible_position_of(cfr: &CfrInfo, items: &[MenuItem], target: usize) -> Option<usize> {
+fn visible_position_of(cfr: &Model<'_>, items: &[MenuItem], target: usize) -> Option<usize> {
     let mut pos = 0usize;
     for (idx, item) in items.iter().enumerate() {
         if !is_item_visible(cfr, items, item) {
@@ -907,7 +425,7 @@ fn visible_position_of(cfr: &CfrInfo, items: &[MenuItem], target: usize) -> Opti
 }
 
 /// Return the item index at a visible-list position without allocating.
-fn visible_index_at(cfr: &CfrInfo, items: &[MenuItem], target_pos: usize) -> Option<usize> {
+fn visible_index_at(cfr: &Model<'_>, items: &[MenuItem], target_pos: usize) -> Option<usize> {
     let mut pos = 0usize;
     for (idx, item) in items.iter().enumerate() {
         if !is_item_visible(cfr, items, item) {
@@ -923,7 +441,7 @@ fn visible_index_at(cfr: &CfrInfo, items: &[MenuItem], target_pos: usize) -> Opt
 
 /// Draw the complete menu
 fn draw_menu(
-    cfr: &CfrInfo,
+    cfr: &Model<'_>,
     items: &[MenuItem],
     selected: usize,
     scroll_offset: usize,
@@ -977,7 +495,7 @@ fn draw_menu(
 
 /// Draw a single menu item
 fn draw_item(
-    cfr: &CfrInfo,
+    cfr: &Model<'_>,
     item: &MenuItem,
     is_selected: bool,
     row: usize,
@@ -985,7 +503,7 @@ fn draw_item(
     cols: usize,
 ) {
     match item {
-        MenuItem::FormHeader { name } => {
+        MenuItem::FormHeader { name, .. } => {
             draw_form_header(name, row, fb_console);
         }
         MenuItem::SubformHeader { name } => {

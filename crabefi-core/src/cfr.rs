@@ -147,104 +147,11 @@ pub struct CfrVarbinaryHeader {
     pub data_length: u32,
 }
 
-/// Enum choice (value and display name)
-#[derive(Debug, Clone)]
-pub struct CfrEnumChoice {
-    pub value: u32,
-    pub ui_name: String,
-}
-
-/// CFR option type with type-specific data
-#[derive(Debug, Clone)]
-pub enum CfrOptionType {
-    /// Boolean option (true/false)
-    Bool { default: bool },
-
-    /// Numeric option with range
-    Number {
-        default: u32,
-        min: u32,
-        max: u32,
-        step: u32,
-        hex_display: bool,
-    },
-
-    /// Enum option with discrete choices
-    Enum {
-        default: u32,
-        choices: Vec<CfrEnumChoice>,
-    },
-
-    /// Variable-length string option
-    Varchar { default: String },
-
-    /// Comment (informational, not editable)
-    Comment,
-}
-
-/// A single CFR option
-#[derive(Debug, Clone)]
-pub struct CfrOption {
-    /// Unique object ID
-    pub object_id: u64,
-    /// Dependency on another option's object_id (0 = none)
-    pub dependency_id: u64,
-    /// Variable name (for storage)
-    pub opt_name: String,
-    /// Display name
-    pub ui_name: String,
-    /// Help text
-    pub ui_helptext: String,
-    /// Option flags
-    pub flags: u32,
-    /// Option type and type-specific data
-    pub option_type: CfrOptionType,
-    /// Dependency values: option is visible when the dependency's current value
-    /// matches one of these. Empty means visible when dependency value != 0.
-    pub dep_values: Vec<u32>,
-}
-
-impl CfrOption {
-    /// Check if this option is editable (ignoring dependency state)
-    pub fn is_editable(&self) -> bool {
-        (self.flags & CFR_OPTFLAG_READONLY) == 0
-            && (self.flags & CFR_OPTFLAG_INACTIVE) == 0
-            && (self.flags & CFR_OPTFLAG_VOLATILE) == 0
-            && !matches!(self.option_type, CfrOptionType::Comment)
-    }
-
-    /// Check if this option is visible (ignoring dependency state)
-    pub fn is_visible(&self) -> bool {
-        (self.flags & CFR_OPTFLAG_SUPPRESS) == 0
-    }
-}
-
-/// A CFR form (category/group of options)
-///
-/// Nested subforms are flattened during parsing: the subform's ui_name is
-/// inserted as a Comment option, then its options are inlined into the parent.
-#[derive(Debug, Clone)]
-pub struct CfrForm {
-    /// Unique object ID
-    pub object_id: u64,
-    /// Dependency on another option's object_id (0 = none)
-    pub dependency_id: u64,
-    /// Display name
-    pub ui_name: String,
-    /// Form flags
-    pub flags: u32,
-    /// Options in this form (including flattened subform options)
-    pub options: Vec<CfrOption>,
-    /// Dependency values for this form
-    pub dep_values: Vec<u32>,
-}
-
-impl CfrForm {
-    /// Check if this form is visible (ignoring dependency state)
-    pub fn is_visible(&self) -> bool {
-        (self.flags & CFR_OPTFLAG_SUPPRESS) == 0
-    }
-}
+// Presentation types are shared with the settings UI in `crabefi-ui`. Parsing
+// and actual variable/CMOS storage remain firmware-owned below.
+pub use crabefi_ui::cfr::{
+    CfrEnumChoice, CfrForm, CfrOption, CfrOptionType, CfrValue, OptionStore,
+};
 
 /// Parsed CFR information
 #[derive(Debug, Clone)]
@@ -313,6 +220,27 @@ impl CfrInfo {
             }
             None => true, // If we can't find the dependency, show the option
         }
+    }
+}
+
+impl crabefi_ui::cfr::SettingsModel for CfrInfo {
+    fn forms(&self) -> &[CfrForm] {
+        &self.forms
+    }
+    fn read_option_value(&self, option: &CfrOption) -> CfrValue {
+        read_option_value(option)
+    }
+    fn write_option_value(&self, option: &CfrOption, value: &CfrValue) -> Result<(), &'static str> {
+        write_option_value(option, value)
+    }
+    fn configured_level(&self) -> log::LevelFilter {
+        crate::logger::configured_level()
+    }
+    fn set_configured_level(&self, level: log::LevelFilter) -> Result<(), &'static str> {
+        crate::logger::set_configured_level(level).map_err(|status| {
+            log::warn!("Failed to persist CrabEFI log level: {:?}", status);
+            "Failed to persist CrabEFI log level"
+        })
     }
 }
 
@@ -927,28 +855,6 @@ fn parse_enum_value(data: &[u8]) -> Option<CfrEnumChoice> {
 pub const COREBOOT_CFR_GUID: r_efi::efi::Guid =
     r_efi::efi::Guid::from_bytes(&crabefi_efi_types::varstore::COREBOOT_CFR_GUID);
 
-/// Value types for CFR options
-#[derive(Debug, Clone, PartialEq)]
-pub enum CfrValue {
-    Bool(bool),
-    Number(u32),
-    Varchar(String),
-}
-
-impl CfrValue {
-    /// Get default value from an option type
-    pub fn from_option_type(opt_type: &CfrOptionType) -> Self {
-        match opt_type {
-            CfrOptionType::Bool { default } => CfrValue::Bool(*default),
-            CfrOptionType::Number { default, .. } | CfrOptionType::Enum { default, .. } => {
-                CfrValue::Number(*default)
-            }
-            CfrOptionType::Varchar { default } => CfrValue::Varchar(default.clone()),
-            CfrOptionType::Comment => CfrValue::Bool(false),
-        }
-    }
-}
-
 /// Convert ASCII string to UCS-2 (UTF-16LE) for UEFI variable names
 fn ascii_to_ucs2(s: &str) -> Vec<u16> {
     let mut result = Vec::with_capacity(s.len() + 1);
@@ -957,17 +863,6 @@ fn ascii_to_ucs2(s: &str) -> Vec<u16> {
     }
     result.push(0); // NULL terminator
     result
-}
-
-/// Storage a platform keeps some options in instead of EFI variables, such
-/// as CMOS RAM. Options it does not keep stay EFI variables.
-pub trait OptionStore: Sync {
-    /// Whether this store keeps `option`.
-    fn keeps(&self, option: &CfrOption) -> bool;
-    /// The stored value of a kept option; `None` while it is unset.
-    fn read(&self, option: &CfrOption) -> Option<CfrValue>;
-    /// Store a kept option.
-    fn write(&self, option: &CfrOption, value: &CfrValue) -> Result<(), &'static str>;
 }
 
 static OPTION_STORE: AtomicPtr<&'static dyn OptionStore> = AtomicPtr::new(core::ptr::null_mut());

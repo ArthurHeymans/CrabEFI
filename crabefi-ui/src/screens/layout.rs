@@ -4,11 +4,16 @@
 //! ThinkPad X61) and large (1080p and up). F8 switches for the session.
 
 use super::render::FontSize;
-use crate::FramebufferConfig;
-use core::sync::atomic::{AtomicU8, Ordering};
+use crate::{FramebufferConfig, Surface};
 
-/// 0: resolution-aware default; 1: large; 2: compact. Session-only preference.
-static TEXT_SIZE: AtomicU8 = AtomicU8::new(0);
+/// The F8 text-size choice. `Auto` follows the resolution.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TextSize {
+    #[default]
+    Auto,
+    Large,
+    Compact,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Metrics {
@@ -56,11 +61,16 @@ fn effective_large(requested: bool, fb: &FramebufferConfig) -> bool {
 }
 
 impl Metrics {
-    pub fn for_fb(fb: &FramebufferConfig) -> Self {
-        let large = match TEXT_SIZE.load(Ordering::Relaxed) {
-            1 => true,
-            2 => false,
-            _ => fb.height >= 900 && fb.width >= 1400,
+    pub fn for_fb(fb: &Surface) -> Self {
+        Self::for_size(fb, fb.text_size())
+    }
+
+    /// Metrics of a framebuffer with an explicit text-size choice.
+    pub fn for_size(fb: &FramebufferConfig, size: TextSize) -> Self {
+        let large = match size {
+            TextSize::Large => true,
+            TextSize::Compact => false,
+            TextSize::Auto => fb.height >= 900 && fb.width >= 1400,
         };
         Self::for_request(fb, large)
     }
@@ -157,9 +167,13 @@ impl Metrics {
     }
 }
 
-pub fn toggle_text_size(fb: &FramebufferConfig) {
+pub fn toggle_text_size(fb: &Surface) {
     let large = Metrics::for_fb(fb).large;
-    TEXT_SIZE.store(if large { 2 } else { 1 }, Ordering::Relaxed);
+    fb.set_text_size(if large {
+        TextSize::Compact
+    } else {
+        TextSize::Large
+    });
 }
 
 #[cfg(test)]
@@ -270,10 +284,10 @@ mod tests {
             blue_mask_pos: 0,
             blue_mask_size: 8,
         };
-        assert!(!Metrics::for_fb(&fb(1024, 768)).large);
-        assert!(!Metrics::for_fb(&fb(1280, 800)).large);
-        assert!(Metrics::for_fb(&fb(1920, 1080)).large);
-        let m = Metrics::for_fb(&fb(1024, 768));
+        assert!(!Metrics::for_size(&fb(1024, 768), TextSize::Auto).large);
+        assert!(!Metrics::for_size(&fb(1280, 800), TextSize::Auto).large);
+        assert!(Metrics::for_size(&fb(1920, 1080), TextSize::Auto).large);
+        let m = Metrics::for_size(&fb(1024, 768), TextSize::Auto);
         let (_, _, w, _) = m.canvas(&fb(1024, 768));
         assert!(m.side_width(w).is_some() && m.help_width(w).is_some());
     }

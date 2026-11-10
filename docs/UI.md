@@ -88,6 +88,12 @@ key/modifier snapshots, or at least `key_state` for Shift+Tab navigation.
 
 ## Layout and implementation
 
+The screens live in `crabefi-ui/src/screens/` (the `ui/` modules below). They
+draw on a `Surface`, which carries the session's paint state and reaches the
+host only through the `Backend` trait. `crabefi-core/src/ui/` is the firmware
+backend; `ui-harness` is a simulated one for tests. See
+[UI Testing](UI_TESTING.md).
+
 - `ui/theme.rs` owns the palette and the dimmed backdrop mapping.
 - `ui/layout.rs` owns typography and physical metrics for both modes.
 - `ui/kit.rs` owns chrome: header and tabs, key legend, notice strip, pane

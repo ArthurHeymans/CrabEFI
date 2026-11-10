@@ -1,0 +1,29 @@
+[package]
+name = "crabefi-ui-harness"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/ArthurHeymans/CrabEFI"
+description = "Simulated test host for the CrabEFI setup UI, native and WebAssembly"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+crabefi-ui = { path = "../crabefi-ui", features = ["screens", "secure-boot", "cfr"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+png = "0.18"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# build.sh takes the matching wasm-bindgen-cli version from Cargo.lock.
+wasm-bindgen = "0.2"
+console_error_panic_hook = "0.1"
+
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = "z"
+codegen-units = 1

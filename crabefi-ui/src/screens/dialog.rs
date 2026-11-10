@@ -10,12 +10,7 @@ use super::{
     render::{self, Rgb},
     theme,
 };
-use crate::{
-    FramebufferConfig,
-    cursor::CursorRenderer,
-    menu_common::{self, KeyPress},
-    time::delay_ms,
-};
+use crate::{KeyPress, Surface, cursor::CursorRenderer};
 use alloc::{string::String, vec::Vec};
 
 pub type Rect = (i32, i32, u32, u32);
@@ -51,7 +46,7 @@ pub fn wrap_lines(text: &str, columns: usize) -> Vec<String> {
     lines
 }
 /// Compatibility: wrapped small text clipped to `rect`.
-pub fn wrapped(fb: &FramebufferConfig, rect: Rect, text: &str, color: Rgb) {
+pub fn wrapped(fb: &Surface, rect: Rect, text: &str, color: Rgb) {
     let m = Metrics::for_fb(fb);
     let lines = (rect.3 / m.small_line).max(1) as usize;
     kit::prose(fb, rect.0, rect.1, rect.2, text, m.small, color, lines);
@@ -118,7 +113,7 @@ impl<'a> Choice<'a> {
     }
 }
 
-fn block_key_width(fb: &FramebufferConfig, blocks: &[Block]) -> u32 {
+fn block_key_width(fb: &Surface, blocks: &[Block]) -> u32 {
     let m = Metrics::for_fb(fb);
     blocks
         .iter()
@@ -132,7 +127,7 @@ fn block_key_width(fb: &FramebufferConfig, blocks: &[Block]) -> u32 {
 }
 
 /// Lays out blocks, optionally painting. Returns the height used.
-fn blocks(fb: &FramebufferConfig, x: i32, y: i32, w: u32, blocks: &[Block], paint: bool) -> u32 {
+fn blocks(fb: &Surface, x: i32, y: i32, w: u32, blocks: &[Block], paint: bool) -> u32 {
     let m = Metrics::for_fb(fb);
     let cols = (w / render::font_width(m.body)).max(1) as usize;
     let key_w = block_key_width(fb, blocks).min(w / 2);
@@ -215,11 +210,11 @@ fn blocks(fb: &FramebufferConfig, x: i32, y: i32, w: u32, blocks: &[Block], pain
     (cy - y) as u32
 }
 
-fn modal_width(fb: &FramebufferConfig, preferred: u32) -> u32 {
+fn modal_width(fb: &Surface, preferred: u32) -> u32 {
     let m = Metrics::for_fb(fb);
     fb.width.saturating_sub(m.pad * 2).min(preferred)
 }
-fn center_modal(fb: &FramebufferConfig, w: u32, h: u32) -> Rect {
+fn center_modal(fb: &Surface, w: u32, h: u32) -> Rect {
     let m = Metrics::for_fb(fb);
     let avail = fb.height.saturating_sub(m.header + m.footer);
     let h = h.min(avail.saturating_sub(16));
@@ -239,7 +234,7 @@ fn change_lead(from: &str, width: u32, font: render::FontSize) -> String {
     )
 }
 
-fn choice_widths(fb: &FramebufferConfig, choices: &[Choice<'_>]) -> Vec<u32> {
+fn choice_widths(fb: &Surface, choices: &[Choice<'_>]) -> Vec<u32> {
     let m = Metrics::for_fb(fb);
     choices
         .iter()
@@ -247,7 +242,7 @@ fn choice_widths(fb: &FramebufferConfig, choices: &[Choice<'_>]) -> Vec<u32> {
         .collect()
 }
 
-fn choice_height(fb: &FramebufferConfig, width: u32, choices: &[Choice<'_>]) -> u32 {
+fn choice_height(fb: &Surface, width: u32, choices: &[Choice<'_>]) -> u32 {
     let widths = choice_widths(fb, choices);
     let total = widths.iter().sum::<u32>() + 12 * widths.len().saturating_sub(1) as u32;
     let m = Metrics::for_fb(fb);
@@ -260,7 +255,7 @@ fn choice_height(fb: &FramebufferConfig, width: u32, choices: &[Choice<'_>]) -> 
 
 /// Right-aligned choices, stacked when a complete row will not fit.
 fn choice_row(
-    fb: &FramebufferConfig,
+    fb: &Surface,
     right: i32,
     y: i32,
     available: u32,
@@ -296,11 +291,11 @@ fn choice_row(
     rects
 }
 
-fn modal_backdrop(backdrop: Backdrop<'_>) {
-    theme::dimmed(backdrop);
+fn modal_backdrop(fb: &Surface, backdrop: Backdrop<'_>) {
+    fb.dimmed(backdrop);
     // Platform backdrops need not use draw_shell, so they need not reset the
     // registry. Only the new modal surface may participate in hover tracking.
-    controls::clear_buttons();
+    controls::clear_buttons(fb);
 }
 
 fn shortcut_choice(choices: &[Choice<'_>], key: KeyPress) -> Option<usize> {
@@ -309,7 +304,7 @@ fn shortcut_choice(choices: &[Choice<'_>], key: KeyPress) -> Option<usize> {
         .flatten()
 }
 
-fn modal_keys(fb: &FramebufferConfig, esc: &str, extra: &[(&str, &str)]) {
+fn modal_keys(fb: &Surface, esc: &str, extra: &[(&str, &str)]) {
     let mut keys: Vec<(&str, &str)> =
         alloc::vec![("Tab Left Right", "Move"), ("Enter", "Activate")];
     keys.extend_from_slice(extra);
@@ -319,14 +314,15 @@ fn modal_keys(fb: &FramebufferConfig, esc: &str, extra: &[(&str, &str)]) {
 
 /// Focus starts on, and Escape returns, choice 0: callers put the safe
 /// option first.
-pub fn modal(
-    fb: &FramebufferConfig,
+pub async fn modal(
+    fb: &crate::Surface,
     backdrop: Backdrop<'_>,
     tone: Tone,
     title: &str,
     content: &[Block],
     choices: &[Choice<'_>],
 ) -> usize {
+    let _scope = fb.dialog_scope(title);
     assert!(!choices.is_empty() && choices.len() <= 3);
     let mut cursor = CursorRenderer::new();
     let mut focused = 0usize;
@@ -359,7 +355,7 @@ pub fn modal(
         };
         let h = chrome + body_h.min(room);
         let rect = center_modal(fb, w, h);
-        modal_backdrop(backdrop);
+        modal_backdrop(fb, backdrop);
         let body = kit::modal_frame(fb, rect, tone, &title);
         if overflow {
             let mut y = body.1;
@@ -400,7 +396,7 @@ pub fn modal(
         loop {
             super::poll_and_render_cursor(fb, &mut cursor);
             super::track_hover(fb, &mut cursor, &mut hover, None);
-            if let Some(key) = menu_common::read_key() {
+            if let Some(key) = fb.key() {
                 let activation = match key {
                     KeyPress::Escape => {
                         cursor.hide(fb);
@@ -441,7 +437,7 @@ pub fn modal(
                     return i;
                 }
             }
-            delay_ms(8);
+            fb.wait_for_frame().await;
         }
     }
 }
@@ -462,8 +458,8 @@ fn choice_kind(label: &str, index: usize) -> ButtonKind {
 }
 
 /// Compatibility choice API: one paragraph, safe choice first.
-pub fn choose(
-    fb: &FramebufferConfig,
+pub async fn choose(
+    fb: &crate::Surface,
     backdrop: Backdrop<'_>,
     title: &str,
     message: &str,
@@ -475,7 +471,7 @@ pub fn choose(
         .map(|(i, l)| Choice::new(l, (i == 0).then_some("Esc"), choice_kind(l, i)))
         .collect();
     let content: Vec<Block> = message.split("\n\n").map(Block::text).collect();
-    modal(fb, backdrop, Tone::Neutral, title, &content, &choices)
+    modal(fb, backdrop, Tone::Neutral, title, &content, &choices).await
 }
 
 // ─── Trust review ───────────────────────────────────────────────────────
@@ -535,7 +531,7 @@ impl ReviewSection {
     }
 }
 
-fn section_label_width(fb: &FramebufferConfig, sections: &[ReviewSection]) -> u32 {
+fn section_label_width(fb: &Surface, sections: &[ReviewSection]) -> u32 {
     let m = Metrics::for_fb(fb);
     sections
         .iter()
@@ -561,12 +557,7 @@ struct VLine {
 const SECTION_TOP: u32 = 8;
 const SECTION_BOTTOM: u32 = 6;
 
-fn layout_section(
-    fb: &FramebufferConfig,
-    w: u32,
-    label_w: u32,
-    section: &ReviewSection,
-) -> Vec<VLine> {
+fn layout_section(fb: &Surface, w: u32, label_w: u32, section: &ReviewSection) -> Vec<VLine> {
     let m = Metrics::for_fb(fb);
     let tw = w.saturating_sub(label_w);
     let mut out = Vec::new();
@@ -599,7 +590,7 @@ fn vlines_height(lines: &[VLine]) -> u32 {
 }
 
 fn paint_vlines(
-    fb: &FramebufferConfig,
+    fb: &Surface,
     x: i32,
     y: i32,
     w: u32,
@@ -741,8 +732,8 @@ fn block_sections(blocks: &[Block]) -> Vec<ReviewSection> {
 /// Identity-before-consent review. Normally `intro`/`outro` stay fixed and
 /// sections page by whole blocks; on short screens they join the pages.
 /// Confirm stays unavailable until every line was actually on screen.
-pub fn review(
-    fb: &FramebufferConfig,
+pub async fn review(
+    fb: &crate::Surface,
     backdrop: Backdrop<'_>,
     title: &str,
     intro: &[Block],
@@ -750,6 +741,7 @@ pub fn review(
     outro: &[Block],
     confirm: Option<&str>,
 ) -> bool {
+    let _scope = fb.dialog_scope(title);
     let mut cursor = CursorRenderer::new();
     let mut page = 0usize;
     let mut focused = 0usize;
@@ -824,7 +816,7 @@ pub fn review(
         let list_h = if pages.len() == 1 { natural } else { room };
         let h = fixed + list_h;
         let rect = center_modal(fb, w, h);
-        modal_backdrop(backdrop);
+        modal_backdrop(fb, backdrop);
         let body = kit::modal_frame(fb, rect, Tone::Ok, title);
         let mut y = body.1;
         if !compact {
@@ -912,7 +904,7 @@ pub fn review(
         loop {
             super::poll_and_render_cursor(fb, &mut cursor);
             super::track_hover(fb, &mut cursor, &mut hover, None);
-            if let Some(key) = menu_common::read_key() {
+            if let Some(key) = fb.key() {
                 let activation = match key {
                     KeyPress::Escape => {
                         cursor.hide(fb);
@@ -979,7 +971,7 @@ pub fn review(
                     None => {}
                 }
             }
-            delay_ms(8);
+            fb.wait_for_frame().await;
         }
     }
 }
@@ -987,7 +979,7 @@ pub fn review(
 // ─── Anchored popovers ──────────────────────────────────────────────────
 
 /// Below the anchor's value side, flipped above when there is no room.
-fn popover_rect(fb: &FramebufferConfig, anchor: Option<Rect>, w: u32, h: u32) -> Rect {
+fn popover_rect(fb: &Surface, anchor: Option<Rect>, w: u32, h: u32) -> Rect {
     let m = Metrics::for_fb(fb);
     let top_limit = m.header as i32 + 4;
     let bottom_limit = (fb.height - m.footer) as i32 - 4;
@@ -1008,7 +1000,7 @@ fn popover_rect(fb: &FramebufferConfig, anchor: Option<Rect>, w: u32, h: u32) ->
     (x, y, w, h)
 }
 
-fn popover_frame(fb: &FramebufferConfig, rect: Rect, title: &str) -> i32 {
+fn popover_frame(fb: &Surface, rect: Rect, title: &str) -> i32 {
     let m = Metrics::for_fb(fb);
     let (x, y, w, h) = rect;
     render::fill_rect(fb, x, y, w, h, theme::SHEET);
@@ -1027,7 +1019,7 @@ fn popover_frame(fb: &FramebufferConfig, rect: Rect, title: &str) -> i32 {
     y + th as i32 + 1
 }
 
-fn radio(fb: &FramebufferConfig, cx: i32, cy: i32, on: bool, bg: Rgb) {
+fn radio(fb: &Surface, cx: i32, cy: i32, on: bool, bg: Rgb) {
     render::draw_dot(fb, cx, cy, 7, theme::INK2);
     render::draw_dot(fb, cx, cy, 5, bg);
     if on {
@@ -1083,7 +1075,7 @@ struct ChoiceRow<'a> {
     hovered: bool,
 }
 
-fn paint_choice_row(fb: &FramebufferConfig, r: &ChoiceRow<'_>) {
+fn paint_choice_row(fb: &Surface, r: &ChoiceRow<'_>) {
     let m = Metrics::for_fb(fb);
     let row = r.rect;
     let mut c = Control::new(0, Role::Option, r.label);
@@ -1124,8 +1116,8 @@ fn paint_choice_row(fb: &FramebufferConfig, r: &ChoiceRow<'_>) {
 /// current value (filled radio) are distinct. A row click only moves focus;
 /// "Use value" or Enter applies, Escape or Cancel leaves the value alone.
 #[allow(clippy::too_many_arguments)]
-pub fn select(
-    fb: &FramebufferConfig,
+pub async fn select(
+    fb: &crate::Surface,
     backdrop: Backdrop<'_>,
     anchor: Option<Rect>,
     title: &str,
@@ -1133,6 +1125,7 @@ pub fn select(
     initial: usize,
     tags: &[(usize, &str)],
 ) -> Option<usize> {
+    let _scope = fb.dialog_scope(title);
     if labels.is_empty() {
         return None;
     }
@@ -1176,7 +1169,7 @@ pub fn select(
         );
         backdrop();
         // The page behind a popover is visible but not clickable.
-        controls::clear_buttons();
+        controls::clear_buttons(fb);
         let top = popover_frame(fb, rect, title);
         let list = (rect.0 + 2, top, rect.2 - 4, slots as u32 * m.row);
         let gutter = if labels.len() > slots {
@@ -1248,7 +1241,7 @@ pub fn select(
         loop {
             super::poll_and_render_cursor(fb, &mut cursor);
             super::track_hover(fb, &mut cursor, &mut hover, None);
-            let (mx, my) = crate::drivers::mouse_cursor::position();
+            let (mx, my) = fb.position();
             let under = contains((list.0, list.1, list.2 - gutter, list.3), mx, my)
                 .then(|| offset + ((my - list.1) as u32 / m.row) as usize)
                 .filter(|i| *i < labels.len() && *i < offset + slots);
@@ -1272,7 +1265,7 @@ pub fn select(
                     );
                 });
             }
-            if let Some(key) = menu_common::read_key() {
+            if let Some(key) = fb.key() {
                 match key {
                     KeyPress::Escape => {
                         cursor.hide(fb);
@@ -1358,7 +1351,7 @@ pub fn select(
                     _ => {}
                 }
             }
-            delay_ms(8);
+            fb.wait_for_frame().await;
         }
     }
 }
@@ -1492,8 +1485,8 @@ impl Editor {
 /// Single-line field editor. With an anchor it is a popover on the row;
 /// without one it is a modal over the dimmed screen.
 #[allow(clippy::too_many_arguments)]
-pub fn input(
-    fb: &FramebufferConfig,
+pub async fn input(
+    fb: &crate::Surface,
     backdrop: Backdrop<'_>,
     anchor: Option<Rect>,
     title: &str,
@@ -1505,12 +1498,13 @@ pub fn input(
     input_with(
         fb, backdrop, anchor, title, hint, initial, limit, true, validate,
     )
+    .await
 }
 
 /// `input`, choosing whether Space on the Apply button commits.
 #[allow(clippy::too_many_arguments)]
-pub fn input_with(
-    fb: &FramebufferConfig,
+pub async fn input_with(
+    fb: &crate::Surface,
     backdrop: Backdrop<'_>,
     anchor: Option<Rect>,
     title: &str,
@@ -1520,6 +1514,7 @@ pub fn input_with(
     space_commits: bool,
     validate: impl Fn(&str) -> Result<(), &'static str>,
 ) -> Option<String> {
+    let _scope = fb.dialog_scope(title);
     let mut editor = Editor::with_limit(initial, limit);
     editor.space_commits = space_commits;
     let mut cursor = CursorRenderer::new();
@@ -1538,13 +1533,13 @@ pub fn input_with(
             let rect = popover_rect(fb, anchor, w, h);
             backdrop();
             // The page behind a popover is visible but not clickable.
-            controls::clear_buttons();
+            controls::clear_buttons(fb);
             let top = popover_frame(fb, rect, title);
             (rect.0 + 12, top + 10, rect.2 - 24, rect)
         } else {
             let h = kit::modal_head_height(fb) + m.gap * 3 + field_h + message_h + m.button + 12;
             let rect = center_modal(fb, w, h);
-            modal_backdrop(backdrop);
+            modal_backdrop(fb, backdrop);
             let body = kit::modal_frame(fb, rect, Tone::Neutral, title);
             (body.0, body.1, body.2, rect)
         };
@@ -1636,7 +1631,7 @@ pub fn input_with(
         loop {
             super::track_hover(fb, &mut cursor, &mut hover, None);
             super::poll_and_render_cursor(fb, &mut cursor);
-            if let Some(key) = menu_common::read_key() {
+            if let Some(key) = fb.key() {
                 if key == KeyPress::F8 {
                     layout::toggle_text_size(fb);
                     break;
@@ -1680,7 +1675,7 @@ pub fn input_with(
                 }
                 break;
             }
-            delay_ms(8);
+            fb.wait_for_frame().await;
         }
     }
 }
@@ -1691,7 +1686,7 @@ mod tests {
     #[test]
     fn narrow_modal_choices_fit_and_repaints_replace_the_hover_registry() {
         let mut pixels = std::vec![0u32; 640 * 480];
-        let fb = FramebufferConfig {
+        let fb = crate::test_surface(crate::FramebufferConfig {
             physical_address: pixels.as_mut_ptr() as u64,
             width: 640,
             height: 480,
@@ -1703,7 +1698,7 @@ mod tests {
             green_mask_size: 8,
             blue_mask_pos: 0,
             blue_mask_size: 8,
-        };
+        });
         let choices = [
             Choice::new("Keep editing", Some("Esc"), ButtonKind::Neutral),
             Choice::new("Discard and restart", None, ButtonKind::Danger),
@@ -1713,13 +1708,16 @@ mod tests {
         let h = choice_height(&fb, w, &choices);
         assert!(h > Metrics::for_fb(&fb).button);
         for _ in 0..3 {
-            modal_backdrop(&|| {});
+            modal_backdrop(&fb, &|| {});
             let rects = choice_row(&fb, 580, 100, w, &choices, Some(0), &[]);
             for r in &rects {
                 assert!(r.0 >= 60 && r.0 + r.2 as i32 <= 580);
                 assert!(r.1 + r.3 as i32 <= 100 + h as i32);
             }
-            assert_eq!(controls::button_at(rects[0].0 + 5, rects[0].1 + 5), Some(0));
+            assert_eq!(
+                controls::button_at(&fb, rects[0].0 + 5, rects[0].1 + 5),
+                Some(0)
+            );
         }
         assert_eq!(shortcut_choice(&choices, KeyPress::F10), Some(2));
         assert_eq!(shortcut_choice(&choices, KeyPress::Enter), None);

@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>CrabEFI setup UI</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="style.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <header>
+    <h1>CrabEFI <span>setup UI</span></h1>
+    <p>The firmware's setup screens, compiled from the same Rust to WebAssembly. Boot devices, firmware settings and Secure Boot variables are simulated in memory; nothing here changes your computer.</p>
+  </header>
+  <main>
+    <section class="controls" aria-label="Simulation">
+      <label>Fixture <select id="scenario"></select></label>
+      <label>Framebuffer
+        <select id="resolution">
+          <option>1024x768</option>
+          <option>640x400</option>
+          <option>800x600</option>
+          <option>1280x720</option>
+          <option>1920x1080</option>
+        </select>
+      </label>
+      <label class="toggle"><input id="fail-writes" type="checkbox">Fail variable writes</label>
+      <button id="reset" type="button">Reset</button>
+      <button id="pause" type="button" aria-pressed="false">Pause clock</button>
+    </section>
+    <div class="display">
+      <canvas id="screen" width="1024" height="768" tabindex="0" role="application" aria-label="CrabEFI setup UI. F6 leaves the display."></canvas>
+    </div>
+    <p id="status" role="status" aria-live="polite">Loading…</p>
+    <p id="error" role="alert" hidden></p>
+    <p class="help">Click the display to give it the keyboard; F6 returns to these controls. Tab and the arrows move, Enter activates, Esc goes back, and B, S and F switch pages. F8 changes the text size, E edits a Linux command line and F10 saves firmware settings.</p>
+    <details>
+      <summary>Simulation state</summary>
+      <pre id="state"></pre>
+    </details>
+    <footer>Built from <a href="https://github.com/ArthurHeymans/CrabEFI">CrabEFI</a> @REVISION@ · <a href="https://github.com/ArthurHeymans/CrabEFI/blob/master/docs/UI_TESTING.md">how this is tested</a></footer>
+  </main>
+  <noscript>This page needs JavaScript to load the WebAssembly UI.</noscript>
+</body>
+</html>

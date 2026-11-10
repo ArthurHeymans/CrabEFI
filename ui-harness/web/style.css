@@ -1,0 +1,28 @@
+:root { font: 14px/1.5 system-ui, sans-serif; color: #d9e1e8; background: #101318; }
+* { box-sizing: border-box; }
+body { margin: 0 auto; padding: 20px; max-width: 1320px; }
+h1 { font-size: 20px; margin: 0; color: #8ff5ff; }
+h1 span { color: #a4b0bb; font-weight: 400; }
+p { margin: 8px 0 16px; }
+header p, .help { max-width: 100ch; color: #a4b0bb; }
+.controls { display: flex; align-items: end; flex-wrap: wrap; gap: 10px; margin: 16px 0; }
+label { display: grid; gap: 4px; color: #a4b0bb; font-size: 12px; }
+label.toggle { display: flex; align-items: center; gap: 6px; min-height: 36px; }
+.toggle input { accent-color: #8ff5ff; }
+button, select { font: inherit; color: #d9e1e8; border: 1px solid #46515c; border-radius: 4px; background: #1a2028; padding: 7px 10px; min-height: 36px; }
+button { cursor: pointer; }
+button:hover { border-color: #8ff5ff; }
+button:focus-visible, select:focus-visible, summary:focus-visible { outline: 2px solid #8ff5ff; outline-offset: 3px; }
+button[aria-pressed="true"] { color: #8ff5ff; border-color: #8ff5ff; }
+.display { background: #080a0d; overflow: auto; border: 1px solid #323b45; }
+canvas { display: block; max-width: 100%; height: auto; margin: auto; cursor: none; touch-action: none; }
+canvas:focus { outline: 2px solid #8ff5ff; outline-offset: -2px; }
+#status { font-family: monospace; color: #8ff5ff; overflow-wrap: anywhere; }
+#error { color: #ff9995; white-space: pre-wrap; }
+.help, footer { font-size: 12px; }
+details { margin-top: 16px; border-top: 1px solid #323b45; padding-top: 12px; }
+summary { cursor: pointer; }
+a { color: inherit; }
+pre { background: #0c0e12; padding: 12px; overflow: auto; font-size: 12px; }
+footer { color: #88939e; margin-top: 20px; }
+@media (max-width: 600px) { body { padding: 12px; } .controls { gap: 8px; } }

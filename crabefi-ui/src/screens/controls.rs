@@ -2,9 +2,8 @@
 //! Descriptions borrow live state; they are not a second retained UI tree or an AT API.
 
 use super::{dialog::Rect, layout::Metrics, render, theme};
-use crate::{FramebufferConfig, menu_common::KeyPress};
+use crate::{KeyPress, Surface};
 use alloc::string::String;
-use alloc::vec::Vec;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Group {
@@ -150,12 +149,7 @@ pub enum ButtonKind {
 
 /// List row: tint for selection, a left bar and bold label (drawn by the
 /// caller), and an inset ink outline for keyboard focus. Returns the fill.
-pub fn row(
-    fb: &FramebufferConfig,
-    rect: Rect,
-    control: &Control<'_>,
-    hovered: bool,
-) -> render::Rgb {
+pub fn row(fb: &Surface, rect: Rect, control: &Control<'_>, hovered: bool) -> render::Rgb {
     let (x, y, w, h) = rect;
     let bg = if control.selected {
         theme::SELECTED
@@ -179,17 +173,12 @@ pub fn row(
 }
 
 /// Compatibility name: a bordered surface used by platform integrations.
-pub fn frame(
-    fb: &FramebufferConfig,
-    rect: Rect,
-    control: &Control<'_>,
-    hovered: bool,
-) -> render::Rgb {
+pub fn frame(fb: &Surface, rect: Rect, control: &Control<'_>, hovered: bool) -> render::Rgb {
     row(fb, rect, control, hovered)
 }
 
 /// Bordered key cap such as `[F10]`. Returns its width.
-pub fn keycap(fb: &FramebufferConfig, x: i32, y: i32, label: &str, on_accent: bool) -> u32 {
+pub fn keycap(fb: &Surface, x: i32, y: i32, label: &str, on_accent: bool) -> u32 {
     keycap_on(
         fb,
         x,
@@ -204,7 +193,7 @@ pub fn keycap(fb: &FramebufferConfig, x: i32, y: i32, label: &str, on_accent: bo
     )
 }
 fn keycap_on(
-    fb: &FramebufferConfig,
+    fb: &Surface,
     x: i32,
     y: i32,
     label: &str,
@@ -224,11 +213,11 @@ fn keycap_on(
     render::draw_text_bold(fb, x + 5, y + 2, label, m.small, fg, Some(bg));
     w
 }
-pub fn keycap_width(fb: &FramebufferConfig, label: &str) -> u32 {
+pub fn keycap_width(fb: &Surface, label: &str) -> u32 {
     render::text_width(label, Metrics::for_fb(fb).small) + 10
 }
 
-pub fn button(fb: &FramebufferConfig, rect: Rect, control: &Control<'_>, kind: ButtonKind) {
+pub fn button(fb: &Surface, rect: Rect, control: &Control<'_>, kind: ButtonKind) {
     button_with_key(fb, rect, control, kind, None);
 }
 
@@ -238,7 +227,7 @@ pub fn button(fb: &FramebufferConfig, rect: Rect, control: &Control<'_>, kind: B
 // shared tracker can highlight whatever button is under the pointer on any
 // page, dialog or popover. A full repaint starts a new record.
 
-struct PaintedButton {
+pub(crate) struct PaintedButton {
     rect: Rect,
     label: String,
     key: Option<String>,
@@ -246,41 +235,25 @@ struct PaintedButton {
     focused: bool,
     enabled: bool,
 }
-#[cfg(not(test))]
-static PAINTED: spin::Mutex<Vec<PaintedButton>> = spin::Mutex::new(Vec::new());
-#[cfg(not(test))]
-fn painted<R>(f: impl FnOnce(&mut Vec<PaintedButton>) -> R) -> R {
-    f(&mut PAINTED.lock())
-}
-// Unit tests paint concurrently; firmware has one UI thread.
-#[cfg(test)]
-std::thread_local! {
-    static PAINTED: core::cell::RefCell<Vec<PaintedButton>> = const { core::cell::RefCell::new(Vec::new()) };
-}
-#[cfg(test)]
-fn painted<R>(f: impl FnOnce(&mut Vec<PaintedButton>) -> R) -> R {
-    PAINTED.with(|p| f(&mut p.borrow_mut()))
-}
-
 /// Forget recorded buttons: the surface is about to be repainted or covered.
-pub fn clear_buttons() {
-    painted(Vec::clear);
+pub fn clear_buttons(fb: &Surface) {
+    fb.buttons().clear();
 }
 
 /// Index of the enabled, recorded button under `(x, y)`; later paints win.
-pub fn button_at(x: i32, y: i32) -> Option<usize> {
-    painted(|p| {
-        p.iter()
-            .rposition(|b| b.enabled && super::dialog::contains(b.rect, x, y))
-    })
+pub fn button_at(fb: &Surface, x: i32, y: i32) -> Option<usize> {
+    fb.buttons()
+        .iter()
+        .rposition(|b| b.enabled && super::dialog::contains(b.rect, x, y))
 }
 
 /// Repaint one recorded button with or without its hover state.
-pub fn repaint_button(fb: &FramebufferConfig, index: usize, hovered: bool) {
-    let Some((rect, label, key, kind, focused)) = painted(|p| {
-        p.get(index)
-            .map(|b| (b.rect, b.label.clone(), b.key.clone(), b.kind, b.focused))
-    }) else {
+pub fn repaint_button(fb: &Surface, index: usize, hovered: bool) {
+    let painted = fb
+        .buttons()
+        .get(index)
+        .map(|b| (b.rect, b.label.clone(), b.key.clone(), b.kind, b.focused));
+    let Some((rect, label, key, kind, focused)) = painted else {
         return;
     };
     let mut c = Control::new(0, Role::Button, &label);
@@ -291,29 +264,27 @@ pub fn repaint_button(fb: &FramebufferConfig, index: usize, hovered: bool) {
 /// Left-aligned label, optional key cap at the right. Focus is a 2px ink
 /// ring outside the button, independent of the Primary fill.
 pub fn button_with_key(
-    fb: &FramebufferConfig,
+    fb: &Surface,
     rect: Rect,
     control: &Control<'_>,
     kind: ButtonKind,
     key: Option<&str>,
 ) {
-    if !theme::is_dimmed() {
-        painted(|p| {
-            p.push(PaintedButton {
-                rect,
-                label: String::from(control.label),
-                key: key.map(String::from),
-                kind,
-                focused: control.focused,
-                enabled: control.enabled,
-            })
+    if !fb.is_dimmed() {
+        fb.buttons().push(PaintedButton {
+            rect,
+            label: String::from(control.label),
+            key: key.map(String::from),
+            kind,
+            focused: control.focused,
+            enabled: control.enabled,
         });
     }
     paint_button(fb, rect, control, kind, key, false);
 }
 
 fn paint_button(
-    fb: &FramebufferConfig,
+    fb: &Surface,
     rect: Rect,
     control: &Control<'_>,
     kind: ButtonKind,
@@ -374,7 +345,7 @@ fn paint_button(
 }
 
 /// Natural width of a button for its label and key cap.
-pub fn button_width(fb: &FramebufferConfig, label: &str, key: Option<&str>) -> u32 {
+pub fn button_width(fb: &Surface, label: &str, key: Option<&str>) -> u32 {
     let m = Metrics::for_fb(fb);
     render::text_width(label, m.body) + 28 + key.map_or(0, |k| keycap_width(fb, k) + 14)
 }
@@ -392,7 +363,7 @@ pub fn scroll(offset: &mut usize, delta: i32, total: usize, slots: usize) {
 /// Restore the region outline after partial row repaints too: a hovered row
 /// must not erase keyboard focus when its selected target is off screen.
 pub fn viewport_focus(
-    fb: &FramebufferConfig,
+    fb: &Surface,
     list: Rect,
     focused: bool,
     selected: usize,
@@ -433,7 +404,7 @@ pub fn scrollbar_thumb(
 }
 
 /// Thin track at the right edge of `list`, inside the scroll gutter.
-pub fn scrollbar(fb: &FramebufferConfig, list: Rect, total: usize, offset: usize, slots: usize) {
+pub fn scrollbar(fb: &Surface, list: Rect, total: usize, offset: usize, slots: usize) {
     let Some((top, thumb)) = scrollbar_thumb(list.3, total, offset, slots) else {
         return;
     };
@@ -549,7 +520,7 @@ mod tests {
     fn button_hover_is_shared_reversible_and_ignores_dimmed_backdrops() {
         let (width, height) = (320u32, 120u32);
         let mut pixels = std::vec![0u32; (width * height) as usize];
-        let fb = FramebufferConfig {
+        let fb = crate::test_surface(crate::FramebufferConfig {
             physical_address: pixels.as_mut_ptr() as u64,
             width,
             height,
@@ -561,9 +532,9 @@ mod tests {
             green_mask_size: 8,
             blue_mask_pos: 0,
             blue_mask_size: 8,
-        };
-        clear_buttons();
-        theme::dimmed(|| {
+        });
+        clear_buttons(&fb);
+        fb.dimmed(|| {
             button_with_key(
                 &fb,
                 (10, 10, 120, 36),
@@ -572,7 +543,11 @@ mod tests {
                 None,
             )
         });
-        assert_eq!(button_at(20, 20), None, "dimmed backdrop buttons are inert");
+        assert_eq!(
+            button_at(&fb, 20, 20),
+            None,
+            "dimmed backdrop buttons are inert"
+        );
         let save = Control::new(1, Role::Button, "Save");
         button_with_key(
             &fb,
@@ -582,7 +557,7 @@ mod tests {
             Some("F10"),
         );
         let painted = pixels.clone();
-        let index = button_at(20, 70).expect("live button is hoverable");
+        let index = button_at(&fb, 20, 70).expect("live button is hoverable");
         repaint_button(&fb, index, true);
         assert_ne!(pixels, painted, "hover is visible");
         repaint_button(&fb, index, false);
@@ -596,9 +571,13 @@ mod tests {
             ButtonKind::Neutral,
             None,
         );
-        assert_eq!(button_at(180, 70), None, "disabled buttons do not react");
-        clear_buttons();
-        assert_eq!(button_at(20, 70), None);
+        assert_eq!(
+            button_at(&fb, 180, 70),
+            None,
+            "disabled buttons do not react"
+        );
+        clear_buttons(&fb);
+        assert_eq!(button_at(&fb, 20, 70), None);
     }
 
     #[test]

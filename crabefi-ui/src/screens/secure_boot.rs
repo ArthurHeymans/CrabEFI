@@ -4,16 +4,13 @@
 use super::{
     NavItem, ScreenNav, canvas,
     controls::{self, ButtonKind, Control, Focus, FocusEvent, Group, Role},
-    dialog::{self, Block, Choice, LineKind, Rect, ReviewSection},
+    dialog::{self, Block, Choice, Rect},
     kit::{self, Fact, StripButton, Tone},
     layout::Metrics,
     render, theme,
 };
 use crate::{
-    FramebufferConfig as FramebufferInfo,
-    cursor::CursorRenderer,
-    menu_common::{self, KeyPress},
-    time::delay_ms,
+    KeyPress, Screen, SecurityAction, Surface as FramebufferInfo, UiState, cursor::CursorRenderer,
 };
 use alloc::{string::String, vec::Vec};
 use core::fmt::Write;
@@ -41,8 +38,8 @@ struct ActionText {
     button: &'static str,
 }
 
-fn action_text(idx: usize) -> ActionText {
-    let on = crate::efi::auth::is_secure_boot_requested();
+fn action_text(fb: &FramebufferInfo, idx: usize) -> ActionText {
+    let on = fb.security_state().requested;
     match idx {
         SHOW_KEYS => ActionText {
             title: "Show enrolled keys",
@@ -103,21 +100,21 @@ fn action_text(idx: usize) -> ActionText {
     }
 }
 
-fn unavailable_reason(idx: usize) -> Option<&'static str> {
-    if matches!(idx, DEFAULT_KEYS | CUSTOM_KEYS) && !crate::efi::auth::is_setup_mode() {
+fn unavailable_reason(fb: &FramebufferInfo, idx: usize) -> Option<&'static str> {
+    if matches!(idx, DEFAULT_KEYS | CUSTOM_KEYS) && !fb.security_state().setup_mode {
         Some("Unavailable: requires Setup Mode")
-    } else if idx == CLEAR && !crate::efi::auth::boot::has_stored_keys() {
+    } else if idx == CLEAR && !fb.security_state().has_stored_keys {
         Some("Unavailable: no keys enrolled")
     } else {
         None
     }
 }
-fn action_color(idx: usize) -> render::Rgb {
-    if unavailable_reason(idx).is_some() {
+fn action_color(fb: &FramebufferInfo, idx: usize) -> render::Rgb {
+    if unavailable_reason(fb, idx).is_some() {
         theme::INK3
     } else if idx == CLEAR {
         theme::BAD
-    } else if idx == TOGGLE && crate::efi::auth::is_secure_boot_requested() {
+    } else if idx == TOGGLE && fb.security_state().requested {
         theme::WARN
     } else {
         theme::INK
@@ -233,8 +230,8 @@ fn sec_layout_with_metrics(fb: &FramebufferInfo, status: bool, m: Metrics) -> Se
 fn status_card(fb: &FramebufferInfo, rect: Rect, compact: bool) {
     let m = Metrics::for_fb(fb);
     kit::side(fb, rect);
-    let state = crate::efi::auth::secure_boot_state();
-    let e = crate::efi::auth::enrollment::get_enrollment_status();
+    let state = fb.security_state();
+    let e = state;
     let (headline, dot, text) = if state.enforcing {
         (
             "Secure Boot is on",
@@ -275,10 +272,10 @@ fn status_card(fb: &FramebufferInfo, rect: Rect, compact: bool) {
         Some(theme::SIDE),
     );
     let counts = [
-        ("PK", e.pk_count, "Platform owner"),
-        ("KEK", e.kek_count, "May update db and dbx"),
-        ("db", e.db_count, "Allowed signers"),
-        ("dbx", e.dbx_count, "Revoked hashes and signers"),
+        ("PK", e.keys.pk, "Platform owner"),
+        ("KEK", e.keys.kek, "May update db and dbx"),
+        ("db", e.keys.db, "Allowed signers"),
+        ("dbx", e.keys.dbx, "Revoked hashes and signers"),
     ];
     if compact {
         let mut line = String::new();
@@ -366,12 +363,12 @@ fn paint_action_row(
 ) {
     let m = Metrics::for_fb(fb);
     let idx = ACTION_ORDER[i];
-    let text = action_text(idx);
+    let text = action_text(fb, idx);
     let rect = l.rows[i];
     let mut c = Control::new(idx as u64, Role::Option, text.title);
     c.selected = i == selected;
     c.focused = focus.group == Group::Content && i == selected;
-    c.enabled = unavailable_reason(idx).is_none();
+    c.enabled = unavailable_reason(fb, idx).is_none();
     let bg = controls::row(fb, rect, &c, hovered == Some(i));
     let ty = rect.1 + ((rect.3 - render::font_height(m.body)) / 2) as i32;
     let name_w = if l.short_text {
@@ -389,10 +386,10 @@ fn paint_action_row(
         &render::ellipsize(text.title, name_w - 20, m.body),
         m.body,
         c.selected,
-        action_color(idx),
+        action_color(fb, idx),
         Some(bg),
     );
-    let desc = unavailable_reason(idx).unwrap_or(if l.short_text {
+    let desc = unavailable_reason(fb, idx).unwrap_or(if l.short_text {
         text.row_short
     } else {
         text.row
@@ -421,15 +418,15 @@ fn paint_details(
 ) -> Option<Rect> {
     let m = Metrics::for_fb(fb);
     let idx = ACTION_ORDER[selected];
-    let text = action_text(idx);
-    let reason = unavailable_reason(idx);
+    let text = action_text(fb, idx);
+    let reason = unavailable_reason(fb, idx);
     let focused = focus.group == Group::Actions;
     let kind = if reason.is_some() {
         ButtonKind::Neutral
     } else {
         match idx {
             CLEAR => ButtonKind::Danger,
-            TOGGLE if crate::efi::auth::is_secure_boot_requested() => ButtonKind::Danger,
+            TOGGLE if fb.security_state().requested => ButtonKind::Danger,
             _ => ButtonKind::Neutral,
         }
     };
@@ -492,6 +489,12 @@ fn draw_screen(
     focus: &Focus,
     status: Option<(&str, Tone)>,
 ) -> Option<Rect> {
+    fb.observe(UiState {
+        screen: Screen::Security,
+        selected: Some(selected),
+        scroll_offset: 0,
+        countdown: 0,
+    });
     super::draw_shell(fb, NavItem::Security, focus, None);
     let m = Metrics::for_fb(fb);
     let l = sec_layout(fb, status.is_some());
@@ -570,15 +573,11 @@ fn draw_progress(fb: &FramebufferInfo, selected: usize, message: &str) {
 
 // ─── Page loop ──────────────────────────────────────────────────────────
 
-pub fn show(fb: &FramebufferInfo) -> ScreenNav {
+pub async fn show(fb: &FramebufferInfo) -> ScreenNav {
     let mut cursor = CursorRenderer::new();
     let mut focus = Focus::new(super::nav_item_index(NavItem::Security));
     // Start on the first harmless, available action.
-    let mut selected = if crate::efi::auth::is_setup_mode() {
-        1
-    } else {
-        0
-    };
+    let mut selected = if fb.security_state().setup_mode { 1 } else { 0 };
     let mut status: Option<(&'static str, Tone)> = None;
     cursor.hide(fb);
     let mut button = draw_screen(fb, selected, &focus, status);
@@ -592,7 +591,7 @@ pub fn show(fb: &FramebufferInfo) -> ScreenNav {
             &mut hover,
             Some((NavItem::Security, &focus)),
         );
-        let (mx, my) = crate::drivers::mouse_cursor::position();
+        let (mx, my) = fb.position();
         let l = sec_layout(fb, status.is_some());
         let next = (0..ACTION_COUNT).find(|i| dialog::contains(l.rows[*i], mx, my));
         if hovered != next {
@@ -603,7 +602,7 @@ pub fn show(fb: &FramebufferInfo) -> ScreenNav {
                 }
             });
         }
-        if let Some(key) = menu_common::read_key() {
+        if let Some(key) = fb.key() {
             let event = super::chrome_key(fb, key, &mut focus, NavItem::Security, 1);
             let mut open = false;
             match event {
@@ -636,7 +635,7 @@ pub fn show(fb: &FramebufferInfo) -> ScreenNav {
                         let backdrop = || {
                             draw_screen(fb, selected, &focus, status);
                         };
-                        super::confirm_reset(fb, &backdrop);
+                        super::confirm_reset(fb, &backdrop).await;
                     }
                     KeyPress::MouseClick { x, y } => {
                         if button.is_some_and(|r| dialog::contains(r, x as i32, y as i32)) {
@@ -656,7 +655,7 @@ pub fn show(fb: &FramebufferInfo) -> ScreenNav {
                 let backdrop = || {
                     draw_screen(fb, selected, &snapshot_focus, None);
                 };
-                status = handle_action(fb, selected, &backdrop);
+                status = handle_action(fb, selected, &backdrop).await;
                 if let Some((message, Tone::Bad)) = status {
                     // Never truncate recovery instructions in the narrow
                     // action bar. The modal wraps the complete result.
@@ -667,7 +666,8 @@ pub fn show(fb: &FramebufferInfo) -> ScreenNav {
                         "Operation failed",
                         &[Block::text(message)],
                         &[Choice::new("Close", Some("Esc"), ButtonKind::Neutral)],
-                    );
+                    )
+                    .await;
                 }
             }
             cursor.hide(fb);
@@ -675,348 +675,18 @@ pub fn show(fb: &FramebufferInfo) -> ScreenNav {
             hovered = None;
             hover.reset();
         }
-        delay_ms(8);
-    }
-}
-
-// ─── Identities ─────────────────────────────────────────────────────────
-
-/// Keep the verified bytes owned across review. Never reopen ESP files after consent.
-enum PendingImport {
-    Keys(crate::efi::auth::key_files::KeyFileSearchResult),
-    Dbx(Vec<u8>, crate::efi::auth::dbx_update::DbxSource),
-}
-fn fingerprint(hash: &[u8; 32]) -> String {
-    let mut text = String::new();
-    for (i, byte) in hash.iter().enumerate() {
-        if i > 0 && i.is_multiple_of(8) {
-            text.push(' ');
+        if fb.reset_requested() {
+            return ScreenNav::Reset;
         }
-        let _ = write!(text, "{byte:02x}");
-    }
-    text
-}
-
-/// Gregorian date of a Unix timestamp (UTC).
-fn date(ts: i64) -> String {
-    let days = ts.div_euclid(86_400);
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + i64::from(mo <= 2);
-    alloc::format!("{y:04}-{mo:02}-{d:02}")
-}
-
-/// Subject common name (or the whole subject's first printable value).
-fn common_name(subject: &[u8]) -> Option<String> {
-    use crabefi_pkcs7::der::{Tlv, tag};
-    let mut rdns = Tlv::parse(subject).ok()?.contents(tag::SEQUENCE).ok()?;
-    let mut fallback = None;
-    while let Ok(set) = rdns.read() {
-        let Ok(mut attrs) = set.contents(tag::SET) else {
-            continue;
-        };
-        while let Ok(attr) = attrs.read() {
-            let Ok(mut fields) = attr.contents(tag::SEQUENCE) else {
-                continue;
-            };
-            let (Ok(oid), Ok(value)) = (fields.read().and_then(|t| t.oid()), fields.read()) else {
-                continue;
-            };
-            let text = core::str::from_utf8(value.value).ok().map(String::from);
-            if oid == [0x55, 0x04, 0x03] {
-                return text;
-            }
-            if fallback.is_none() {
-                fallback = text;
-            }
-        }
-    }
-    fallback
-}
-
-/// Subject, fingerprint and validity lines for one certificate.
-fn certificate_lines(section: ReviewSection, der: &[u8], note: &str) -> ReviewSection {
-    let parsed = crabefi_pkcs7::x509::Certificate::parse(der).ok();
-    let subject = parsed
-        .as_ref()
-        .and_then(|c| common_name(c.subject))
-        .map_or_else(
-            || String::from("(unreadable subject)"),
-            |cn| alloc::format!("CN={cn}"),
-        );
-    let validity = parsed
-        .and_then(|c| c.validity().ok())
-        .map(|v| alloc::format!("valid {} to {}", date(v.not_before), date(v.not_after)));
-    let note = match (note.is_empty(), validity) {
-        (true, Some(v)) => v,
-        (false, Some(v)) => alloc::format!("{note}, {v}"),
-        (_, None) => String::from(note),
-    };
-    let section = section.line(LineKind::Body, &subject).line(
-        LineKind::Fingerprint,
-        &alloc::format!("SHA-256 {}", fingerprint(&crate::efi::auth::sha256(der))),
-    );
-    if note.is_empty() {
-        section
-    } else {
-        section.line(LineKind::Note, &note)
+        fb.wait_for_frame().await;
     }
 }
 
-fn dbx_effect(append: bool) -> &'static str {
-    if append {
-        "Adds revocations to the existing dbx. Existing revocations are kept."
-    } else {
-        "This replaces the existing dbx. Revocations absent from this file are removed, so previously revoked boot software may start again."
-    }
-}
-
-fn timestamp_text(t: crabefi_efi_types::authentication::EfiTime) -> String {
-    let (year, month, day, hour, minute, second, timezone) = (
-        t.year, t.month, t.day, t.hour, t.minute, t.second, t.timezone,
-    );
-    let zone = match timezone {
-        0 => String::from("UTC"),
-        0x7ff => String::from("timezone unspecified"),
-        offset => alloc::format!(
-            "UTC{}{h:02}:{m:02}",
-            if offset < 0 { '-' } else { '+' },
-            h = offset.unsigned_abs() / 60,
-            m = offset.unsigned_abs() % 60
-        ),
-    };
-    alloc::format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} {zone}")
-}
-
-type Prepared = (PendingImport, Vec<Block>, Vec<ReviewSection>, Vec<Block>);
-
-#[cfg(test)]
-mod dbx_review_tests {
-    use super::*;
-
-    #[test]
-    fn warnings_match_the_write_mode() {
-        assert!(dbx_effect(true).contains("kept"));
-        assert!(!dbx_effect(true).contains("removed"));
-        assert!(dbx_effect(false).contains("removed"));
-    }
-
-    #[test]
-    fn timestamps_do_not_claim_an_unconverted_utc_time() {
-        let mut time = crabefi_efi_types::authentication::EfiTime::zero();
-        time.timezone = 90;
-        assert!(timestamp_text(time).ends_with("UTC+01:30"));
-        time.timezone = -330;
-        assert!(timestamp_text(time).ends_with("UTC-05:30"));
-        time.timezone = 0x7ff;
-        assert!(timestamp_text(time).ends_with("timezone unspecified"));
-        time.timezone = 0;
-        assert!(timestamp_text(time).ends_with(" UTC"));
-    }
-}
-
-fn prepare_import(idx: usize) -> Result<Option<Prepared>, &'static str> {
-    use crate::efi::auth::{self, dbx_update, key_files, sha256};
-    match idx {
-        CUSTOM_KEYS => {
-            let keys = key_files::find_key_files().ok_or_else(|| {
-                crate::secure_boot_menu::custom_pk_error(auth::AuthError::NoSuitableKey)
-            })?;
-            key_files::validate_key_files(&keys)
-                .map_err(crate::secure_boot_menu::custom_pk_error)?;
-            let pk = keys.pk.as_deref().ok_or("No PK certificate supplied")?;
-            let bundled = auth::enrollment::microsoft_uefi_ca_db_certificate();
-            let mut sections = alloc::vec![certificate_lines(
-                ReviewSection::labelled("PK"),
-                pk,
-                "PK.cer"
-            )];
-            match keys.kek.as_deref() {
-                Some(kek) if kek != pk => sections.push(certificate_lines(
-                    ReviewSection::labelled("KEK"),
-                    kek,
-                    "KEK.cer",
-                )),
-                Some(_) => sections.push(
-                    ReviewSection::labelled("KEK")
-                        .line(LineKind::Body, "Same certificate as PK")
-                        .line(LineKind::Note, "KEK.cer is byte-identical to PK.cer"),
-                ),
-                None => sections.push(
-                    ReviewSection::labelled("KEK")
-                        .line(LineKind::Body, "Same certificate as PK")
-                        .line(
-                            LineKind::Note,
-                            "No KEK.cer supplied; PK is also enrolled as KEK",
-                        ),
-                ),
-            }
-            let mut db_count = 1;
-            if let Some(db) = keys.db.as_deref() {
-                db_count += 1;
-                if db == pk {
-                    sections.push(
-                        ReviewSection::labelled("db")
-                            .line(LineKind::Body, "Same certificate as PK")
-                            .line(LineKind::Note, "db.cer is byte-identical to PK.cer"),
-                    );
-                } else if keys.kek.as_deref() == Some(db) {
-                    sections.push(
-                        ReviewSection::labelled("db")
-                            .line(LineKind::Body, "Same certificate as KEK")
-                            .line(LineKind::Note, "db.cer is byte-identical to KEK.cer"),
-                    );
-                } else {
-                    sections.push(certificate_lines(
-                        ReviewSection::labelled("db"),
-                        db,
-                        "db.cer",
-                    ));
-                }
-            }
-            sections.push(certificate_lines(
-                ReviewSection::labelled("db"),
-                bundled,
-                "Bundled with CrabEFI; signs shim and most GPU/NIC option ROMs",
-            ));
-            let dbx = auth::enrollment::get_enrollment_status().dbx_count;
-            let intro = alloc::vec![
-                Block::fact("Source", keys.source),
-                Block::fact(
-                    "Result",
-                    &alloc::format!(
-                        "Replaces PK (1), KEK (1) and db ({db_count}). dbx ({dbx}) is kept."
-                    ),
-                ),
-            ];
-            let outro = alloc::vec![Block::muted(if auth::is_secure_boot_requested() {
-                "Enrolling PK leaves Setup Mode. Secure Boot is enforced as soon as the keys are enrolled."
-            } else {
-                "Enrolling PK leaves Setup Mode. Secure Boot stays off until you enable it on this page."
-            })];
-            Ok(Some((PendingImport::Keys(keys), intro, sections, outro)))
-        }
-        DBX => {
-            let (data, source) = dbx_update::find_dbx_file().ok_or_else(|| {
-                crate::secure_boot_menu::dbx_error(auth::AuthError::NoSuitableKey)
-            })?;
-            let preview = dbx_update::preview_dbx_update(&data, source)
-                .map_err(crate::secure_boot_menu::dbx_error)?;
-            let mut intro = alloc::vec![
-                Block::fact("Source", preview.entries.source),
-                Block::fact(
-                    "Contents",
-                    &alloc::format!(
-                        "{} SHA-256 hashes, {} certificates",
-                        preview.entries.sha256_count,
-                        preview.entries.x509_count
-                    ),
-                ),
-                Block::fact(
-                    "Applies as",
-                    if preview.append {
-                        "Adds to the current revocations"
-                    } else {
-                        "Replaces the current revocations"
-                    },
-                ),
-            ];
-            if let Some(t) = preview.timestamp {
-                intro.push(Block::fact("Timestamp", &timestamp_text(t)));
-            }
-            let mut sections = Vec::new();
-            sections.push(match preview.signer_sha256 {
-                Some(signer) => ReviewSection::labelled("Signer")
-                    .line(LineKind::Body, "Verified against an enrolled KEK or PK")
-                    .line(
-                        LineKind::Fingerprint,
-                        &alloc::format!("SHA-256 {}", fingerprint(&signer)),
-                    ),
-                None => ReviewSection::labelled("Signer")
-                    .line(LineKind::Warn, "Unsigned update")
-                    .line(
-                        LineKind::Note,
-                        "Signature not verified. Allowed only for provisioning in Setup Mode.",
-                    ),
-            });
-            sections.push(
-                ReviewSection::labelled("File")
-                    .line(LineKind::Body, "Exactly these bytes are imported")
-                    .line(
-                        LineKind::Fingerprint,
-                        &alloc::format!("SHA-256 {}", fingerprint(&sha256(&data))),
-                    ),
-            );
-            let outro = alloc::vec![Block::text(dbx_effect(preview.append))];
-            Ok(Some((
-                PendingImport::Dbx(data, source),
-                intro,
-                sections,
-                outro,
-            )))
-        }
-        _ => Ok(None),
-    }
-}
-
-fn enrolled_key_sections() -> Vec<ReviewSection> {
-    use crate::efi::auth;
-    let complete = auth::boot::key_inventory_complete();
-    let mut sections = Vec::new();
-    if !complete {
-        sections.push(ReviewSection::labelled("Warning").line(LineKind::Warn, "Stored key data is malformed or could not be fully loaded. The identities and counts below are incomplete."));
-    }
-    for (label, db) in [
-        ("PK", auth::pk_database()),
-        ("KEK", auth::kek_database()),
-        ("db", auth::db_database()),
-    ] {
-        let mut any = false;
-        for der in db.x509_certificates() {
-            any = true;
-            sections.push(certificate_lines(ReviewSection::labelled(label), der, ""));
-        }
-        let hashes = db.sha256_hashes().count();
-        let other = db.len() - db.x509_certificates().count() - hashes;
-        if !any {
-            sections.push(
-                ReviewSection::labelled(label).line(LineKind::Note, "No certificates enrolled"),
-            );
-        }
-        if hashes > 0 {
-            sections.push(ReviewSection::labelled(label).line(
-                LineKind::Body,
-                &alloc::format!("{hashes} SHA-256 hash entries"),
-            ));
-        }
-        if other > 0 {
-            sections.push(ReviewSection::labelled(label).line(
-                LineKind::Body,
-                &alloc::format!("{other} entries of other signature types"),
-            ));
-        }
-    }
-    let dbx = auth::dbx_database();
-    let certs = dbx.x509_certificates().count();
-    let hashes = dbx.sha256_hashes().count();
-    let other = dbx.len() - certs - hashes;
-    let mut line = alloc::format!("{hashes} revoked hashes, {certs} revoked certificates");
-    if other > 0 {
-        let _ = write!(line, ", {other} other entries");
-    }
-    sections.push(ReviewSection::labelled("dbx").line(LineKind::Body, &line));
-    sections
-}
-
-fn show_key_details(fb: &FramebufferInfo, backdrop: dialog::Backdrop<'_>) {
-    let s = crate::efi::auth::secure_boot_state();
-    let sections = enrolled_key_sections();
+// Identities are supplied by the host. Firmware retains the verified bytes
+// and certificate parsing; the test harness labels its simulated records.
+async fn show_key_details(fb: &FramebufferInfo, backdrop: dialog::Backdrop<'_>) {
+    let s = fb.security_state();
+    let sections = fb.enrolled_keys();
     let intro = [
         Block::fact(
             "Mode",
@@ -1036,33 +706,41 @@ fn show_key_details(fb: &FramebufferInfo, backdrop: dialog::Backdrop<'_>) {
         &sections,
         &[],
         None,
-    );
+    )
+    .await;
 }
 
 // ─── Operations ─────────────────────────────────────────────────────────
 
-fn handle_action(
+async fn handle_action(
     fb: &FramebufferInfo,
     selected: usize,
     backdrop: dialog::Backdrop<'_>,
 ) -> Option<(&'static str, Tone)> {
-    use crate::efi::auth;
     let idx = ACTION_ORDER[selected];
     if idx == SHOW_KEYS {
-        show_key_details(fb, backdrop);
+        show_key_details(fb, backdrop).await;
         return None;
     }
-    if let Some(reason) = unavailable_reason(idx) {
+    if let Some(reason) = unavailable_reason(fb, idx) {
         return Some((reason, Tone::Warn));
     }
     if matches!(idx, CUSTOM_KEYS | DBX) {
         draw_progress(fb, selected, "Loading and verifying identities...");
-        let prepared = match prepare_import(idx) {
-            Ok(Some(p)) => p,
-            Ok(None) => return None,
+        let prepared = match fb.prepare_import(if idx == CUSTOM_KEYS {
+            SecurityAction::EnrollCustomPk
+        } else {
+            SecurityAction::ImportDbx
+        }) {
+            Ok(p) => p,
             Err(error) => return Some((error, Tone::Bad)),
         };
-        let (pending, intro, sections, outro) = prepared;
+        let crate::ImportReview {
+            payload,
+            intro,
+            sections,
+            outro,
+        } = prepared;
         let (title, confirm) = if idx == CUSTOM_KEYS {
             ("Review keys before enrolling", "Enroll these keys")
         } else {
@@ -1076,26 +754,21 @@ fn handle_action(
             &sections,
             &outro,
             Some(confirm),
-        ) {
+        )
+        .await
+        {
             return Some(("Cancelled; nothing was changed.", Tone::Neutral));
         }
         draw_progress(fb, selected, "Working; please wait...");
-        let result = match pending {
-            PendingImport::Keys(keys) => auth::key_files::enroll_key_files(keys)
-                .map(|_| "Custom keys enrolled; the reviewed certificates are now trusted.")
-                .map_err(crate::secure_boot_menu::custom_pk_error),
-            PendingImport::Dbx(data, source) => auth::dbx_update::enroll_dbx_data(data, source)
-                .map(|_| "dbx imported; the reviewed update is committed.")
-                .map_err(crate::secure_boot_menu::dbx_error),
-        };
+        let result = fb.commit_import(payload);
         return Some(match result {
             Ok(message) => (message, Tone::Ok),
             Err(message) => (message, Tone::Bad),
         });
     }
-    let e = auth::enrollment::get_enrollment_status();
+    let e = fb.security_state();
     let (title, tone, mut content, confirm, kind) = match idx {
-        TOGGLE if auth::is_secure_boot_requested() => (
+        TOGGLE if fb.security_state().requested => (
             "Disable Secure Boot?",
             Tone::Warn,
             alloc::vec![
@@ -1142,11 +815,11 @@ fn handle_action(
                 Block::text("This permanently deletes every enrolled key and signature list:"),
                 Block::strong_fact(
                     "PK",
-                    &alloc::format!("{} (platform owner)", plural(e.pk_count, "certificate"))
+                    &alloc::format!("{} (platform owner)", plural(e.keys.pk, "certificate"))
                 ),
-                Block::strong_fact("KEK", &plural(e.kek_count, "certificate")),
-                Block::strong_fact("db", &plural(e.db_count, "entry")),
-                Block::strong_fact("dbx", &plural(e.dbx_count, "revocation")),
+                Block::strong_fact("KEK", &plural(e.keys.kek, "certificate")),
+                Block::strong_fact("db", &plural(e.keys.db, "entry")),
+                Block::strong_fact("dbx", &plural(e.keys.dbx, "revocation")),
                 Block::text(
                     "Secure Boot stops enforcing until new keys are enrolled. This cannot be undone; keep copies of your keys before continuing."
                 ),
@@ -1155,7 +828,7 @@ fn handle_action(
             ButtonKind::Danger,
         ),
     };
-    if idx == CLEAR && !auth::boot::key_inventory_complete() {
+    if idx == CLEAR && e.keys_incomplete {
         content.insert(0, Block::text("Warning: the key inventory is incomplete. These counts may omit malformed stored entries; clearing deletes those entries too."));
     }
     let choice = dialog::modal(
@@ -1168,27 +841,19 @@ fn handle_action(
             Choice::new("Cancel", Some("Esc"), ButtonKind::Neutral),
             Choice::new(confirm, None, kind),
         ],
-    );
+    )
+    .await;
     if choice != 1 {
         return Some(("Cancelled; nothing was changed.", Tone::Neutral));
     }
     draw_progress(fb, selected, "Working; please wait...");
-    let result = match idx {
-        TOGGLE => {
-            let (message, ok) = crate::secure_boot_menu::toggle_secure_boot_action();
-            return Some((message, if ok { Tone::Ok } else { Tone::Bad }));
-        }
-        DEFAULT_KEYS => auth::boot::enroll_and_persist_default_keys()
-            .map(|_| "Default keys enrolled.")
-            .map_err(|_| "Failed to enroll keys; check variable storage."),
-        _ => auth::boot::clear_all_keys()
-            .map(|_| "All keys cleared; Setup Mode restored.")
-            .map_err(crate::secure_boot_menu::clear_keys_error),
+    let action = match idx {
+        TOGGLE => SecurityAction::Toggle,
+        DEFAULT_KEYS => SecurityAction::EnrollDefaults,
+        _ => SecurityAction::ClearKeys,
     };
-    Some(match result {
-        Ok(message) => (message, Tone::Ok),
-        Err(message) => (message, Tone::Bad),
-    })
+    let (message, ok) = fb.security_action(action);
+    Some((message, if ok { Tone::Ok } else { Tone::Bad }))
 }
 
 fn plural(n: usize, noun: &str) -> String {
@@ -1205,27 +870,13 @@ fn plural(n: usize, noun: &str) -> String {
 mod tests {
     use super::*;
     #[test]
-    fn identity_fingerprint_preserves_every_sha256_byte() {
-        let hash = core::array::from_fn(|i| i as u8);
-        assert_eq!(
-            fingerprint(&hash),
-            "0001020304050607 08090a0b0c0d0e0f 1011121314151617 18191a1b1c1d1e1f"
-        );
-    }
-    #[test]
-    fn unix_dates_are_gregorian() {
-        assert_eq!(date(0), "1970-01-01");
-        assert_eq!(date(951_782_400), "2000-02-29");
-        assert_eq!(date(2_082_758_399), "2035-12-31");
-    }
-    #[test]
     fn plural_nouns() {
         assert_eq!(plural(1, "entry"), "1 entry");
         assert_eq!(plural(2, "entry"), "2 entries");
         assert_eq!(plural(0, "certificate"), "0 certificates");
     }
     fn fb(mem: &mut [u32], width: u32, height: u32) -> FramebufferInfo {
-        FramebufferInfo {
+        crate::test_surface(crate::FramebufferConfig {
             physical_address: mem.as_mut_ptr() as u64,
             width,
             height,
@@ -1237,7 +888,7 @@ mod tests {
             green_mask_size: 8,
             blue_mask_pos: 0,
             blue_mask_size: 8,
-        }
+        })
     }
     #[test]
     fn every_action_row_fits_above_the_key_legend() {
