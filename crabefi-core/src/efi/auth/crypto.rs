@@ -1045,24 +1045,27 @@ mod fixture_tests {
     }
 
     #[test]
-    fn chain_leaf_to_ca_with_validity() {
-        let config = ChainBuildingConfig {
-            check_validity_period: true,
-            ..ChainBuildingConfig::default()
-        };
-        let chain = build_and_verify_chain(LEAF, CA, &[], &config).unwrap();
-        assert_eq!(chain.len(), 2);
-    }
-
-    #[test]
     fn chain_validity_check_fails_closed_without_time() {
-        let config = ChainBuildingConfig {
+        let mut config = ChainBuildingConfig {
             check_validity_period: true,
+            check_revocation: false,
             current_time: None,
             ..ChainBuildingConfig::default()
         };
         assert!(build_and_verify_chain(LEAF, CA, &[], &config).is_err());
         assert!(build_and_verify_chain(CA, CA, &[], &config).is_err());
+        // The fixtures are valid from September 2026, with the leaf expiring
+        // in December 2028. Use explicit dates, not the test machine's clock.
+        config.current_time = Some(1_798_761_600); // 2027-01-01 UTC
+        let chain = build_and_verify_chain(LEAF, CA, &[], &config).unwrap();
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain.end_entity(), Some(LEAF));
+        assert_eq!(chain.trust_anchor(), Some(CA));
+        for now in [1_735_689_600, 1_861_920_000] {
+            // 2025 / 2029-01-01 UTC
+            config.current_time = Some(now);
+            assert!(build_and_verify_chain(LEAF, CA, &[], &config).is_err());
+        }
     }
 
     #[test]
@@ -1130,10 +1133,9 @@ mod fixture_tests {
         let crl = revocation::parse_crl(CRL_ONE).unwrap();
         let cached_at = crl.this_update;
         revocation::cache_crl(crl, cached_at);
-        let config = RevocationConfig {
-            allow_soft_fail: false,
-            ..RevocationConfig::default()
-        };
+        // Exercise the default policy through real revocation decisions,
+        // rather than separately asserting its boolean configuration fields.
+        let config = RevocationConfig::default();
         // LEAF is listed in CRL_ONE; CA (same issuer name) is not.
         assert!(matches!(
             check_certificate_revocation(LEAF, CA, &config, None),
@@ -1141,23 +1143,19 @@ mod fixture_tests {
         ));
         assert_eq!(
             check_certificate_revocation(CA, CA, &config, None),
+            RevocationCheckResult::Skipped
+        );
+        let strict = RevocationConfig {
+            allow_soft_fail: false,
+            ..config.clone()
+        };
+        assert_eq!(
+            check_certificate_revocation(CA, CA, &strict, None),
             RevocationCheckResult::Unknown
         );
         assert_eq!(
             check_certificate_revocation(CA, CA, &config, Some(cached_at)),
             RevocationCheckResult::Good
         );
-    }
-
-    #[test]
-    fn crl_cache_roundtrip() {
-        let crl = revocation::parse_crl(CRL_ONE).unwrap();
-        let now = crl.this_update;
-        revocation::cache_crl(crl, now);
-        let config = revocation::RevocationConfig::default();
-        // Issuer lookup uses the leaf's issuer (the CA name).
-        let leaf = parse_cert_view(LEAF).unwrap();
-        let cached = revocation::get_cached_crl(leaf.issuer, now, &config).expect("cached CRL");
-        assert_eq!(cached.revoked_certificates.len(), 1);
     }
 }

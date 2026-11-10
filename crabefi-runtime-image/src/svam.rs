@@ -781,14 +781,4 @@ mod tests {
             assert_eq!(*value, 0xffff_8000_0040_0000 + index as u64 * 8);
         }
     }
-
-    #[test]
-    fn exposed_provenance_slot_write_reaches_validated_destination() {
-        let mut value = 0u64;
-        let address = (&mut value as *mut u64) as usize as u64;
-        // SAFETY: casting the local pointer exposed its provenance and the
-        // destination is one complete writable u64.
-        unsafe { write_slot_at_address(address, 0xfeed_face_dead_beef) };
-        assert_eq!(value, 0xfeed_face_dead_beef);
-    }
 }

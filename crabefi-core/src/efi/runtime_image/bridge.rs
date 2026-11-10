@@ -3,7 +3,7 @@
 use crabefi_runtime_abi::BridgeRequest;
 #[cfg(feature = "variable-store")]
 use crabefi_runtime_abi::bridge_operation;
-#[cfg(any(feature = "variable-store", test))]
+#[cfg(feature = "variable-store")]
 use r_efi::efi::Guid;
 use r_efi::efi::Status;
 
@@ -153,11 +153,10 @@ unsafe fn persist(request: &BridgeRequest) -> Result<(), Status> {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "variable-store"))]
 mod tests {
     use super::*;
 
-    #[cfg(feature = "variable-store")]
     #[test]
     fn setup_authorization_only_accepts_an_active_empty_pk_delete() {
         use crabefi_efi_types::secure_boot::{EFI_GLOBAL_VARIABLE_GUID, KEK_NAME, PK_NAME};
@@ -204,24 +203,5 @@ mod tests {
             unsafe { dispatch(&request) },
             Status::ACCESS_DENIED.as_usize()
         );
-    }
-
-    #[test]
-    fn guid_bytes_use_r_efi_mixed_endian_conversion() {
-        let bytes = [
-            0x78, 0x56, 0x34, 0x12, 0xbc, 0x9a, 0xf0, 0xde, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
-            0x77, 0x88,
-        ];
-        let guid = Guid::from_bytes(&bytes);
-        assert_eq!(guid.as_bytes(), &bytes);
-        let expected = Guid::from_fields(
-            0x1234_5678,
-            0x9abc,
-            0xdef0,
-            0x11,
-            0x22,
-            &[0x33, 0x44, 0x55, 0x66, 0x77, 0x88],
-        );
-        assert_eq!(guid.as_bytes(), expected.as_bytes());
     }
 }

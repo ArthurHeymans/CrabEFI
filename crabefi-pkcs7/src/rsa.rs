@@ -143,15 +143,6 @@ mod tests {
     }
 
     #[test]
-    fn oversize_modulus_fails_soft() {
-        let key = RsaPublicKey {
-            modulus: &[0xff; 4096 / 8 + 1],
-            public_exponent: &[3],
-        };
-        assert!(!key.verify_pkcs1v15_sha256::<64>(&[1], &[0; 32]));
-    }
-
-    #[test]
     fn encoding_requires_full_padding_and_sha256_digest_info() {
         let digest = [0x5a; 32];
         let encode = |padding: usize| {

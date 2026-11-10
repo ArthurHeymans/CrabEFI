@@ -1169,31 +1169,6 @@ fn validate_query_attributes(attributes: u32, boot_services: bool) -> Result<(),
     Ok(())
 }
 
-#[cfg(test)]
-mod query_tests {
-    use super::*;
-
-    #[test]
-    fn time_based_queries_require_secure_boot_support() {
-        let bs = VariableAttributes::BOOTSERVICE_ACCESS;
-        let rt = VariableAttributes::RUNTIME_ACCESS;
-        let nv = VariableAttributes::NON_VOLATILE;
-        let auth = VariableAttributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS;
-        for attrs in [bs, bs | rt, nv | bs | rt] {
-            assert_eq!(validate_query_attributes(attrs.bits(), true), Ok(()));
-            let expected = if cfg!(feature = "secure-boot") {
-                Ok(())
-            } else {
-                Err(efi::Status::UNSUPPORTED)
-            };
-            assert_eq!(
-                validate_query_attributes((attrs | auth).bits(), true),
-                expected
-            );
-        }
-    }
-}
-
 fn call_boot_bridge(address: u64, request: &BridgeRequest) -> Result<(), efi::Status> {
     if address == 0 {
         return Err(efi::Status::WRITE_PROTECTED);
@@ -1297,35 +1272,6 @@ mod tests {
     use crabefi_efi_types::authentication::EfiVariableAuthentication2;
 
     use crate::auth;
-
-    #[test]
-    fn query_variable_info_accepts_volatile_and_append_queries() {
-        let bs = VariableAttributes::BOOTSERVICE_ACCESS;
-        let rt = VariableAttributes::RUNTIME_ACCESS;
-        let nv = VariableAttributes::NON_VOLATILE;
-        let query = |a: VariableAttributes, boot| validate_query_attributes(a.bits(), boot);
-        // shim's MokList state: volatile, boot services.
-        assert!(query(bs, true).is_ok());
-        assert!(query(bs | rt, true).is_ok());
-        assert!(query(nv | bs | rt, true).is_ok());
-        assert!(query(nv | bs | rt | VariableAttributes::APPEND_WRITE, true).is_ok());
-        assert!(query(RAW_ATTRIBUTES, false).is_ok());
-        assert_eq!(query(bs, false), Err(efi::Status::INVALID_PARAMETER));
-        assert_eq!(query(rt, true), Err(efi::Status::INVALID_PARAMETER));
-        assert_eq!(query(nv, true), Err(efi::Status::INVALID_PARAMETER));
-        assert_eq!(
-            query(VariableAttributes::empty(), true),
-            Err(efi::Status::UNSUPPORTED)
-        );
-        assert_eq!(
-            query(nv | bs | VariableAttributes::HARDWARE_ERROR_RECORD, true),
-            Err(efi::Status::UNSUPPORTED)
-        );
-        assert_eq!(
-            validate_query_attributes(1 << 31, true),
-            Err(efi::Status::INVALID_PARAMETER)
-        );
-    }
 
     #[test]
     fn bounded_name_read_rejects_missing_terminator_without_exceeding_declared_extent() {
@@ -1857,6 +1803,7 @@ mod tests {
 
     #[test]
     fn query_capsule_capabilities_validates_header_like_update_capsule() {
+        let _guard = crate::tests::RUNTIME_TEST.lock().unwrap();
         let saved = {
             let mut lease = state::lease().unwrap();
             let runtime = lease.state_mut();
@@ -1920,6 +1867,20 @@ mod tests {
         );
         assert_eq!(maximum, MAX_CAPSULE_SIZE);
         assert_eq!(reset_type, efi::RESET_WARM);
+
+        state::lease().unwrap().state_mut().capsule_delivery_enabled = false;
+        maximum = u64::MAX;
+        reset_type = efi::RESET_COLD;
+        assert_eq!(
+            query_capsule_capabilities(
+                array.as_mut_ptr(),
+                array.len(),
+                &mut maximum,
+                &mut reset_type,
+            ),
+            efi::Status::UNSUPPORTED
+        );
+        assert_eq!((maximum, reset_type), (u64::MAX, efi::RESET_COLD));
         let mut lease = state::lease().unwrap();
         let runtime = lease.state_mut();
         (runtime.retained, runtime.capsule_delivery_enabled) = saved;

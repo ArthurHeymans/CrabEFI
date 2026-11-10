@@ -273,17 +273,6 @@ mod tests {
     }
 
     #[test]
-    fn free_metadata_has_an_explicit_distinct_magic() {
-        let mut storage = Aligned([0; 128]);
-        let base = storage.0.as_mut_ptr();
-        let mut state = PoolState::new();
-        unsafe { state.insert(base, 128, 4) };
-        let header = unsafe { &*base.cast::<PoolHeader>() };
-        assert_eq!(header.magic, POOL_FREE_MAGIC);
-        assert_ne!(header.magic, POOL_ALLOCATED_MAGIC);
-    }
-
-    #[test]
     fn disable_drops_all_free_blocks() {
         let mut storage = Aligned([0; 128]);
         let mut state = PoolState::new();

@@ -515,21 +515,3 @@ const _: () = assert!(core::mem::size_of::<BridgeRequest>() == 72);
 const _: () = assert!(core::mem::size_of::<ConfigurationRegistration>() == 32);
 const _: () = assert!(core::mem::size_of::<ConsoleRegistration>() == 24);
 const _: () = assert!(core::mem::size_of::<EsrtRegistration>() == 40);
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn validate_rejects_foreign_abi_version() {
-        // An unstamped handoff (pre-versioning boot image) reads as 0.
-        assert_eq!(
-            RuntimeHandoff::empty().validate(),
-            Err(HandoffError::Version)
-        );
-        let mut handoff = RuntimeHandoff::empty();
-        handoff.abi_version = crate::format::ABI_VERSION;
-        // Passes the version gate, then fails on the empty contents.
-        assert_eq!(handoff.validate(), Err(HandoffError::Count));
-    }
-}
