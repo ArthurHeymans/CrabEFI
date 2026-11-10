@@ -56,7 +56,6 @@ const VOLUME_LABEL: &str = "EFI";
 
 // A FAT name may contain 255 BMP characters (up to 765 UTF-8 bytes).
 const MAX_PATH_LEN: usize = 1024;
-const MAX_FILE_HANDLES: usize = 32;
 pub const FILE_MODE_READ: u64 = efi_file::MODE_READ;
 pub const FILE_MODE_WRITE: u64 = efi_file::MODE_WRITE;
 pub const FILE_MODE_CREATE: u64 = efi_file::MODE_CREATE;
