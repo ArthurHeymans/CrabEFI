@@ -70,12 +70,21 @@ Boot page", "You are restarting the computer") and lists each change as
 Trust review shows identities before consent: source, result, and every
 certificate that will be enrolled, including the bundled Microsoft UEFI CA,
 each with subject, labelled SHA-256 fingerprint and validity. Byte-identical
-certificates are identified as the same certificate. Identity blocks are never
-split; long reviews page by whole blocks, and the confirm button stays
-unavailable until every page was shown. The import commits the owned bytes
+certificates are identified as the same certificate. Identity blocks that fit
+on a page are kept together; oversized blocks split at visual-line boundaries.
+Long reviews are paged, and the confirm button stays unavailable until every
+page was shown. The import commits the owned bytes
 verified before review; changing the ESP file while a review is open does not
 change what is enrolled. This UI does not replace runtime authentication,
 persistence or replay enforcement.
+
+Dbx preflight also enforces the runtime's input limits: a 48 KiB authenticated
+envelope, 16 KiB certificates, and a 32 KiB variable payload. Exceeding an input
+limit is distinct from running out of free variable storage.
+
+Buffered keyboard drivers retain modifier state with each queued press. Platform
+`ConsoleInput` providers should implement `read_key_with_state` for atomic
+key/modifier snapshots, or at least `key_state` for Shift+Tab navigation.
 
 ## Layout and implementation
 

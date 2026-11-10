@@ -306,8 +306,10 @@ pub enum AuthError {
     InvalidSignatureList,
     /// Cryptographic operation failed
     CryptoError,
-    /// Buffer too small
+    /// Buffer too small or variable storage exhausted
     BufferTooSmall,
+    /// Input exceeds the runtime authentication or variable payload limit
+    InputTooLarge,
     /// Certificate has been revoked
     CertificateRevoked,
     /// Certificate chain too deep (exceeded maximum allowed depth)
@@ -317,6 +319,9 @@ pub enum AuthError {
     /// Enrollment failed after some key databases were already persisted;
     /// the stored keys no longer match either the old or the reviewed set.
     PartialEnrollment,
+    /// Clear-all was interrupted after entering Setup Mode; repair storage
+    /// and retry the idempotent physical-presence clear operation.
+    PartialKeyClear,
 }
 
 /// DER decode failures are certificate-structure errors. Boundaries that
@@ -338,7 +343,9 @@ impl From<AuthError> for r_efi::efi::Status {
             AuthError::SignatureVerificationFailed => r_efi::efi::Status::SECURITY_VIOLATION,
             AuthError::NoSuitableKey => r_efi::efi::Status::SECURITY_VIOLATION,
             AuthError::CertificateParseError => r_efi::efi::Status::INVALID_PARAMETER,
-            AuthError::PartialEnrollment => r_efi::efi::Status::DEVICE_ERROR,
+            AuthError::PartialEnrollment | AuthError::PartialKeyClear => {
+                r_efi::efi::Status::DEVICE_ERROR
+            }
             AuthError::CertificateNotYetValid => r_efi::efi::Status::SECURITY_VIOLATION,
             AuthError::CertificateExpired => r_efi::efi::Status::SECURITY_VIOLATION,
             AuthError::CertificateNotCA => r_efi::efi::Status::SECURITY_VIOLATION,
@@ -350,6 +357,7 @@ impl From<AuthError> for r_efi::efi::Status {
             AuthError::InvalidSignatureList => r_efi::efi::Status::INVALID_PARAMETER,
             AuthError::CryptoError => r_efi::efi::Status::DEVICE_ERROR,
             AuthError::BufferTooSmall => r_efi::efi::Status::BUFFER_TOO_SMALL,
+            AuthError::InputTooLarge => r_efi::efi::Status::BAD_BUFFER_SIZE,
             AuthError::CertificateRevoked => r_efi::efi::Status::SECURITY_VIOLATION,
             AuthError::ChainTooDeep => r_efi::efi::Status::SECURITY_VIOLATION,
             AuthError::ChainBuildingFailed => r_efi::efi::Status::SECURITY_VIOLATION,

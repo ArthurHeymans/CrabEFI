@@ -230,8 +230,8 @@ pub fn show_secure_boot_menu() {
                                         Ok(()) => {
                                             status_message = Some(("All keys cleared", true));
                                         }
-                                        Err(_) => {
-                                            status_message = Some(("Failed to clear keys", false));
+                                        Err(error) => {
+                                            status_message = Some((clear_keys_error(error), false));
                                         }
                                     }
                                 } else {
@@ -350,6 +350,14 @@ pub(crate) fn import_dbx_update() -> Result<&'static str, &'static str> {
     }
 }
 
+pub(crate) fn clear_keys_error(error: auth::AuthError) -> &'static str {
+    if error == auth::AuthError::PartialKeyClear {
+        "Keys only partly cleared; repair variable storage, then retry Clear all keys. Secure Boot is off."
+    } else {
+        "Failed to clear keys; check variable storage and authentication history."
+    }
+}
+
 pub(crate) fn dbx_error(error: auth::AuthError) -> &'static str {
     match error {
         auth::AuthError::NoSuitableKey if auth::is_setup_mode() => {
@@ -369,6 +377,9 @@ pub(crate) fn dbx_error(error: auth::AuthError) -> &'static str {
         }
         auth::AuthError::BufferTooSmall => {
             "Not enough variable storage for dbx; free space before retrying"
+        }
+        auth::AuthError::InputTooLarge => {
+            "dbx input exceeds the supported file, certificate or variable size limit"
         }
         auth::AuthError::InvalidHeader => "Invalid dbx file format",
         _ => "Failed to import dbx update",

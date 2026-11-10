@@ -25,9 +25,8 @@ use alloc::vec::Vec;
 use crabefi_efi_types::{
     authentication::EfiTime,
     secure_boot::{
-        DB_NAME, DBX_NAME, EFI_CERT_TYPE_PKCS7_GUID, EFI_GLOBAL_VARIABLE_GUID,
-        EFI_IMAGE_SECURITY_DATABASE_GUID, KEK_NAME, PK_NAME, SECURE_BOOT_ENABLE_NAME,
-        SecureBootVariable,
+        DBX_NAME, EFI_CERT_TYPE_PKCS7_GUID, EFI_GLOBAL_VARIABLE_GUID,
+        EFI_IMAGE_SECURITY_DATABASE_GUID, SECURE_BOOT_ENABLE_NAME, SecureBootVariable,
     },
 };
 use crabefi_pkcs7::time::DateTime;
@@ -47,6 +46,8 @@ const SECURE_BOOT_KEY_ATTRS: u32 = super::attributes::NON_VOLATILE
 
 struct DatabaseSnapshot {
     initialized: bool,
+    #[cfg(feature = "ui")]
+    complete: bool,
     data: Option<Vec<u8>>,
 }
 
@@ -54,6 +55,8 @@ impl DatabaseSnapshot {
     const fn new() -> Self {
         Self {
             initialized: false,
+            #[cfg(feature = "ui")]
+            complete: false,
             data: None,
         }
     }
@@ -213,10 +216,16 @@ fn refresh_key_database(
 
     let mut database = key_database(variable);
     database.clear();
+    #[cfg(feature = "ui")]
+    let mut complete = true;
     if let Some(value) = data.as_deref()
         && !value.is_empty()
     {
         if let Err(error) = database.load_from_signature_lists(value) {
+            #[cfg(feature = "ui")]
+            {
+                complete = false;
+            }
             log::warn!("Failed to parse {:?} variable: {:?}", variable, error);
         } else {
             log::debug!("Loaded {} {:?} entries", database.len(), variable);
@@ -239,6 +248,8 @@ fn refresh_key_database(
     let mut snapshots = KEY_DATABASE_SNAPSHOTS.lock();
     snapshots[variable.index()] = DatabaseSnapshot {
         initialized: true,
+        #[cfg(feature = "ui")]
+        complete,
         data,
     };
 }
@@ -265,8 +276,19 @@ fn refresh_key_databases_with_force(force: bool) {
     }
 }
 
+/// Counts and identities must not imply a complete inventory after a
+/// malformed database or a cache-capacity error.
+#[cfg(feature = "ui")]
+pub(crate) fn key_inventory_complete() -> bool {
+    refresh_key_databases();
+    KEY_DATABASE_SNAPSHOTS
+        .lock()
+        .iter()
+        .all(|snapshot| snapshot.initialized && snapshot.complete)
+}
+
 /// Get variable data from the authoritative runtime image store.
-fn get_variable_data(guid: &Guid, name: &[u16]) -> Option<Vec<u8>> {
+pub(crate) fn get_variable_data(guid: &Guid, name: &[u16]) -> Option<Vec<u8>> {
     crate::efi::runtime_image::client::variables::get(guid, name).map(|(_, data)| data)
 }
 
@@ -514,16 +536,14 @@ pub(crate) fn persist_key_variable(
     var_type: SecureBootVariable,
     data: &[u8],
 ) -> Result<(), AuthError> {
-    let (guid, name) = match var_type {
-        SecureBootVariable::PK => (Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID), PK_NAME),
-        SecureBootVariable::Kek => (Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID), KEK_NAME),
-        SecureBootVariable::Db => (Guid::from_bytes(&EFI_IMAGE_SECURITY_DATABASE_GUID), DB_NAME),
-        SecureBootVariable::Dbx => (
-            Guid::from_bytes(&EFI_IMAGE_SECURITY_DATABASE_GUID),
-            DBX_NAME,
-        ),
-    };
+    let envelope = prepare_key_variable(var_type, data)?;
+    submit_key_variable(var_type, &envelope, data.is_empty())
+}
 
+/// Read history and allocate before any destructive setup transition.
+fn prepare_key_variable(var_type: SecureBootVariable, data: &[u8]) -> Result<Vec<u8>, AuthError> {
+    let guid = Guid::from_bytes(var_type.guid());
+    let name = var_type.name();
     use zerocopy::IntoBytes;
 
     let timestamp = next_firmware_timestamp(var_type, &guid, name)?;
@@ -537,15 +557,22 @@ pub(crate) fn persist_key_variable(
     envelope.extend_from_slice(&super::WIN_CERT_TYPE_EFI_GUID.to_le_bytes());
     envelope.extend_from_slice(&EFI_CERT_TYPE_PKCS7_GUID);
     envelope.extend_from_slice(data);
+    Ok(envelope)
+}
 
+fn submit_key_variable(
+    var_type: SecureBootVariable,
+    envelope: &[u8],
+    deletion: bool,
+) -> Result<(), AuthError> {
     let status = crate::efi::runtime_image::client::variables::set(
-        &guid,
-        name,
+        &Guid::from_bytes(var_type.guid()),
+        var_type.name(),
         SECURE_BOOT_KEY_ATTRS,
-        &envelope,
+        envelope,
     );
     if status == r_efi::efi::Status::SUCCESS
-        || (data.is_empty() && status == r_efi::efi::Status::NOT_FOUND)
+        || (deletion && status == r_efi::efi::Status::NOT_FOUND)
     {
         // Clear-all is idempotent in Setup Mode; preserve ordinary public
         // SetVariable semantics while accepting an already-absent key here.
@@ -616,6 +643,18 @@ pub(crate) fn has_stored_keys() -> bool {
 pub fn clear_all_keys() -> Result<(), AuthError> {
     log::warn!("Clearing all Secure Boot keys by physical-presence setup action!");
 
+    // Validate every remaining replay history and prepare every envelope
+    // before disabling enforcement or deleting PK. Reuse these envelopes so
+    // a later history read cannot strand a half-cleared key set in Setup Mode.
+    let deletions = [
+        SecureBootVariable::Dbx,
+        SecureBootVariable::Db,
+        SecureBootVariable::Kek,
+    ]
+    .into_iter()
+    .map(|variable| prepare_key_variable(variable, &[]).map(|envelope| (variable, envelope)))
+    .collect::<Result<Vec<_>, _>>()?;
+
     // Record the user's clear intent durably before deleting any keys. If
     // clearing is interrupted after PK deletion, initialization must not
     // mistake the partial state for a fresh store and re-enroll defaults.
@@ -639,16 +678,13 @@ pub fn clear_all_keys() -> Result<(), AuthError> {
         }
     }
 
-    for variable in [
-        SecureBootVariable::Dbx,
-        SecureBootVariable::Db,
-        SecureBootVariable::Kek,
-    ] {
-        if let Err(error) = persist_key_variable(variable, &[]) {
+    for (variable, envelope) in deletions {
+        if let Err(error) = submit_key_variable(variable, &envelope, true) {
             // A preceding delete may already have changed live image policy.
             // Always reconcile disposable boot caches before reporting failure.
             force_refresh_key_databases();
-            return Err(error);
+            log::error!("Key clearing interrupted: {error:?}; repair storage and retry clear-all");
+            return Err(AuthError::PartialKeyClear);
         }
     }
 

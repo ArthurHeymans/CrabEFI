@@ -317,6 +317,91 @@ fn interrupted_key_clear_survives_reset(config: RuntimePlatformConfig) {
     auth::boot::clear_all_keys().unwrap();
 }
 
+/// Microsoft's shipping dbx update, through the public SetVariable path
+/// against the default keys: a 21 KiB payload, signed as an append and
+/// stamped 2010.
+#[cfg(feature = "secure-boot")]
+fn microsoft_dbx_update_appends(config: RuntimePlatformConfig) {
+    use crabefi::efi::auth;
+    use crabefi_efi_types::{
+        authentication::EfiVariableAuthentication2, secure_boot::SecureBootVariable,
+    };
+    const UPDATE: &[u8] = include_bytes!("../src/efi/auth/testdata/microsoft_dbxupdate_x64.bin");
+    let revocations = EfiVariableAuthentication2::from_bytes(UPDATE)
+        .and_then(|header| header.variable_data(UPDATE))
+        .unwrap();
+
+    let media = Arc::new(Mutex::new(vec![0xff; 256 * 1024]));
+    let writes = Arc::new(AtomicUsize::new(0));
+    let boot = || {
+        let client = runtime_image::load(crabefi::BUNDLED_RUNTIME_IMAGE, config).unwrap();
+        runtime_image::install(client);
+        varstore::init_persistence(VariableStorage::Platform(Box::leak(Box::new(Region {
+            bytes: media.clone(),
+            writes: writes.clone(),
+            failure: Arc::new(AtomicUsize::new(0)),
+        }))))
+        .unwrap();
+        client.complete_import().unwrap();
+        client
+    };
+    let guid = efi::Guid::from_bytes(SecureBootVariable::Dbx.guid());
+    let import = |client: &runtime_image::RuntimeImageClient, append: u32| {
+        let mut name = SecureBootVariable::Dbx.name().to_vec();
+        name.push(0);
+        let attributes = efi::VARIABLE_NON_VOLATILE
+            | efi::VARIABLE_BOOTSERVICE_ACCESS
+            | efi::VARIABLE_RUNTIME_ACCESS
+            | efi::VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS
+            | append;
+        unsafe {
+            ((*client.runtime_services()).set_variable)(
+                name.as_mut_ptr(),
+                &guid as *const _ as *mut _,
+                attributes,
+                UPDATE.len(),
+                UPDATE.as_ptr().cast_mut().cast(),
+            )
+        }
+    };
+    let dbx = || {
+        runtime_image::client::variables::get(&guid, SecureBootVariable::Dbx.name())
+            .map(|(_, data)| data)
+    };
+
+    let client = boot();
+    auth::boot::enroll_and_persist_default_keys().unwrap();
+    // The signature covers an append; the same bytes must not replace dbx.
+    assert_eq!(import(&client, 0), efi::Status::SECURITY_VIOLATION);
+    assert_eq!(
+        import(&client, efi::VARIABLE_APPEND_WRITE),
+        efi::Status::SUCCESS
+    );
+    assert_eq!(dbx().as_deref(), Some(revocations));
+
+    // Importing it again adds nothing and writes nothing.
+    let writes_before = writes.load(Ordering::Relaxed);
+    assert_eq!(
+        import(&client, efi::VARIABLE_APPEND_WRITE),
+        efi::Status::SUCCESS
+    );
+    assert_eq!(dbx().as_deref(), Some(revocations));
+    assert_eq!(writes.load(Ordering::Relaxed), writes_before);
+
+    // Clearing leaves dbx history from this firmware's own, far newer clock.
+    // The 2010 update must still be accepted, and survive a reboot.
+    auth::boot::clear_all_keys().unwrap();
+    auth::boot::enroll_and_persist_default_keys().unwrap();
+    assert_eq!(dbx(), None);
+    assert_eq!(
+        import(&client, efi::VARIABLE_APPEND_WRITE),
+        efi::Status::SUCCESS
+    );
+    boot();
+    assert_eq!(dbx().as_deref(), Some(revocations));
+    auth::boot::clear_all_keys().unwrap();
+}
+
 #[test]
 fn actual_loader_seal_svam_and_runtime_services_with_and_without_retained_staging() {
     let ram = Ram::new();
@@ -351,6 +436,7 @@ fn actual_loader_seal_svam_and_runtime_services_with_and_without_retained_stagin
         #[cfg(feature = "secure-boot")]
         if !retained {
             interrupted_key_clear_survives_reset(config);
+            microsoft_dbx_update_appends(config);
         }
         let client = runtime_image::load(crabefi::BUNDLED_RUNTIME_IMAGE, config)
             .expect("actual core image loader");
@@ -487,6 +573,18 @@ fn actual_loader_seal_svam_and_runtime_services_with_and_without_retained_stagin
                 efi::Status::SECURITY_VIOLATION
             );
             let media_before = media.lock().unwrap().clone();
+            // History must be readable before the clear intent or PK deletion
+            // commits. A read failure must leave enforcement and every key intact.
+            let writes_before = writes.load(Ordering::Relaxed);
+            failure.store(5, Ordering::Relaxed);
+            assert_eq!(
+                auth::boot::clear_all_keys(),
+                Err(auth::AuthError::AccessDenied)
+            );
+            assert!(!auth::is_setup_mode());
+            assert!(auth::is_secure_boot_enabled());
+            assert_eq!(writes.load(Ordering::Relaxed), writes_before);
+            assert_eq!(*media.lock().unwrap(), media_before);
             failure.store(1, Ordering::Relaxed);
             assert!(auth::boot::clear_all_keys().is_err());
             assert!(!auth::is_setup_mode());

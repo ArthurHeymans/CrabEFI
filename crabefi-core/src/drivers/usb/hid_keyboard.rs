@@ -122,6 +122,8 @@ pub struct BootKeys {
     num_lock: bool,
     /// Key buffer
     key_buffer: [u16; 16],
+    /// Modifier/toggle snapshot for each queued press.
+    key_states: [crate::platform::KeyState; 16],
     /// Buffer read index
     read_idx: usize,
     /// Buffer write index
@@ -239,7 +241,7 @@ impl BootKeys {
         // Process each new keycode
         for keycode in new_keycodes {
             if let Some(efi_key) = self.translate_keycode(keycode, report) {
-                self.enqueue_key(efi_key);
+                self.enqueue_key(efi_key, self.efi_state_for(report.modifiers));
 
                 // Handle lock keys
                 match keycode {
@@ -286,7 +288,7 @@ impl BootKeys {
             // Initial delay expired - start repeating
             self.repeat_delay_timeout = None;
             self.repeat_interval_timeout = Some(Timeout::from_ms(REPEAT_INTERVAL_MS));
-            self.enqueue_key(self.last_key);
+            self.enqueue_key(self.last_key, self.efi_state());
             return;
         }
 
@@ -295,16 +297,17 @@ impl BootKeys {
             && interval_timeout.is_expired()
         {
             // Time for another repeat
-            self.enqueue_key(self.last_key);
+            self.enqueue_key(self.last_key, self.efi_state());
             self.repeat_interval_timeout = Some(Timeout::from_ms(REPEAT_INTERVAL_MS));
         }
     }
 
     /// Enqueue a key
-    fn enqueue_key(&mut self, key: u16) {
+    fn enqueue_key(&mut self, key: u16, state: crate::platform::KeyState) {
         let next_write = (self.write_idx + 1) % self.key_buffer.len();
         if next_write != self.read_idx {
             self.key_buffer[self.write_idx] = key;
+            self.key_states[self.write_idx] = state;
             self.write_idx = next_write;
         }
     }
@@ -755,6 +758,13 @@ impl crate::drivers::keyboard_common::KeyboardDevice for UsbHidKeyboard {
         self.keys.read_key()
     }
 
+    fn read_key_with_state(&mut self) -> Option<(crate::platform::Key, crate::platform::KeyState)> {
+        super::with_controller(self.controller_idx, |controller| {
+            UsbHidKeyboard::poll(self, controller)
+        })?;
+        self.keys.read_key_with_state()
+    }
+
     fn key_state(&mut self) -> crate::platform::KeyState {
         self.keys.efi_state()
     }
@@ -770,12 +780,22 @@ impl BootKeys {
         })
     }
 
+    pub fn read_key_with_state(
+        &mut self,
+    ) -> Option<(crate::platform::Key, crate::platform::KeyState)> {
+        let state = self.key_states[self.read_idx];
+        self.read_key().map(|key| (key, state))
+    }
+
     /// EFI shift/toggle state bits, without the VALID flags.
     pub fn efi_state(&self) -> crate::platform::KeyState {
+        self.efi_state_for(self.prev_report.modifiers)
+    }
+
+    fn efi_state_for(&self, mods: u8) -> crate::platform::KeyState {
         use crate::drivers::keyboard_common::efi_shift_state::*;
         use crate::drivers::keyboard_common::efi_toggle_state::*;
 
-        let mods = self.prev_report.modifiers;
         let mut shift_state = 0u32;
         let mut toggle_state = 0u8;
 

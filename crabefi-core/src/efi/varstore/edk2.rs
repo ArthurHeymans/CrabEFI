@@ -275,7 +275,7 @@ where
         // append point and is reused by the next write, so nothing valid
         // can follow it: this is a clean end, not corruption.
         if state == 0xFF {
-            break;
+            return (vars, !malformed);
         }
 
         // Parse fields based on format
@@ -402,6 +402,16 @@ where
         offset = next;
     }
 
+    // A short tail cannot hold a header, but may hold a torn/corrupt record
+    // or unreadable flash. It is absent history only when it is blank.
+    if offset < end {
+        let mut tail = vec![0; (end - offset) as usize];
+        if !read_fn(offset, &mut tail)
+            || !(tail.iter().all(|&b| b == 0xff) || tail.iter().all(|&b| b == 0))
+        {
+            return (vars, false);
+        }
+    }
     (vars, !malformed)
 }
 
@@ -858,6 +868,44 @@ mod tests {
         // Non-blank garbage where free space is expected is corruption too.
         let garbage = vec![0xab; VARIABLE_DATA_OFFSET as usize + 256];
         assert!(checked(&garbage, 256).is_none());
+    }
+
+    #[test]
+    fn checked_walk_inspects_short_tails_even_after_a_valid_record() {
+        let mut record =
+            build_variable_record(&[0; 16], &[b'x' as u16, 0], 0x27, &[], Some(timestamp()))
+                .unwrap();
+        record[2] = VAR_ADDED;
+        for prefix in [&[][..], record.as_slice()] {
+            for length in 1..AUTH_VAR_HEADER_SIZE {
+                for byte in [0, 0xff, 0xab] {
+                    let mut region = vec![0xff; VARIABLE_DATA_OFFSET as usize];
+                    region.extend_from_slice(prefix);
+                    region.extend(core::iter::repeat_n(byte, length));
+                    let size = (prefix.len() + length) as u32;
+                    let mut read = |offset: u32, output: &mut [u8]| {
+                        output.copy_from_slice(
+                            &region[offset as usize..offset as usize + output.len()],
+                        );
+                        true
+                    };
+                    assert_eq!(
+                        walk_variables_checked(&mut read, true, size).is_some(),
+                        byte != 0xab
+                    );
+                    let mut unreadable = |offset: u32, output: &mut [u8]| {
+                        if offset >= VARIABLE_DATA_OFFSET + prefix.len() as u32 {
+                            return false;
+                        }
+                        output.copy_from_slice(
+                            &region[offset as usize..offset as usize + output.len()],
+                        );
+                        true
+                    };
+                    assert!(walk_variables_checked(&mut unreadable, true, size).is_none());
+                }
+            }
+        }
     }
 
     #[test]

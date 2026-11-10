@@ -434,6 +434,12 @@ impl<I: I2c> KeyboardDevice for HidKeyboard<I> {
         device.keys.read_key()
     }
 
+    fn read_key_with_state(&mut self) -> Option<(Key, KeyState)> {
+        let mut device = self.0.borrow_mut();
+        device.poll();
+        device.keys.read_key_with_state()
+    }
+
     fn key_state(&mut self) -> KeyState {
         self.0.borrow().keys.efi_state()
     }

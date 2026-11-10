@@ -243,11 +243,13 @@ fn show_boot_menu(timeout_seconds: u32, firmware_ui_requested: bool) {
 
     if let Some(selected_index) = selected {
         log::info!("Selected index: {}", selected_index);
-        if let Some(entry) = boot_menu.get_entry(selected_index) {
+        // Boot a clone so a one-shot command-line edit applies to this
+        // attempt only and never sticks to the menu's entry.
+        if let Some(entry) = boot_menu.entry_for_boot(selected_index) {
             log::info!("Booting: {} from {}", entry.name, entry.path);
             log::info!("Entry kind: {:?}", entry.kind);
             log::info!("Storage: {:?}", entry.storage);
-            boot_selected_entry(entry);
+            boot_selected_entry(&entry);
             log::warn!("boot_selected_entry returned - boot failed!");
         } else {
             log::error!("Failed to get entry at index {}", selected_index);
@@ -470,6 +472,10 @@ fn boot_selected_entry(entry: &menu::BootEntry) {
 /// Installs BlockIO protocols for the entry's disk, then boots from its ESP
 /// through the storage-agnostic boot module.
 fn boot_uefi_entry(entry: &menu::BootEntry) {
+    boot_uefi_path(entry, &entry.path);
+}
+
+fn boot_uefi_path(entry: &menu::BootEntry, path: &str) {
     use crate::boot;
     use crate::drivers::storage;
 
@@ -490,7 +496,7 @@ fn boot_uefi_entry(entry: &menu::BootEntry) {
         &path_info,
         entry.storage,
         info.block_size,
-        &entry.path,
+        path,
     ) {
         return;
     }
@@ -519,8 +525,9 @@ fn boot_linux_entry(
     if efi::auth::is_secure_boot_enabled() {
         log::warn!("Direct Linux boot disabled: Secure Boot is active");
         log::info!("Falling back to UEFI boot path for secure verification");
-        // Fall back to UEFI boot which will verify the bootloader signature
-        boot_uefi_entry(entry);
+        // The entry path is the direct kernel, not a UEFI loader. Start the
+        // architecture fallback loader on this same ESP under verification.
+        boot_uefi_path(entry, menu::EFI_BOOT_PATH);
         return;
     }
 

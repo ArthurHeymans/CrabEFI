@@ -38,7 +38,8 @@ remain denied. This is not an authenticated-variable implementation.
 
 Authenticated `dbx` imports additionally require a durable replay floor: the
 anti-downgrade check compares the update timestamp against the persisted
-authenticated-variable history (including deletion records), so builds without
+authenticated-variable history (including deletion records; appending updates
+only need that history to be readable), so builds without
 `variable-store` (or with an unreadable or malformed store) reject `dbx`
 updates instead of falling back to an in-memory timestamp that a key deletion
 could reset. This

@@ -1,5 +1,8 @@
 //! Bounded packed EFI variable store and transaction buffer.
 
+use crabefi_efi_types::authentication::{
+    EfiSignatureList, SignatureListIterator, validate_signature_database,
+};
 use crabefi_efi_types::secure_boot::{
     EFI_GLOBAL_VARIABLE_GUID, SECURE_BOOT_ENABLE_NAME, SecureBootVariable, identify_key_database,
     is_status_variable,
@@ -124,9 +127,79 @@ impl VariableTransaction {
         Ok(destination)
     }
 
+    /// Stage `old` followed by the signatures of `input` it does not hold yet.
+    ///
+    /// UEFI forbids appending an `EFI_SIGNATURE_DATA` a signature database
+    /// already contains. It also makes an append safe to repeat, which
+    /// deferred replay relies on. A list left without new signatures is
+    /// dropped.
+    fn stage_new_signatures(&mut self, old: &[u8], input: &[u8]) -> Result<&[u8], Status> {
+        if !input.is_empty() && !validate_signature_database(input) {
+            return Err(Status::INVALID_PARAMETER);
+        }
+        let mut len = self.push(0, old)?;
+        for (list, bytes) in SignatureListIterator::new(input) {
+            let header = bytes
+                .get(..signatures_offset(list))
+                .ok_or(Status::INVALID_PARAMETER)?;
+            let start = len;
+            for signature in signatures(list, bytes) {
+                if contains_signature(old, &list.signature_type, signature) {
+                    continue;
+                }
+                if len == start {
+                    len = self.push(len, header)?;
+                }
+                len = self.push(len, signature)?;
+            }
+            if len != start {
+                // signature_list_size follows the 16-byte signature type.
+                let list_size = u32::try_from(len - start).map_err(|_| Status::DEVICE_ERROR)?;
+                self.push(start + 16, &list_size.to_le_bytes())?;
+            }
+        }
+        self.bytes.get(..len).ok_or(Status::DEVICE_ERROR)
+    }
+
+    /// Copy `bytes` to offset `at`, returning the offset after them.
+    fn push(&mut self, at: usize, bytes: &[u8]) -> Result<usize, Status> {
+        let end = at
+            .checked_add(bytes.len())
+            .ok_or(Status::OUT_OF_RESOURCES)?;
+        self.bytes
+            .get_mut(at..end)
+            .ok_or(Status::OUT_OF_RESOURCES)?
+            .copy_from_slice(bytes);
+        Ok(end)
+    }
+
     pub fn data(&self, len: usize) -> Option<&[u8]> {
         self.bytes.get(..len)
     }
+}
+
+/// Whether `database` holds `signature` (owner and data) under `signature_type`.
+fn contains_signature(database: &[u8], signature_type: &[u8; 16], signature: &[u8]) -> bool {
+    SignatureListIterator::new(database).any(|(list, bytes)| {
+        list.signature_type == *signature_type
+            && signatures(list, bytes).any(|existing| existing == signature)
+    })
+}
+
+/// Offset of the first `EFI_SIGNATURE_DATA` in a signature list.
+fn signatures_offset(list: &EfiSignatureList) -> usize {
+    EfiSignatureList::HEADER_SIZE.saturating_add(list.signature_header_size as usize)
+}
+
+/// The `EFI_SIGNATURE_DATA` entries of the list `bytes`, owner included.
+fn signatures<'a>(list: &EfiSignatureList, bytes: &'a [u8]) -> impl Iterator<Item = &'a [u8]> {
+    let size = list.signature_size as usize;
+    let mut rest = bytes.get(signatures_offset(list)..).unwrap_or_default();
+    core::iter::from_fn(move || {
+        let (signature, tail) = rest.split_at_checked(size).filter(|_| size != 0)?;
+        rest = tail;
+        Some(signature)
+    })
 }
 
 pub struct PreparedWrite {
@@ -380,7 +453,16 @@ impl VariableStore {
         } else {
             &[]
         };
-        let staged = transaction.stage(old, input)?;
+        let signature_database = append
+            && slot
+                .name
+                .get(..usize::from(slot.name_len))
+                .is_some_and(|name| identify_key_database(&slot.guid, name).is_some());
+        let staged = if signature_database && !old.is_empty() {
+            transaction.stage_new_signatures(old, input)?
+        } else {
+            transaction.stage(old, input)?
+        };
         if staged.len() > self.available_after_replacing(prepared.slot) {
             return Err(Status::OUT_OF_RESOURCES);
         }

@@ -25,7 +25,7 @@ Runtime/System Tables, configuration storage, Runtime Properties, Memory
 Attributes Table (MAT), ESRT storage, variable metadata/payload arena,
 transaction buffer, manifests, phase machine, and image-local time/reset
 code. The packed variable arena is 128 KiB; its
-per-variable limit remains 16 KiB. Large zero-initialized store state is
+per-variable limit is 32 KiB. Large zero-initialized store state is
 in `.bss`, not ROM data.
 
 RSA verification allocates nothing: operands live in fixed stack buffers
@@ -78,6 +78,13 @@ read-only status variables. PK, KEK, db, and dbx time-based authenticated
 updates, appends, and deletions are verified inside the runtime image using its
 authoritative key databases, replay timestamps, and fixed stack RSA buffers.
 Boot enrollment uses the same standard `SetVariable` entry point.
+
+Appends to PK, KEK, db, and dbx follow UEFI: signatures the database already
+holds are skipped, and the envelope's timestamp may be older than the
+variable's. Microsoft stamps every dbx update 2010, so successive updates only
+apply this way. An older append never lowers the recorded timestamp, which
+replacements and deletions must still exceed. Appends to other authenticated
+variables keep requiring a newer timestamp.
 
 Both sides verify certificates with the shared allocation-free
 `crabefi-pkcs7` crate (DER/X.509/CMS views and stack-backed schoolbook

@@ -212,9 +212,25 @@ fn read_serial_key() -> Option<KeyPress> {
         spin::Mutex::new((SerialKeyParser::new(), None));
     let mut serial = SERIAL.lock();
     let (parser, deadline) = &mut *serial;
+    poll_serial_key(parser, deadline, serial_driver::try_read)
+}
+
+fn poll_serial_key(
+    parser: &mut SerialKeyParser,
+    deadline: &mut Option<Timeout>,
+    mut next: impl FnMut() -> Option<u8>,
+) -> Option<KeyPress> {
+    // Expire before consuming a byte: input arriving after a polling gap must
+    // not become the final byte of an abandoned escape sequence.
+    if deadline.as_ref().is_some_and(Timeout::is_expired) {
+        *deadline = None;
+        if let Some(key) = parser.expire_partial() {
+            return Some(key);
+        }
+    }
     // Bound work per poll even if serial input is continuously available.
     for _ in 0..32 {
-        let Some(byte) = parser.pending.take().or_else(serial_driver::try_read) else {
+        let Some(byte) = parser.pending.take().or_else(&mut next) else {
             break;
         };
         let key = parser.feed(byte);
@@ -240,6 +256,34 @@ fn read_serial_key() -> Option<KeyPress> {
 #[cfg(test)]
 mod serial_tests {
     use super::*;
+
+    #[test]
+    fn polling_expires_sequences_before_consuming_new_input() {
+        for prefix in [b"\x1b[".as_slice(), b"\x1bO".as_slice()] {
+            let mut parser = SerialKeyParser::new();
+            for &byte in prefix {
+                parser.feed(byte);
+            }
+            let mut deadline = Some(Timeout::from_ms(0));
+            let mut input = b"A".iter().copied();
+            assert_eq!(
+                poll_serial_key(&mut parser, &mut deadline, || input.next()),
+                Some(KeyPress::Char('A'))
+            );
+        }
+        let mut parser = SerialKeyParser::new();
+        parser.feed(0x1b);
+        let mut deadline = Some(Timeout::from_ms(0));
+        let mut input = b"A".iter().copied();
+        assert_eq!(
+            poll_serial_key(&mut parser, &mut deadline, || input.next()),
+            Some(KeyPress::Escape)
+        );
+        assert_eq!(
+            poll_serial_key(&mut parser, &mut deadline, || input.next()),
+            Some(KeyPress::Char('A'))
+        );
+    }
 
     #[test]
     fn physical_and_serial_backward_tab_and_delete_agree() {

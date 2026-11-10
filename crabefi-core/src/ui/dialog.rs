@@ -188,7 +188,7 @@ fn blocks(fb: &FramebufferConfig, x: i32, y: i32, w: u32, blocks: &[Block], pain
                 if paint {
                     render::draw_text(fb, x, cy, name, m.body, theme::INK, None);
                     let vx = x + key_w as i32;
-                    let lead = alloc::format!("{from} -> ");
+                    let lead = change_lead(from, w - key_w, m.body);
                     let lw = render::draw_text(
                         fb,
                         vx,
@@ -231,25 +231,61 @@ fn center_modal(fb: &FramebufferConfig, w: u32, h: u32) -> Rect {
     )
 }
 
-/// Right-aligned button row. Returns rectangles in choice order.
+fn change_lead(from: &str, width: u32, font: render::FontSize) -> String {
+    let reserved = render::text_width(" -> ", font);
+    alloc::format!(
+        "{} -> ",
+        render::ellipsize(from, width.saturating_sub(reserved) / 2, font)
+    )
+}
+
+fn choice_widths(fb: &FramebufferConfig, choices: &[Choice<'_>]) -> Vec<u32> {
+    let m = Metrics::for_fb(fb);
+    choices
+        .iter()
+        .map(|c| controls::button_width(fb, c.label, c.key).max(if m.large { 180 } else { 140 }))
+        .collect()
+}
+
+fn choice_height(fb: &FramebufferConfig, width: u32, choices: &[Choice<'_>]) -> u32 {
+    let widths = choice_widths(fb, choices);
+    let total = widths.iter().sum::<u32>() + 12 * widths.len().saturating_sub(1) as u32;
+    let m = Metrics::for_fb(fb);
+    if total <= width {
+        m.button
+    } else {
+        choices.len() as u32 * (m.button + 8) - 8
+    }
+}
+
+/// Right-aligned choices, stacked when a complete row will not fit.
 fn choice_row(
     fb: &FramebufferConfig,
     right: i32,
     y: i32,
+    available: u32,
     choices: &[Choice<'_>],
     focused: Option<usize>,
     enabled: &[bool],
 ) -> Vec<Rect> {
     let m = Metrics::for_fb(fb);
-    let widths: Vec<u32> = choices
-        .iter()
-        .map(|c| controls::button_width(fb, c.label, c.key).max(if m.large { 180 } else { 140 }))
-        .collect();
+    let widths = choice_widths(fb, choices);
     let total: u32 = widths.iter().sum::<u32>() + 12 * widths.len().saturating_sub(1) as u32;
+    let stacked = total > available;
     let mut x = right - total as i32;
     let mut rects = Vec::new();
     for (i, (choice, w)) in choices.iter().zip(&widths).enumerate() {
-        let rect = (x, y, *w, m.button);
+        let rect = if stacked {
+            let w = (*w).min(available);
+            (
+                right - w as i32,
+                y + i as i32 * (m.button + 8) as i32,
+                w,
+                m.button,
+            )
+        } else {
+            (x, y, *w, m.button)
+        };
         let mut c = Control::new(i as u64, Role::Button, choice.label);
         c.focused = focused == Some(i);
         c.enabled = enabled.get(i).copied().unwrap_or(true);
@@ -258,6 +294,19 @@ fn choice_row(
         x += *w as i32 + 12;
     }
     rects
+}
+
+fn modal_backdrop(backdrop: Backdrop<'_>) {
+    theme::dimmed(backdrop);
+    // Platform backdrops need not use draw_shell, so they need not reset the
+    // registry. Only the new modal surface may participate in hover tracking.
+    controls::clear_buttons();
+}
+
+fn shortcut_choice(choices: &[Choice<'_>], key: KeyPress) -> Option<usize> {
+    (key == KeyPress::F10)
+        .then(|| choices.iter().position(|choice| choice.key == Some("F10")))
+        .flatten()
 }
 
 fn modal_keys(fb: &FramebufferConfig, esc: &str, extra: &[(&str, &str)]) {
@@ -281,20 +330,72 @@ pub fn modal(
     assert!(!choices.is_empty() && choices.len() <= 3);
     let mut cursor = CursorRenderer::new();
     let mut focused = 0usize;
+    let mut page = 0usize;
     loop {
         cursor.hide(fb);
         let m = Metrics::for_fb(fb);
         let w = modal_width(fb, if m.large { 820 } else { 720 });
         let inner = w - m.pad * 2;
         let body_h = blocks(fb, 0, 0, inner, content, false);
-        let h = kit::modal_head_height(fb) + m.gap * 3 + body_h + m.button + 4;
+        let buttons_h = choice_height(fb, inner, choices);
+        let chrome = kit::modal_head_height(fb) + m.gap * 3 + buttons_h + 4;
+        let room = fb.height.saturating_sub(m.header + m.footer + 16 + chrome);
+        // Stacking choices must not merely move clipping into the body. Page
+        // long confirmations/results on short displays, like trust reviews.
+        let sections = block_sections(content);
+        let label_w = section_label_width(fb, &sections);
+        let lines: Vec<_> = sections
+            .iter()
+            .map(|section| layout_section(fb, inner, label_w, section))
+            .collect();
+        let overflow = body_h > room;
+        let pages = paginate(&lines, room);
+        let page_count = if overflow { pages.len() } else { 1 };
+        page = page.min(page_count - 1);
+        let title = if page_count > 1 {
+            alloc::format!("{title} ({}/{page_count})", page + 1)
+        } else {
+            String::from(title)
+        };
+        let h = chrome + body_h.min(room);
         let rect = center_modal(fb, w, h);
-        theme::dimmed(backdrop);
-        let body = kit::modal_frame(fb, rect, tone, title);
-        blocks(fb, body.0, body.1, body.2, content, true);
-        let by = rect.1 + rect.3 as i32 - m.button as i32 - m.gap as i32;
-        let rects = choice_row(fb, body.0 + body.2 as i32, by, choices, Some(focused), &[]);
-        modal_keys(fb, choices[0].label, &[]);
+        modal_backdrop(backdrop);
+        let body = kit::modal_frame(fb, rect, tone, &title);
+        if overflow {
+            let mut y = body.1;
+            for (s, range) in &pages[page] {
+                y += paint_vlines(
+                    fb,
+                    body.0,
+                    y,
+                    inner,
+                    label_w,
+                    &sections[*s].label,
+                    &lines[*s][range.clone()],
+                ) as i32;
+            }
+        } else {
+            blocks(fb, body.0, body.1, body.2, content, true);
+        }
+        let by = rect.1 + rect.3 as i32 - buttons_h as i32 - m.gap as i32;
+        let rects = choice_row(
+            fb,
+            body.0 + body.2 as i32,
+            by,
+            inner,
+            choices,
+            Some(focused),
+            &[],
+        );
+        modal_keys(
+            fb,
+            choices[0].label,
+            if page_count > 1 {
+                &[("PgUp PgDn", "Details")]
+            } else {
+                &[]
+            },
+        );
         let mut hover = super::Hover::default();
         loop {
             super::poll_and_render_cursor(fb, &mut cursor);
@@ -307,6 +408,17 @@ pub fn modal(
                     }
                     KeyPress::F8 => {
                         layout::toggle_text_size(fb);
+                        page = 0;
+                        break;
+                    }
+                    KeyPress::PageUp | KeyPress::PageDown | KeyPress::MouseScroll(_) => {
+                        if key == KeyPress::PageUp
+                            || matches!(key, KeyPress::MouseScroll(z) if z > 0)
+                        {
+                            page = page.saturating_sub(1);
+                        } else {
+                            page = (page + 1).min(page_count - 1);
+                        }
                         break;
                     }
                     KeyPress::Tab | KeyPress::Right | KeyPress::Down => {
@@ -317,6 +429,7 @@ pub fn modal(
                         focused = (focused + choices.len() - 1) % choices.len();
                         break;
                     }
+                    KeyPress::F10 => shortcut_choice(choices, key),
                     KeyPress::Enter | KeyPress::Char(' ') => Some(focused),
                     KeyPress::MouseClick { x, y } => {
                         rects.iter().position(|r| contains(*r, x as i32, y as i32))
@@ -652,7 +765,15 @@ pub fn review(
         let avail = fb.height.saturating_sub(m.header + m.footer + 16);
         let intro_h = blocks(fb, 0, 0, inner, intro, false);
         let outro_h = blocks(fb, 0, 0, inner, outro, false);
-        let base = kit::modal_head_height(fb) + m.gap * 3 + m.button + counter_h;
+        let choices = match confirm {
+            Some(confirm) => alloc::vec![
+                Choice::new("Cancel", Some("Esc"), ButtonKind::Neutral),
+                Choice::new(confirm, None, ButtonKind::Accent),
+            ],
+            None => alloc::vec![Choice::new("Close", Some("Esc"), ButtonKind::Neutral)],
+        };
+        let buttons_h = choice_height(fb, inner, &choices);
+        let base = kit::modal_head_height(fb) + m.gap * 3 + buttons_h + counter_h;
         let normal_fixed = base + m.gap * 2 + intro_h + outro_h;
         let label_w_of = |entries: &[ReviewSection]| section_label_width(fb, entries);
         let tallest = {
@@ -703,7 +824,7 @@ pub fn review(
         let list_h = if pages.len() == 1 { natural } else { room };
         let h = fixed + list_h;
         let rect = center_modal(fb, w, h);
-        theme::dimmed(backdrop);
+        modal_backdrop(backdrop);
         let body = kit::modal_frame(fb, rect, Tone::Ok, title);
         let mut y = body.1;
         if !compact {
@@ -748,19 +869,13 @@ pub fn review(
         if !compact {
             blocks(fb, body.0, y, inner, outro, true);
         }
-        let by = rect.1 + rect.3 as i32 - m.button as i32 - m.gap as i32;
-        let choices = match confirm {
-            Some(confirm) => alloc::vec![
-                Choice::new("Cancel", Some("Esc"), ButtonKind::Neutral),
-                Choice::new(confirm, None, ButtonKind::Accent),
-            ],
-            None => alloc::vec![Choice::new("Close", Some("Esc"), ButtonKind::Neutral)],
-        };
+        let by = rect.1 + rect.3 as i32 - buttons_h as i32 - m.gap as i32;
         focused = focused.min(choices.len() - 1);
         let rects = choice_row(
             fb,
             body.0 + inner as i32,
             by,
+            inner,
             &choices,
             Some(focused),
             &[true, all_seen],
@@ -1429,7 +1544,7 @@ pub fn input_with(
         } else {
             let h = kit::modal_head_height(fb) + m.gap * 3 + field_h + message_h + m.button + 12;
             let rect = center_modal(fb, w, h);
-            theme::dimmed(backdrop);
+            modal_backdrop(backdrop);
             let body = kit::modal_frame(fb, rect, Tone::Neutral, title);
             (body.0, body.1, body.2, rect)
         };
@@ -1574,6 +1689,53 @@ pub fn input_with(
 mod tests {
     use super::*;
     #[test]
+    fn narrow_modal_choices_fit_and_repaints_replace_the_hover_registry() {
+        let mut pixels = std::vec![0u32; 640 * 480];
+        let fb = FramebufferConfig {
+            physical_address: pixels.as_mut_ptr() as u64,
+            width: 640,
+            height: 480,
+            stride: 640,
+            bits_per_pixel: 32,
+            red_mask_pos: 16,
+            red_mask_size: 8,
+            green_mask_pos: 8,
+            green_mask_size: 8,
+            blue_mask_pos: 0,
+            blue_mask_size: 8,
+        };
+        let choices = [
+            Choice::new("Keep editing", Some("Esc"), ButtonKind::Neutral),
+            Choice::new("Discard and restart", None, ButtonKind::Danger),
+            Choice::new("Save and restart", Some("F10"), ButtonKind::Primary),
+        ];
+        let w = 520;
+        let h = choice_height(&fb, w, &choices);
+        assert!(h > Metrics::for_fb(&fb).button);
+        for _ in 0..3 {
+            modal_backdrop(&|| {});
+            let rects = choice_row(&fb, 580, 100, w, &choices, Some(0), &[]);
+            for r in &rects {
+                assert!(r.0 >= 60 && r.0 + r.2 as i32 <= 580);
+                assert!(r.1 + r.3 as i32 <= 100 + h as i32);
+            }
+            assert_eq!(controls::button_at(rects[0].0 + 5, rects[0].1 + 5), Some(0));
+        }
+        assert_eq!(shortcut_choice(&choices, KeyPress::F10), Some(2));
+        assert_eq!(shortcut_choice(&choices, KeyPress::Enter), None);
+    }
+
+    #[test]
+    fn long_saved_values_leave_space_for_the_proposed_value() {
+        let width = 240;
+        let font = render::FontSize::Normal;
+        let lead = change_lead(&"old value".repeat(40), width, font);
+        let remaining = width - render::text_width(&lead, font);
+        assert!(remaining >= (width - render::text_width(" -> ", font)) / 2);
+        assert!(!render::ellipsize("new value", remaining, font).is_empty());
+    }
+
+    #[test]
     fn wrapping_bounds_long_words_and_unicode() {
         let lines = wrap_lines("hello extraordinarilylong éééééé end", 5);
         assert!(lines.iter().all(|s| s.chars().count() <= 5));
@@ -1586,7 +1748,7 @@ mod tests {
     /// A section of `groups` line groups, each `per` wrapped lines of 20 px.
     fn section(groups: usize, per: usize) -> Vec<VLine> {
         (0..groups)
-            .flat_map(|g| {
+            .flat_map(|_g| {
                 (0..per).map(move |j| VLine {
                     kind: LineKind::Body,
                     text: String::new(),

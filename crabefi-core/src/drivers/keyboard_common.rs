@@ -45,6 +45,13 @@ pub trait KeyboardDevice {
     /// Next key press, or `None` when none is waiting. Must not wait for input.
     fn read_key(&mut self) -> Option<Key>;
 
+    /// A key with the modifiers that accompanied it. Buffered devices should
+    /// override this instead of sampling state after processing releases.
+    fn read_key_with_state(&mut self) -> Option<(Key, KeyState)> {
+        let key = self.read_key()?;
+        Some((key, self.key_state()))
+    }
+
     /// Pressed modifiers and active toggles, without the VALID bits.
     fn key_state(&mut self) -> KeyState {
         KeyState::default()
@@ -108,10 +115,9 @@ pub fn try_read_key() -> Option<(u16, u16)> {
 /// Keep the legacy tuple API unchanged for EFI console consumers.
 pub fn try_read_key_with_state() -> Option<(Key, KeyState)> {
     with_devices(|devices| {
-        devices.iter_mut().find_map(|device| {
-            let key = device.read_key()?;
-            Some((key, device.key_state()))
-        })
+        devices
+            .iter_mut()
+            .find_map(|device| device.read_key_with_state())
     })
 }
 
@@ -139,6 +145,11 @@ impl KeyboardDevice for PlatformKeyboard {
     fn read_key(&mut self) -> Option<Key> {
         self.0.poll();
         self.0.read_key()
+    }
+
+    fn read_key_with_state(&mut self) -> Option<(Key, KeyState)> {
+        self.0.poll();
+        self.0.read_key_with_state()
     }
 
     fn key_state(&mut self) -> KeyState {

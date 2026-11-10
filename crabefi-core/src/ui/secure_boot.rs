@@ -73,7 +73,7 @@ fn action_text(idx: usize) -> ActionText {
             row: "Review a signed .auth revocation file first",
             row_short: "Reviews signed .auth file first",
             detail: "Reads a dbx update from EFI\\keys\\ and shows its signer, timestamp and contents before importing. In User Mode only updates signed by an enrolled KEK or PK are accepted.",
-            changes: "Replaces dbx",
+            changes: "Adds to or replaces dbx; mode shown in review",
             button: "Review update...",
         },
         TOGGLE if on => ActionText {
@@ -140,8 +140,11 @@ struct SecLayout {
 }
 
 fn sec_layout(fb: &FramebufferInfo, status: bool) -> SecLayout {
-    let m = Metrics::for_fb(fb);
-    let (cx, cy, cw, ch) = canvas(fb);
+    sec_layout_with_metrics(fb, status, Metrics::for_fb(fb))
+}
+
+fn sec_layout_with_metrics(fb: &FramebufferInfo, status: bool, m: Metrics) -> SecLayout {
+    let (cx, cy, cw, ch) = m.canvas(fb);
     let bottom = cy + ch as i32;
     let side_w = m.side_width(cw);
     // Narrow screens report status beside the action button instead.
@@ -154,7 +157,7 @@ fn sec_layout(fb: &FramebufferInfo, status: bool) -> SecLayout {
             .max(render::font_height(m.big) + m.line * 3 + 8)
             + m.pad * 2
     };
-    let strip_h = kit::strip_height(fb);
+    let strip_h = m.row + 8;
     let title_h = render::font_height(m.title) + 8;
     let group_h = m.small_line + 10;
     let bar_h = if side_w.is_none() {
@@ -654,6 +657,18 @@ pub fn show(fb: &FramebufferInfo) -> ScreenNav {
                     draw_screen(fb, selected, &snapshot_focus, None);
                 };
                 status = handle_action(fb, selected, &backdrop);
+                if let Some((message, Tone::Bad)) = status {
+                    // Never truncate recovery instructions in the narrow
+                    // action bar. The modal wraps the complete result.
+                    dialog::modal(
+                        fb,
+                        &backdrop,
+                        Tone::Bad,
+                        "Operation failed",
+                        &[Block::text(message)],
+                        &[Choice::new("Close", Some("Esc"), ButtonKind::Neutral)],
+                    );
+                }
             }
             cursor.hide(fb);
             button = draw_screen(fb, selected, &focus, status);
@@ -754,7 +769,57 @@ fn certificate_lines(section: ReviewSection, der: &[u8], note: &str) -> ReviewSe
     }
 }
 
+fn dbx_effect(append: bool) -> &'static str {
+    if append {
+        "Adds revocations to the existing dbx. Existing revocations are kept."
+    } else {
+        "This replaces the existing dbx. Revocations absent from this file are removed, so previously revoked boot software may start again."
+    }
+}
+
+fn timestamp_text(t: crabefi_efi_types::authentication::EfiTime) -> String {
+    let (year, month, day, hour, minute, second, timezone) = (
+        t.year, t.month, t.day, t.hour, t.minute, t.second, t.timezone,
+    );
+    let zone = match timezone {
+        0 => String::from("UTC"),
+        0x7ff => String::from("timezone unspecified"),
+        offset => alloc::format!(
+            "UTC{}{h:02}:{m:02}",
+            if offset < 0 { '-' } else { '+' },
+            h = offset.unsigned_abs() / 60,
+            m = offset.unsigned_abs() % 60
+        ),
+    };
+    alloc::format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} {zone}")
+}
+
 type Prepared = (PendingImport, Vec<Block>, Vec<ReviewSection>, Vec<Block>);
+
+#[cfg(test)]
+mod dbx_review_tests {
+    use super::*;
+
+    #[test]
+    fn warnings_match_the_write_mode() {
+        assert!(dbx_effect(true).contains("kept"));
+        assert!(!dbx_effect(true).contains("removed"));
+        assert!(dbx_effect(false).contains("removed"));
+    }
+
+    #[test]
+    fn timestamps_do_not_claim_an_unconverted_utc_time() {
+        let mut time = crabefi_efi_types::authentication::EfiTime::zero();
+        time.timezone = 90;
+        assert!(timestamp_text(time).ends_with("UTC+01:30"));
+        time.timezone = -330;
+        assert!(timestamp_text(time).ends_with("UTC-05:30"));
+        time.timezone = 0x7ff;
+        assert!(timestamp_text(time).ends_with("timezone unspecified"));
+        time.timezone = 0;
+        assert!(timestamp_text(time).ends_with(" UTC"));
+    }
+}
 
 fn prepare_import(idx: usize) -> Result<Option<Prepared>, &'static str> {
     use crate::efi::auth::{self, dbx_update, key_files, sha256};
@@ -853,16 +918,17 @@ fn prepare_import(idx: usize) -> Result<Option<Prepared>, &'static str> {
                         preview.entries.x509_count
                     ),
                 ),
+                Block::fact(
+                    "Applies as",
+                    if preview.append {
+                        "Adds to the current revocations"
+                    } else {
+                        "Replaces the current revocations"
+                    },
+                ),
             ];
             if let Some(t) = preview.timestamp {
-                let (year, month, day, hour, minute, second) =
-                    (t.year, t.month, t.day, t.hour, t.minute, t.second);
-                intro.push(Block::fact(
-                    "Timestamp",
-                    &alloc::format!(
-                        "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} UTC"
-                    ),
-                ));
+                intro.push(Block::fact("Timestamp", &timestamp_text(t)));
             }
             let mut sections = Vec::new();
             sections.push(match preview.signer_sha256 {
@@ -887,9 +953,7 @@ fn prepare_import(idx: usize) -> Result<Option<Prepared>, &'static str> {
                         &alloc::format!("SHA-256 {}", fingerprint(&sha256(&data))),
                     ),
             );
-            let outro = alloc::vec![Block::text(
-                "This replaces the existing dbx. Revocations absent from this file are removed, so previously revoked boot software may start again."
-            )];
+            let outro = alloc::vec![Block::text(dbx_effect(preview.append))];
             Ok(Some((
                 PendingImport::Dbx(data, source),
                 intro,
@@ -903,7 +967,11 @@ fn prepare_import(idx: usize) -> Result<Option<Prepared>, &'static str> {
 
 fn enrolled_key_sections() -> Vec<ReviewSection> {
     use crate::efi::auth;
+    let complete = auth::boot::key_inventory_complete();
     let mut sections = Vec::new();
+    if !complete {
+        sections.push(ReviewSection::labelled("Warning").line(LineKind::Warn, "Stored key data is malformed or could not be fully loaded. The identities and counts below are incomplete."));
+    }
     for (label, db) in [
         ("PK", auth::pk_database()),
         ("KEK", auth::kek_database()),
@@ -1026,7 +1094,7 @@ fn handle_action(
         });
     }
     let e = auth::enrollment::get_enrollment_status();
-    let (title, tone, content, confirm, kind) = match idx {
+    let (title, tone, mut content, confirm, kind) = match idx {
         TOGGLE if auth::is_secure_boot_requested() => (
             "Disable Secure Boot?",
             Tone::Warn,
@@ -1087,6 +1155,9 @@ fn handle_action(
             ButtonKind::Danger,
         ),
     };
+    if idx == CLEAR && !auth::boot::key_inventory_complete() {
+        content.insert(0, Block::text("Warning: the key inventory is incomplete. These counts may omit malformed stored entries; clearing deletes those entries too."));
+    }
     let choice = dialog::modal(
         fb,
         backdrop,
@@ -1112,7 +1183,7 @@ fn handle_action(
             .map_err(|_| "Failed to enroll keys; check variable storage."),
         _ => auth::boot::clear_all_keys()
             .map(|_| "All keys cleared; Setup Mode restored.")
-            .map_err(|_| "Failed to clear keys; check variable storage."),
+            .map_err(crate::secure_boot_menu::clear_keys_error),
     };
     Some(match result {
         Ok(message) => (message, Tone::Ok),
@@ -1179,19 +1250,22 @@ mod tests {
             (1920, 1080),
         ] {
             let f = fb(&mut [], width, height);
-            for status in [false, true] {
-                let l = sec_layout(&f, status);
-                let (_, cy, _, ch) = canvas(&f);
-                for r in l.rows {
-                    assert!(
-                        r.1 + r.3 as i32 <= cy + ch as i32,
-                        "{width}x{height} status={status}"
-                    );
-                }
-                if let Some(bar) = l.bar {
-                    assert!(
-                        l.rows[ACTION_COUNT - 1].1 + l.rows[ACTION_COUNT - 1].3 as i32 <= bar.1
-                    );
+            for large in [false, true] {
+                let m = Metrics::for_request(&f, large);
+                for status in [false, true] {
+                    let l = sec_layout_with_metrics(&f, status, m);
+                    let (_, cy, _, ch) = m.canvas(&f);
+                    for r in l.rows {
+                        assert!(
+                            r.1 + r.3 as i32 <= cy + ch as i32,
+                            "{width}x{height} status={status} large={large}"
+                        );
+                    }
+                    if let Some(bar) = l.bar {
+                        assert!(
+                            l.rows[ACTION_COUNT - 1].1 + l.rows[ACTION_COUNT - 1].3 as i32 <= bar.1
+                        );
+                    }
                 }
             }
             if (width, height) == (1024, 768) {
