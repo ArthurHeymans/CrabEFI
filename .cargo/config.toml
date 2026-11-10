@@ -9,6 +9,14 @@
 # sha2_backend_soft="compact" selects the looped software implementation
 # over the unrolled one: less .text for hash operations where firmware
 # boot-time latency (not GB/s throughput) is what matters.
+# Guest test apps also use software hashing: UEFI does not provide the SIMD
+# execution environment assumed by the accelerated SHA-2 backends.
+[target.'cfg(target_os = "uefi")']
+rustflags = [
+    "--cfg", "sha2_backend=\"soft\"",
+    "--cfg", "sha2_backend_soft=\"compact\"",
+]
+
 [target.x86_64-unknown-none]
 rustflags = [
     "-C", "relocation-model=pic",

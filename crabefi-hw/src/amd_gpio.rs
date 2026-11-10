@@ -48,15 +48,21 @@ impl GpioPin {
     /// Whether the pad latched an interrupt, clearing the latch. The pad
     /// must be configured to set its interrupt status.
     pub fn take_interrupt_status(&mut self) -> bool {
-        let control = self.control.extract();
-        if !control.is_set(Control::INTERRUPT_STATUS) {
-            return false;
-        }
-        // Status bits are write-1-to-clear; keep a pending wake status.
-        self.control
-            .set(control.get() & !Control::WAKE_STATUS::SET.value);
-        true
+        take_interrupt_status(self.control)
     }
+}
+
+fn take_interrupt_status<C>(register: &C) -> bool
+where
+    C: Readable<T = u32, R = Control::Register> + Writeable<T = u32, R = Control::Register>,
+{
+    let control = register.extract();
+    if !control.is_set(Control::INTERRUPT_STATUS) {
+        return false;
+    }
+    // Status bits are write-1-to-clear; keep a pending wake status.
+    register.set(control.get() & !Control::WAKE_STATUS::SET.value);
+    true
 }
 
 impl ErrorType for GpioPin {
@@ -95,7 +101,7 @@ mod tests {
     }
 
     #[test]
-    fn interrupt_status_is_taken_once_without_clearing_wake_status() {
+    fn interrupt_acknowledgement_writes_only_the_interrupt_status_bit() {
         let bank = Box::leak(Box::new([0u32; 4]));
         let base = bank.as_ptr() as usize;
         // SAFETY: RAM-backed fake bank.
@@ -106,5 +112,50 @@ mod tests {
         // The write sets the interrupt status bit (to clear it) and leaves
         // wake status and configuration alone.
         assert_eq!(bank[3], (1 << 28) | 0x1000);
+    }
+
+    #[test]
+    fn interrupt_status_is_taken_once_without_clearing_wake_status() {
+        use core::cell::Cell;
+
+        struct W1cControl {
+            value: Cell<u32>,
+            writes: Cell<usize>,
+        }
+        impl Readable for W1cControl {
+            type T = u32;
+            type R = Control::Register;
+            fn get(&self) -> u32 {
+                self.value.get()
+            }
+        }
+        impl Writeable for W1cControl {
+            type T = u32;
+            type R = Control::Register;
+            fn set(&self, value: u32) {
+                // Model the hardware, independently of the production masks:
+                // bits 28/29 clear when written as one, other bits are RW.
+                let status = (1 << 28) | (1 << 29);
+                self.value
+                    .set((value & !status) | (self.value.get() & status & !value));
+                self.writes.set(self.writes.get() + 1);
+            }
+        }
+
+        let register = W1cControl {
+            value: Cell::new(0x1000),
+            writes: Cell::new(0),
+        };
+        assert!(!take_interrupt_status(&register));
+        assert_eq!(register.writes.get(), 0);
+        register.value.set((1 << 28) | (1 << 29) | 0x1000);
+        assert!(take_interrupt_status(&register));
+        assert_eq!(register.value.get(), (1 << 29) | 0x1000);
+        assert!(!take_interrupt_status(&register));
+        assert_eq!(
+            register.writes.get(),
+            1,
+            "an acknowledged interrupt is not taken twice"
+        );
     }
 }

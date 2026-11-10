@@ -7,6 +7,7 @@ edition = "2021"
 
 [dependencies]
 r-efi = "5.3"
+sha2 = { version = "=0.11.0", default-features = false }
 
 [profile.release]
 panic = "abort"

@@ -125,22 +125,21 @@ fn ucs2_to_ascii_print(text: *const Char16) {
     }
 }
 
-/// Get UCS-2 string length (in chars, not bytes)
-fn ucs2_strlen(text: *const Char16) -> usize {
-    if text.is_null() {
-        return 0;
-    }
-    let mut i = 0;
-    loop {
-        let ch = unsafe { *(text as *const u16).add(i) };
-        if ch == 0 {
-            return i;
-        }
-        i += 1;
-        if i > 4096 {
-            return i;
-        }
-    }
+// Independent UEFI wire fixtures: ACPI PNP0A03/UID 0, PCI device 1/function
+// 0, and USB port 1/interface 0, each followed by End Entire where appropriate.
+const PCI_ROOT_PATH: [u8; 16] = [
+    2, 1, 12, 0, 0xd0, 0x41, 3, 0x0a, 0, 0, 0, 0, 0x7f, 0xff, 4, 0,
+];
+const PCI_PATH: [u8; 10] = [1, 1, 6, 0, 0, 1, 0x7f, 0xff, 4, 0];
+const USB_PATH: [u8; 10] = [3, 5, 6, 0, 1, 0, 0x7f, 0xff, 4, 0];
+const PCI_ROOT_PCI_PATH: [u8; 22] = [
+    2, 1, 12, 0, 0xd0, 0x41, 3, 0x0a, 0, 0, 0, 0, 1, 1, 6, 0, 0, 1, 0x7f, 0xff, 4, 0,
+];
+
+/// # Safety
+/// `node` must name at least `expected.len()` readable bytes from the protocol.
+unsafe fn bytes_match(node: *const device_path::Protocol, expected: &[u8]) -> bool {
+    unsafe { core::slice::from_raw_parts(node.cast::<u8>(), expected.len()) == expected }
 }
 
 fn ucs2_equals_ascii(text: *const Char16, expected: &str) -> bool {
@@ -231,12 +230,19 @@ fn test_device_path_utilities(dpu: &device_path_utilities::Protocol) -> (usize, 
     {
         let acpi = (dpu.create_device_node)(0x02, 0x01, 12); // ACPI node
         if !acpi.is_null() {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    PCI_ROOT_PATH.as_ptr().add(4),
+                    (acpi as *mut u8).add(4),
+                    8,
+                );
+            }
             // AppendDeviceNode(NULL, acpi) should create a path: acpi + end(4) = 16 bytes
             let path = (dpu.append_device_node)(core::ptr::null(), acpi);
             if !path.is_null() {
                 let size = (dpu.get_device_path_size)(path);
-                if size == 16 {
-                    // 12 (ACPI) + 4 (End) = 16
+                if size == 16 && unsafe { bytes_match(path, &PCI_ROOT_PATH) } {
+                    // Check node contents and the terminal End Entire node too.
                     println("[PASS] get_size: ACPI+End path is 16 bytes");
                     passed += 1;
                 } else {
@@ -250,8 +256,13 @@ fn test_device_path_utilities(dpu: &device_path_utilities::Protocol) -> (usize, 
                 let dup = (dpu.duplicate_device_path)(path);
                 if !dup.is_null() {
                     let dup_size = (dpu.get_device_path_size)(dup);
-                    if dup_size == size {
-                        println("[PASS] duplicate: Duplicate has same size");
+                    if dup_size == PCI_ROOT_PATH.len()
+                        && dup != path
+                        && unsafe { bytes_match(dup, &PCI_ROOT_PATH) }
+                    {
+                        println(
+                            "[PASS] duplicate: Independent allocation preserves exact path bytes",
+                        );
                         passed += 1;
                     } else {
                         println("[FAIL] duplicate: Size mismatch after duplication");
@@ -279,11 +290,21 @@ fn test_device_path_utilities(dpu: &device_path_utilities::Protocol) -> (usize, 
     {
         // Create path1: PCI(dev=1,func=0) + End
         let pci = (dpu.create_device_node)(0x01, 0x01, 6);
+        if !pci.is_null() {
+            unsafe {
+                *(pci as *mut u8).add(5) = 1;
+            }
+        }
         let path1 = (dpu.append_device_node)(core::ptr::null(), pci);
         free_pool(pci as *mut c_void);
 
         // Create path2: USB(port=1,iface=0) + End
         let usb = (dpu.create_device_node)(0x03, 0x05, 6);
+        if !usb.is_null() {
+            unsafe {
+                *(usb as *mut u8).add(4) = 1;
+            }
+        }
         let path2 = (dpu.append_device_node)(core::ptr::null(), usb);
         free_pool(usb as *mut c_void);
 
@@ -292,8 +313,15 @@ fn test_device_path_utilities(dpu: &device_path_utilities::Protocol) -> (usize, 
             if !combined.is_null() {
                 // Expected: PCI(6) + USB(6) + End(4) = 16
                 let size = (dpu.get_device_path_size)(combined);
-                if size == 16 {
-                    println("[PASS] append_device_path: PCI+USB path is 16 bytes");
+                if size == 16
+                    && unsafe {
+                        bytes_match(
+                            combined,
+                            &[1, 1, 6, 0, 0, 1, 3, 5, 6, 0, 1, 0, 0x7f, 0xff, 4, 0],
+                        )
+                    }
+                {
+                    println("[PASS] append_device_path: Exact PCI+USB node order and payloads");
                     passed += 1;
                 } else {
                     print("[FAIL] append_device_path: Expected 16, got ");
@@ -319,8 +347,8 @@ fn test_device_path_utilities(dpu: &device_path_utilities::Protocol) -> (usize, 
         let result = (dpu.append_device_path)(core::ptr::null(), core::ptr::null());
         if !result.is_null() {
             let size = (dpu.get_device_path_size)(result);
-            if size == 4 {
-                // Just an End node
+            if size == 4 && unsafe { bytes_match(result, &[0x7f, 0xff, 4, 0]) } {
+                // Exactly one End Entire node.
                 println("[PASS] append_both_null: Returns end-only path (4 bytes)");
                 passed += 1;
             } else {
@@ -358,10 +386,20 @@ fn test_device_path_utilities(dpu: &device_path_utilities::Protocol) -> (usize, 
     // Test 9: AppendDevicePathInstance + IsDevicePathMultiInstance
     {
         let node1 = (dpu.create_device_node)(0x01, 0x01, 6);
+        if !node1.is_null() {
+            unsafe {
+                *(node1 as *mut u8).add(5) = 1;
+            }
+        }
         let path1 = (dpu.append_device_node)(core::ptr::null(), node1);
         free_pool(node1 as *mut c_void);
 
         let node2 = (dpu.create_device_node)(0x03, 0x05, 6);
+        if !node2.is_null() {
+            unsafe {
+                *(node2 as *mut u8).add(4) = 1;
+            }
+        }
         let path2 = (dpu.append_device_node)(core::ptr::null(), node2);
         free_pool(node2 as *mut c_void);
 
@@ -381,7 +419,7 @@ fn test_device_path_utilities(dpu: &device_path_utilities::Protocol) -> (usize, 
                 let mut iter = multi_path as *mut device_path::Protocol;
                 let mut inst_size: usize = 0;
                 let inst1 = (dpu.get_next_device_path_instance)(&mut iter, &mut inst_size);
-                if !inst1.is_null() && inst_size == 10 {
+                if !inst1.is_null() && inst_size == 10 && unsafe { bytes_match(inst1, &PCI_PATH) } {
                     // First instance: PCI(6) + End(4) = 10
                     println("[PASS] get_next_instance_1: First instance is 10 bytes");
                     passed += 1;
@@ -395,7 +433,10 @@ fn test_device_path_utilities(dpu: &device_path_utilities::Protocol) -> (usize, 
 
                 if !iter.is_null() {
                     let inst2 = (dpu.get_next_device_path_instance)(&mut iter, &mut inst_size);
-                    if !inst2.is_null() && inst_size == 10 {
+                    if !inst2.is_null()
+                        && inst_size == 10
+                        && unsafe { bytes_match(inst2, &USB_PATH) }
+                    {
                         println("[PASS] get_next_instance_2: Second instance is 10 bytes");
                         passed += 1;
                     } else {
@@ -466,15 +507,14 @@ fn test_device_path_to_text(
             );
             if !text.is_null() {
                 // Should be "Pci(0x1F,0x0)"
-                let len = ucs2_strlen(text);
                 print("[    ] node_to_text_pci: \"");
                 ucs2_to_ascii_print(text);
                 println("\"");
-                if len > 0 {
-                    println("[PASS] node_to_text_pci: PCI node converted to text");
+                if ucs2_equals_ascii(text, "Pci(0x1F,0x0)") {
+                    println("[PASS] node_to_text_pci: Exact PCI device/function text");
                     passed += 1;
                 } else {
-                    println("[FAIL] node_to_text_pci: Empty text for PCI node");
+                    println("[FAIL] node_to_text_pci: Unexpected PCI device/function text");
                     failed += 1;
                 }
                 free_pool(text as *mut c_void);
@@ -522,12 +562,11 @@ fn test_device_path_to_text(
                         print("[    ] path_to_text_pci_root: \"");
                         ucs2_to_ascii_print(text);
                         println("\"");
-                        let len = ucs2_strlen(text);
-                        if len > 5 {
-                            println("[PASS] path_to_text_pci_root: Full path converted to text");
+                        if ucs2_equals_ascii(text, "PciRoot(0x0)/Pci(0x1,0x0)") {
+                            println("[PASS] path_to_text_pci_root: Exact ACPI/PCI path text");
                             passed += 1;
                         } else {
-                            println("[FAIL] path_to_text_pci_root: Text too short");
+                            println("[FAIL] path_to_text_pci_root: Unexpected ACPI/PCI path text");
                             failed += 1;
                         }
                         free_pool(text as *mut c_void);
@@ -629,7 +668,7 @@ fn test_device_path_from_text(
         if !node.is_null() {
             let ntype = unsafe { node_type(node as *const u8) };
             let nlen = unsafe { node_len(node as *const u8) };
-            if ntype == 0x02 && nlen == 12 {
+            if ntype == 0x02 && nlen == 12 && unsafe { bytes_match(node, &PCI_ROOT_PATH[..12]) } {
                 println("[PASS] text_to_node_pci_root: PciRoot(0x0) parsed as ACPI node");
                 passed += 1;
             } else {
@@ -679,7 +718,10 @@ fn test_device_path_from_text(
                     *(node as *const u8).add(7),
                 ])
             };
-            if hid == 0xb0c041d0 {
+            if hid == 0xb0c041d0
+                && unsafe { node_len(node.cast()) } == 12
+                && unsafe { bytes_match(node, &[2, 1, 12, 0, 0xd0, 0x41, 0xc0, 0xb0, 1, 0, 0, 0]) }
+            {
                 println("[PASS] text_to_node_acpi_pnp: Acpi(PNPB0C0,0x1) parsed correctly");
                 passed += 1;
             } else {
@@ -728,7 +770,7 @@ fn test_device_path_from_text(
         if !path.is_null() {
             let size = (dpu.get_device_path_size)(path);
             // ACPI(12) + PCI(6) + End(4) = 22
-            if size == 22 {
+            if size == 22 && unsafe { bytes_match(path, &PCI_ROOT_PCI_PATH) } {
                 println("[PASS] text_to_path_pci: Path is 22 bytes (ACPI+PCI+End)");
                 passed += 1;
             } else {
@@ -744,12 +786,11 @@ fn test_device_path_from_text(
                 print("[    ] round_trip: \"");
                 ucs2_to_ascii_print(text_out);
                 println("\"");
-                let len = ucs2_strlen(text_out);
-                if len > 10 {
-                    println("[PASS] round_trip: FromText->ToText round-trip produced text");
+                if ucs2_equals_ascii(text_out, "PciRoot(0x0)/Pci(0x1,0x0)") {
+                    println("[PASS] round_trip: Exact canonical text preserved");
                     passed += 1;
                 } else {
-                    println("[FAIL] round_trip: Round-trip text too short");
+                    println("[FAIL] round_trip: Canonical path text changed");
                     failed += 1;
                 }
                 free_pool(text_out as *mut c_void);
@@ -787,7 +828,14 @@ fn test_device_path_from_text(
         if !node.is_null() {
             let ntype = unsafe { node_type(node as *const u8) };
             let nsub = unsafe { *(node as *const u8).add(1) };
-            if ntype == 0x04 && nsub == 0x04 {
+            if ntype == 0x04
+                && nsub == 0x04
+                && unsafe { node_len(node.cast()) } == 32
+                && ucs2_equals_ascii(
+                    unsafe { (node as *const u8).add(4).cast() },
+                    "\\EFI\\BOOT\\t.e",
+                )
+            {
                 // Media type, File Path subtype
                 println("[PASS] text_to_node_filepath: File path parsed as Media/FilePath node");
                 passed += 1;

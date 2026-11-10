@@ -343,7 +343,7 @@ mod tests {
     }
 
     #[test]
-    fn maximum_authenticated_input_verifies_without_arena() {
+    fn maximum_sized_tampered_envelope_reaches_signature_verification() {
         let mut store = VariableStore::new();
         let mut transaction = VariableTransaction::new();
         let global = EFI_GLOBAL_VARIABLE_GUID;

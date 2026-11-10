@@ -211,7 +211,26 @@ mod tests {
     }
 
     #[test]
-    fn last_attempt_record_round_trips_version_and_status() {
+    fn last_attempt_record_matches_persisted_bytes_and_rejects_invalid_records() {
+        // CrabEFI record v1: LE format version, attempted version, status.
+        let golden = [1, 0, 0, 0, 0x78, 0x56, 0x34, 0x12, 5, 0, 0, 0];
+        assert_eq!(
+            encode_last_attempt(&CapsuleResult::failure(
+                CapsuleResultStatus::ErrorFlashWriteFailed,
+                0x1234_5678,
+            )),
+            golden
+        );
+        assert_eq!(
+            decode_last_attempt(&golden),
+            Some((0x1234_5678, CapsuleResultStatus::ErrorFlashWriteFailed))
+        );
+        let mut unknown_status = golden;
+        unknown_status[8] = 7;
+        assert_eq!(decode_last_attempt(&unknown_status), None);
+        let mut unknown_version = golden;
+        unknown_version[0] = 2;
+        assert_eq!(decode_last_attempt(&unknown_version), None);
         for status in [
             CapsuleResultStatus::Success,
             CapsuleResultStatus::Error,

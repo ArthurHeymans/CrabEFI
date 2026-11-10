@@ -2019,12 +2019,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_kvm_check() {
-        // Just ensure it doesn't panic
-        let _ = is_kvm_available();
-    }
-
     fn fmap_flash(count: u16, extra_bytes: usize) -> tempfile::NamedTempFile {
         const HEADER: usize = 56;
         const AREA: usize = 42;

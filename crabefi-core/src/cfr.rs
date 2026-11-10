@@ -1096,8 +1096,7 @@ pub fn write_option_value(option: &CfrOption, value: &CfrValue) -> Result<(), &'
 }
 
 /// Delete a CFR option from storage (revert to default)
-// Completes the write/delete facade checked structurally by
-// ci/run-coreboot-feature-tests.sh; no menu path calls it yet.
+// No menu path calls this yet; the runtime lifecycle test covers the facade.
 #[allow(dead_code)]
 pub fn delete_option_value(option: &CfrOption) -> Result<(), &'static str> {
     if store_of(option).is_some() {
