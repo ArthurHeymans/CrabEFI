@@ -88,6 +88,43 @@ impl Drop for EcamRam {
     }
 }
 
+// These requests must be rejected before touching privileged I/O ports, so
+// they are safe to exercise in a host test (through the runtime enum too).
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn legacy_subwords_reject_invalid_requests_before_port_io() {
+    let access = AnyPciAccess::IoCam(IoCamAccess);
+    let address = PciAddress::new(0, 0xff, 31, 7);
+    let wrong_segment = PciAddress::new(1, 0xff, 31, 7);
+    for (address, offset) in [(wrong_segment, 0), (address, 256), (address, u16::MAX)] {
+        assert_eq!(
+            access.try_read8(address, offset),
+            Err(ConfigAccessError::OutOfRange)
+        );
+        assert_eq!(
+            access.try_write8(address, offset, 0xff),
+            Err(ConfigAccessError::OutOfRange)
+        );
+    }
+    for (address, offset) in [
+        (wrong_segment, 0),
+        (address, 1),
+        (address, 253),
+        (address, 255),
+        (address, 256),
+        (address, u16::MAX),
+    ] {
+        assert_eq!(
+            access.try_read16(address, offset),
+            Err(ConfigAccessError::OutOfRange)
+        );
+        assert_eq!(
+            access.try_write16(address, offset, 0xffff),
+            Err(ConfigAccessError::OutOfRange)
+        );
+    }
+}
+
 #[test]
 fn ecam_native_subwords_preserve_every_neighboring_lane() {
     let fixture = EcamRam::new();
@@ -133,6 +170,16 @@ fn ecam_subwords_obey_last_byte_alignment_segment_and_bus_bounds() {
             Err(ConfigAccessError::OutOfRange)
         );
     }
+    for offset in [4096, u16::MAX] {
+        assert_eq!(
+            access.try_write8(last, offset, 0xff),
+            Err(ConfigAccessError::OutOfRange)
+        );
+        assert_eq!(
+            access.try_read8(last, offset),
+            Err(ConfigAccessError::OutOfRange)
+        );
+    }
     for invalid in [
         PciAddress::new(6, 0x40, 31, 7),
         PciAddress::new(7, 0x3f, 31, 7),
@@ -144,6 +191,14 @@ fn ecam_subwords_obey_last_byte_alignment_segment_and_bus_bounds() {
         );
         assert_eq!(
             access.try_read8(invalid, 0),
+            Err(ConfigAccessError::OutOfRange)
+        );
+        assert_eq!(
+            access.try_write16(invalid, 0, 0xffff),
+            Err(ConfigAccessError::OutOfRange)
+        );
+        assert_eq!(
+            access.try_read16(invalid, 0),
             Err(ConfigAccessError::OutOfRange)
         );
     }
