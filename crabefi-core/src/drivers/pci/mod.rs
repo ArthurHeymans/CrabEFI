@@ -340,17 +340,28 @@ pub fn command_register(address: PciAddress) -> CommandRegister {
 /// Enable only assigned decode types and bus mastering for a DMA driver.
 pub fn enable_device(dev: &PciDevice) {
     with_access(|access| {
-        let mut header = PciHeader::new(dev.address);
-        let original = header.command(access);
-        let enabled = enabled_command(dev, original);
-        header.update_command(access, |_| enabled);
-        log::debug!(
-            "Enabled device {}: cmd {:#06x} -> {:#06x}",
-            dev.address,
-            original.bits(),
-            enabled.bits()
-        );
+        if let Err(error) = enable_device_with_access(access, dev) {
+            log::warn!("PCI {}: enable failed: {:?}", dev.address, error);
+        }
     });
+}
+
+fn enable_device_with_access(
+    access: &impl PciAccess,
+    dev: &PciDevice,
+) -> Result<(), ConfigAccessError> {
+    let original = CommandRegister::from_bits_retain(access.try_read16(dev.address, 0x04)?);
+    let enabled = enabled_command(dev, original);
+    // pci_types::update_command performs a dword RMW, acknowledging W1C
+    // status in the upper half. Only write the command register itself.
+    access.try_write16(dev.address, 0x04, enabled.bits())?;
+    log::debug!(
+        "Enabled device {}: cmd {:#06x} -> {:#06x}",
+        dev.address,
+        original.bits(),
+        enabled.bits()
+    );
+    Ok(())
 }
 
 /// Read a 16-bit PCI configuration-space register.
@@ -563,14 +574,19 @@ pub fn disable_all_bus_mastering_for_handoff() {
 }
 
 /// Clear BME without changing decode enables or probing BARs.
-fn disable_bus_mastering(access: &AnyPciAccess, address: PciAddress) -> bool {
-    let mut header = PciHeader::new(address);
-    let command = header.command(access);
+fn disable_bus_mastering(access: &impl PciAccess, address: PciAddress) -> bool {
+    let Ok(bits) = access.try_read16(address, 0x04) else {
+        return false;
+    };
+    let command = CommandRegister::from_bits_retain(bits);
     if !command.contains(CommandRegister::BUS_MASTER_ENABLE) {
         return false;
     }
     let new_command = command - CommandRegister::BUS_MASTER_ENABLE;
-    header.update_command(access, |_| new_command);
+    if let Err(error) = access.try_write16(address, 0x04, new_command.bits()) {
+        log::warn!("PCI {}: bus master disable failed: {:?}", address, error);
+        return false;
+    }
     log::debug!(
         "PCI {}: bus master disabled for OS handoff ({:#06x} -> {:#06x})",
         address,
@@ -912,6 +928,82 @@ mod tests {
                 .command(TestConfig)
                 .contains(CommandRegister::BUS_MASTER_ENABLE)
         );
+    }
+
+    struct CommandConfig {
+        command_status: core::cell::Cell<u32>,
+        dword_writes: core::cell::Cell<usize>,
+        word_writes: core::cell::Cell<usize>,
+    }
+
+    impl ConfigRegionAccess for CommandConfig {
+        unsafe fn read(&self, _address: PciAddress, offset: u16) -> u32 {
+            assert_eq!(offset, 0x04);
+            self.command_status.get()
+        }
+
+        unsafe fn write(&self, _address: PciAddress, offset: u16, value: u32) {
+            assert_eq!(offset, 0x04);
+            let prior = self.command_status.get();
+            // Low half RW, upper half W1C, unlike the RAM ECAM fixture.
+            self.command_status
+                .set((prior & 0xffff_0000 & !value) | (value & 0xffff));
+            self.dword_writes.set(self.dword_writes.get() + 1);
+        }
+    }
+
+    impl PciAccess for CommandConfig {
+        fn name(&self) -> &'static str {
+            "native command/W1C fixture"
+        }
+
+        fn max_offset(&self) -> u16 {
+            255
+        }
+
+        fn contains_address(&self, _address: PciAddress) -> bool {
+            true
+        }
+
+        fn try_write16(
+            &self,
+            _address: PciAddress,
+            offset: u16,
+            value: u16,
+        ) -> Result<(), ConfigAccessError> {
+            assert_eq!(offset, 0x04);
+            self.command_status
+                .set((self.command_status.get() & 0xffff_0000) | u32::from(value));
+            self.word_writes.set(self.word_writes.get() + 1);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn enable_and_handoff_preserve_w1c_status_with_native_command_writes() {
+        let access = CommandConfig {
+            command_status: core::cell::Cell::new(0xa900_0140),
+            dword_writes: core::cell::Cell::new(0),
+            word_writes: core::cell::Cell::new(0),
+        };
+        let mut dev = PciDevice::new(PciAddress::new(7, 0x40, 1, 2));
+        dev.bars[0] = PciBar {
+            bar_type: BarType::Memory32,
+            address: 0x1000,
+            ..PciBar::default()
+        };
+
+        enable_device_with_access(&access, &dev).unwrap();
+        assert_eq!(access.command_status.get(), 0xa900_0146);
+        assert_eq!(access.word_writes.get(), 1);
+        assert_eq!(access.dword_writes.get(), 0);
+
+        assert!(disable_bus_mastering(&access, dev.address));
+        assert_eq!(access.command_status.get(), 0xa900_0142);
+        assert_eq!(access.word_writes.get(), 2);
+        assert_eq!(access.dword_writes.get(), 0);
+        assert!(!disable_bus_mastering(&access, dev.address));
+        assert_eq!(access.word_writes.get(), 2);
     }
 
     #[test]
