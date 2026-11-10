@@ -572,7 +572,10 @@ fn apply_variable(
     )?;
     // Authenticated commits (including deletions) record their timestamp so
     // later envelopes must be strictly newer.
-    prepared.timestamp = verified.timestamp.unwrap_or_default();
+    let recorded = verified
+        .timestamp
+        .map(|timestamp| recorded_timestamp(store, &request, verified.secure_variable, timestamp));
+    prepared.timestamp = recorded.unwrap_or_default();
     let staged_len = store
         .stage(
             transaction,
@@ -587,13 +590,24 @@ fn apply_variable(
     if secure_variable.is_some() && !prepared.delete && !validate_signature_database(staged) {
         return Err(efi::Status::INVALID_PARAMETER);
     }
+    // An append that adds nothing and does not advance the timestamp leaves
+    // the variable as it is. Do not rewrite flash for it.
+    if request.append()
+        && store
+            .find(&request.guid, request.name, false)
+            .is_some_and(|slot| {
+                usize::from(slot.data_len) == staged_len && slot.timestamp == prepared.timestamp
+            })
+    {
+        return Ok(());
+    }
 
     if prepared
         .attributes
         .contains(VariableAttributes::NON_VOLATILE)
     {
         if phase.boot_services() {
-            persist_through_bridge(bridge, &request, &prepared, staged, verified.timestamp)?;
+            persist_through_bridge(bridge, &request, &prepared, staged, recorded)?;
         } else {
             let sink = deferred.as_mut().ok_or(efi::Status::DEVICE_ERROR)?;
             queue_deferred(sink, &request, &prepared, staged, verified.timestamp)?;
@@ -601,11 +615,47 @@ fn apply_variable(
     }
 
     store.commit(transaction, prepared, request.name)?;
-    if let (Some(variable), Some(timestamp)) = (verified.secure_variable, verified.timestamp) {
+    if let (Some(variable), Some(timestamp)) = (verified.secure_variable, recorded) {
         store.commit_auth_timestamp(variable, timestamp);
     }
     store.refresh_policy();
     Ok(())
+}
+
+/// Timestamp to record for an authenticated write: the envelope's own, unless
+/// an append carried an older one than the variable already has. An append
+/// must not lower the floor later replacements and deletions are held to.
+fn recorded_timestamp(
+    store: &VariableStore,
+    request: &VariableRequest<'_>,
+    secure_variable: Option<SecureBootVariable>,
+    timestamp: VariableTimestamp,
+) -> VariableTimestamp {
+    let history = store.auth_history_timestamp(&request.guid, request.name);
+    [
+        secure_variable.map(|variable| store.auth_timestamp(variable)),
+        history,
+    ]
+    .into_iter()
+    .flatten()
+    .fold(timestamp, |newest, floor| {
+        if timestamp_is_after(floor, newest) {
+            floor
+        } else {
+            newest
+        }
+    })
+}
+
+#[cfg(feature = "secure-boot")]
+fn timestamp_is_after(timestamp: VariableTimestamp, other: VariableTimestamp) -> bool {
+    auth::efi_time_from_timestamp(timestamp).is_after(&auth::efi_time_from_timestamp(other))
+}
+
+/// Without authenticated variables no write carries a timestamp.
+#[cfg(not(feature = "secure-boot"))]
+fn timestamp_is_after(_timestamp: VariableTimestamp, _other: VariableTimestamp) -> bool {
+    false
 }
 
 /// Ask boot setup for narrowly scoped physical-presence authorization. Never
@@ -828,48 +878,65 @@ pub fn replay_deferred(lease: &mut state::Lease) -> Result<usize, efi::Status> {
     }
     let (store, transaction) = (&mut variables.store, &mut variables.transaction);
     region.replay(|record, authenticated, deletion| {
-        if authenticated
-            != (record.attributes & efi::VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS != 0)
-            || (!authenticated && deletion != record.deleted())
-        {
-            return Err(efi::Status::DEVICE_ERROR);
-        }
-        let name_len = record
-            .name
-            .iter()
-            .position(|unit| *unit == 0)
-            .unwrap_or(record.name.len());
-        if name_len == 0 || name_len > MAX_VARIABLE_NAME_LEN {
-            return Err(efi::Status::DEVICE_ERROR);
-        }
-        let name = &record.name[..name_len];
-        if authenticated {
-            let secure_floor = secure_boot::identify_key_database(&record.guid.bytes, name)
-                .map(|variable| store.auth_timestamp(variable));
-            let already_applied = secure_floor == Some(record.timestamp)
-                || store.auth_history_timestamp(&record.guid.bytes, name) == Some(record.timestamp);
-            if already_applied {
-                // Persistence committed before the retained acknowledgement.
-                // The recorded floor proves this authenticated operation has
-                // already taken effect, including append and deletion.
-                return Ok(());
-            }
-        }
-        let result = VariableAttributes::from_bits(record.attributes)
-            .ok_or(efi::Status::INVALID_PARAMETER)
-            .and_then(|attributes| {
-                apply_variable(
-                    VariableContext::boot(store, transaction, bridge),
-                    VariableRequest {
-                        guid: record.guid.bytes,
-                        name,
-                        attributes,
-                        data: record.data,
-                    },
-                )
-            });
-        replay_apply_result(result, authenticated, deletion)
+        replay_record(store, transaction, bridge, record, authenticated, deletion)
     })
+}
+
+/// Apply one journalled write through the ordinary service path.
+fn replay_record(
+    store: &mut VariableStore,
+    transaction: &mut VariableTransaction,
+    bridge: u64,
+    record: &deferred::VariableRecord<'_>,
+    authenticated: bool,
+    deletion: bool,
+) -> Result<(), efi::Status> {
+    if authenticated
+        != (record.attributes & efi::VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS != 0)
+        || (!authenticated && deletion != record.deleted())
+    {
+        return Err(efi::Status::DEVICE_ERROR);
+    }
+    let name_len = record
+        .name
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(record.name.len());
+    if name_len == 0 || name_len > MAX_VARIABLE_NAME_LEN {
+        return Err(efi::Status::DEVICE_ERROR);
+    }
+    let name = &record.name[..name_len];
+    let secure_variable = secure_boot::identify_key_database(&record.guid.bytes, name);
+    // An append to a signature database may carry any timestamp, so the
+    // floor says nothing about whether it was applied. Replaying one is
+    // harmless: signatures the database already holds are skipped.
+    let replayable =
+        secure_variable.is_some() && record.attributes & efi::VARIABLE_APPEND_WRITE != 0;
+    if authenticated && !replayable {
+        let secure_floor = secure_variable.map(|variable| store.auth_timestamp(variable));
+        let already_applied = secure_floor == Some(record.timestamp)
+            || store.auth_history_timestamp(&record.guid.bytes, name) == Some(record.timestamp);
+        if already_applied {
+            // Persistence committed before the retained acknowledgement.
+            // The recorded floor proves this authenticated operation has
+            // already taken effect, including deletion.
+            return Ok(());
+        }
+    }
+    let result = VariableAttributes::from_bits(record.attributes)
+        .ok_or(efi::Status::INVALID_PARAMETER)
+        .and_then(|attributes| {
+            apply_variable(
+                VariableContext::boot(store, transaction, bridge),
+                VariableRequest {
+                    guid: record.guid.bytes,
+                    name,
+                    attributes,
+                    data: record.data,
+                },
+            )
+        });
+    replay_apply_result(result, authenticated, deletion)
 }
 
 /// A raw deletion may have reached durable storage before reset while its
@@ -1527,6 +1594,127 @@ mod tests {
         envelope
     }
 
+    /// One SHA-256 signature list holding `hashes`, each filled with its byte.
+    fn hash_list(hashes: &[u8]) -> Vec<u8> {
+        use crabefi_efi_types::secure_boot::EFI_CERT_SHA256_GUID;
+
+        let mut list = EFI_CERT_SHA256_GUID.to_vec();
+        list.extend_from_slice(&(28 + 48 * hashes.len() as u32).to_le_bytes());
+        list.extend_from_slice(&0u32.to_le_bytes()); // signature_header_size
+        list.extend_from_slice(&48u32.to_le_bytes()); // signature_size
+        for hash in hashes {
+            list.extend_from_slice(&[0x77; 16]); // owner
+            list.extend_from_slice(&[*hash; 32]);
+        }
+        list
+    }
+
+    fn dbx_envelope(year: u16, hashes: &[u8]) -> Vec<u8> {
+        let mut envelope = unsigned_envelope(year);
+        envelope.extend_from_slice(&hash_list(hashes));
+        envelope
+    }
+
+    #[test]
+    fn older_appends_extend_signature_databases_without_lowering_the_floor() {
+        let dbx = SecureBootVariable::Dbx;
+        let append = AUTH_ATTRIBUTES | VariableAttributes::APPEND_WRITE;
+        // Setup Mode: timestamps are enforced, signatures are not.
+        let mut fixture = Fixture::new();
+        fixture.import(
+            *dbx.guid(),
+            dbx.name(),
+            AUTH_ATTRIBUTES,
+            &hash_list(&[1, 2]),
+            Some(timestamp(2025)),
+        );
+
+        // Microsoft stamps every dbx update 2010. Only new hashes are added.
+        let update = dbx_envelope(2010, &[2, 3]);
+        assert_eq!(
+            fixture.apply(Phase::BootActive, dbx, append, &update),
+            efi::Status::SUCCESS
+        );
+        let merged = [hash_list(&[1, 2]), hash_list(&[3])].concat();
+        assert_eq!(fixture.store.key_database_data(dbx), Some(&merged[..]));
+        assert_eq!(fixture.store.auth_timestamp(dbx), timestamp(2025));
+        assert_eq!(
+            fixture.store.auth_history_timestamp(dbx.guid(), dbx.name()),
+            Some(timestamp(2025))
+        );
+
+        // Repeating it changes nothing and does not touch flash.
+        assert_eq!(
+            fixture.write_using_bridge(
+                Phase::BootActive,
+                *dbx.guid(),
+                dbx.name(),
+                append,
+                &update,
+                failing_setup_bridge as *const () as u64,
+            ),
+            efi::Status::SUCCESS
+        );
+        assert_eq!(fixture.store.key_database_data(dbx), Some(&merged[..]));
+
+        // A newer append advances the floor; an older replacement is a replay.
+        assert_eq!(
+            fixture.apply(Phase::BootActive, dbx, append, &dbx_envelope(2026, &[4])),
+            efi::Status::SUCCESS
+        );
+        assert_eq!(fixture.store.auth_timestamp(dbx), timestamp(2026));
+        assert_eq!(
+            fixture.apply(Phase::BootActive, dbx, AUTH_ATTRIBUTES, &update),
+            efi::Status::SECURITY_VIOLATION
+        );
+
+        // Variables that are not signature databases keep the strict rule.
+        let (guid, name) = ([0x42; 16], [b'A' as u16]);
+        fixture.import(guid, &name, AUTH_ATTRIBUTES, b"x", Some(timestamp(2025)));
+        assert!(matches!(
+            auth::verify_authenticated_variable(
+                &fixture.store,
+                &name,
+                &guid,
+                append.bits(),
+                &unsigned_envelope(2010),
+            ),
+            Err(auth::AuthError::InvalidTimestamp)
+        ));
+    }
+
+    #[test]
+    fn post_ebs_append_with_an_already_recorded_timestamp_is_not_dropped_on_replay() {
+        let dbx = SecureBootVariable::Dbx;
+        let append = AUTH_ATTRIBUTES | VariableAttributes::APPEND_WRITE;
+        let stored = hash_list(&[1]);
+        let mut fixture = Fixture::retained();
+        let mut reboot = Fixture::new();
+        // Both updates carry the timestamp dbx already has, as Microsoft's do.
+        for target in [&mut fixture, &mut reboot] {
+            target.import(
+                *dbx.guid(),
+                dbx.name(),
+                AUTH_ATTRIBUTES | VariableAttributes::RUNTIME_ACCESS,
+                &stored,
+                Some(timestamp(2010)),
+            );
+        }
+        assert_eq!(
+            fixture.apply(
+                Phase::SealedPhysical,
+                dbx,
+                append,
+                &dbx_envelope(2010, &[2])
+            ),
+            efi::Status::SUCCESS
+        );
+
+        assert_eq!(replay_into(&mut fixture, &mut reboot, |_, _, _| ()), 1);
+        let merged = [stored, hash_list(&[2])].concat();
+        assert_eq!(reboot.store.key_database_data(dbx), Some(&merged[..]));
+    }
+
     #[test]
     fn deleted_authenticated_variables_keep_rollback_floors() {
         let mut fixture = Fixture::new();
@@ -1995,17 +2183,14 @@ mod tests {
         DeferredRegion::new(&mut fixture.buffer)
             .replay(|record, authenticated, deletion| {
                 inspect(record, authenticated, deletion);
-                let name_len = record.name.iter().position(|unit| *unit == 0).unwrap();
-                match target.write(
-                    Phase::BootActive,
-                    record.guid.bytes,
-                    &record.name[..name_len],
-                    VariableAttributes::from_bits_retain(record.attributes),
-                    record.data,
-                ) {
-                    efi::Status::SUCCESS => Ok(()),
-                    status => Err(status),
-                }
+                replay_record(
+                    &mut target.store,
+                    &mut target.transaction,
+                    successful_bridge as *const () as u64,
+                    record,
+                    authenticated,
+                    deletion,
+                )
             })
             .unwrap()
     }

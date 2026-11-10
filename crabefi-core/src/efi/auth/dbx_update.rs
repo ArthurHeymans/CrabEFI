@@ -358,17 +358,6 @@ fn inspect_authenticated_dbx_update(
         return Err(AuthError::InvalidTimestamp);
     }
 
-    // Anti-downgrade check: verify timestamp is newer than current dbx
-    {
-        let current_timestamp = super::boot::dbx_replay_floor()?;
-        if !update_timestamp.is_after(&current_timestamp) {
-            log::error!(
-                "dbx update timestamp is not newer than current (possible downgrade attack)"
-            );
-            return Err(AuthError::InvalidTimestamp);
-        }
-    }
-
     // Get the PKCS#7 signature data
     let pkcs7_data = auth_header.cert_data(data).ok_or_else(|| {
         log::error!("Failed to extract PKCS#7 data from dbx update");
@@ -386,6 +375,16 @@ fn inspect_authenticated_dbx_update(
         })?;
 
     log::info!("dbx update signature verified successfully");
+
+    // Anti-downgrade check: a replacement must be newer than the current
+    // dbx. An append is exempt, as in the runtime: it can only add
+    // revocations, and Microsoft stamps every update it publishes 2010.
+    // Unreadable history still refuses either kind.
+    let replay_floor = super::boot::dbx_replay_floor()?;
+    if !append && !update_timestamp.is_after(&replay_floor) {
+        log::error!("dbx update timestamp is not newer than current (possible downgrade attack)");
+        return Err(AuthError::InvalidTimestamp);
+    }
 
     Ok(DbxPreview {
         entries: apply_signature_list_entries(sig_list_data, source)?,

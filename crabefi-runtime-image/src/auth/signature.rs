@@ -57,19 +57,27 @@ pub fn verify_authenticated_variable<'a>(
         .ok_or(AuthError::InvalidHeader)?;
     let secure_variable = identify_key_database(vendor_guid, variable_name);
 
-    if let Some(variable) = secure_variable {
-        let previous = super::efi_time_from_timestamp(store.auth_timestamp(variable));
-        if !authentication.time_stamp.is_after(&previous) {
-            return Err(AuthError::InvalidTimestamp);
+    // UEFI exempts appends from the timestamp check. Microsoft relies on it:
+    // every dbx update it publishes carries the same 2010 timestamp. Only the
+    // signature databases get the exemption here, because appending to them
+    // skips signatures they already hold, so a replayed append changes
+    // nothing. Other variables keep the stricter rule.
+    let replayable = secure_variable.is_some() && attributes & efi::VARIABLE_APPEND_WRITE != 0;
+    if !replayable {
+        if let Some(variable) = secure_variable {
+            let previous = super::efi_time_from_timestamp(store.auth_timestamp(variable));
+            if !authentication.time_stamp.is_after(&previous) {
+                return Err(AuthError::InvalidTimestamp);
+            }
         }
-    }
-    // Every authenticated variable carries its last accepted timestamp —
-    // live or as a deletion tombstone — so replaying an older signed
-    // envelope fails even for variables outside the secure-boot databases.
-    if let Some(previous) = store.auth_history_timestamp(vendor_guid, variable_name) {
-        let previous = super::efi_time_from_timestamp(previous);
-        if !authentication.time_stamp.is_after(&previous) {
-            return Err(AuthError::InvalidTimestamp);
+        // Every authenticated variable carries its last accepted timestamp —
+        // live or as a deletion tombstone — so replaying an older signed
+        // envelope fails even for variables outside the secure-boot databases.
+        if let Some(previous) = store.auth_history_timestamp(vendor_guid, variable_name) {
+            let previous = super::efi_time_from_timestamp(previous);
+            if !authentication.time_stamp.is_after(&previous) {
+                return Err(AuthError::InvalidTimestamp);
+            }
         }
     }
 
