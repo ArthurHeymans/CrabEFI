@@ -95,8 +95,12 @@ pub(super) struct Snapshot {
 }
 
 const SLOTS_PER_SLAB: usize = 16;
-// Bound requested handle/record payload and slab headers, not a fixed number
-// of simultaneous opens. Allocator failure remains an honest EFI error.
+// Policy: limit retained handle/record payload and slab headers to 1 MiB,
+// one quarter of the built-in 4 MiB boot heap, to leave headroom for other
+// firmware services. This still imposes a size-derived slot ceiling, rounded
+// down to whole slabs; allocation may fail sooner. It is not a strict heap-usage
+// bound: allocator overhead, excess Vec capacity and transient old/new buffers
+// during reallocation are not counted.
 const POOL_BUDGET: usize = 1024 * 1024;
 const SLOT_COST: usize = core::mem::size_of::<FileHandle>()
     + core::mem::size_of::<OpenFile>()

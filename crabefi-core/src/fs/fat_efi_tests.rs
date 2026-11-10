@@ -93,7 +93,9 @@ fn efi_file_identity_metadata_and_durability() {
     filesystem_info_uses_the_flexible_label_offset();
     volume_label_rejects_changed_media();
     opens_are_relative_to_the_source_location_not_its_access_mode();
+    allocator_failures_do_not_create_a_file();
     many_aliases_keep_identity_and_cursors_across_pool_growth();
+    many_distinct_files_keep_metadata_across_pool_growth();
     exhausted_handle_pool_does_not_create_a_file();
 }
 
@@ -140,6 +142,85 @@ fn volume_label_rejects_changed_media() {
         Status::MEDIA_CHANGED
     );
     assert_eq!(unsafe { ((*root).close)(root) }, Status::MEDIA_CHANGED);
+}
+
+fn allocator_failures_do_not_create_a_file() {
+    use crate::test_allocator::with_budget;
+
+    let root = mount();
+    let file = open(root, "A", true);
+    write(file, &[0xaa, 0xbb]);
+    seek(file, 1);
+    let mut aliases = Vec::new();
+    let mut name: Vec<_> = "A".encode_utf16().chain([0]).collect();
+    let mut full = false;
+    // Fill retained slots without allowing another slab. Reads by the RAM
+    // disk fixture do not allocate, so only pool growth can hit this denial.
+    for _ in 0..2048 {
+        let mut handle = core::ptr::null_mut();
+        let (status, attempts) = with_budget(0, || unsafe {
+            ((*root).open)(
+                root,
+                &mut handle,
+                name.as_mut_ptr(),
+                ef::MODE_READ | ef::MODE_WRITE,
+                0,
+            )
+        });
+        if status == Status::OUT_OF_RESOURCES {
+            assert_eq!(attempts, 1);
+            full = true;
+            break;
+        }
+        assert_eq!(status, Status::SUCCESS);
+        assert_eq!(attempts, 0);
+        aliases.push(handle);
+    }
+    assert!(full, "must reach a slab boundary before the payload budget");
+    let mut name: Vec<_> = "NEW".encode_utf16().chain([0]).collect();
+    for allowed in 0..3 {
+        let sentinel = core::ptr::dangling_mut::<ef::Protocol>();
+        let mut result = sentinel;
+        let (status, attempts) = with_budget(allowed, || unsafe {
+            ((*root).open)(
+                root,
+                &mut result,
+                name.as_mut_ptr(),
+                ef::MODE_READ | ef::MODE_WRITE | ef::MODE_CREATE,
+                0,
+            )
+        });
+        assert_eq!(status, Status::OUT_OF_RESOURCES);
+        assert_eq!(attempts, allowed + 1);
+        assert_eq!(result, sentinel);
+    }
+    // Earlier vtables, independent cursors and metadata survive every failure.
+    assert_eq!(read_byte(file), (1, 0xbb));
+    for alias in aliases.iter().copied() {
+        assert_eq!(read_byte(alias), (1, 0xaa));
+    }
+    let released = aliases.pop().unwrap();
+    assert_eq!(unsafe { ((*released).close)(released) }, Status::SUCCESS);
+    let mut result = core::ptr::null_mut();
+    let (status, attempts) = with_budget(0, || unsafe {
+        ((*root).open)(root, &mut result, name.as_mut_ptr(), ef::MODE_READ, 0)
+    });
+    assert_eq!(
+        status,
+        Status::NOT_FOUND,
+        "failed creation must not reach disk"
+    );
+    assert_eq!(
+        attempts, 0,
+        "a closed slot must remain reusable without heap"
+    );
+    let created = open(root, "NEW", true);
+    // With the reused slot occupied, this retry must successfully grow.
+    let grown = open(root, "A", false);
+    assert_eq!(read_byte(grown), (1, 0xaa));
+    for handle in aliases.into_iter().chain([file, created, grown, root]) {
+        assert_eq!(unsafe { ((*handle).close)(handle) }, Status::SUCCESS);
+    }
 }
 
 fn exhausted_handle_pool_does_not_create_a_file() {
@@ -248,6 +329,39 @@ fn many_aliases_keep_identity_and_cursors_across_pool_growth() {
     let reopened = open(root, "Long Name.bin", false);
     assert_eq!(read_byte(reopened), (1, 0xdd));
     assert_eq!(unsafe { ((*reopened).close)(reopened) }, Status::SUCCESS);
+    assert_eq!(unsafe { ((*root).close)(root) }, Status::SUCCESS);
+}
+
+fn many_distinct_files_keep_metadata_across_pool_growth() {
+    let root = mount();
+    let mut files = Vec::new();
+    // Exceed the storage retained by the preceding 96-alias scenario too.
+    for index in 0..192 {
+        let name = alloc::format!("F{index:03}.BIN");
+        let file = open(root, &name, true);
+        // Every live record has a different size and contents. Keep its cursor
+        // on the last byte while later slabs and the node vector grow.
+        let data = [index as u8; 192];
+        write(file, &data[..=index]);
+        seek(file, index as u64);
+        files.push(file);
+    }
+    for (index, file) in files.into_iter().enumerate() {
+        assert_eq!(read_byte(file), (1, index as u8));
+        assert_eq!(read_byte(file), (0, 0));
+        let name = alloc::format!("F{index:03}.BIN");
+        let alias = open(root, &name, false);
+        seek(alias, index as u64);
+        assert_eq!(read_byte(alias), (1, index as u8));
+        assert_eq!(read_byte(alias), (0, 0));
+        assert_eq!(unsafe { ((*file).close)(file) }, Status::SUCCESS);
+        assert_eq!(unsafe { ((*alias).close)(alias) }, Status::SUCCESS);
+        let reopened = open(root, &name, false);
+        seek(reopened, index as u64);
+        assert_eq!(read_byte(reopened), (1, index as u8));
+        assert_eq!(read_byte(reopened), (0, 0));
+        assert_eq!(unsafe { ((*reopened).close)(reopened) }, Status::SUCCESS);
+    }
     assert_eq!(unsafe { ((*root).close)(root) }, Status::SUCCESS);
 }
 

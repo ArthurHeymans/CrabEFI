@@ -49,6 +49,8 @@ pub mod peripheral;
 pub mod platform;
 #[cfg(feature = "secure-boot")]
 pub mod secure_boot_menu;
+#[cfg(test)]
+mod test_allocator;
 pub mod time;
 pub mod timestamp;
 #[cfg(feature = "ui")]

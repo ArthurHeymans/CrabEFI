@@ -78,6 +78,47 @@ fn denied_growth_preserves_existing_storage_and_can_reuse_a_freed_slot() {
 }
 
 #[test]
+fn allocator_failures_do_not_publish_partial_slabs_or_consume_reservations() {
+    use crate::test_allocator::with_budget;
+
+    for occupied in [0, SLOTS_PER_SLAB] {
+        // Fail the slab buffer, outer slab vector, and node vector in turn.
+        // Each case starts fresh so retained capacity cannot skip a failure.
+        for allowed in 0..3 {
+            let mut pool = FilePool::new();
+            let pointers: Vec<_> = (0..occupied)
+                .map(|position| {
+                    let index = pool.reserve().unwrap();
+                    pool.set_position(index, position as u64 + 1);
+                    &raw mut pool.handles[index.0].protocol
+                })
+                .collect();
+            let (result, attempts) = with_budget(allowed, || pool.reserve());
+            assert!(matches!(result, Err(Status::OUT_OF_RESOURCES)));
+            assert_eq!(attempts, allowed + 1);
+            assert_eq!(pool.handles.len(), occupied);
+            assert_eq!(pool.nodes.len(), occupied);
+            assert_eq!(pool.handles.slabs.len() * SLOTS_PER_SLAB, occupied);
+            for (index, pointer) in pointers.into_iter().enumerate() {
+                assert_eq!(pointer, &raw mut pool.handles[index].protocol);
+                assert!(pool.handles[index].in_use);
+                assert_eq!(pool.handles[index].position, index as u64 + 1);
+            }
+            if occupied != 0 {
+                pool.release(HandleId(0));
+                let (result, attempts) = with_budget(0, || pool.reserve());
+                assert_eq!(result.unwrap().0, 0);
+                assert_eq!(attempts, 0, "reuse must not require an allocation");
+            }
+            // Retry must start at the first new slot, not skip a reservation
+            // consumed by a failed grow, even if it retained vector capacity.
+            assert_eq!(pool.reserve().unwrap().0, occupied);
+            assert_eq!(pool.handles.len(), occupied + SLOTS_PER_SLAB);
+        }
+    }
+}
+
+#[test]
 fn payload_budget_bounds_growth_without_imposing_a_fixed_32_slot_limit() {
     let mut pool = FilePool::new();
     let slots = (POOL_BUDGET / SLOT_COST / SLOTS_PER_SLAB) * SLOTS_PER_SLAB;
