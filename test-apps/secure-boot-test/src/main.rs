@@ -744,33 +744,61 @@ fn test_write_readonly_setupmode(
     }
 }
 
-/// Test 14: Verify attribute enforcement
+/// Test 14: GUID isolation and immutable attributes of an existing variable.
 fn test_attribute_enforcement(console: &Console, st: *mut SystemTable, results: &mut TestResults) {
     console.print("[TEST] attribute_enforcement: ");
 
-    let mut buffer = [0u8; 64];
-
-    // Try reading db with wrong GUID (Global instead of Security)
-    let result1 = get_variable(st, DB_NAME.as_ptr(), &EFI_GLOBAL_VARIABLE_GUID, &mut buffer);
-    let result2 = get_variable(
-        st,
-        DB_NAME.as_ptr(),
-        &EFI_IMAGE_SECURITY_DATABASE_GUID,
-        &mut buffer,
+    // A private, volatile fixture makes this check meaningful in Setup Mode
+    // too, without enrolling or changing any real Secure Boot database.
+    let guid = Guid::from_fields(
+        0x68d449d1,
+        0x72d0,
+        0x40de,
+        0x91,
+        0x23,
+        &[0xd8, 0x41, 0xf0, 0x2d, 0x70, 0x65],
     );
+    let mut name = [0u16; 24];
+    for (unit, byte) in name.iter_mut().zip(b"CrabEFIAttributeTest") {
+        *unit = u16::from(*byte);
+    }
+    let attributes = efi::VARIABLE_BOOTSERVICE_ACCESS | efi::VARIABLE_RUNTIME_ACCESS;
+    let expected = [0x19, 0x24, 0x51, 0x83];
+    let created = set_variable(st, name.as_ptr(), &guid, attributes, &expected);
+    let mut buffer = [0u8; 64];
+    let initial = get_variable(st, name.as_ptr(), &guid, &mut buffer);
+    let initial_matches =
+        initial == Ok((expected.len(), attributes)) && buffer[..expected.len()] == expected;
+    let wrong_guid = get_variable(st, name.as_ptr(), &EFI_GLOBAL_VARIABLE_GUID, &mut buffer);
 
-    let pass = match (result1, result2) {
-        (Err(_), Err(_)) => true,
-        (Err(_), Ok(_)) => true,
-        (Ok(_), Err(_)) => true,
-        (Ok((s1, _)), Ok((s2, _))) => s1 != s2,
-    };
+    // UEFI SetVariable must reject changing the attributes of an existing
+    // variable, and rejection must leave its original value untouched.
+    let changed_attributes = set_variable(
+        st,
+        name.as_ptr(),
+        &guid,
+        efi::VARIABLE_BOOTSERVICE_ACCESS,
+        &[0xff],
+    );
+    let after = get_variable(st, name.as_ptr(), &guid, &mut buffer);
+    let unchanged =
+        after == Ok((expected.len(), attributes)) && buffer[..expected.len()] == expected;
+    let deleted = set_variable(st, name.as_ptr(), &guid, 0, &[]);
+    let absent = get_variable(st, name.as_ptr(), &guid, &mut buffer);
 
-    if pass {
+    if created == Status::SUCCESS
+        && initial_matches
+        && wrong_guid == Err(Status::NOT_FOUND)
+        && changed_attributes == Status::INVALID_PARAMETER
+        && unchanged
+        && deleted == Status::SUCCESS
+        && absent == Err(Status::NOT_FOUND)
+    {
         console.println("[PASS]");
         results.record_pass();
     } else {
-        console.println("[FAIL] GUID not properly enforced");
+        console
+            .println("[FAIL] fixture, GUID isolation, attributes or rejected-write state mismatch");
         results.record_fail();
     }
 }

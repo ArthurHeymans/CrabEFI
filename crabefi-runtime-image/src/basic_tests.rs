@@ -2,8 +2,8 @@
 
 use crate::{
     efi::{self, VariableAttributes},
-    services::{VariableContext, VariableRequest, apply_variable, capsule_delivery_available},
-    state::{Phase, RetainedBuffer, RuntimeState},
+    services::{VariableContext, VariableRequest, apply_variable},
+    state::Phase,
     store::{VariableStore, VariableTransaction},
 };
 use crabefi_efi_types::secure_boot;
@@ -23,20 +23,6 @@ fn apply(
         ..VariableContext::boot(store, transaction, 0)
     };
     efi::status(apply_variable(context, request))
-}
-
-#[test]
-fn capsule_delivery_requires_boot_consumer_enablement() {
-    let mut runtime = RuntimeState::new();
-    runtime.retained = Some(RetainedBuffer {
-        physical_base: 0x1000,
-        virtual_base: 0,
-        size: 0x1000,
-    });
-    assert!(!capsule_delivery_available(&runtime));
-
-    runtime.capsule_delivery_enabled = true;
-    assert!(capsule_delivery_available(&runtime));
 }
 
 #[test]

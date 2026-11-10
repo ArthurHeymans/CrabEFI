@@ -185,29 +185,60 @@ fn required_attributes(content: &[u8]) -> Vec<u8> {
     ])
 }
 
-fn assert_rejected_without_panic(pkcs7: &[u8], trusted: &[u8]) {
-    let outcome = std::panic::catch_unwind(|| verify_pkcs7_signature(pkcs7, &[], trusted));
-    let verification = outcome.expect("adversarial DER input must not panic");
-    assert!(
-        verification.is_err() || verification == Ok(false),
-        "malformed or over-limit input was accepted"
-    );
+fn sign(key: &rsa::RsaPrivateKey, content: &[u8]) -> Vec<u8> {
+    rsa::pkcs1v15::SigningKey::<Sha256>::new(key.clone())
+        .sign_prehash(&Sha256::digest(content))
+        .unwrap()
+        .to_vec()
+}
+
+fn verify_without_panic(
+    pkcs7: &[u8],
+    content: &[u8],
+    trusted: &[u8],
+) -> Result<bool, auth::AuthError> {
+    std::panic::catch_unwind(|| verify_pkcs7_signature(pkcs7, content, trusted))
+        .expect("adversarial DER input must not panic")
 }
 
 #[test]
 fn more_than_sixteen_certificates_is_rejected_without_panic() {
-    let certificates = vec![tlv(0x30, &[]); 17];
-    let input = signed_data(OID_SHA256, &certificates, &[]);
-    assert_rejected_without_panic(&input, &[]);
+    let key = test_key();
+    let trusted = certificate(&key, 1, 1, 1, false);
+    let signers = [signer(1, 1, &sign(&key, &[]))];
+    let mut certificates = vec![trusted.clone(); 16];
+    let accepted = signed_data(OID_SHA256, &certificates, &signers);
+    assert_eq!(verify_without_panic(&accepted, &[], &trusted), Ok(true));
+    certificates.push(trusted.clone());
+    let input = signed_data(OID_SHA256, &certificates, &signers);
+    assert_eq!(
+        verify_without_panic(&input, &[], &trusted),
+        Err(auth::AuthError::OutOfResources)
+    );
 }
 
 #[test]
-fn more_than_eight_signers_is_rejected_without_panic() {
+fn signer_budget_accepts_eighth_and_rejects_ninth_attempt() {
     let key = test_key();
     let trusted = certificate(&key, 1, 1, 1, false);
-    let signers = (0..9).map(|_| signer(99, 1, &[])).collect::<Vec<_>>();
+    let signature = sign(&key, &[]);
+    let valid = signer(1, 1, &signature);
+    let mut wrong_signature = signature;
+    wrong_signature[0] ^= 0x80;
+    let rejected = signer(1, 1, &wrong_signature);
+    // The policy limits attempts, not total signers after an early success.
+    // All entries have a real matching certificate; only their signatures
+    // differ, with the successful attempt at the boundary being tested.
+    let mut signers = vec![rejected.clone(); 7];
+    signers.push(valid);
+    let accepted = signed_data(OID_SHA256, std::slice::from_ref(&trusted), &signers);
+    assert_eq!(verify_without_panic(&accepted, &[], &trusted), Ok(true));
+    signers.insert(0, rejected);
     let input = signed_data(OID_SHA256, std::slice::from_ref(&trusted), &signers);
-    assert_rejected_without_panic(&input, &trusted);
+    assert_eq!(
+        verify_without_panic(&input, &[], &trusted),
+        Err(auth::AuthError::OutOfResources)
+    );
 }
 
 #[test]
@@ -234,8 +265,20 @@ fn chain_deeper_than_five_is_rejected_without_panic() {
 
 #[test]
 fn non_sha256_digest_set_is_rejected_without_panic() {
-    let input = signed_data(OID_SHA1, &[], &[]);
-    assert_rejected_without_panic(&input, &[]);
+    let key = test_key();
+    let trusted = certificate(&key, 1, 1, 1, false);
+    let content = b"digest policy";
+    let signers = [signer(1, 1, &sign(&key, content))];
+    let certificates = std::slice::from_ref(&trusted);
+    let accepted = signed_data(OID_SHA256, certificates, &signers);
+    assert_eq!(verify_without_panic(&accepted, content, &trusted), Ok(true));
+    // Change only digestAlgorithms: signer, certificate and signature remain
+    // the known-good baseline, so a missing policy check would accept it.
+    let input = signed_data(OID_SHA1, certificates, &signers);
+    assert_eq!(
+        verify_without_panic(&input, content, &trusted),
+        Err(auth::AuthError::CryptoError)
+    );
 }
 
 #[test]
@@ -295,50 +338,72 @@ fn signed_attributes_require_unique_matching_content_type_and_digest() {
     let content_type = attribute(OID_CONTENT_TYPE, &[tlv(0x06, OID_DATA)]);
     let digest: [u8; 32] = Sha256::digest(content).into();
     let message_digest = attribute(OID_MESSAGE_DIGEST, &[tlv(0x04, &digest)]);
+    use auth::AuthError::{InvalidHeader, SignatureVerificationFailed};
     let malformed = [
-        message_digest.clone(),
-        content_type.clone(),
-        concat(&[
-            content_type.clone(),
-            content_type.clone(),
-            message_digest.clone(),
-        ]),
-        concat(&[
-            content_type.clone(),
-            message_digest.clone(),
-            message_digest.clone(),
-        ]),
-        concat(&[
-            attribute(OID_CONTENT_TYPE, &[tlv(0x06, OID_SIGNED_DATA)]),
-            message_digest.clone(),
-        ]),
-        concat(&[
-            attribute(
-                OID_CONTENT_TYPE,
-                &[tlv(0x06, OID_DATA), tlv(0x06, OID_DATA)],
-            ),
-            message_digest.clone(),
-        ]),
-        concat(&[
-            content_type.clone(),
-            attribute(OID_MESSAGE_DIGEST, &[tlv(0x04, &[0; 32])]),
-        ]),
-        concat(&[
-            content_type,
-            attribute(
-                OID_MESSAGE_DIGEST,
-                &[tlv(0x04, &digest), tlv(0x04, &digest)],
-            ),
-        ]),
+        (message_digest.clone(), InvalidHeader),
+        (content_type.clone(), InvalidHeader),
+        (
+            concat(&[
+                content_type.clone(),
+                content_type.clone(),
+                message_digest.clone(),
+            ]),
+            InvalidHeader,
+        ),
+        (
+            concat(&[
+                content_type.clone(),
+                message_digest.clone(),
+                message_digest.clone(),
+            ]),
+            InvalidHeader,
+        ),
+        (
+            concat(&[
+                attribute(OID_CONTENT_TYPE, &[tlv(0x06, OID_SIGNED_DATA)]),
+                message_digest.clone(),
+            ]),
+            InvalidHeader,
+        ),
+        (
+            concat(&[
+                attribute(
+                    OID_CONTENT_TYPE,
+                    &[tlv(0x06, OID_DATA), tlv(0x06, OID_DATA)],
+                ),
+                message_digest.clone(),
+            ]),
+            InvalidHeader,
+        ),
+        (
+            concat(&[
+                content_type.clone(),
+                attribute(OID_MESSAGE_DIGEST, &[tlv(0x04, &[0; 32])]),
+            ]),
+            SignatureVerificationFailed,
+        ),
+        (
+            concat(&[
+                content_type,
+                attribute(
+                    OID_MESSAGE_DIGEST,
+                    &[tlv(0x04, &digest), tlv(0x04, &digest)],
+                ),
+            ]),
+            InvalidHeader,
+        ),
     ];
-    for attributes in malformed {
+    for (attributes, expected) in malformed {
+        // Even malformed attributes have a valid RSA signature over their
+        // exact SET bytes. An unrelated signature error cannot satisfy this
+        // test if an attribute-policy check is accidentally removed.
+        let signature = sign(&key, &tlv(0x31, &attributes));
         let cms = signed_data(
             OID_SHA256,
             std::slice::from_ref(&trusted),
-            &[signer_with_attributes(1, 1, Some(&attributes), &[])],
+            &[signer_with_attributes(1, 1, Some(&attributes), &signature)],
         );
-        let result = verify_pkcs7_signature(&cms, content, &trusted);
-        assert!(result.is_err(), "malformed signed attributes were accepted");
+        assert_eq!(verify_without_panic(&cms, content, &trusted), Err(expected));
     }
 }
 

@@ -345,7 +345,7 @@ pub extern "C" fn runtime_image_get_system_table() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    static RUNTIME_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(crate) static RUNTIME_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn seal_erases_boot_bridge_and_runtime_nv_never_calls_it() {
@@ -398,14 +398,41 @@ mod tests {
         let bs = efi::VARIABLE_BOOTSERVICE_ACCESS;
         let rt = efi::VARIABLE_RUNTIME_ACCESS;
         let nv = efi::VARIABLE_NON_VOLATILE;
+        let auth = efi::VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS;
+        let ok = efi::Status::SUCCESS;
+        let invalid = efi::Status::INVALID_PARAMETER;
+        let unsupported = efi::Status::UNSUPPORTED;
+        let authenticated = if cfg!(feature = "secure-boot") {
+            ok
+        } else {
+            unsupported
+        };
         for phase in [Phase::BootActive, Phase::SealedPhysical, Phase::Virtual] {
             state::lease().unwrap().advance(phase);
-            for attributes in [
-                bs,
-                bs | rt,
-                nv | bs | rt,
-                nv | bs | rt | efi::VARIABLE_APPEND_WRITE,
+            // Explicit API expectations, not a second copy of the validator.
+            for (attributes, boot, runtime) in [
+                (bs, ok, invalid),
+                (bs | rt, ok, ok),
+                (nv | bs | rt, ok, ok),
+                (nv | bs | rt | efi::VARIABLE_APPEND_WRITE, ok, ok),
+                (bs | auth, authenticated, invalid),
+                (bs | rt | auth, authenticated, authenticated),
+                (nv | bs | rt | auth, authenticated, authenticated),
+                (0, unsupported, unsupported),
+                (rt, invalid, invalid),
+                (nv, invalid, invalid),
+                (
+                    nv | bs | efi::VARIABLE_HARDWARE_ERROR_RECORD,
+                    unsupported,
+                    invalid,
+                ),
+                (1 << 31, invalid, invalid),
             ] {
+                let expected = if phase == Phase::BootActive {
+                    boot
+                } else {
+                    runtime
+                };
                 let (mut maximum, mut remaining, mut variable) = (u64::MAX, u64::MAX, u64::MAX);
                 let status = services::query_variable_info(
                     attributes,
@@ -413,17 +440,16 @@ mod tests {
                     &mut remaining,
                     &mut variable,
                 );
-                if phase.runtime() && attributes & rt == 0 {
-                    assert_eq!(status, efi::Status::INVALID_PARAMETER);
+                assert_eq!(status, expected, "{phase:?}, attributes={attributes:#x}");
+                if expected == ok {
+                    assert_eq!(maximum, VariableStore::maximum_storage());
+                    assert_eq!(remaining, expected_remaining);
+                    assert_eq!(variable, MAX_VARIABLE_DATA_SIZE as u64);
+                } else {
                     assert_eq!(
                         (maximum, remaining, variable),
                         (u64::MAX, u64::MAX, u64::MAX)
                     );
-                } else {
-                    assert_eq!(status, efi::Status::SUCCESS);
-                    assert_eq!(maximum, VariableStore::maximum_storage());
-                    assert_eq!(remaining, expected_remaining);
-                    assert_eq!(variable, MAX_VARIABLE_DATA_SIZE as u64);
                 }
             }
         }

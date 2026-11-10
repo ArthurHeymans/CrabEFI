@@ -703,19 +703,8 @@ mod tests {
         efi_time_from_timestamp, efi_time_from_unix, next_timestamp_after, replay_floor,
         utc_seconds,
     };
-    use crate::efi::utils::ucs2_eq;
     use alloc::vec;
     use crabefi_efi_types::authentication::EfiTime;
-
-    #[test]
-    fn test_ucs2_eq() {
-        let name1 = [0x50, 0x4B, 0x00]; // "PK\0"
-        let name2 = [0x50, 0x4B, 0x00, 0x00, 0x00]; // "PK\0" with padding
-
-        assert!(ucs2_eq(&name1, &name1));
-        assert!(ucs2_eq(&name2, &name1));
-        assert!(ucs2_eq(&name1, &name2));
-    }
 
     #[test]
     fn replay_floor_survives_same_session_refresh_and_authenticated_deletion() {

@@ -43,19 +43,3 @@ pub fn mmio_write() {
 pub fn mmio_general() {
     mem_barrier(BarrierKind::Mmio, BarrierType::General);
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn all_hardware_barrier_helpers_are_callable() {
-        publish_to_device();
-        consume_from_device();
-        dma_read();
-        dma_write();
-        mmio_write();
-        #[cfg(target_arch = "riscv64")]
-        mmio_general();
-    }
-}

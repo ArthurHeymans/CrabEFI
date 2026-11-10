@@ -49,42 +49,15 @@ do
     "$TMPDIR/$test_name"
 done
 
-python3 - "$ROOT/crabefi-core/src/cfr.rs" <<'PY'
-import re
-import sys
-from pathlib import Path
+rustc --edition=2021 --test "$ROOT/test-apps/tcg-test/src/tpm.rs" -o "$TMPDIR/tcg_wire_tests"
+"$TMPDIR/tcg_wire_tests"
 
-src = Path(sys.argv[1]).read_text()
-
-write_match = re.search(
-    r"pub fn write_option_value\(.*?\n}\n\n/// Delete a CFR option",
-    src,
-    re.S,
-)
-assert write_match, "write_option_value block not found"
-write_block = write_match.group(0)
-assert "variables::set(&COREBOOT_CFR_GUID, &name, attrs, &data)" in write_block, (
-    "CFR writes must use the authoritative runtime-image SetVariable facade"
-)
-assert "status != efi::Status::SUCCESS" in write_block, (
-    "CFR writes must propagate runtime-image failures"
-)
-assert "store_of(option)" in write_block and "store.write(option, value)" in write_block, (
-    "Kept CFR options must be written through the platform OptionStore"
-)
-
-delete_match = re.search(r"pub fn delete_option_value\(.*?\n}\n\Z", src, re.S)
-assert delete_match, "delete_option_value block not found"
-delete_block = delete_match.group(0)
-assert "variables::delete(&COREBOOT_CFR_GUID, &name)" in delete_block, (
-    "CFR deletes must use the authoritative runtime-image facade"
-)
-assert "matches!(status, efi::Status::SUCCESS | efi::Status::NOT_FOUND)" in delete_block, (
-    "CFR deletes must treat an already-absent override as the requested default state"
-)
-assert 'return Err("Failed to delete CFR variable")' in delete_block, (
-    "CFR deletes must still propagate failures other than NOT_FOUND"
-)
-
-print("CFR runtime-image variable facade regression checks passed")
-PY
+# Check real CFR writes, reads, deletion and error propagation, not source text.
+HOST="$(rustc -vV | awk '/^host:/ {print $2}')"
+cargo test --locked --manifest-path "$ROOT/Cargo.toml" -p crabefi-core \
+    --target "$HOST" --no-default-features --features cfr --test cfr_store
+if [[ "$HOST" == x86_64-unknown-linux-gnu ]]; then
+    cargo test --locked --manifest-path "$ROOT/Cargo.toml" -p crabefi-core \
+        --target "$HOST" --no-default-features \
+        --features cfr,variable-store,bundled-runtime-image --test runtime_lifecycle
+fi

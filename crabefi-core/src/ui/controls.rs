@@ -602,12 +602,15 @@ mod tests {
     }
 
     #[test]
-    fn scrolling_does_not_retarget_a_selection() {
-        let selected = 2;
+    fn scrolling_and_revealing_a_row_move_the_viewport() {
         let mut offset = 0;
         scroll(&mut offset, 5, 12, 4);
-        assert_eq!((offset, selected), (5, 2));
-        ensure_visible(&mut offset, selected, 12, 4);
+        assert_eq!(offset, 5);
+        ensure_visible(&mut offset, 2, 12, 4);
         assert_eq!(offset, 2);
+        scroll(&mut offset, i32::MAX, 12, 4);
+        assert_eq!(offset, 8);
+        scroll(&mut offset, i32::MIN, 12, 4);
+        assert_eq!(offset, 0);
     }
 }
