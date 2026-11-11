@@ -45,6 +45,8 @@ replay-test-reset-after-persist = ["crabefi/replay-test-reset-after-persist"]
 # Test only: payload MM never confirms READY_TO_BOOT, which must stop the boot.
 payload-mm-test-lose-ready-to-boot = ["crabefi/payload-mm-test-lose-ready-to-boot"]
 secure-boot-enforced = ["crabefi/secure-boot-enforced"]
+max-log-level-error = ["crabefi/max-log-level-error"]
+default-log-level-error = ["crabefi/default-log-level-error"]
 
 [dependencies]
 crabefi = { package = "crabefi-core", path = "../crabefi-core", features = [

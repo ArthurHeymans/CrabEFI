@@ -2,7 +2,13 @@
 pub use log::LevelFilter;
 
 /// Default log level when no persistent CrabEFI log-level variable exists.
-pub const DEFAULT_LEVEL: LevelFilter = LevelFilter::Debug;
+/// Debug lines are slow on a 115200 baud console (about 6.5 ms each); the
+/// `default-log-level-error` feature starts at Error instead.
+pub const DEFAULT_LEVEL: LevelFilter = if cfg!(feature = "default-log-level-error") {
+    LevelFilter::Error
+} else {
+    LevelFilter::Debug
+};
 
 /// Log levels shown in the CrabEFI settings menu.
 pub const LEVEL_CHOICES: [LevelFilter; 6] = [
