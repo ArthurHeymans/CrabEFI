@@ -40,6 +40,7 @@ pub mod tags {
     pub const CB_TAG_CBMEM_CONSOLE: u32 = 0x0017;
     pub const CB_TAG_SPI_FLASH: u32 = 0x0029;
     pub const CB_TAG_BOOT_MEDIA_PARAMS: u32 = 0x0030;
+    pub const CB_TAG_TSC_INFO: u32 = 0x0032;
     pub const CB_TAG_PAYLOAD_MM_INTERFACE_INFO: u32 = 0x003b;
     pub const CB_TAG_PAYLOAD_MM_SMRAM_REGION: u32 = 0x003c;
     pub const CB_TAG_PAYLOAD_MM_SHARED_MEM: u32 = 0x003d;
@@ -161,6 +162,15 @@ struct CbAcpiRsdp {
     tag: u32,
     size: u32,
     rsdp_pointer: u64,
+}
+
+/// Constant TSC rate (coreboot's `struct lb_tsc_info`)
+#[repr(C, packed)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
+struct CbTscInfo {
+    tag: u32,
+    size: u32,
+    freq_khz: u32,
 }
 
 /// coreboot `struct lb_payload_mm_interface_info`
@@ -474,6 +484,8 @@ pub struct CorebootInfo {
     pub cbmem_console: Option<u64>,
     /// Timestamp table address (from CB_TAG_TIMESTAMPS)
     pub timestamps: Option<u64>,
+    /// Constant TSC frequency in kHz (from CB_TAG_TSC_INFO)
+    pub tsc_freq_khz: Option<u32>,
     /// coreboot-mediated payload MM interface (CB_TAG_PAYLOAD_MM_*)
     pub payload_mm: PayloadMmInfo,
     /// SMBIOS tables address (from CBMEM entry)
@@ -528,6 +540,7 @@ impl CorebootInfo {
             version: None,
             cbmem_console: None,
             timestamps: None,
+            tsc_freq_khz: None,
             payload_mm: PayloadMmInfo::default(),
             smbios: None,
             smmstorev2: None,
@@ -842,6 +855,9 @@ fn parse_record(record_bytes: &[u8], info: &mut CorebootInfo, depth: usize) {
         tags::CB_TAG_TIMESTAMPS => {
             parse_timestamps(record_bytes, info);
         }
+        tags::CB_TAG_TSC_INFO => {
+            parse_tsc_info(record_bytes, info);
+        }
         tags::CB_TAG_PAYLOAD_MM_INTERFACE_INFO => {
             if let Ok((mm, _)) = CbPayloadMmInterfaceInfo::read_from_prefix(record_bytes) {
                 info.payload_mm.apm_cmd = Some(mm.apm_cmd);
@@ -1141,6 +1157,18 @@ fn parse_acpi_rsdp(record_bytes: &[u8], info: &mut CorebootInfo) {
     info.acpi_rsdp = Some(rsdp_pointer);
 
     log::debug!("ACPI RSDP: {:#x}", rsdp_pointer);
+}
+
+/// Parse the constant TSC frequency
+fn parse_tsc_info(record_bytes: &[u8], info: &mut CorebootInfo) {
+    let Ok((tsc, _)) = CbTscInfo::read_from_prefix(record_bytes) else {
+        log::warn!("Failed to parse TSC info record");
+        return;
+    };
+    let freq_khz = tsc.freq_khz;
+    if freq_khz != 0 {
+        info.tsc_freq_khz = Some(freq_khz);
+    }
 }
 
 /// Parse devicetree (FDT) pointer
