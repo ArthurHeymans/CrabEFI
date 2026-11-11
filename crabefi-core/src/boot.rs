@@ -447,6 +447,8 @@ fn execute_bootloader(
     }
 
     log::info!("Executing bootloader...");
+    // Same ID and point as U-Boot's TS_U_BOOT_START_KERNEL, for payload comparisons.
+    crate::timestamp::record(1100);
     // No exit-data consumer at this level; StartImage frees any returned data.
     // SAFETY: image_handle came from a successful LoadImage; no exit data is requested.
     let status = unsafe { (bs.start_image)(image_handle, ptr::null_mut(), ptr::null_mut()) };
