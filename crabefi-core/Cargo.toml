@@ -20,6 +20,10 @@ secure-boot = ["pkcs7", "crabefi-runtime-bundle?/secure-boot", "crabefi-ui/secur
 external-boot-setting = ["cfr"]
 # Production builds: turn Secure Boot on at every boot, also after a setup action turned it off.
 secure-boot-enforced = ["secure-boot"]
+# Cap logging at Error whatever CrabEFILogLevel says (production builds).
+max-log-level-error = []
+# Start at the Error log level when no CrabEFILogLevel variable exists.
+default-log-level-error = ["crabefi-ui/default-log-level-error"]
 # Signed firmware capsule application requires durable result persistence.
 capsule-update = ["pkcs7", "variable-store"]
 # Shared verification implementation, not a runtime policy switch.
