@@ -31,6 +31,9 @@ external-boot-deny = []
 internal-hot-plug-sata = []
 # Offer the external-boot policy in the setup menu (stricter values only).
 external-boot-setting = ["crabefi/external-boot-setting"]
+# Load crabefi-mm into coreboot-owned SMRAM (coreboot PAYLOAD_MM_INTERFACE);
+# needs CRABEFI_MM_ELF at build time.
+payload-mm = []
 
 [dependencies]
 crabefi = { package = "crabefi-core", path = "../crabefi-core", features = [
