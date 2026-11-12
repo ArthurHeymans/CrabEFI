@@ -402,10 +402,7 @@ impl VariableStore {
             (Some(index), _) => {
                 // An append keeps the stored attributes, so it must name them
                 // too (EDK2 rejects any attribute change but a deletion).
-                if !delete
-                    && self.slots[index].attributes != attributes
-                    && identify_key_database(&guid, name).is_none()
-                {
+                if !delete && self.slots[index].attributes != attributes {
                     return Err(Status::INVALID_PARAMETER);
                 }
                 index
