@@ -15,6 +15,7 @@ pub(crate) mod boot_policy;
 mod filesystem;
 mod fwui;
 pub(crate) mod sct;
+mod secure_boot_auth;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CaptureScenario {
@@ -66,15 +67,20 @@ fn add_x86_boot_args(cmd: &mut Command, firmware: &str, scenario: CaptureScenari
     }
 }
 
-fn prepare_runtime_test_flash(source: &Path) -> Result<tempfile::NamedTempFile> {
-    const FMAP_SIGNATURE: &[u8; 8] = b"__FMAP__";
-    const FMAP_HEADER_SIZE: usize = 56;
-    const FMAP_AREA_SIZE: usize = 42;
-    const SMMSTORE_SIZE: usize = 64 * 1024;
-    const SMMSTORE_TRAILING_GUARD: usize = 64 * 1024;
+const FMAP_HEADER_SIZE: usize = 56;
+const FMAP_AREA_SIZE: usize = 42;
 
-    let mut bytes = fs::read(source)
-        .with_context(|| format!("failed to read runtime test flash {}", source.display()))?;
+/// Location of the FMAP area table and of the SMMSTORE area, if any.
+struct FmapAreas {
+    count_offset: usize,
+    count: u16,
+    areas: usize,
+    smmstore: Option<(usize, usize)>,
+}
+
+fn fmap_smmstore(bytes: &[u8]) -> Result<FmapAreas> {
+    const FMAP_SIGNATURE: &[u8; 8] = b"__FMAP__";
+
     let fmap = bytes
         .windows(FMAP_SIGNATURE.len())
         .position(|window| window == FMAP_SIGNATURE)
@@ -90,7 +96,7 @@ fn prepare_runtime_test_flash(source: &Path) -> Result<tempfile::NamedTempFile> 
     let areas = fmap
         .checked_add(FMAP_HEADER_SIZE)
         .context("FMAP areas offset overflow")?;
-    let existing_smmstore = (0..usize::from(count)).find_map(|index| {
+    let smmstore = (0..usize::from(count)).find_map(|index| {
         let entry = areas.checked_add(index.checked_mul(FMAP_AREA_SIZE)?)?;
         let bytes = bytes.get(entry..entry + FMAP_AREA_SIZE)?;
         let name = &bytes[8..40];
@@ -105,7 +111,27 @@ fn prepare_runtime_test_flash(source: &Path) -> Result<tempfile::NamedTempFile> 
             )
         })
     });
-    if let Some((offset, size)) = existing_smmstore {
+    Ok(FmapAreas {
+        count_offset,
+        count,
+        areas,
+        smmstore,
+    })
+}
+
+fn prepare_runtime_test_flash(source: &Path) -> Result<tempfile::NamedTempFile> {
+    const SMMSTORE_SIZE: usize = 64 * 1024;
+    const SMMSTORE_TRAILING_GUARD: usize = 64 * 1024;
+
+    let mut bytes = fs::read(source)
+        .with_context(|| format!("failed to read runtime test flash {}", source.display()))?;
+    let FmapAreas {
+        count_offset,
+        count,
+        areas,
+        smmstore,
+    } = fmap_smmstore(&bytes)?;
+    if let Some((offset, size)) = smmstore {
         let end = offset
             .checked_add(size)
             .context("existing SMMSTORE range overflow")?;
@@ -856,6 +882,9 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
     }
     if app_name == "boot-policy-test" {
         return boot_policy::run(config, disk_path);
+    }
+    if app_name == "secure-boot-auth-test" {
+        return secure_boot_auth::run(config, disk_path);
     }
     let scenario = CaptureScenario::for_test_app(app_name);
     println!(
