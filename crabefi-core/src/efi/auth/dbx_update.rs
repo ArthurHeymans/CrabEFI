@@ -365,7 +365,7 @@ fn inspect_authenticated_dbx_update(
     // comparator would otherwise let out-of-range fields (seconds, nanoseconds,
     // timezone) sort after the current timestamp and defeat the anti-downgrade
     // check. Mirrors the runtime image's verify_authenticated_variable.
-    if !update_timestamp.is_valid() {
+    if !update_timestamp.is_valid() || !update_timestamp.has_zero_authentication_fields() {
         log::error!("dbx update timestamp is malformed");
         return Err(AuthError::InvalidTimestamp);
     }

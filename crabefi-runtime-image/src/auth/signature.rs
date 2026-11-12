@@ -38,6 +38,11 @@ pub fn verify_authenticated_variable<'a>(
     }
     let authentication =
         EfiVariableAuthentication2::from_bytes(data).ok_or(AuthError::InvalidHeader)?;
+    // UEFI 2.10 8.2: only the date and time of the TimeStamp may be set;
+    // EDK2 also answers EFI_SECURITY_VIOLATION.
+    if !authentication.time_stamp.has_zero_authentication_fields() {
+        return Err(AuthError::InvalidTimestamp);
+    }
     if (authentication.auth_info.hdr.dw_length as usize) < WinCertificateUefiGuid::HEADER_SIZE
         || authentication.auth_info.hdr.w_revision != WIN_CERT_REVISION
         || authentication.auth_info.hdr.w_certificate_type != WIN_CERT_TYPE_EFI_GUID
@@ -187,7 +192,7 @@ mod tests {
             minute: 4,
             second: 5,
             pad1: 0,
-            nanosecond: 6,
+            nanosecond: 0,
             timezone: 0,
             daylight: 0,
             pad2: 0,
@@ -401,5 +406,31 @@ mod tests {
         assert!(store.setup_mode());
         assert!(!store.secure_boot_enabled());
         assert_eq!(store.auth_timestamp(SecureBootVariable::PK), timestamp);
+    }
+
+    #[test]
+    fn timestamp_fields_other_than_date_and_time_are_rejected() {
+        let store = VariableStore::new();
+        let guid = EFI_GLOBAL_VARIABLE_GUID;
+        let pk = include_bytes!("../../tests/fixtures/pk.esl");
+        let valid = setup_envelope(2025, pk);
+        assert!(verify_authenticated_variable(&store, PK_NAME, &guid, ATTRIBUTES, &valid).is_ok());
+        // Pad1, Nanosecond, TimeZone (60 and unspecified), Daylight, Pad2.
+        for (offset, value) in [
+            (7, &[1][..]),
+            (8, &1u32.to_le_bytes()[..]),
+            (12, &60i16.to_le_bytes()[..]),
+            (12, &0x7ffi16.to_le_bytes()[..]),
+            (14, &[1][..]),
+            (15, &[1][..]),
+        ] {
+            let mut envelope = valid.clone();
+            envelope[offset..offset + value.len()].copy_from_slice(value);
+            assert_eq!(
+                verify_authenticated_variable(&store, PK_NAME, &guid, ATTRIBUTES, &envelope)
+                    .unwrap_err(),
+                AuthError::InvalidTimestamp
+            );
+        }
     }
 }
