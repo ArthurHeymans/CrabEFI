@@ -28,6 +28,12 @@ from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 HERE = Path(__file__).resolve().parent
 KEYS = HERE / "fixtures" / "keys"
+# Public Microsoft UEFI CAs from www.microsoft.com/pkiops/certs, by SHA-1 thumbprint.
+MICROSOFT = {
+    "microsoft-uefi-ca-2011.der": "46def63b5ce61cf8ba0de2e6639c1019d0ed14f3",
+    "microsoft-uefi-ca-2023.der": "b5eeb4a6706048073f0ed296e7f580a790b59eaa",
+}
+MICROSOFT_OWNER = uuid.UUID("77fa9abd-0359-4d32-bd60-28f4e78f784b").bytes_le
 
 GLOBAL = uuid.UUID("8be4df61-93ca-11d2-aa0d-00e098032b8c").bytes_le
 SECURITY_DB = uuid.UUID("d719b2cb-3d3a-4596-a3bc-dad00e67656f").bytes_le
@@ -120,11 +126,11 @@ def der(cert):
 # ---------------------------------------------------------------------------
 
 
-def esl(signature_type, entries):
+def esl(signature_type, entries, owner=OWNER):
     """One EFI_SIGNATURE_LIST holding equally sized EFI_SIGNATURE_DATA."""
     size = 16 + len(entries[0])
     assert all(16 + len(entry) == size for entry in entries)
-    body = b"".join(OWNER + entry for entry in entries)
+    body = b"".join(owner + entry for entry in entries)
     return signature_type + struct.pack("<III", 28 + len(body), 0, size) + body
 
 
@@ -384,6 +390,12 @@ def generate(out):
         esl_x509(certs["db-direct"]) + esl_sha256(authenticode_sha256(plain["img-hash-dbx"])),
     )
     put("dbx-x509sha256.esl", esl_x509_sha256(certs["db-signer2"]))
+    microsoft = b""
+    for name, thumbprint in MICROSOFT.items():
+        cert = (HERE / "fixtures" / "microsoft" / name).read_bytes()
+        assert hashlib.sha1(cert).hexdigest() == thumbprint, name
+        microsoft += esl(CERT_X509, [cert], MICROSOFT_OWNER)
+    put("microsoft-uefi-ca.esl", microsoft)
 
     def auth(case, var, attrs, payload, signer, n, expect, **kwargs):
         data = auth2(var, attrs, files[payload] if payload else b"",
@@ -539,6 +551,14 @@ def generate(out):
     step("mode e-user-mode-after-reenroll 0 1")
     load_deny("e-unsigned-after-reenroll", "img-unsigned")
     load_deny("e-dbx-persisted", "img-hash-dbx")
+    # Ubuntu 24.04 shim (opt-in, see fetch_ubuntu_shim.py): Microsoft UEFI CA
+    # 2011 chain; the dual-signed build carries it as its second signature.
+    step("opt load u-shim-without-microsoft-ca ubuntu/shimx64.efi.signed.latest deny")
+    auth("u-db-add-microsoft-uefi-ca", "db", AUTH | APPEND, "microsoft-uefi-ca.esl", "kek", 11,
+         "SUCCESS")
+    step("var u-microsoft-uefi-ca-present db has microsoft-uefi-ca.esl")
+    step("opt load u-shim-signed ubuntu/shimx64.efi.signed.latest verify")
+    step("opt load u-shim-dualsigned ubuntu/shimx64.efi.dualsigned verify")
     # Attribute changes of existing Secure Boot variables (UEFI 2.10 8.2.6).
     auth("s3-db-append-drops-rt", "db", NV | BS | AT | APPEND, "db-ca.esl", "kek", 1,
          "INVALID_PARAMETER")

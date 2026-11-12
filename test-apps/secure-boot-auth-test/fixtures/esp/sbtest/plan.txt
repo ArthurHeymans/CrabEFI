@@ -113,6 +113,11 @@ set e-pk-reenroll PK 0x27 e-pk-reenroll.auth SUCCESS
 mode e-user-mode-after-reenroll 0 1
 load e-unsigned-after-reenroll img-unsigned.efi deny
 load e-dbx-persisted img-hash-dbx.efi deny
+opt load u-shim-without-microsoft-ca ubuntu/shimx64.efi.signed.latest deny
+set u-db-add-microsoft-uefi-ca db 0x67 u-db-add-microsoft-uefi-ca.auth SUCCESS
+var u-microsoft-uefi-ca-present db has microsoft-uefi-ca.esl
+opt load u-shim-signed ubuntu/shimx64.efi.signed.latest verify
+opt load u-shim-dualsigned ubuntu/shimx64.efi.dualsigned verify
 set s3-db-append-drops-rt db 0x63 s3-db-append-drops-rt.auth INVALID_PARAMETER
 set s3-kek-volatile KEK 0x26 s3-kek-volatile.auth INVALID_PARAMETER
 set f-securebootenable-write SecureBootEnable 0x7 u8-0.bin ERROR
