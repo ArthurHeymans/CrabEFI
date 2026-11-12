@@ -287,6 +287,22 @@ interactive serial/text menu (also with `--ui`'s text fallback), not graphical
 rendering. Runtime requests use retained-memory warm-reset staging, not
 power-loss-safe runtime flash writes. See [capabilities](capabilities.md).
 
+### Secure Boot key hierarchy and image verification
+
+`secure-boot-auth-test` boots three times on file-backed SMMSTORE that starts
+with keys cleared and Secure Boot requested. It enrolls a test PKI, then checks
+time-based authenticated writes, the PK/KEK/db/dbx signer rules, persistence
+across cold boots and `LoadImage` against db/dbx. Every check prints
+`SBAUTH PASS|FAIL <id>`; logs are kept under `target/sb-auth-reports/`.
+
+```bash
+./crabefi test --app secure-boot-auth-test --timeout 300   # needs sbsign
+```
+
+The fixtures and the plan the app executes come from
+`test-apps/secure-boot-auth-test/gen_fixtures.py` (python3-cryptography,
+sbsign). Its keys under `fixtures/keys` are test-only.
+
 ### Interactive QEMU
 
 ```bash
@@ -407,6 +423,7 @@ Test apps live in `test-apps/` and target `x86_64-unknown-uefi` / `aarch64-unkno
 | `fwui-test` | x86-64 persistent reboot-to-setup and subsequent normal boot |
 | `storage-security-test` | Storage security command tests |
 | `secure-boot-test` | Secure Boot verification tests |
+| `secure-boot-auth-test` | Authenticated variables, PK/KEK/db/dbx hierarchy and LoadImage verification over three cold boots |
 | `fw-dump` | Firmware info dump utility |
 
 ```bash
