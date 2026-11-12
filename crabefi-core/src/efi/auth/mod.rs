@@ -128,12 +128,6 @@ pub const WIN_CERT_TYPE_EFI_GUID: u16 = 0x0EF1;
 // Secure Boot State
 // ============================================================================
 
-/// Variable attributes for the SecureBootEnable user preference variable
-/// This is non-volatile so it persists across resets
-#[cfg(feature = "secure-boot")]
-const SECURE_BOOT_ENABLE_ATTRS: u32 =
-    attributes::NON_VOLATILE | attributes::BOOTSERVICE_ACCESS | attributes::RUNTIME_ACCESS;
-
 /// Read the image-owned standard SetupMode variable.
 #[cfg(feature = "secure-boot")]
 pub fn is_setup_mode() -> bool {
@@ -246,16 +240,12 @@ pub fn disable_secure_boot() -> Result<(), r_efi::efi::Status> {
     Ok(())
 }
 
-/// Persist the SecureBootEnable preference to non-volatile storage
+/// Persist the SecureBootEnable preference to non-volatile storage. Only
+/// CrabEFI's own setup actions call this; outside Setup Mode the runtime
+/// image accepts the write only through the setup authorization scope.
 #[cfg(feature = "secure-boot")]
 fn persist_secure_boot_enable_preference(enabled: bool) -> r_efi::efi::Status {
-    let value: u8 = if enabled { 1 } else { 0 };
-    let status = crate::efi::runtime_image::client::variables::set(
-        &Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID),
-        SECURE_BOOT_ENABLE_NAME,
-        SECURE_BOOT_ENABLE_ATTRS,
-        &[value],
-    );
+    let status = crate::efi::runtime_image::bridge::set_secure_boot_enable_from_setup(enabled);
     if status == r_efi::efi::Status::SUCCESS {
         log::debug!("SecureBootEnable preference persisted: {}", enabled);
     } else {
