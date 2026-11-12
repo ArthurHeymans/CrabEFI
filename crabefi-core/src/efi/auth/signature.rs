@@ -7,7 +7,7 @@
 
 use sha2::{Digest, Sha256};
 
-use super::variables::{db_database, dbx_database};
+use super::variables::{KeyDatabase, db_database, dbx_database};
 
 /// Return whether a binary image hash is revoked by dbx.
 pub fn is_hash_forbidden(hash: &[u8; 32]) -> bool {
@@ -22,7 +22,11 @@ pub fn is_hash_allowed(hash: &[u8; 32]) -> bool {
 /// Return whether a certificate is revoked by dbx, either as an X.509 entry
 /// or as an EFI_CERT_X509_SHA256 hash of its TBSCertificate.
 pub fn is_certificate_forbidden(cert_der: &[u8]) -> bool {
-    let dbx = dbx_database();
+    certificate_forbidden(&dbx_database(), cert_der)
+}
+
+/// [`is_certificate_forbidden`] against the given dbx.
+pub(crate) fn certificate_forbidden(dbx: &KeyDatabase, cert_der: &[u8]) -> bool {
     dbx.find_x509_certificate(cert_der).is_some()
         || crabefi_pkcs7::x509::Certificate::parse(cert_der)
             .is_ok_and(|cert| dbx.contains_x509_tbs_sha256(&Sha256::digest(cert.tbs).into()))

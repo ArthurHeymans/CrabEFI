@@ -19,9 +19,9 @@ use super::AuthError;
 #[cfg(feature = "secure-boot")]
 use super::crypto::verify_pkcs7_signature_chain;
 #[cfg(feature = "secure-boot")]
-use super::signature::{is_certificate_forbidden, is_hash_allowed, is_hash_forbidden};
+use super::signature::certificate_forbidden;
 #[cfg(feature = "secure-boot")]
-use super::variables::db_database;
+use super::variables::{KeyDatabase, db_database, dbx_database};
 use crate::efi::digest::{
     SHA1_DIGEST_SIZE, SHA256_DIGEST_SIZE, SHA384_DIGEST_SIZE, SHA512_DIGEST_SIZE, TPM_ALG_SHA1,
     TPM_ALG_SHA256, TPM_ALG_SHA384, TPM_ALG_SHA512, TaggedDigest, digest_size_for_algorithm,
@@ -30,7 +30,7 @@ use crate::pe::{DATA_DIRECTORY_ENTRY_SIZE, IMAGE_DIRECTORY_ENTRY_SECURITY, parse
 use alloc::vec::Vec;
 
 #[cfg(feature = "secure-boot")]
-use crabefi_efi_types::constant_time_eq;
+use crabefi_efi_types::{constant_time_eq, secure_boot::EFI_CERT_TYPE_PKCS7_GUID};
 #[cfg(feature = "secure-boot")]
 use crabefi_pkcs7::cms::SignedData;
 #[cfg(feature = "secure-boot")]
@@ -72,13 +72,6 @@ struct SectionInfo {
     file_offset: u32,
     /// Size of raw data
     size_of_raw_data: u32,
-}
-
-/// Embedded Authenticode signature data
-#[cfg(feature = "secure-boot")]
-pub struct AuthenticodeSignature<'a> {
-    /// The PKCS#7 SignedData blob
-    pub pkcs7_data: &'a [u8],
 }
 
 /// Compute Authenticode digests for all requested hash algorithms.
@@ -320,125 +313,126 @@ fn parse_pe_for_hash(pe_data: &[u8]) -> Result<PeInfo, AuthError> {
     })
 }
 
-/// Extract the embedded Authenticode signature from a PE file
-///
-/// # Arguments
-///
-/// * `pe_data` - The complete PE file data
-///
-/// # Returns
-///
-/// The Authenticode signature if present, or None if unsigned
+/// WIN_CERTIFICATE type carrying a WIN_CERTIFICATE_UEFI_GUID
 #[cfg(feature = "secure-boot")]
-pub fn extract_authenticode_signature(
-    pe_data: &[u8],
-) -> Result<Option<AuthenticodeSignature<'_>>, AuthError> {
+const WIN_CERT_TYPE_EFI_GUID: u16 = 0x0EF1;
+
+/// Size of the WIN_CERTIFICATE header
+#[cfg(feature = "secure-boot")]
+const WIN_CERTIFICATE_HEADER_SIZE: usize = 8;
+
+/// PKCS#7 SignedData of every Authenticode signature in the attribute
+/// certificate table, in table order.
+///
+/// Entries are 8-byte aligned (PE/COFF 4.7) and must end exactly at the end
+/// of the table, otherwise the table is corrupt (EDK2
+/// DxeImageVerificationLib rejects such images too). Certificate types other
+/// than PKCS#7 are skipped.
+#[cfg(feature = "secure-boot")]
+fn authenticode_signatures(pe_data: &[u8]) -> Result<Vec<&[u8]>, AuthError> {
     let info = parse_pe_for_hash(pe_data)?;
-
-    // Check if there's a certificate table
     if info.cert_table_rva == 0 || info.cert_table_size == 0 {
-        return Ok(None);
+        return Ok(Vec::new());
     }
-
-    // Certificate table is at a file offset (not RVA)
-    let cert_offset = info.cert_table_rva as usize;
-    let cert_end = cert_offset
+    // The certificate table is located by file offset, not RVA.
+    let start = info.cert_table_rva as usize;
+    let table = start
         .checked_add(info.cert_table_size as usize)
-        .ok_or(AuthError::InvalidHeader)?;
-
-    if cert_end > pe_data.len() {
-        log::warn!("Certificate table extends beyond file");
+        .and_then(|end| pe_data.get(start..end))
+        .ok_or_else(|| {
+            log::warn!("Certificate table extends beyond file");
+            AuthError::InvalidHeader
+        })?;
+    let mut signatures = Vec::new();
+    let mut offset = 0usize;
+    while let Some(entry) = table.get(offset..).filter(|entry| !entry.is_empty()) {
+        let header = entry
+            .get(..WIN_CERTIFICATE_HEADER_SIZE)
+            .filter(|_| entry.len() > WIN_CERTIFICATE_HEADER_SIZE)
+            .ok_or(AuthError::InvalidHeader)?;
+        let length = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
+        let certificate_type = u16::from_le_bytes([header[6], header[7]]);
+        let body = entry
+            .get(WIN_CERTIFICATE_HEADER_SIZE..length)
+            .filter(|body| !body.is_empty())
+            .ok_or(AuthError::InvalidHeader)?;
+        match certificate_type {
+            WIN_CERT_TYPE_PKCS_SIGNED_DATA => signatures.push(body),
+            WIN_CERT_TYPE_EFI_GUID => {
+                let (cert_type, data) = body
+                    .split_at_checked(16)
+                    .filter(|(_, data)| !data.is_empty())
+                    .ok_or(AuthError::InvalidHeader)?;
+                if cert_type == EFI_CERT_TYPE_PKCS7_GUID {
+                    signatures.push(data);
+                }
+            }
+            other => log::debug!("Skipping certificate type {:#x}", other),
+        }
+        offset = offset
+            .checked_add(length.next_multiple_of(8))
+            .ok_or(AuthError::InvalidHeader)?;
+    }
+    if offset != table.len() {
+        log::warn!("Attribute certificate table is corrupt");
         return Err(AuthError::InvalidHeader);
     }
-
-    // Parse WIN_CERTIFICATE structure
-    // dwLength: DWORD (4 bytes)
-    // wRevision: WORD (2 bytes)
-    // wCertificateType: WORD (2 bytes)
-    // bCertificate: variable
-    if info.cert_table_size < 8 {
-        return Err(AuthError::InvalidHeader);
-    }
-
-    let dw_length = u32::from_le_bytes([
-        pe_data[cert_offset],
-        pe_data[cert_offset + 1],
-        pe_data[cert_offset + 2],
-        pe_data[cert_offset + 3],
-    ]) as usize;
-
-    let w_certificate_type =
-        u16::from_le_bytes([pe_data[cert_offset + 6], pe_data[cert_offset + 7]]);
-
-    // Check for PKCS#7 signed data
-    if w_certificate_type != WIN_CERT_TYPE_PKCS_SIGNED_DATA {
-        log::debug!("Certificate type is not PKCS#7: {:#x}", w_certificate_type);
-        return Ok(None);
-    }
-
-    // Extract PKCS#7 data (after 8-byte header)
-    let pkcs7_start = cert_offset.checked_add(8).ok_or(AuthError::InvalidHeader)?;
-    let pkcs7_len = dw_length.saturating_sub(8);
-    let pkcs7_end = pkcs7_start
-        .checked_add(pkcs7_len)
-        .ok_or(AuthError::InvalidHeader)?;
-
-    if pkcs7_end > pe_data.len() {
-        return Err(AuthError::InvalidHeader);
-    }
-
-    Ok(Some(AuthenticodeSignature {
-        pkcs7_data: &pe_data[pkcs7_start..pkcs7_end],
-    }))
+    Ok(signatures)
 }
 
-/// Verify a PE image for Secure Boot
-///
-/// This performs the full Secure Boot verification:
-/// 1. Compute the Authenticode hash
-/// 2. Check if hash is in dbx (forbidden) - reject if found
-/// 3. Check if hash is in db (allowed) - accept if found
-/// 4. If signed, verify signature against db certificates
-///
-/// # Arguments
-///
-/// * `pe_data` - The complete PE file data
-///
-/// # Returns
+/// Verify a PE image for Secure Boot against the current db and dbx.
 ///
 /// * `Ok(true)` - Image is authorized for execution
 /// * `Ok(false)` - Image is NOT authorized
-/// * `Err(...)` - Verification error
+/// * `Err(...)` - Malformed image or certificate table
 #[cfg(feature = "secure-boot")]
 pub fn verify_pe_image_secure_boot(pe_data: &[u8]) -> Result<bool, AuthError> {
-    // Compute the Authenticode hash
+    let db = db_database();
+    let dbx = dbx_database();
+    verify_pe_image(pe_data, &db, &dbx)
+}
+
+/// UEFI 2.10 chapter 32 image verification, over every signature as in
+/// EDK2's DxeImageVerificationHandler:
+///
+/// 1. Reject if the image hash is in dbx, or if any signature is revoked by
+///    dbx (see [`signature_forbidden`]), whatever the other signatures say.
+/// 2. Otherwise accept if any signature verifies against a certificate in db,
+///    or if the image hash is in db.
+#[cfg(feature = "secure-boot")]
+fn verify_pe_image(pe_data: &[u8], db: &KeyDatabase, dbx: &KeyDatabase) -> Result<bool, AuthError> {
     let image_hash = compute_authenticode_hash(pe_data)?;
-
     log::debug!("PE Authenticode hash: {:02x?}", &image_hash[..8]);
-
-    // Check if hash is in dbx (forbidden database)
-    if is_hash_forbidden(&image_hash) {
+    if dbx.contains_sha256_hash(&image_hash) {
         log::warn!("Secure Boot: Image hash is in forbidden database (dbx)");
         return Ok(false);
     }
 
-    // Check if hash is in db (allowed database)
-    if is_hash_allowed(&image_hash) {
+    let signatures = authenticode_signatures(pe_data)?;
+    let mut allowed = false;
+    for (index, pkcs7) in signatures.iter().enumerate() {
+        let covers_image = signature_covers_image(pkcs7, &image_hash);
+        if signature_forbidden(pkcs7, &image_hash, covers_image, dbx) {
+            log::warn!("Secure Boot: Signature {} is revoked by dbx", index);
+            return Ok(false);
+        }
+        if !allowed && covers_image && signature_allowed(pkcs7, &image_hash, db, dbx) {
+            log::info!("Secure Boot: Signature {} verified against db", index);
+            allowed = true;
+        }
+    }
+    if allowed {
+        return Ok(true);
+    }
+    if db.contains_sha256_hash(&image_hash) {
         log::info!("Secure Boot: Image hash found in allowed database (db)");
         return Ok(true);
     }
-
-    // Try to extract and verify embedded signature
-    match extract_authenticode_signature(pe_data)? {
-        Some(sig) => {
-            log::debug!("Secure Boot: Found embedded Authenticode signature");
-            verify_authenticode_signature(&image_hash, &sig)
-        }
-        None => {
-            log::warn!("Secure Boot: Unsigned image not in db");
-            Ok(false)
-        }
-    }
+    log::warn!(
+        "Secure Boot: None of {} signatures verified and the image hash is not in db",
+        signatures.len()
+    );
+    Ok(false)
 }
 
 /// Extract the Authenticode hash from the SpcIndirectDataContent in a PKCS#7 signature.
@@ -486,83 +480,82 @@ fn spc_digest(econtent: Tlv<'_>) -> Result<&[u8], DecodeError> {
     Ok(digest)
 }
 
-/// Verify an Authenticode signature against the db database
+/// Whether the SpcIndirectDataContent digest of `pkcs7` is this image's
+/// Authenticode hash. A signature over other content proves nothing about
+/// the image; checking it prevents signature transplants.
 #[cfg(feature = "secure-boot")]
-fn verify_authenticode_signature(
-    image_hash: &[u8],
-    sig: &AuthenticodeSignature,
-) -> Result<bool, AuthError> {
-    // Verify the Authenticode hash matches what's embedded in the PKCS#7's
-    // SpcIndirectDataContent. This prevents signature transplant attacks where
-    // a valid signature from one PE image is attached to a different image.
-    match extract_spc_authenticode_hash(sig.pkcs7_data) {
-        Ok(Some(spc_hash)) => {
-            if !constant_time_eq(spc_hash, image_hash) {
-                log::warn!(
-                    "Authenticode hash in SpcIndirectDataContent does not match computed image hash"
-                );
-                log::debug!(
-                    "SPC hash: {:02x?}, image hash: {:02x?}",
-                    &spc_hash[..core::cmp::min(8, spc_hash.len())],
-                    &image_hash[..core::cmp::min(8, image_hash.len())]
-                );
-                return Ok(false);
-            }
-            log::debug!("Authenticode hash matches SpcIndirectDataContent");
+fn signature_covers_image(pkcs7: &[u8], image_hash: &[u8; 32]) -> bool {
+    match extract_spc_authenticode_hash(pkcs7) {
+        Ok(Some(spc_hash)) if constant_time_eq(spc_hash, image_hash) => true,
+        Ok(Some(_)) => {
+            log::warn!("Authenticode digest in SpcIndirectDataContent does not match the image");
+            false
         }
         Ok(None) => {
             log::warn!("No SpcIndirectDataContent found in PKCS#7 signature");
-            return Ok(false);
+            false
         }
         Err(e) => {
             log::debug!("Failed to extract SPC authenticode hash: {:?}", e);
-            return Ok(false);
+            false
         }
     }
+}
 
-    // Get all X.509 certificates from db
-    let db = db_database();
-    let certificates: Vec<&[u8]> = db.x509_certificates().collect();
-
-    if certificates.is_empty() {
-        log::warn!("Secure Boot: No certificates in db for signature verification");
-        return Ok(false);
+/// EDK2 IsForbiddenByDbx: a signature is revoked when a certificate it
+/// carries is in dbx (as X.509 or as TBSCertificate hash), or when it
+/// verifies up to an X.509 certificate in dbx. An unparsable signature
+/// counts as revoked.
+#[cfg(feature = "secure-boot")]
+fn signature_forbidden(
+    pkcs7: &[u8],
+    image_hash: &[u8; 32],
+    covers_image: bool,
+    dbx: &KeyDatabase,
+) -> bool {
+    let Ok(signed) = SignedData::parse(pkcs7) else {
+        log::warn!("Secure Boot: Unparsable Authenticode signature");
+        return true;
+    };
+    if signed
+        .certificates()
+        .any(|certificate| certificate_forbidden(dbx, certificate.encoded))
+    {
+        return true;
     }
+    covers_image
+        && dbx.x509_certificates().any(|revoked| {
+            matches!(
+                verify_pkcs7_signature_chain(pkcs7, image_hash, revoked, false),
+                Ok(Some(_))
+            )
+        })
+}
 
-    // Try to verify against each certificate in db
-    for cert_der in certificates {
-        // Check if this certificate is forbidden
-        if is_certificate_forbidden(cert_der) {
-            log::debug!("Secure Boot: Skipping forbidden certificate");
-            continue;
-        }
-
-        match verify_pkcs7_signature_chain(sig.pkcs7_data, image_hash, cert_der, false) {
-            Ok(Some(chain)) => {
-                // Revocation is not limited to the trust anchor: a dbx entry
-                // naming the signer or any intermediate in the verified
-                // chain revokes the image even though it chains to db.
-                if chain
+/// Whether `pkcs7` verifies up to a db certificate through a chain without
+/// dbx-revoked certificates.
+#[cfg(feature = "secure-boot")]
+fn signature_allowed(
+    pkcs7: &[u8],
+    image_hash: &[u8; 32],
+    db: &KeyDatabase,
+    dbx: &KeyDatabase,
+) -> bool {
+    db.x509_certificates()
+        .filter(|trusted| !certificate_forbidden(dbx, trusted))
+        .any(
+            |trusted| match verify_pkcs7_signature_chain(pkcs7, image_hash, trusted, false) {
+                Ok(Some(chain)) => !chain
                     .certificates
                     .iter()
-                    .any(|cert| is_certificate_forbidden(cert))
-                {
-                    log::warn!("Secure Boot: Signing chain contains a dbx-revoked certificate");
-                    return Ok(false);
+                    .any(|certificate| certificate_forbidden(dbx, certificate)),
+                Ok(None) => false,
+                Err(e) => {
+                    log::debug!("Secure Boot: Signature verification error: {:?}", e);
+                    false
                 }
-                log::info!("Secure Boot: Signature verified successfully");
-                return Ok(true);
-            }
-            Ok(None) => continue,
-            Err(e) => {
-                log::debug!("Secure Boot: Signature verification error: {:?}", e);
-                continue;
-            }
-        }
-    }
-
-    log::warn!("Secure Boot: No matching signature found in db");
-    Ok(false)
+            },
+        )
 }
 
 #[cfg(test)]
@@ -621,5 +614,131 @@ mod tests {
         assert!(spc_digest(Tlv::parse(&padded_spc).unwrap()).is_err());
         // Not a SEQUENCE.
         assert!(spc_digest(Tlv::parse(&[0x31, 0x00]).unwrap()).is_err());
+    }
+
+    /// Images from testdata/gen_authenticode.py, both over the same image:
+    /// DUAL carries a rogue then a db-signer signature, REVERSED the other way.
+    #[cfg(feature = "secure-boot")]
+    mod multiple_signatures {
+        use super::super::super::variables::KeyDatabaseEntry;
+        use super::*;
+        use crabefi_efi_types::secure_boot::{
+            EFI_CERT_SHA256_GUID, EFI_CERT_X509_GUID, EFI_CERT_X509_SHA256_GUID,
+        };
+
+        const DUAL: &[u8] = include_bytes!("testdata/authenticode-dual.efi");
+        const REVERSED: &[u8] = include_bytes!("testdata/authenticode-dual-reversed.efi");
+        const DB_CA: &[u8] = include_bytes!("testdata/authenticode-db-ca.der");
+        const DB_SIGNER: &[u8] = include_bytes!("testdata/authenticode-db-signer.der");
+        const ROGUE: &[u8] = include_bytes!("testdata/authenticode-rogue.der");
+
+        fn database(entries: &[([u8; 16], &[u8])]) -> KeyDatabase {
+            let mut database = KeyDatabase::new();
+            for (cert_type, data) in entries {
+                database
+                    .add_entry(KeyDatabaseEntry {
+                        cert_type: *cert_type,
+                        data: data.to_vec(),
+                        owner: [0; 16],
+                    })
+                    .unwrap();
+            }
+            database
+        }
+
+        fn empty() -> KeyDatabase {
+            KeyDatabase::new()
+        }
+
+        /// EFI_CERT_X509_SHA256 entry: TBSCertificate hash, no revocation time.
+        fn tbs_hash(certificate: &[u8]) -> Vec<u8> {
+            let tbs = crabefi_pkcs7::x509::Certificate::parse(certificate)
+                .unwrap()
+                .tbs;
+            let mut entry = Sha256::digest(tbs).to_vec();
+            entry.extend_from_slice(&[0; 16]);
+            entry
+        }
+
+        #[test]
+        fn any_signature_verifying_against_db_authorizes_the_image() {
+            for image in [DUAL, REVERSED] {
+                assert_eq!(
+                    authenticode_signatures(image).map(|signatures| signatures.len()),
+                    Ok(2)
+                );
+                for trusted in [DB_CA, DB_SIGNER] {
+                    let db = database(&[(EFI_CERT_X509_GUID, trusted)]);
+                    assert_eq!(verify_pe_image(image, &db, &empty()), Ok(true));
+                }
+                assert_eq!(verify_pe_image(image, &empty(), &empty()), Ok(false));
+            }
+        }
+
+        #[test]
+        fn a_revoked_signature_rejects_the_image_whatever_the_others_say() {
+            let db = database(&[(EFI_CERT_X509_GUID, DB_CA)]);
+            let rogue_tbs = tbs_hash(ROGUE);
+            let signer_tbs = tbs_hash(DB_SIGNER);
+            for dbx in [
+                database(&[(EFI_CERT_X509_GUID, ROGUE)]),
+                database(&[(EFI_CERT_X509_SHA256_GUID, &rogue_tbs)]),
+                database(&[(EFI_CERT_X509_SHA256_GUID, &signer_tbs)]),
+                // The issuer of the db signer, which its signature does not carry.
+                database(&[(EFI_CERT_X509_GUID, DB_CA)]),
+            ] {
+                for image in [DUAL, REVERSED] {
+                    assert_eq!(verify_pe_image(image, &db, &dbx), Ok(false));
+                }
+            }
+
+            // An image hash in db does not override a revoked signature, and
+            // an image hash in dbx overrides a valid one.
+            let image_hash = compute_authenticode_hash(DUAL).unwrap();
+            let hash_db = database(&[(EFI_CERT_SHA256_GUID, &image_hash)]);
+            assert_eq!(verify_pe_image(DUAL, &hash_db, &empty()), Ok(true));
+            let dbx = database(&[(EFI_CERT_X509_GUID, ROGUE)]);
+            assert_eq!(verify_pe_image(DUAL, &hash_db, &dbx), Ok(false));
+            assert_eq!(verify_pe_image(DUAL, &db, &hash_db), Ok(false));
+        }
+
+        fn read_u32(image: &[u8], offset: usize) -> u32 {
+            u32::from_le_bytes(image[offset..offset + 4].try_into().unwrap())
+        }
+
+        /// File offset of the PE32+ security directory entry of `image`.
+        fn security_directory(image: &[u8]) -> usize {
+            read_u32(image, 0x3c) as usize + 24 + 112 + 4 * 8
+        }
+
+        /// `image` with its certificate table size changed by `size`.
+        fn with_table_size(image: &[u8], size: impl Fn(u32) -> u32) -> Vec<u8> {
+            let entry = security_directory(image) + 4;
+            let mut image = image.to_vec();
+            let resized = size(read_u32(&image, entry));
+            image[entry..entry + 4].copy_from_slice(&resized.to_le_bytes());
+            image
+        }
+
+        #[test]
+        fn corrupt_certificate_tables_are_rejected() {
+            let db = database(&[(EFI_CERT_X509_GUID, DB_CA)]);
+            // The last entry no longer fits.
+            let truncated = with_table_size(DUAL, |size| size - 8);
+            // Eight zero bytes after the last entry.
+            let mut padded = with_table_size(DUAL, |size| size + 8);
+            padded.extend_from_slice(&[0; 8]);
+            // A first entry whose length overruns the table.
+            let table = read_u32(DUAL, security_directory(DUAL)) as usize;
+            let mut overrun = DUAL.to_vec();
+            overrun[table..table + 4].copy_from_slice(&4000u32.to_le_bytes());
+            for image in [truncated, padded, overrun] {
+                assert_eq!(
+                    authenticode_signatures(&image),
+                    Err(AuthError::InvalidHeader)
+                );
+                assert!(!matches!(verify_pe_image(&image, &db, &empty()), Ok(true)));
+            }
+        }
     }
 }
