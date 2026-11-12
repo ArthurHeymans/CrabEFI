@@ -414,6 +414,8 @@ impl crabefi::VariableStoreLocator for CorebootVariableStoreLocator {
 struct CorebootCapsuleBackend {
     firmware_info: Option<crabefi::FirmwareInfo>,
     fmap_offset: Option<u64>,
+    #[cfg(feature = "payload-mm")]
+    boot_media: Option<tables::BootMediaInfo>,
     fmap_loaded: bool,
     fmap_regions: alloc::vec::Vec<crabefi::FmapRegion>,
 }
@@ -426,6 +428,8 @@ impl CorebootCapsuleBackend {
         Self {
             firmware_info,
             fmap_offset: boot_media.map(|media| media.fmap_offset),
+            #[cfg(feature = "payload-mm")]
+            boot_media,
             fmap_loaded: false,
             fmap_regions: alloc::vec::Vec::new(),
         }
@@ -436,6 +440,28 @@ impl CorebootCapsuleBackend {
             return;
         }
         self.fmap_loaded = true;
+        // Payload MM owns the flash; the FMAP is read from the mapped flash.
+        #[cfg(feature = "payload-mm")]
+        if crabefi::efi::payload_mm::active()
+            && let Some(boot_media) = self.boot_media
+        {
+            let regions = &mut self.fmap_regions;
+            if payload_mm::for_each_fmap_area(boot_media, |name, offset, size| {
+                let mut region_name = heapless::String::new();
+                if region_name.push_str(name).is_ok() {
+                    regions.push(crabefi::FmapRegion {
+                        name: region_name,
+                        offset,
+                        size,
+                    });
+                }
+            })
+            .is_none()
+            {
+                log::warn!("Capsule backend could not load FMAP");
+            }
+            return;
+        }
         let parsed = crabefi::efi::varstore::with_spi_storage_mut(|storage| {
             fmap::read_fmap(storage.controller_mut(), self.fmap_offset)
         })
@@ -481,6 +507,24 @@ impl crabefi::CapsuleBackend for CorebootCapsuleBackend {
             .ok_or(crabefi::StorageError::InvalidArgument)?;
         if offset as u64 + data.len() as u64 > u64::from(region.size) {
             return Err(crabefi::StorageError::InvalidArgument);
+        }
+        // With payload MM only SMM may write the flash (firmware phase only).
+        #[cfg(feature = "payload-mm")]
+        if crabefi::efi::payload_mm::active() {
+            let erased = crabefi::efi::payload_mm::firmware_erase(
+                u64::from(region.offset),
+                u64::from(region.size),
+            );
+            let status = if erased == r_efi::efi::Status::SUCCESS {
+                crabefi::efi::payload_mm::firmware_write(u64::from(write_offset), data)
+            } else {
+                erased
+            };
+            return match status {
+                r_efi::efi::Status::SUCCESS => Ok(()),
+                r_efi::efi::Status::ACCESS_DENIED => Err(crabefi::StorageError::AccessDenied),
+                _ => Err(crabefi::StorageError::IoError),
+            };
         }
         crabefi::efi::varstore::with_spi_storage_mut(|storage| {
             let controller = storage.controller_mut();
@@ -967,9 +1011,14 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     crabefi::time::init(cb_info.acpi_rsdp);
 
     // Before any flash access: from here on the flash may only be writable from SMM.
+    // Fail closed: without the MM variable authority (or with a corrupt store)
+    // Secure Boot keys are missing or unprotected, so nothing may be booted.
     #[cfg(feature = "payload-mm")]
     if let Err(error) = payload_mm::load(&cb_info.payload_mm, cb_info.boot_media) {
-        log::warn!("payload MM not used: {error}");
+        log::error!("payload MM unavailable ({error}): refusing to boot");
+        loop {
+            crabefi::arch::halt();
+        }
     }
 
     // ================================================================
