@@ -106,6 +106,10 @@ pub mod bridge_operation {
     /// Ask boot firmware whether its physical-presence setup action is
     /// currently authorizing an unsigned PK deletion. This never writes media.
     pub const AUTHORIZE_SETUP_PK_DELETE: u32 = 3;
+    /// Ask boot firmware whether its physical-presence setup action is
+    /// currently writing exactly this SecureBootEnable value. This never
+    /// writes media.
+    pub const AUTHORIZE_SETUP_SECURE_BOOT_ENABLE: u32 = 4;
 }
 
 /// UEFI memory descriptor shared by the boot allocator and runtime-image ABI.

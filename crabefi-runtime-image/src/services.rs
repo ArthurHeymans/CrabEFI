@@ -552,7 +552,7 @@ fn apply_variable(
         )
     } else {
         (
-            check_write_policy(store, &request)?,
+            check_write_policy(store, &request, phase, bridge)?,
             verify(store, &request)?,
         )
     };
@@ -687,10 +687,56 @@ fn setup_pk_delete_authorized(
         .is_ok()
 }
 
+/// Ask boot setup whether its physical-presence action is writing exactly
+/// this SecureBootEnable value. Never consulted after ExitBootServices.
+fn setup_secure_boot_enable_authorized(
+    request: &VariableRequest<'_>,
+    phase: Phase,
+    bridge: u64,
+) -> bool {
+    phase == Phase::BootActive
+        && !phase.runtime()
+        && !request.authenticated()
+        && call_boot_bridge(
+            bridge,
+            &BridgeRequest {
+                operation: bridge_operation::AUTHORIZE_SETUP_SECURE_BOOT_ENABLE,
+                attributes: request.attributes.bits(),
+                guid: request.guid,
+                name_address: request.name.as_ptr() as u64,
+                name_len: request.name.len() as u32,
+                data_len: request.data.len() as u32,
+                data_address: request.data.as_ptr() as u64,
+                ..BridgeRequest::default()
+            },
+        )
+        .is_ok()
+}
+
+/// SecureBootEnable switches enforcement off, so outside Setup Mode only
+/// CrabEFI's physical-presence setup action may change it, and nothing may
+/// after ExitBootServices.
+fn check_secure_boot_enable(
+    store: &VariableStore,
+    request: &VariableRequest<'_>,
+    phase: Phase,
+    bridge: u64,
+) -> Result<(), efi::Status> {
+    if phase.runtime() || !phase.boot_services() {
+        Err(efi::Status::WRITE_PROTECTED)
+    } else if store.setup_mode() || setup_secure_boot_enable_authorized(request, phase, bridge) {
+        Ok(())
+    } else {
+        Err(efi::Status::SECURITY_VIOLATION)
+    }
+}
+
 /// Reject writes to protected variables and raw writes to authenticated ones.
 fn check_write_policy(
     store: &VariableStore,
     request: &VariableRequest<'_>,
+    phase: Phase,
+    bridge: u64,
 ) -> Result<Option<SecureBootVariable>, efi::Status> {
     let (guid, name) = (&request.guid, request.name);
     if secure_boot::is_status_variable(guid, name)
@@ -700,11 +746,11 @@ fn check_write_policy(
     }
     let secure_variable = secure_boot::identify_key_database(guid, name);
     #[cfg(not(feature = "secure-boot"))]
-    if secure_variable.is_some()
-        || (*guid == secure_boot::EFI_GLOBAL_VARIABLE_GUID
-            && secure_boot::name_matches(name, secure_boot::SECURE_BOOT_ENABLE_NAME))
-    {
+    if secure_variable.is_some() || secure_boot::is_secure_boot_enable(guid, name) {
         return Err(efi::Status::UNSUPPORTED);
+    }
+    if secure_boot::is_secure_boot_enable(guid, name) {
+        check_secure_boot_enable(store, request, phase, bridge)?;
     }
     if secure_variable.is_some() && !request.authenticated() && !store.setup_mode() {
         return Err(efi::Status::SECURITY_VIOLATION);
@@ -906,6 +952,11 @@ fn replay_record(
         return Err(efi::Status::DEVICE_ERROR);
     }
     let name = &record.name[..name_len];
+    if secure_boot::is_secure_boot_enable(&record.guid.bytes, name) {
+        // Never writable after ExitBootServices, so a journalled request comes
+        // from an older image or forged retained memory: consume it unapplied.
+        return Ok(());
+    }
     let secure_variable = secure_boot::identify_key_database(&record.guid.bytes, name);
     // An append to a signature database may carry any timestamp, so the
     // floor says nothing about whether it was applied. Replaying one is
@@ -1169,6 +1220,8 @@ fn validate_query_attributes(attributes: u32, boot_services: bool) -> Result<(),
     Ok(())
 }
 
+// The image audit allows a single register call site for the bridge.
+#[inline(never)]
 fn call_boot_bridge(address: u64, request: &BridgeRequest) -> Result<(), efi::Status> {
     if address == 0 {
         return Err(efi::Status::WRITE_PROTECTED);
@@ -1320,6 +1373,31 @@ mod tests {
             efi::Status::SUCCESS.as_usize()
         } else {
             efi::Status::WRITE_PROTECTED.as_usize()
+        }
+    }
+
+    extern "C" fn secure_boot_enable_bridge(request: *const BridgeRequest) -> usize {
+        // SAFETY: same immediate-call contract as successful_bridge.
+        let Some(request) = (unsafe { request.as_ref() }) else {
+            return efi::Status::INVALID_PARAMETER.as_usize();
+        };
+        if request.operation != bridge_operation::AUTHORIZE_SETUP_SECURE_BOOT_ENABLE {
+            return successful_bridge(request);
+        }
+        // SAFETY: the runtime image passes its live request data.
+        let data = unsafe {
+            core::slice::from_raw_parts(
+                request.data_address as *const u8,
+                request.data_len as usize,
+            )
+        };
+        if request.guid == secure_boot::EFI_GLOBAL_VARIABLE_GUID
+            && request.attributes == RAW_ATTRIBUTES.bits()
+            && data == [0]
+        {
+            efi::Status::SUCCESS.as_usize()
+        } else {
+            efi::Status::ACCESS_DENIED.as_usize()
         }
     }
 
@@ -1899,15 +1977,12 @@ mod tests {
             pk,
             Some(floor),
         );
-        assert_eq!(
-            fixture.write(
-                Phase::BootActive,
-                secure_boot::EFI_GLOBAL_VARIABLE_GUID,
-                secure_boot::SECURE_BOOT_ENABLE_NAME,
-                RAW_ATTRIBUTES,
-                &[1]
-            ),
-            efi::Status::SUCCESS
+        fixture.import(
+            secure_boot::EFI_GLOBAL_VARIABLE_GUID,
+            secure_boot::SECURE_BOOT_ENABLE_NAME,
+            RAW_ATTRIBUTES,
+            &[1],
+            None,
         );
         assert!(fixture.store.secure_boot_enabled());
 
@@ -2010,6 +2085,83 @@ mod tests {
             );
             assert!(!fixture.store.setup_mode());
         }
+    }
+
+    #[test]
+    fn secure_boot_enable_needs_setup_mode_or_physical_presence() {
+        let guid = secure_boot::EFI_GLOBAL_VARIABLE_GUID;
+        let name = secure_boot::SECURE_BOOT_ENABLE_NAME;
+        let mut fixture = Fixture::retained();
+        assert_eq!(
+            fixture.write(Phase::BootActive, guid, name, RAW_ATTRIBUTES, &[1]),
+            efi::Status::SUCCESS
+        );
+        for phase in [Phase::SealedPhysical, Phase::Virtual] {
+            assert_eq!(
+                fixture.write(phase, guid, name, RAW_ATTRIBUTES, &[0]),
+                efi::Status::WRITE_PROTECTED
+            );
+        }
+        fixture.enroll_raw();
+        assert!(fixture.store.secure_boot_enabled());
+
+        let envelope = unsigned_envelope(2099);
+        for (attributes, data) in [
+            (RAW_ATTRIBUTES, &[0][..]),
+            (VariableAttributes::empty(), &[][..]),
+            (AUTH_ATTRIBUTES, &envelope[..]),
+        ] {
+            assert_eq!(
+                fixture.write(Phase::BootActive, guid, name, attributes, data),
+                efi::Status::SECURITY_VIOLATION
+            );
+        }
+        // The setup action authorizes its exact value, and only at boot.
+        let bridge = secure_boot_enable_bridge as *const () as u64;
+        assert_eq!(
+            fixture.write_using_bridge(Phase::BootActive, guid, name, RAW_ATTRIBUTES, &[1], bridge),
+            efi::Status::SECURITY_VIOLATION
+        );
+        for phase in [Phase::SealedPhysical, Phase::Virtual] {
+            assert_eq!(
+                fixture.write_using_bridge(phase, guid, name, RAW_ATTRIBUTES, &[0], bridge),
+                efi::Status::WRITE_PROTECTED
+            );
+        }
+        assert!(fixture.store.secure_boot_enabled());
+        assert_eq!(
+            fixture.write_using_bridge(Phase::BootActive, guid, name, RAW_ATTRIBUTES, &[0], bridge),
+            efi::Status::SUCCESS
+        );
+        assert!(!fixture.store.secure_boot_enabled());
+        assert!(!fixture.store.setup_mode());
+    }
+
+    #[test]
+    fn journalled_secure_boot_enable_is_consumed_unapplied() {
+        let guid = secure_boot::EFI_GLOBAL_VARIABLE_GUID;
+        let name = secure_boot::SECURE_BOOT_ENABLE_NAME;
+        let mut fixture = Fixture::retained();
+        DeferredRegion::new(&mut fixture.buffer)
+            .queue_write(
+                &mut fixture.deferred_transaction,
+                deferred::DeferredWrite {
+                    guid,
+                    name,
+                    attributes: RAW_ATTRIBUTES,
+                    data: &[0],
+                    timestamp: VariableTimestamp::default(),
+                    authenticated: false,
+                    deletion: false,
+                },
+            )
+            .unwrap();
+        // Setup Mode would accept the same write at boot.
+        let mut reboot = Fixture::new();
+        reboot.import(guid, name, RAW_ATTRIBUTES, &[1], None);
+        assert_eq!(replay_into(&mut fixture, &mut reboot, |_, _, _| ()), 1);
+        let slot = reboot.store.find(&guid, name, false).unwrap();
+        assert_eq!(reboot.store.data(slot), Some([1].as_slice()));
     }
 
     #[test]

@@ -78,6 +78,9 @@ read-only status variables. PK, KEK, db, and dbx time-based authenticated
 updates, appends, and deletions are verified inside the runtime image using its
 authoritative key databases, replay timestamps, and fixed stack RSA buffers.
 Boot enrollment uses the same standard `SetVariable` entry point.
+SecureBootEnable changes only in Setup Mode or while CrabEFI's
+physical-presence setup action authorizes that exact value through the boot
+bridge, and never after ExitBootServices.
 
 Appends to PK, KEK, db, and dbx follow UEFI: signatures the database already
 holds are skipped, and the envelope's timestamp may be older than the
