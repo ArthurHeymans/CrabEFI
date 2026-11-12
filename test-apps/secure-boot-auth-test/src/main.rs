@@ -233,6 +233,7 @@ impl Variable {
             "db" | "dbx" => (alias, SECURITY_DB),
             "priv1" => ("CrabEfiSbTestPriv1", TEST_GUID),
             "priv2" => ("CrabEfiSbTestPriv2", TEST_GUID),
+            "stress" => ("CrabEfiSbTestStress", TEST_GUID),
             "stage" => ("CrabEfiSbTestStage", TEST_GUID),
             _ => return None,
         };
@@ -562,6 +563,20 @@ fn step_var(results: &mut Results, id: &str, args: &[&str]) {
                 format_args!("{}/{} entries of {} present", present, total, file),
             );
         }
+        ("oneof", Some(first), Some(second)) => {
+            let ok = [first, second]
+                .iter()
+                .any(|file| read_file(file).is_some_and(|value| value.as_ref() == data.as_ref()));
+            results.check(
+                id,
+                ok,
+                format_args!(
+                    "{} bytes, {}",
+                    data.len,
+                    if ok { "intact" } else { "corrupt" }
+                ),
+            );
+        }
         ("count", Some(expected), None) => {
             let mut count = 0;
             let valid = for_each_signature(data.as_ref(), |_, _| count += 1);
@@ -712,6 +727,28 @@ fn step_load_status(results: &mut Results, id: &str, args: &[&str]) {
     );
 }
 
+/// Alternate a raw NV variable between two values until the host kills
+/// QEMU; `SBAUTH WRITE n` follows each completed write.
+fn step_stress(results: &mut Results, id: &str, alias: &str, files: [&str; 2], count: &str) {
+    let (Some(variable), Some(first), Some(second), Some(count)) = (
+        Variable::named(alias),
+        read_file(files[0]),
+        read_file(files[1]),
+        parse_number(count),
+    ) else {
+        return results.check(id, false, format_args!("bad arguments"));
+    };
+    for index in 0..count {
+        let data = if index % 2 == 0 { &first } else { &second };
+        let status = variable.set(0x7, data.as_ref());
+        if status != Status::SUCCESS {
+            return results.check(id, false, format_args!("write {}: {}", index, Name(status)));
+        }
+        say!("SBAUTH WRITE {}", index + 1);
+    }
+    results.check(id, true, format_args!("{} writes", count));
+}
+
 fn step_digest(label: &str) {
     let _ = write!(Console, "SBSTATE {}", label);
     for alias in ["PK", "KEK", "db", "dbx"] {
@@ -755,7 +792,17 @@ fn run() -> Status {
     let Some(stage_variable) = Variable::named("stage") else {
         return Status::ABORTED;
     };
-    let stage = stage_variable.byte().map_or(1, usize::from);
+    // The host selects the power-loss stages through the ESP.
+    let stage = read_file("stage.txt")
+        .and_then(|text| {
+            core::str::from_utf8(text.as_ref())
+                .ok()?
+                .trim()
+                .parse()
+                .ok()
+        })
+        .or_else(|| stage_variable.byte().map(usize::from))
+        .unwrap_or(1);
     let Some(plan) = read_file("plan.txt") else {
         say!("SBAUTH FAIL plan: cannot read \\sbtest\\plan.txt");
         return Status::NOT_FOUND;
@@ -800,6 +847,9 @@ fn run() -> Status {
                 reset(efi::RESET_SHUTDOWN);
             }
             ["digest", label] => step_digest(label),
+            ["stress", id, alias, first, second, count] => {
+                step_stress(&mut results, id, alias, [first, second], count)
+            }
             // Optional assets, such as a downloaded shim, may be absent.
             ["opt", "load", id, file, args @ ..] => {
                 if read_file(file).is_none() {

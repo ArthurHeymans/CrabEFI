@@ -126,3 +126,14 @@ load f-unsigned-still-denied img-unsigned.efi deny
 set f-securebootenable-restore SecureBootEnable 0x7 u8-1.bin ANY
 digest s3-end
 end
+stage 4
+digest s4-start
+stress w-stress stress stress-a.bin stress-b.bin 1000
+end
+stage 5
+digest s5-check
+mode w-still-enforcing 0 1
+load w-unsigned-still-denied img-unsigned.efi deny
+var w-value-intact stress oneof stress-a.bin stress-b.bin
+set w-store-writable stress 0x7 stress-a.bin SUCCESS
+end
