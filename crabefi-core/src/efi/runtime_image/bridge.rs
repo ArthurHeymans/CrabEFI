@@ -86,12 +86,22 @@ pub(crate) fn set_secure_boot_enable_from_setup(enabled: bool) -> Status {
         let value = u8::from(enabled);
         SETUP_SECURE_BOOT_ENABLE.set(Some(value));
         let _scope = ResetAuthorization;
-        super::client::variables::set(
-            &Guid::from_bytes(&crabefi_efi_types::secure_boot::EFI_GLOBAL_VARIABLE_GUID),
-            crabefi_efi_types::secure_boot::SECURE_BOOT_ENABLE_NAME,
-            SECURE_BOOT_ENABLE_ATTRIBUTES,
-            &[value],
-        )
+        let write = || {
+            super::client::variables::set(
+                &Guid::from_bytes(&crabefi_efi_types::secure_boot::EFI_GLOBAL_VARIABLE_GUID),
+                crabefi_efi_types::secure_boot::SECURE_BOOT_ENABLE_NAME,
+                SECURE_BOOT_ENABLE_ATTRIBUTES,
+                &[value],
+            )
+        };
+        // With payload MM the MM bridge decides, from this firmware-phase grant.
+        #[cfg(target_arch = "x86_64")]
+        return crate::efi::payload_mm::with_setup_authorization(
+            crabefi_runtime_abi::bridge_operation::AUTHORIZE_SETUP_SECURE_BOOT_ENABLE,
+            write,
+        );
+        #[cfg(not(target_arch = "x86_64"))]
+        write()
     }
 }
 
