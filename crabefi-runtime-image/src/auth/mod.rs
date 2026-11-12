@@ -1,5 +1,6 @@
 //! Image-local UEFI time-based authenticated-variable enforcement.
 
+pub mod cert_db;
 mod crypto;
 mod limits;
 mod signature;

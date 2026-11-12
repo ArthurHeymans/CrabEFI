@@ -18,6 +18,8 @@ const OID_CONTENT_TYPE: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09
 const OID_MESSAGE_DIGEST: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x04];
 const OID_SHA256_WITH_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b];
 const OID_BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
+const OID_COMMON_NAME: &[u8] = &[0x55, 0x04, 0x03];
+const OID_ORGANIZATION: &[u8] = &[0x55, 0x04, 0x0a];
 
 fn verify_pkcs7_signature(
     pkcs7: &[u8],
@@ -115,13 +117,23 @@ fn subject_public_key(key: &rsa::RsaPublicKey) -> Vec<u8> {
 }
 
 fn certificate(key: &rsa::RsaPrivateKey, serial: u8, issuer: u8, subject: u8, ca: bool) -> Vec<u8> {
+    named_certificate(key, serial, &name(issuer), &name(subject), ca)
+}
+
+fn named_certificate(
+    key: &rsa::RsaPrivateKey,
+    serial: u8,
+    issuer: &[u8],
+    subject: &[u8],
+    ca: bool,
+) -> Vec<u8> {
     let public = rsa::RsaPublicKey::from(key);
     let mut tbs_fields = concat(&[
         integer(&[serial]),
         algorithm(OID_SHA256_WITH_RSA),
-        name(issuer),
+        issuer.to_vec(),
         tlv(0x30, &[]),
-        name(subject),
+        subject.to_vec(),
         subject_public_key(&public),
     ]);
     if ca {
@@ -152,6 +164,52 @@ fn certificate(key: &rsa::RsaPrivateKey, serial: u8, issuer: u8, subject: u8, ca
 
 fn signer(issuer: u8, serial: u8, signature: &[u8]) -> Vec<u8> {
     signer_with_attributes(issuer, serial, None, signature)
+}
+
+/// SignerInfo naming the certificate `serial` of the DER Name `issuer`.
+fn named_signer(issuer: &[u8], serial: u8) -> Vec<u8> {
+    let identity = tlv(0x30, &concat(&[issuer.to_vec(), integer(&[serial])]));
+    tlv(
+        0x30,
+        &concat(&[
+            integer(&[1]),
+            identity,
+            algorithm(OID_SHA256),
+            tlv(0x30, &[]),
+            tlv(0x04, &[0; 128]),
+        ]),
+    )
+}
+
+/// A Name of one RDN per (attribute OID, DER string) pair.
+fn rdn_name(attributes: &[(&[u8], Vec<u8>)]) -> Vec<u8> {
+    let rdns: Vec<Vec<u8>> = attributes
+        .iter()
+        .map(|(oid, value)| tlv(0x31, &tlv(0x30, &concat(&[tlv(0x06, oid), value.clone()]))))
+        .collect();
+    tlv(0x30, &rdns.concat())
+}
+
+fn common_name(text: &str) -> Vec<u8> {
+    rdn_name(&[(OID_COMMON_NAME, tlv(0x0c, text.as_bytes()))])
+}
+
+/// The first element inside the DER SEQUENCE `der` (a certificate's TBS).
+fn first_element(der: &[u8]) -> &[u8] {
+    let header = |bytes: &[u8]| match bytes[1] {
+        length @ 0..=0x7f => (2, length as usize),
+        count => {
+            let count = (count & 0x7f) as usize;
+            let length = bytes[2..2 + count]
+                .iter()
+                .fold(0, |length, byte| length << 8 | *byte as usize);
+            (2 + count, length)
+        }
+    };
+    let (outer, _) = header(der);
+    let inner = &der[outer..];
+    let (size, length) = header(inner);
+    &inner[..size + length]
 }
 
 fn signer_with_attributes(
@@ -405,6 +463,115 @@ fn signed_attributes_require_unique_matching_content_type_and_digest() {
         );
         assert_eq!(verify_without_panic(&cms, content, &trusted), Err(expected));
     }
+}
+
+fn private_signer_digest(cms: &[u8]) -> Result<([u8; 32], Vec<u8>), auth::AuthError> {
+    std::panic::catch_unwind(|| {
+        auth::crypto::private_signer(cms).map(|signer| (signer.digest, signer.top_level.to_vec()))
+    })
+    .expect("adversarial DER input must not panic")
+}
+
+fn binding(common_name: &[u8], top_level: &[u8]) -> [u8; 32] {
+    Sha256::new()
+        .chain_update(common_name)
+        .chain_update(first_element(top_level))
+        .finalize()
+        .into()
+}
+
+#[test]
+fn private_signer_binds_the_common_name_and_the_top_level_issuer() {
+    let key = test_key();
+    let (root_name, mid_name) = (common_name("Root"), common_name("Mid"));
+    let root = named_certificate(&key, 1, &root_name, &root_name, true);
+    let mid = named_certificate(&key, 2, &root_name, &mid_name, true);
+    let leaf = named_certificate(&key, 3, &mid_name, &common_name("Leaf"), false);
+    let signers = [named_signer(&mid_name, 3)];
+    // Any certificate order; the walk stops at the self-issued root.
+    let cms = signed_data(
+        OID_SHA256,
+        &[root.clone(), leaf.clone(), mid.clone()],
+        &signers,
+    );
+    assert_eq!(
+        private_signer_digest(&cms),
+        Ok((binding(b"Leaf", &root), root.clone()))
+    );
+    // Without the root, the intermediate is the top level.
+    let cms = signed_data(OID_SHA256, &[leaf.clone(), mid.clone()], &signers);
+    assert_eq!(
+        private_signer_digest(&cms),
+        Ok((binding(b"Leaf", &mid), mid))
+    );
+
+    // The CN in UTF-8 (BMPString here), the first one, cut to 127 bytes.
+    for (subject, text) in [
+        (
+            rdn_name(&[(OID_COMMON_NAME, tlv(0x1e, &[0x00, 0x4c, 0x00, 0xe9]))]),
+            "L\u{e9}".to_string(),
+        ),
+        (
+            rdn_name(&[
+                (OID_ORGANIZATION, tlv(0x0c, b"Org")),
+                (OID_COMMON_NAME, tlv(0x13, b"First")),
+                (OID_COMMON_NAME, tlv(0x13, b"Second")),
+            ]),
+            "First".to_string(),
+        ),
+        (common_name(&"a".repeat(200)), "a".repeat(127)),
+        (common_name("Cut\0here"), "Cut".to_string()),
+    ] {
+        let leaf = named_certificate(&key, 3, &root_name, &subject, false);
+        let cms = signed_data(
+            OID_SHA256,
+            &[leaf, root.clone()],
+            &[named_signer(&root_name, 3)],
+        );
+        assert_eq!(
+            private_signer_digest(&cms),
+            Ok((binding(text.as_bytes(), &root), root.clone()))
+        );
+    }
+}
+
+#[test]
+fn private_signer_rejects_ambiguous_or_nameless_signers_without_panic() {
+    let key = test_key();
+    let root_name = common_name("Root");
+    let root = named_certificate(&key, 1, &root_name, &root_name, true);
+    let signer = named_signer(&root_name, 1);
+    let no_name = rdn_name(&[(OID_ORGANIZATION, tlv(0x0c, b"Org"))]);
+    let nameless = named_certificate(&key, 1, &no_name, &no_name, true);
+    for (certificates, signers, expected) in [
+        (
+            vec![root.clone()],
+            vec![signer.clone(), signer.clone()],
+            auth::AuthError::NoSuitableKey,
+        ),
+        (vec![root.clone()], vec![], auth::AuthError::InvalidHeader),
+        (vec![], vec![signer.clone()], auth::AuthError::NoSuitableKey),
+        (
+            vec![nameless],
+            vec![named_signer(&no_name, 1)],
+            auth::AuthError::NoSuitableKey,
+        ),
+    ] {
+        let cms = signed_data(OID_SHA256, &certificates, &signers);
+        assert_eq!(private_signer_digest(&cms), Err(expected));
+    }
+
+    // Issuers that keep issuing each other stop at the depth limit.
+    let (a, b) = (common_name("A"), common_name("B"));
+    let certificates = [
+        named_certificate(&key, 1, &b, &a, true),
+        named_certificate(&key, 2, &a, &b, true),
+    ];
+    let cms = signed_data(OID_SHA256, &certificates, &[named_signer(&b, 1)]);
+    assert_eq!(
+        private_signer_digest(&cms),
+        Err(auth::AuthError::ChainTooDeep)
+    );
 }
 
 fn test_key() -> rsa::RsaPrivateKey {
