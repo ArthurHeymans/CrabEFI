@@ -389,6 +389,9 @@ fn execute_bootloader(
     path: &str,
     device_handle: r_efi::efi::Handle,
 ) -> Result<(), Status> {
+    // From here on third-party code runs: end payload MM's firmware phase.
+    #[cfg(target_arch = "x86_64")]
+    efi::payload_mm::ready_to_boot();
     use core::ptr;
     use efi::allocator::free_pool;
     use efi::protocols::loaded_image::LOADED_IMAGE_PROTOCOL_GUID;

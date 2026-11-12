@@ -34,12 +34,22 @@ pub(crate) fn delete_pk_from_setup() -> Status {
         }
         SETUP_PK_DELETE_ACTIVE.set(true);
         let _scope = ResetAuthorization;
-        super::client::variables::set(
-            &Guid::from_bytes(&crabefi_efi_types::secure_boot::EFI_GLOBAL_VARIABLE_GUID),
-            crabefi_efi_types::secure_boot::PK_NAME,
-            0,
-            &[],
-        )
+        let delete = || {
+            super::client::variables::set(
+                &Guid::from_bytes(&crabefi_efi_types::secure_boot::EFI_GLOBAL_VARIABLE_GUID),
+                crabefi_efi_types::secure_boot::PK_NAME,
+                0,
+                &[],
+            )
+        };
+        // With payload MM the MM bridge decides, from this firmware-phase grant.
+        #[cfg(target_arch = "x86_64")]
+        return crate::efi::payload_mm::with_setup_authorization(
+            crabefi_runtime_abi::bridge_operation::AUTHORIZE_SETUP_PK_DELETE,
+            delete,
+        );
+        #[cfg(not(target_arch = "x86_64"))]
+        delete()
     }
 }
 
@@ -116,6 +126,31 @@ unsafe fn persist(request: &BridgeRequest) -> Result<(), Status> {
     }
     let timestamp = (request.timestamp_valid != 0).then_some(request.timestamp);
     let guid = Guid::from_bytes(&request.guid);
+    // Payload MM owns the store: the ring-0 image only persists boot-time
+    // bookkeeping such as the capsule staging reservation, through MM's
+    // firmware-phase variable command.
+    #[cfg(target_arch = "x86_64")]
+    if crate::efi::payload_mm::active()
+        && matches!(
+            request.operation,
+            bridge_operation::PERSIST_WRITE | bridge_operation::PERSIST_DELETE
+        )
+    {
+        return match (request.operation, timestamp) {
+            (bridge_operation::PERSIST_WRITE, None) => {
+                match crate::efi::payload_mm::set_firmware_variable(
+                    &guid,
+                    name,
+                    request.attributes,
+                    data,
+                ) {
+                    Status::SUCCESS => Ok(()),
+                    status => Err(status),
+                }
+            }
+            _ => Err(Status::UNSUPPORTED),
+        };
+    }
     match request.operation {
         bridge_operation::AUTHORIZE_SETUP_PK_DELETE => {
             return if setup_pk_delete_authorized(request, name, SETUP_PK_DELETE_ACTIVE.get()) {

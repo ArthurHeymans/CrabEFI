@@ -382,6 +382,8 @@ fn validate_and_commit(
     if let Some(base) = proxy_virtual {
         crate::proxy::set_virtual(base);
     }
+    #[cfg(not(all(target_arch = "x86_64", not(feature = "mm"))))]
+    let _ = proxy_virtual;
     if let (Some(retained), Some(base)) = (&mut runtime.retained, retained_virtual_base) {
         retained.virtual_base = base;
     }

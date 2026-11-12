@@ -229,6 +229,13 @@ fn init_persistence_and_boot(
     };
 
     let persistence_writable = persistence_available && efi::varstore::is_varstore_writable();
+    // Payload MM owns a writable store: everything below (retained capsule
+    // staging, Secure Boot, capsules) persists through it.
+    let (persistence_available, persistence_writable) = if mm_variables {
+        (true, true)
+    } else {
+        (persistence_available, persistence_writable)
+    };
     if persistence_available && !persistence_writable {
         log::warn!("Variable store is preserved read-only; capsule updates are disabled");
     }
@@ -238,38 +245,35 @@ fn init_persistence_and_boot(
     let capsule_backend_available = cfg!(feature = "capsule-update") && capsule_backend.is_some();
     let mut capsule_delivery_usable = false;
     let mut retained_staging_ready = false;
-    if persistence_available {
-        if persistence_writable && retained_staging {
-            match runtime.prepare_retained_staging() {
-                Ok(()) => {
-                    retained_staging_ready = true;
-                    let boot_consumer_ready = supports_capsule_delivery(
-                        persistence_writable,
-                        true,
-                        capsule_backend_available,
-                    );
-                    if boot_consumer_ready {
-                        match runtime.enable_capsule_delivery() {
-                            Ok(()) => capsule_delivery_usable = true,
-                            Err(status) => {
-                                log::warn!("Runtime capsule delivery setup failed: {:?}", status)
-                            }
+    if persistence_available && persistence_writable && retained_staging {
+        match runtime.prepare_retained_staging() {
+            Ok(()) => {
+                retained_staging_ready = true;
+                let boot_consumer_ready = supports_capsule_delivery(
+                    persistence_writable,
+                    true,
+                    capsule_backend_available,
+                );
+                if boot_consumer_ready {
+                    match runtime.enable_capsule_delivery() {
+                        Ok(()) => capsule_delivery_usable = true,
+                        Err(status) => {
+                            log::warn!("Runtime capsule delivery setup failed: {:?}", status)
                         }
                     }
                 }
-                Err(status) => {
-                    log::warn!("Runtime image retained staging setup failed: {:?}", status)
-                }
             }
-            if let Err(status) = runtime.replay_deferred() {
-                retained_staging_ready = false;
-                log::warn!("Runtime image deferred replay failed: {:?}", status);
+            Err(status) => {
+                log::warn!("Runtime image retained staging setup failed: {:?}", status)
             }
+        }
+        if let Err(status) = runtime.replay_deferred() {
+            retained_staging_ready = false;
+            log::warn!("Runtime image deferred replay failed: {:?}", status);
         }
     }
 
-    // Variables are persistent here, through boot code or through payload MM.
-    if persistence_available || mm_variables {
+    if persistence_available {
         logger::apply_persisted_level();
     }
 
@@ -680,6 +684,8 @@ pub fn init_platform(mut config: PlatformConfig) -> ! {
     let mm_variables = config.runtime.mm_proxy.enabled != 0;
     if mm_variables {
         log::info!("Variables are served by payload MM");
+        #[cfg(target_arch = "x86_64")]
+        efi::payload_mm::configure(config.runtime.mm_proxy);
     }
     init_persistence_and_boot(
         if mm_variables {
@@ -688,7 +694,7 @@ pub fn init_platform(mut config: PlatformConfig) -> ! {
             config.variable_storage
         },
         config.capsule_backend,
-        config.runtime.deferred_buffer.size != 0 && !mm_variables,
+        config.runtime.deferred_buffer.size != 0,
         mm_variables,
     );
 }

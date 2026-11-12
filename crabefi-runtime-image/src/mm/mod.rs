@@ -16,7 +16,7 @@ use core::ffi::c_void;
 use core::ptr::{
     addr_of, addr_of_mut, read_unaligned, read_volatile, write_unaligned, write_volatile,
 };
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crabefi_runtime_abi::{BridgeRequest, MAX_VARIABLE_NAME_LEN, bridge_operation};
 
@@ -96,6 +96,18 @@ static mut CONTEXT: Context = Context {
 };
 static mut STORE: NvStore = NvStore::empty();
 static READY_TO_BOOT: AtomicBool = AtomicBool::new(false);
+/// Setup authorization opened by the firmware (bridge operation), 0 if none.
+static SETUP_AUTHORIZATION: AtomicU32 = AtomicU32::new(0);
+
+/// Firmware-only commands are refused once third-party code may have run.
+fn firmware_phase() -> bool {
+    !READY_TO_BOOT.load(Ordering::Acquire)
+}
+
+fn end_firmware_phase() {
+    READY_TO_BOOT.store(true, Ordering::Release);
+    SETUP_AUTHORIZATION.store(0, Ordering::Release);
+}
 
 // Requests are copied here before they are checked or used (no TOCTOU on ring-0 memory).
 static mut NAME: [u16; NAME_CAPACITY / 2] = [0; NAME_CAPACITY / 2];
@@ -291,15 +303,25 @@ fn persist(request: &BridgeRequest) -> Result<(), efi::Status> {
             store.write(&request.guid, name, request.attributes, &[], timestamp)
         }
         bridge_operation::PERSIST_DELETE => store.retire(&request.guid, name, None),
-        // Physical-presence PK deletion needs a firmware-only command that is
-        // gated by READY_TO_BOOT; not offered yet.
-        bridge_operation::AUTHORIZE_SETUP_PK_DELETE => return Err(efi::Status::ACCESS_DENIED),
+        // Physical-presence setup actions, opened by the firmware before any
+        // boot option ran (SETUP_AUTHORIZE).
+        bridge_operation::AUTHORIZE_SETUP_PK_DELETE
+        | bridge_operation::AUTHORIZE_SETUP_SECURE_BOOT_ENABLE => {
+            return if firmware_phase()
+                && SETUP_AUTHORIZATION.load(Ordering::Acquire) == request.operation
+            {
+                Ok(())
+            } else {
+                Err(efi::Status::ACCESS_DENIED)
+            };
+        }
         _ => return Err(efi::Status::UNSUPPORTED),
     };
     result.map_err(|error| match error {
         nvstore::Error::Full => efi::Status::OUT_OF_RESOURCES,
         nvstore::Error::Invalid => efi::Status::INVALID_PARAMETER,
         nvstore::Error::Device => efi::Status::DEVICE_ERROR,
+        nvstore::Error::Corrupt => efi::Status::VOLUME_CORRUPTED,
     })
 }
 
@@ -380,6 +402,89 @@ fn load_name(config: &InitConfig, request: &Request, name: &mut [u16]) -> Result
     Ok(())
 }
 
+/// Firmware update writes, anywhere in flash except the variable store, which
+/// only changes through the verified variable services.
+fn firmware_flash(
+    config: &InitConfig,
+    request: &Request,
+    data_capacity: usize,
+    data: &mut [u8],
+) -> efi::Status {
+    let (offset, length) = (request.offset, request.data_size);
+    let Some(end) = offset.checked_add(length) else {
+        return efi::Status::INVALID_PARAMETER;
+    };
+    if length == 0
+        || end > config.flash_size
+        || ranges_overlap(offset, length, config.store_offset, config.store_size)
+    {
+        return efi::Status::ACCESS_DENIED;
+    }
+    let flash = Flash::new(config.flash_base, config.flash_size);
+    let done = if request.command == command::FIRMWARE_ERASE {
+        flash.erase(offset, length)
+    } else {
+        let length = length as usize;
+        if length > data_capacity {
+            return efi::Status::BAD_BUFFER_SIZE;
+        }
+        copy_in(config.comm_base + DATA_OFFSET, &mut data[..length]);
+        flash.program(offset, &data[..length])
+    };
+    if done {
+        efi::Status::SUCCESS
+    } else {
+        efi::Status::DEVICE_ERROR
+    }
+}
+
+/// Persist and publish a firmware status variable that SetVariable protects
+/// (for example ESRT last-attempt status). Key databases and Secure Boot state
+/// are never written this way.
+fn set_firmware_variable(request: &Request, name: &[u16], data: &[u8]) -> efi::Status {
+    use crabefi_efi_types::secure_boot;
+    let length = name
+        .iter()
+        .position(|&unit| unit == 0)
+        .unwrap_or(name.len());
+    if length == 0 || length > MAX_VARIABLE_NAME_LEN {
+        return efi::Status::INVALID_PARAMETER;
+    }
+    let guid = request.guid;
+    let unterminated = &name[..length];
+    if secure_boot::identify_key_database(&guid, unterminated).is_some()
+        || secure_boot::is_status_variable(&guid, unterminated)
+        || (guid == secure_boot::EFI_GLOBAL_VARIABLE_GUID
+            && secure_boot::name_matches(unterminated, secure_boot::SECURE_BOOT_ENABLE_NAME))
+        || request.attributes & efi::VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS != 0
+    {
+        return efi::Status::ACCESS_DENIED;
+    }
+    // SAFETY: single-threaded SMM.
+    let store = unsafe { &mut *addr_of_mut!(STORE) };
+    if let Err(error) = store.write(&guid, &name[..=length], request.attributes, data, None) {
+        return match error {
+            nvstore::Error::Full => efi::Status::OUT_OF_RESOURCES,
+            _ => efi::Status::DEVICE_ERROR,
+        };
+    }
+    let Ok(mut lease) = state::lease_in(&[Phase::BootActive]) else {
+        return efi::Status::DEVICE_ERROR;
+    };
+    let (_, variables) = lease.parts_mut();
+    match variables.store.import(
+        &mut variables.transaction,
+        guid,
+        unterminated,
+        efi::VariableAttributes::from_bits_retain(request.attributes),
+        data,
+        None,
+    ) {
+        Ok(()) => efi::Status::SUCCESS,
+        Err(status) => status,
+    }
+}
+
 fn dispatch(config: &InitConfig, request: &mut Request) -> efi::Status {
     let data_capacity = (config.comm_size - DATA_OFFSET).min(DATA_CAPACITY as u64) as usize;
     // SAFETY: single-threaded SMM; MM-private scratch.
@@ -388,13 +493,50 @@ fn dispatch(config: &InitConfig, request: &mut Request) -> efi::Status {
     match request.command {
         command::PING => efi::Status::SUCCESS,
         command::READY_TO_BOOT => {
-            READY_TO_BOOT.store(true, Ordering::Release);
+            end_firmware_phase();
             efi::Status::SUCCESS
         }
         command::EXIT_BOOT_SERVICES => {
-            READY_TO_BOOT.store(true, Ordering::Release);
+            end_firmware_phase();
             MM_RUNTIME_LATCH.store(true, Ordering::Release);
             efi::Status::SUCCESS
+        }
+        command::SETUP_AUTHORIZE
+        | command::FIRMWARE_ERASE
+        | command::FIRMWARE_WRITE
+        | command::SET_FIRMWARE_VARIABLE
+            if !firmware_phase() =>
+        {
+            efi::Status::ACCESS_DENIED
+        }
+        command::SETUP_AUTHORIZE => match (request.attributes, request.data_size) {
+            (
+                bridge_operation::AUTHORIZE_SETUP_PK_DELETE
+                | bridge_operation::AUTHORIZE_SETUP_SECURE_BOOT_ENABLE,
+                1,
+            ) => {
+                SETUP_AUTHORIZATION.store(request.attributes, Ordering::Release);
+                efi::Status::SUCCESS
+            }
+            (_, 0) => {
+                SETUP_AUTHORIZATION.store(0, Ordering::Release);
+                efi::Status::SUCCESS
+            }
+            _ => efi::Status::INVALID_PARAMETER,
+        },
+        command::FIRMWARE_ERASE | command::FIRMWARE_WRITE => {
+            firmware_flash(config, request, data_capacity, data)
+        }
+        command::SET_FIRMWARE_VARIABLE => {
+            if let Err(status) = load_name(config, request, name) {
+                return status;
+            }
+            let size = request.data_size as usize;
+            if size == 0 || size > data_capacity.min(crabefi_runtime_abi::MAX_VARIABLE_DATA_SIZE) {
+                return efi::Status::INVALID_PARAMETER;
+            }
+            copy_in(config.comm_base + DATA_OFFSET, &mut data[..size]);
+            set_firmware_variable(request, name, &data[..size])
         }
         command::GET_VARIABLE => {
             if let Err(status) = load_name(config, request, name) {
