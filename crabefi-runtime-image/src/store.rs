@@ -400,11 +400,7 @@ impl VariableStore {
         let attributes = attributes.difference(VariableAttributes::APPEND_WRITE);
         let slot = match (existing, delete) {
             (Some(index), _) => {
-                if !delete
-                    && !append
-                    && self.slots[index].attributes != attributes
-                    && identify_key_database(&guid, name).is_none()
-                {
+                if !delete && !append && self.slots[index].attributes != attributes {
                     return Err(Status::INVALID_PARAMETER);
                 }
                 index

@@ -26,6 +26,10 @@ use crate::{
 #[cfg(feature = "secure-boot")]
 use crate::auth;
 
+const KEY_DATABASE_ATTRIBUTES: VariableAttributes = VariableAttributes::NON_VOLATILE
+    .union(VariableAttributes::BOOTSERVICE_ACCESS)
+    .union(VariableAttributes::RUNTIME_ACCESS)
+    .union(VariableAttributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS);
 const MAX_CAPSULE_SIZE: u64 = 16 * 1024 * 1024;
 const CAPSULE_FLAGS_PERSIST_ACROSS_RESET: u32 = 0x0001_0000;
 const CAPSULE_UPDATE_GUID: efi::Guid = efi::Guid::from_fields(
@@ -468,6 +472,11 @@ impl VariableRequest<'_> {
         self.attributes.contains(VariableAttributes::APPEND_WRITE)
     }
 
+    /// A deletion without an authentication envelope.
+    fn raw_delete(&self) -> bool {
+        self.attributes.is_empty() || (self.data.is_empty() && !self.append())
+    }
+
     /// The request creates, updates or deletes a non-volatile variable.
     fn nonvolatile(&self, store: &VariableStore) -> bool {
         self.attributes.contains(VariableAttributes::NON_VOLATILE)
@@ -762,6 +771,20 @@ fn check_write_policy(
     // deleted variable cannot be silently re-created with raw content.
     if !request.authenticated() && store.auth_history_timestamp(guid, name).is_some() {
         return Err(efi::Status::WRITE_PROTECTED);
+    }
+    // UEFI 2.10 3.3 (Table 3-1) and 8.2: PK, KEK, db and dbx are
+    // NV|BS|RT|TIME_BASED_AUTHENTICATED_WRITE_ACCESS; APPEND_WRITE may be
+    // added. Raw deletions are left to the checks above, as in EDK2's
+    // VarCheck. EDK2 checks attributes first; checking them last keeps
+    // CrabEFI's statuses for raw writes in User Mode and over history.
+    if secure_variable.is_some()
+        && !request.raw_delete()
+        && request
+            .attributes
+            .difference(VariableAttributes::APPEND_WRITE)
+            != KEY_DATABASE_ATTRIBUTES
+    {
+        return Err(efi::Status::INVALID_PARAMETER);
     }
     Ok(secure_variable)
 }
@@ -1511,8 +1534,11 @@ mod tests {
                 .unwrap();
         }
 
-        fn enroll_raw(&mut self) {
-            let pk = include_bytes!("../tests/fixtures/pk.esl");
+        /// Enroll the test certificate as KEK, db, dbx and PK with unsigned
+        /// Setup Mode envelopes.
+        fn enroll(&mut self) {
+            let mut envelope = unsigned_envelope(2024);
+            envelope.extend_from_slice(include_bytes!("../tests/fixtures/pk.esl"));
             for variable in [
                 SecureBootVariable::Kek,
                 SecureBootVariable::Db,
@@ -1520,7 +1546,7 @@ mod tests {
                 SecureBootVariable::PK,
             ] {
                 assert_eq!(
-                    self.apply(Phase::BootActive, variable, RAW_ATTRIBUTES, pk),
+                    self.apply(Phase::BootActive, variable, AUTH_ATTRIBUTES, &envelope),
                     efi::Status::SUCCESS
                 );
             }
@@ -1967,7 +1993,7 @@ mod tests {
     #[test]
     fn setup_pk_delete_is_transactional_and_preserves_the_authentication_floor() {
         let mut fixture = Fixture::retained();
-        fixture.enroll_raw();
+        fixture.enroll();
         let pk = include_bytes!("../tests/fixtures/pk.esl");
         let floor = timestamp(2030);
         fixture.import(
@@ -2042,7 +2068,7 @@ mod tests {
     #[test]
     fn setup_authorization_cannot_bypass_other_authentication_or_runtime_checks() {
         let mut fixture = Fixture::retained();
-        fixture.enroll_raw();
+        fixture.enroll();
         let bridge = setup_bridge as *const () as u64;
         for variable in [
             SecureBootVariable::Kek,
@@ -2088,6 +2114,73 @@ mod tests {
     }
 
     #[test]
+    fn secure_databases_require_their_attributes() {
+        let mut fixture = Fixture::retained();
+        let mut envelope = unsigned_envelope(2024);
+        envelope.extend_from_slice(include_bytes!("../tests/fixtures/pk.esl"));
+        let without = |attribute| AUTH_ATTRIBUTES.difference(attribute);
+        for variable in [
+            SecureBootVariable::PK,
+            SecureBootVariable::Kek,
+            SecureBootVariable::Db,
+            SecureBootVariable::Dbx,
+        ] {
+            // Setup Mode skips signatures, not the attribute rule.
+            for (attributes, data) in [
+                (RAW_ATTRIBUTES, &envelope[16 + 24..]),
+                (without(VariableAttributes::NON_VOLATILE), &envelope[..]),
+                (without(VariableAttributes::RUNTIME_ACCESS), &envelope[..]),
+                (
+                    AUTH_ATTRIBUTES | VariableAttributes::HARDWARE_ERROR_RECORD,
+                    &envelope[..],
+                ),
+            ] {
+                assert_eq!(
+                    fixture.apply(Phase::BootActive, variable, attributes, data),
+                    efi::Status::INVALID_PARAMETER
+                );
+                assert_eq!(fixture.store.key_database_data(variable), None);
+            }
+        }
+        fixture.enroll();
+
+        // Appends and replacements of enrolled databases keep them too.
+        let update = include_bytes!("../tests/fixtures/db-update.bin");
+        for attributes in [
+            without(VariableAttributes::RUNTIME_ACCESS) | VariableAttributes::APPEND_WRITE,
+            without(VariableAttributes::NON_VOLATILE),
+        ] {
+            assert_eq!(
+                fixture.apply(
+                    Phase::BootActive,
+                    SecureBootVariable::Db,
+                    attributes,
+                    update
+                ),
+                efi::Status::INVALID_PARAMETER
+            );
+        }
+        assert_eq!(
+            fixture.apply(
+                Phase::BootActive,
+                SecureBootVariable::Db,
+                AUTH_ATTRIBUTES,
+                update
+            ),
+            efi::Status::SUCCESS
+        );
+        let slot = fixture
+            .store
+            .find(
+                SecureBootVariable::Db.guid(),
+                SecureBootVariable::Db.name(),
+                false,
+            )
+            .unwrap();
+        assert_eq!(slot.attributes, AUTH_ATTRIBUTES);
+    }
+
+    #[test]
     fn secure_boot_enable_needs_setup_mode_or_physical_presence() {
         let guid = secure_boot::EFI_GLOBAL_VARIABLE_GUID;
         let name = secure_boot::SECURE_BOOT_ENABLE_NAME;
@@ -2102,7 +2195,7 @@ mod tests {
                 efi::Status::WRITE_PROTECTED
             );
         }
-        fixture.enroll_raw();
+        fixture.enroll();
         assert!(fixture.store.secure_boot_enabled());
 
         let envelope = unsigned_envelope(2099);
@@ -2167,7 +2260,7 @@ mod tests {
     #[test]
     fn real_service_path_covers_all_secure_databases() {
         let mut fixture = Fixture::retained();
-        fixture.enroll_raw();
+        fixture.enroll();
 
         assert_eq!(
             fixture.apply(
@@ -2361,7 +2454,7 @@ mod tests {
     #[test]
     fn authenticated_post_ebs_write_replays_once_through_service_logic() {
         let mut fixture = Fixture::retained();
-        fixture.enroll_raw();
+        fixture.enroll();
         assert_eq!(
             fixture.apply(
                 Phase::SealedPhysical,
@@ -2373,7 +2466,7 @@ mod tests {
         );
 
         let mut reboot = Fixture::new();
-        reboot.enroll_raw();
+        reboot.enroll();
         let processed = replay_into(&mut fixture, &mut reboot, |_, authenticated, _| {
             assert!(authenticated)
         });
