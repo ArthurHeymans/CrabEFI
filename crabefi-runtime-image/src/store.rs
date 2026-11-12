@@ -162,7 +162,7 @@ impl VariableTransaction {
     }
 
     /// Copy `bytes` to offset `at`, returning the offset after them.
-    fn push(&mut self, at: usize, bytes: &[u8]) -> Result<usize, Status> {
+    pub fn push(&mut self, at: usize, bytes: &[u8]) -> Result<usize, Status> {
         let end = at
             .checked_add(bytes.len())
             .ok_or(Status::OUT_OF_RESOURCES)?;
@@ -464,6 +464,17 @@ impl VariableStore {
         }
         prepared.data_len = staged.len();
         Ok(staged)
+    }
+
+    /// Take `len` bytes the caller wrote to the transaction as the value of
+    /// `prepared`.
+    #[cfg(feature = "secure-boot")]
+    pub fn accept_staged(&self, prepared: &mut PreparedWrite, len: usize) -> Result<(), Status> {
+        if len > MAX_VARIABLE_DATA_SIZE || len > self.available_after_replacing(prepared.slot) {
+            return Err(Status::OUT_OF_RESOURCES);
+        }
+        prepared.data_len = len;
+        Ok(())
     }
 
     pub fn commit(

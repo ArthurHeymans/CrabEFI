@@ -74,20 +74,7 @@ pub fn verify_pkcs7_signature_hash(
     }
 
     let mut slots = [&[][..]; MAX_CERTIFICATES];
-    let mut certificate_count = 0usize;
-    for certificate in signed.certificates() {
-        if certificate.tag != tag::SEQUENCE || certificate.encoded.len() > MAX_CERTIFICATE_SIZE {
-            return Err(AuthError::InvalidHeader);
-        }
-        let slot = slots
-            .get_mut(certificate_count)
-            .ok_or(AuthError::OutOfResources)?;
-        *slot = certificate.encoded;
-        certificate_count += 1;
-    }
-    let certificates = slots
-        .get(..certificate_count)
-        .ok_or(AuthError::CertificateParseError)?;
+    let certificates = collect_certificates(&signed, &mut slots)?;
     if certificates.is_empty() {
         return Err(AuthError::NoSuitableKey);
     }
@@ -115,6 +102,193 @@ pub fn verify_pkcs7_signature_hash(
         return Err(AuthError::InvalidHeader);
     }
     Ok(false)
+}
+
+/// The certificates of `signed`, at most [`MAX_CERTIFICATES`].
+fn collect_certificates<'a, 'b>(
+    signed: &SignedData<'a>,
+    slots: &'b mut [&'a [u8]; MAX_CERTIFICATES],
+) -> Result<&'b [&'a [u8]], AuthError> {
+    let mut count = 0usize;
+    for certificate in signed.certificates() {
+        if certificate.tag != tag::SEQUENCE || certificate.encoded.len() > MAX_CERTIFICATE_SIZE {
+            return Err(AuthError::InvalidHeader);
+        }
+        let slot = slots.get_mut(count).ok_or(AuthError::OutOfResources)?;
+        *slot = certificate.encoded;
+        count += 1;
+    }
+    slots.get(..count).ok_or(AuthError::CertificateParseError)
+}
+
+/// Signer identity a private authenticated variable is bound to (UEFI 2.10
+/// 8.2, SetVariable): the CN of the signing certificate and the tbsCertificate
+/// of the top-level issuer certificate in SignedData.certificates (the signer
+/// itself without one). `digest` hashes both like EDK2's certdb.
+pub struct PrivateSigner<'a> {
+    /// SHA-256 over the CN as EDK2's X509GetCommonName returns it and the
+    /// complete top-level TBSCertificate.
+    pub digest: [u8; 32],
+    /// The top-level certificate the signature has to verify up to.
+    pub top_level: &'a [u8],
+}
+
+/// Find the [`PrivateSigner`] of a detached CMS signature. Only finds it; the
+/// caller still verifies the signature up to `top_level`.
+pub fn private_signer(pkcs7_data: &[u8]) -> Result<PrivateSigner<'_>, AuthError> {
+    if pkcs7_data.len() > super::MAX_AUTHENTICATED_ENVELOPE_SIZE {
+        return Err(AuthError::OutOfResources);
+    }
+    let signed = SignedData::parse(pkcs7_data)?;
+    let mut slots = [&[][..]; MAX_CERTIFICATES];
+    let certificates = collect_certificates(&signed, &mut slots)?;
+    // One SignerInfo, so the binding names a single identity.
+    let mut signers = signed.signers();
+    let signer = signers.next().ok_or(AuthError::InvalidHeader)??;
+    if signers.next().is_some() {
+        return Err(AuthError::NoSuitableKey);
+    }
+    let signer = find_signer(signer.identifier, certificates)?.ok_or(AuthError::NoSuitableKey)?;
+    let mut top = signer;
+    let mut depth = 0usize;
+    while top.certificate.issuer != top.certificate.subject {
+        let Some(issuer) = find_issuer(top, certificates)? else {
+            break;
+        };
+        depth += 1;
+        if depth > MAX_CHAIN_DEPTH {
+            return Err(AuthError::ChainTooDeep);
+        }
+        top = issuer;
+    }
+    let mut name = [0u8; MAX_COMMON_NAME];
+    let mut digest = Sha256::new();
+    digest.update(common_name(signer.certificate.subject, &mut name)?);
+    digest.update(top.certificate.tbs);
+    Ok(PrivateSigner {
+        digest: digest.finalize().into(),
+        top_level: top.certificate.encoded,
+    })
+}
+
+/// A certificate in `certificates` that issued and signed `certificate`.
+fn find_issuer<'a>(
+    certificate: PolicyCertificate<'_>,
+    certificates: &[&'a [u8]],
+) -> Result<Option<PolicyCertificate<'a>>, AuthError> {
+    for raw in certificates {
+        let candidate = parse_certificate(raw)?;
+        if candidate.certificate.encoded != certificate.certificate.encoded
+            && candidate.certificate.subject == certificate.certificate.issuer
+            && verify_certificate(certificate, candidate)
+        {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
+}
+
+/// EDK2's CN buffer holds 127 bytes and a terminator.
+const MAX_COMMON_NAME: usize = 127;
+const OID_COMMON_NAME: &[u8] = &[0x55, 0x04, 0x03];
+
+/// The first commonName of the DER `name` as EDK2's X509GetCommonName returns
+/// it: converted to UTF-8, cut to 127 bytes, then at the first NUL.
+fn common_name<'b>(
+    name: &[u8],
+    buffer: &'b mut [u8; MAX_COMMON_NAME],
+) -> Result<&'b [u8], AuthError> {
+    let mut names = Tlv::parse(name)?.contents(tag::SEQUENCE)?;
+    while !names.is_empty() {
+        let mut attributes = names.read()?.contents(tag::SET)?;
+        while !attributes.is_empty() {
+            let mut attribute = attributes.read()?.contents(tag::SEQUENCE)?;
+            if attribute.read()?.oid()? != OID_COMMON_NAME {
+                continue;
+            }
+            let length = utf8(attribute.read()?, buffer)?;
+            let text = buffer
+                .get(..length)
+                .ok_or(AuthError::CertificateParseError)?;
+            let end = text.iter().position(|byte| *byte == 0).unwrap_or(length);
+            return text.get(..end).ok_or(AuthError::CertificateParseError);
+        }
+    }
+    Err(AuthError::NoSuitableKey)
+}
+
+/// Convert a directory string to UTF-8 like OpenSSL's ASN1_STRING_to_UTF8
+/// (one-byte strings as Latin-1), keeping the bytes that fit in `buffer`.
+fn utf8(value: Tlv<'_>, buffer: &mut [u8; MAX_COMMON_NAME]) -> Result<usize, AuthError> {
+    const UTF8_STRING: u8 = 0x0c;
+    const NUMERIC_STRING: u8 = 0x12;
+    const PRINTABLE_STRING: u8 = 0x13;
+    const T61_STRING: u8 = 0x14;
+    const IA5_STRING: u8 = 0x16;
+    const VISIBLE_STRING: u8 = 0x1a;
+    const UNIVERSAL_STRING: u8 = 0x1c;
+    const BMP_STRING: u8 = 0x1e;
+
+    let mut length = 0usize;
+    let mut push = |byte: u8| {
+        if let Some(slot) = buffer.get_mut(length) {
+            *slot = byte;
+            length += 1;
+        }
+    };
+    let mut push_char = |code: u32| -> Result<(), AuthError> {
+        let character = char::from_u32(code).ok_or(AuthError::CertificateParseError)?;
+        let mut encoded = [0u8; 4];
+        let code = u32::from(character);
+        let used = if code < 0x80 {
+            encoded[0] = code as u8;
+            1
+        } else if code < 0x800 {
+            encoded[0] = 0xc0 | (code >> 6) as u8;
+            encoded[1] = 0x80 | (code & 0x3f) as u8;
+            2
+        } else if code < 0x1_0000 {
+            encoded[0] = 0xe0 | (code >> 12) as u8;
+            encoded[1] = 0x80 | ((code >> 6) & 0x3f) as u8;
+            encoded[2] = 0x80 | (code & 0x3f) as u8;
+            3
+        } else {
+            encoded[0] = 0xf0 | (code >> 18) as u8;
+            encoded[1] = 0x80 | ((code >> 12) & 0x3f) as u8;
+            encoded[2] = 0x80 | ((code >> 6) & 0x3f) as u8;
+            encoded[3] = 0x80 | (code & 0x3f) as u8;
+            4
+        };
+        encoded.iter().take(used).for_each(|byte| push(*byte));
+        Ok(())
+    };
+    match value.tag {
+        UTF8_STRING => {
+            let text =
+                core::str::from_utf8(value.value).map_err(|_| AuthError::CertificateParseError)?;
+            text.chars()
+                .try_for_each(|character| push_char(u32::from(character)))?;
+        }
+        NUMERIC_STRING | PRINTABLE_STRING | T61_STRING | IA5_STRING | VISIBLE_STRING => value
+            .value
+            .iter()
+            .try_for_each(|byte| push_char(u32::from(*byte)))?,
+        BMP_STRING | UNIVERSAL_STRING => {
+            let width = if value.tag == BMP_STRING { 2 } else { 4 };
+            let units = value.value.chunks_exact(width);
+            if !units.remainder().is_empty() {
+                return Err(AuthError::CertificateParseError);
+            }
+            units
+                .map(|unit| {
+                    unit.iter()
+                        .fold(0u32, |code, byte| code << 8 | u32::from(*byte))
+                })
+                .try_for_each(&mut push_char)?;
+        }
+        _ => return Err(AuthError::NoSuitableKey),
+    }
+    Ok(length)
 }
 
 /// `digestAlgorithms` must be exactly SHA-256.

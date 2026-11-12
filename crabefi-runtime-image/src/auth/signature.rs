@@ -5,6 +5,7 @@ use crabefi_efi_types::{
         EfiTime, EfiVariableAuthentication2, SignatureIterator, SignatureListIterator,
         WinCertificateUefiGuid,
     },
+    constant_time_eq,
     secure_boot::{
         EFI_CERT_TYPE_PKCS7_GUID, EFI_CERT_X509_GUID, SecureBootVariable, identify_key_database,
     },
@@ -13,7 +14,7 @@ use sha2::{Digest, Sha256};
 use zerocopy::IntoBytes;
 
 use super::{
-    AuthError, MAX_AUTHENTICATED_ENVELOPE_SIZE, WIN_CERT_REVISION, WIN_CERT_TYPE_EFI_GUID,
+    AuthError, MAX_AUTHENTICATED_ENVELOPE_SIZE, WIN_CERT_REVISION, WIN_CERT_TYPE_EFI_GUID, cert_db,
 };
 use crate::{efi, store::VariableStore};
 
@@ -24,6 +25,8 @@ pub struct VerifiedVariable<'a> {
     pub payload: &'a [u8],
     pub timestamp: EfiTime,
     pub secure_variable: Option<SecureBootVariable>,
+    /// Signer binding of a private authenticated variable.
+    pub private_signer: Option<[u8; cert_db::DIGEST_SIZE]>,
 }
 
 pub fn verify_authenticated_variable<'a>(
@@ -62,13 +65,10 @@ pub fn verify_authenticated_variable<'a>(
         .ok_or(AuthError::InvalidHeader)?;
     let secure_variable = identify_key_database(vendor_guid, variable_name);
 
-    // UEFI exempts appends from the timestamp check. Microsoft relies on it:
-    // every dbx update it publishes carries the same 2010 timestamp. Only the
-    // signature databases get the exemption here, because appending to them
-    // skips signatures they already hold, so a replayed append changes
-    // nothing. Other variables keep the stricter rule.
-    let replayable = secure_variable.is_some() && attributes & efi::VARIABLE_APPEND_WRITE != 0;
-    if !replayable {
+    // UEFI 2.10 8.2 exempts appends from the timestamp check. Microsoft
+    // relies on it: every dbx update it publishes carries the same 2010
+    // timestamp.
+    if attributes & efi::VARIABLE_APPEND_WRITE == 0 {
         if let Some(variable) = secure_variable {
             let previous = super::efi_time_from_timestamp(store.auth_timestamp(variable));
             if !authentication.time_stamp.is_after(&previous) {
@@ -86,6 +86,7 @@ pub fn verify_authenticated_variable<'a>(
         }
     }
 
+    let mut private_signer = None;
     if !store.setup_mode() || secure_variable.is_none() {
         if signature.is_empty() {
             return Err(AuthError::InvalidHeader);
@@ -103,7 +104,12 @@ pub fn verify_authenticated_variable<'a>(
                 || (database == SecureBootVariable::Kek
                     && verify_database(store, SecureBootVariable::PK, signature, &signed_hash)?)
         } else {
-            verify_database(store, SecureBootVariable::Db, signature, &signed_hash)?
+            let signer = super::crypto::private_signer(signature)?;
+            if !bound_to(store, vendor_guid, variable_name, &signer.digest) {
+                return Err(AuthError::SignatureVerificationFailed);
+            }
+            private_signer = Some(signer.digest);
+            super::crypto::verify_pkcs7_signature_hash(signature, &signed_hash, signer.top_level)?
         };
         if !authorized {
             return Err(AuthError::SignatureVerificationFailed);
@@ -114,7 +120,30 @@ pub fn verify_authenticated_variable<'a>(
         payload,
         timestamp: authentication.time_stamp,
         secure_variable,
+        private_signer,
     })
+}
+
+/// Whether a private authenticated variable may be written by `signer`
+/// (UEFI 2.10 8.2, SetVariable): any signer creates it, after that only the
+/// one bound on creation, as in EDK2's certdb.
+fn bound_to(
+    store: &VariableStore,
+    guid: &[u8; 16],
+    name: &[u16],
+    signer: &[u8; cert_db::DIGEST_SIZE],
+) -> bool {
+    let Some(variable) = store.find(guid, name, false) else {
+        return true;
+    };
+    let nonvolatile = variable
+        .attributes
+        .contains(efi::VariableAttributes::NON_VOLATILE);
+    store
+        .find(&cert_db::GUID, cert_db::name(nonvolatile), false)
+        .and_then(|db| store.data(db))
+        .and_then(|db| cert_db::find(db, guid, name))
+        .is_some_and(|bound| constant_time_eq(bound, signer))
 }
 
 fn verify_database(
