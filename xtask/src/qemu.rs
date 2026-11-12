@@ -885,6 +885,28 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
     let mut failed = 0;
 
     match app_name {
+        "mm-gate-test" => {
+            let fails = result
+                .output
+                .lines()
+                .filter(|l| l.contains("MMGATE FAIL"))
+                .count();
+            let passes = result
+                .output
+                .lines()
+                .filter(|l| l.contains("MMGATE PASS"))
+                .count();
+            for line in result.output.lines().filter(|l| l.contains("MMGATE ")) {
+                println!("  {}", line.trim());
+            }
+            if result.output.contains("MMGATE DONE") && fails == 0 {
+                println!("[PASS] mm_gate: {passes} checks passed");
+                passed += 1;
+            } else {
+                println!("[FAIL] mm_gate: {fails} failed checks or no MMGATE DONE");
+                failed += 1;
+            }
+        }
         "hello" => {
             // Test 1: Check if "Hello from CrabEFI!" appears
             if result.output.contains("Hello from CrabEFI!") {

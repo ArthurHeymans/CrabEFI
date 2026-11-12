@@ -142,6 +142,40 @@ fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
     ))
 }
 
+/// Visit every FMAP area (name, offset, size) in the memory-mapped flash.
+pub fn for_each_fmap_area(
+    boot_media: BootMediaInfo,
+    mut f: impl FnMut(&str, u32, u32),
+) -> Option<()> {
+    let flash_size = boot_media.boot_media_size;
+    if flash_size == 0 || flash_size > 16 * 1024 * 1024 {
+        return None;
+    }
+    let fmap = ((1u64 << 32) - flash_size + boot_media.fmap_offset) as *const u8;
+    let read = |offset: usize, buf: &mut [u8]| {
+        for (i, byte) in buf.iter_mut().enumerate() {
+            // SAFETY: the FMAP lies in the memory-mapped flash coreboot described.
+            *byte = unsafe { read_volatile(fmap.add(offset + i)) };
+        }
+    };
+    let mut header = [0u8; 56];
+    read(0, &mut header);
+    if &header[..8] != b"__FMAP__" {
+        return None;
+    }
+    let areas = u16::from_le_bytes([header[54], header[55]]) as usize;
+    for i in 0..areas.min(64) {
+        let mut area = [0u8; 42];
+        read(56 + i * 42, &mut area);
+        let name = &area[8..40];
+        let len = name.iter().position(|&b| b == 0).unwrap_or(32);
+        if let Ok(name) = core::str::from_utf8(&name[..len]) {
+            f(name, read_u32(&area, 0)?, read_u32(&area, 4)?);
+        }
+    }
+    Some(())
+}
+
 /// Find an FMAP area (offset, size) in the memory-mapped flash.
 fn fmap_area(flash_base: u64, fmap_offset: u64, name: &[u8]) -> Option<(u64, u64)> {
     let fmap = (flash_base + fmap_offset) as *const u8;

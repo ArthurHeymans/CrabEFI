@@ -290,5 +290,6 @@ const fn empty() -> Request {
         maximum_storage: 0,
         remaining_storage: 0,
         maximum_variable: 0,
+        offset: 0,
     }
 }

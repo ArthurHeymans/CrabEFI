@@ -1067,6 +1067,15 @@ pub(crate) fn persist_firmware_variable(
     attributes: u32,
     data: &[u8],
 ) -> Result<(), VarStoreError> {
+    #[cfg(target_arch = "x86_64")]
+    if crate::efi::payload_mm::active() {
+        return match crate::efi::payload_mm::set_firmware_variable(guid, name, attributes, data) {
+            r_efi::efi::Status::SUCCESS => Ok(()),
+            r_efi::efi::Status::OUT_OF_RESOURCES => Err(VarStoreError::StoreFull),
+            r_efi::efi::Status::ACCESS_DENIED => Err(VarStoreError::WriteProtected),
+            _ => Err(VarStoreError::StorageFailure),
+        };
+    }
     let name_len = name
         .iter()
         .position(|unit| *unit == 0)

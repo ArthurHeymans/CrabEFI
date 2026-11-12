@@ -656,6 +656,9 @@ fn boot_linux_entry(
     initrd_paths: &crate::bls::Initrds,
     cmdline: &heapless::String<512>,
 ) {
+    // From here on third-party code runs: end payload MM's firmware phase.
+    #[cfg(target_arch = "x86_64")]
+    crate::efi::payload_mm::ready_to_boot();
     use crate::fs;
 
     // Defense in depth: Direct Linux boot entries should not appear in the menu
@@ -756,6 +759,9 @@ fn boot_payload_entry(
     path: &heapless::String<128>,
     format: crate::payload::PayloadFormat,
 ) {
+    // From here on third-party code runs: end payload MM's firmware phase.
+    #[cfg(target_arch = "x86_64")]
+    crate::efi::payload_mm::ready_to_boot();
     log::info!("Chainloading payload: {}", entry.name);
     log::info!("  Path: {}", path);
     log::info!("  Format: {:?}", format);
