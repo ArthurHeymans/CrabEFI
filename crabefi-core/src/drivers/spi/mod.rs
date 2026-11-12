@@ -4,8 +4,6 @@
 //! sibling `rflasher-internal` crate. CrabEFI keeps only the firmware-facing
 //! adapter and the QEMU pflash backend here.
 
-#[cfg(target_arch = "x86_64")]
-pub mod mm;
 pub mod qemu;
 
 use rflasher_internal::{
@@ -229,8 +227,6 @@ pub enum AnySpiController {
     Intel(rflasher_internal::IchSpiController<CrabEfiPciAccess>),
     Amd(rflasher_internal::Spi100Controller<CrabEfiPciAccess>),
     Qemu(qemu::QemuPflashController),
-    #[cfg(target_arch = "x86_64")]
-    Mm(mm::MmFlashController),
 }
 
 impl FirmwareStorage for AnySpiController {
@@ -241,8 +237,6 @@ impl FirmwareStorage for AnySpiController {
     fn capacity(&self) -> Option<u64> {
         match self {
             Self::Qemu(c) => Some(c.flash_size() as u64),
-            #[cfg(target_arch = "x86_64")]
-            Self::Mm(c) => Some(c.flash_size() as u64),
             Self::Intel(_) | Self::Amd(_) => None,
         }
     }
@@ -304,8 +298,6 @@ impl SpiController for AnySpiController {
             Self::Intel(_) => "Intel ICH/PCH SPI",
             Self::Amd(_) => "AMD SPI100",
             Self::Qemu(c) => c.name(),
-            #[cfg(target_arch = "x86_64")]
-            Self::Mm(c) => c.name(),
         }
     }
 
@@ -316,8 +308,6 @@ impl SpiController for AnySpiController {
             Self::Intel(c) => c.is_locked(),
             Self::Amd(c) => c.is_locked(),
             Self::Qemu(c) => c.is_locked(),
-            #[cfg(target_arch = "x86_64")]
-            Self::Mm(c) => c.is_locked(),
         }
     }
 
@@ -328,8 +318,6 @@ impl SpiController for AnySpiController {
             Self::Intel(c) => c.writes_enabled(),
             Self::Amd(c) => c.writes_enabled(),
             Self::Qemu(c) => c.writes_enabled(),
-            #[cfg(target_arch = "x86_64")]
-            Self::Mm(c) => c.writes_enabled(),
         }
     }
 
@@ -340,8 +328,6 @@ impl SpiController for AnySpiController {
             Self::Intel(c) => c.enable_bios_write().map_err(map_internal_error),
             Self::Amd(c) => c.enable_bios_write().map_err(map_internal_error),
             Self::Qemu(c) => c.enable_writes(),
-            #[cfg(target_arch = "x86_64")]
-            Self::Mm(c) => c.enable_writes(),
         }
     }
 
@@ -352,8 +338,6 @@ impl SpiController for AnySpiController {
             Self::Intel(c) => c.controller_read(addr, buf, 0).map_err(map_core_error),
             Self::Amd(c) => c.controller_read(addr, buf, 0).map_err(map_core_error),
             Self::Qemu(c) => c.read(addr, buf),
-            #[cfg(target_arch = "x86_64")]
-            Self::Mm(c) => c.read(addr, buf),
         }
     }
 
@@ -364,8 +348,6 @@ impl SpiController for AnySpiController {
             Self::Intel(c) => c.controller_write(addr, data).map_err(map_core_error),
             Self::Amd(c) => c.controller_write(addr, data).map_err(map_core_error),
             Self::Qemu(c) => c.write(addr, data),
-            #[cfg(target_arch = "x86_64")]
-            Self::Mm(c) => c.write(addr, data),
         }
     }
 
@@ -376,8 +358,6 @@ impl SpiController for AnySpiController {
             Self::Intel(c) => c.controller_erase(addr, len).map_err(map_core_error),
             Self::Amd(c) => c.controller_erase(addr, len).map_err(map_core_error),
             Self::Qemu(c) => c.erase(addr, len),
-            #[cfg(target_arch = "x86_64")]
-            Self::Mm(c) => c.erase(addr, len),
         }
     }
 
@@ -390,8 +370,6 @@ impl SpiController for AnySpiController {
             },
             Self::Amd(_) => SpiMode::SoftwareSequencing,
             Self::Qemu(c) => c.mode(),
-            #[cfg(target_arch = "x86_64")]
-            Self::Mm(c) => c.mode(),
         }
     }
 
@@ -400,8 +378,6 @@ impl SpiController for AnySpiController {
             Self::Intel(c) => c.get_bios_region(),
             Self::Amd(_) => None,
             Self::Qemu(c) => c.get_bios_region(),
-            #[cfg(target_arch = "x86_64")]
-            Self::Mm(c) => c.get_bios_region(),
         }
     }
 }
@@ -471,12 +447,6 @@ pub fn detect_and_init() -> Option<AnySpiController> {
     if cfg!(target_arch = "aarch64") || cfg!(target_arch = "riscv64") {
         log::debug!("SPI flash detection skipped on non-x86 (no memory-mapped SPI flash)");
         return None;
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    if let Some(controller) = mm::controller() {
-        log::info!("Using the payload MM flash service");
-        return Some(AnySpiController::Mm(controller));
     }
 
     log::debug!("Checking for QEMU environment...");

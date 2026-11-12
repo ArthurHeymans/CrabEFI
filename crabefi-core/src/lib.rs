@@ -75,7 +75,8 @@ pub use boot_policy::{BootPolicy, ExternalBoot, UsbInit};
 #[cfg(feature = "bundled-runtime-image")]
 pub use bundled_runtime::BUNDLED_RUNTIME_IMAGE;
 pub use crabefi_runtime_abi::{
-    RuntimeExternalRange, RuntimeResetConfig, RuntimeTimeConfig, reset_mechanism, time_mechanism,
+    MmProxyConfig, RuntimeExternalRange, RuntimeResetConfig, RuntimeTimeConfig, reset_mechanism,
+    time_mechanism,
 };
 pub use platform::{
     BlockDevice, BlockDeviceInfo, BlockError, BootResult, CapsuleBackend, CapsuleRegion,
@@ -197,6 +198,7 @@ fn init_persistence_and_boot(
     variable_storage: platform::VariableStorage<'_>,
     capsule_backend: Option<&mut dyn platform::CapsuleBackend>,
     retained_staging: bool,
+    mm_variables: bool,
 ) -> ! {
     // ---- Variable persistence ----
     // SAFETY: init_platform and this tail never return, so the caller's borrowed
@@ -212,6 +214,7 @@ fn init_persistence_and_boot(
     // I/O errors) never halts the boot: log the failure and continue with
     // volatile variables.
     let persistence_available = match efi::varstore::init_persistence(variable_storage) {
+        Err(_) if mm_variables => false,
         Ok(()) => {
             log::info!("Variable store persistence initialized");
             true
@@ -263,7 +266,10 @@ fn init_persistence_and_boot(
                 log::warn!("Runtime image deferred replay failed: {:?}", status);
             }
         }
+    }
 
+    // Variables are persistent here, through boot code or through payload MM.
+    if persistence_available || mm_variables {
         logger::apply_persisted_level();
     }
 
@@ -669,9 +675,20 @@ pub fn init_platform(mut config: PlatformConfig) -> ! {
     }
 
     // ---- 16. Variable persistence, Secure Boot, and boot manager ----
+    // With payload MM the SMM image owns the flash store; boot code only
+    // forwards variable services to it.
+    let mm_variables = config.runtime.mm_proxy.enabled != 0;
+    if mm_variables {
+        log::info!("Variables are served by payload MM");
+    }
     init_persistence_and_boot(
-        config.variable_storage,
+        if mm_variables {
+            platform::VariableStorage::None
+        } else {
+            config.variable_storage
+        },
         config.capsule_backend,
-        config.runtime.deferred_buffer.size != 0,
+        config.runtime.deferred_buffer.size != 0 && !mm_variables,
+        mm_variables,
     );
 }
