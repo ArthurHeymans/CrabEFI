@@ -48,6 +48,17 @@ pub fn prepare_rom(
 
 /// Prepare x86_64 (Q35) firmware
 fn prepare_rom_x86_64(crabefi_elf: &Path, output_dir: &Path) -> Result<PreparedFirmware> {
+    let output_rom = output_dir.join("coreboot.rom");
+    // A payload-less q35 ROM built elsewhere, e.g. coreboot with PAYLOAD_MM_INTERFACE.
+    if let Some(base) = std::env::var_os("CRABEFI_Q35_ROM") {
+        println!("Using base ROM {}", Path::new(&base).display());
+        std::fs::copy(&base, &output_rom).context("Failed to copy CRABEFI_Q35_ROM")?;
+        inject_crabefi_payload(&output_rom, crabefi_elf)?;
+        return Ok(PreparedFirmware {
+            coreboot_rom: output_rom,
+            tfa_flash: None,
+        });
+    }
     let compressed_rom = project_root().join("firmware/coreboot-qemu-q35.rom.zst");
 
     if !compressed_rom.exists() {
@@ -57,8 +68,6 @@ fn prepare_rom_x86_64(crabefi_elf: &Path, output_dir: &Path) -> Result<PreparedF
             compressed_rom.display()
         );
     }
-
-    let output_rom = output_dir.join("coreboot.rom");
 
     // Decompress the ROM
     println!("Decompressing base ROM...");

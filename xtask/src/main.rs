@@ -477,6 +477,25 @@ fn cmd_build_payload(
     if target_dir != "target" {
         cmd.arg("--target-dir").arg(&target_dir);
     }
+    // CRABEFI_PAYLOAD_MM=1: also build crabefi-mm and load it into coreboot's
+    // payload MM SMRAM (needs a coreboot base ROM with PAYLOAD_MM_INTERFACE,
+    // see CRABEFI_Q35_ROM).
+    if std::env::var_os("CRABEFI_PAYLOAD_MM").is_some() && matches!(arch, Arch::X86_64) {
+        let output = std::process::Command::new(project_root.join("crabefi-mm/build.sh"))
+            .stderr(std::process::Stdio::inherit())
+            .output()
+            .context("Failed to run crabefi-mm/build.sh")?;
+        if !output.status.success() {
+            bail!("crabefi-mm build failed");
+        }
+        let elf = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .last()
+            .unwrap_or_default()
+            .to_string();
+        cmd.env("CRABEFI_MM_ELF", elf);
+        features.push("payload-mm");
+    }
     cmd.arg("--features").arg(features.join(","));
 
     let target_triple = match arch {

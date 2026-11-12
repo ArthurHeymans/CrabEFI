@@ -44,7 +44,14 @@ impl CaptureScenario {
 }
 
 fn add_x86_boot_args(cmd: &mut Command, firmware: &str, scenario: CaptureScenario) {
-    if scenario.writable_flash() {
+    // Payload MM runs: like AMD ROM Armor 3, the flash only accepts writes from SMM.
+    if std::env::var_os("CRABEFI_PAYLOAD_MM").is_some() {
+        cmd.args(["-global", "driver=cfi.pflash01,property=secure,value=on"]);
+        cmd.args([
+            "-drive",
+            &format!("if=pflash,format=raw,file={firmware},snapshot=on"),
+        ]);
+    } else if scenario.writable_flash() {
         cmd.args([
             "-drive",
             &format!("if=pflash,format=raw,file={firmware},snapshot=on"),
