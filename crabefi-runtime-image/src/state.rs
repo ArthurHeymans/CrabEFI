@@ -63,8 +63,41 @@ impl Phase {
 
     /// ExitBootServices has completed.
     pub fn runtime(self) -> bool {
-        matches!(self, Self::SealedPhysical | Self::Virtual)
+        matches!(self, Self::SealedPhysical | Self::Virtual) || mm_runtime_latched()
     }
+}
+
+/// In SMM the image never seals: it keeps persisting directly, but once the
+/// trusted payload reported ExitBootServices callers only get the runtime view.
+#[cfg(feature = "mm")]
+pub static MM_RUNTIME_LATCH: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+fn mm_runtime_latched() -> bool {
+    #[cfg(feature = "mm")]
+    return MM_RUNTIME_LATCH.load(Ordering::Acquire);
+    #[cfg(not(feature = "mm"))]
+    false
+}
+
+/// Forward variable services to the payload MM image when the boot loader
+/// configured it. The buffer is RuntimeServicesData; SVAM resolves it like the
+/// retained journal.
+fn configure_mm_proxy(handoff: &RuntimeHandoff) -> Result<(), efi::Status> {
+    let proxy = handoff.mm_proxy;
+    if proxy.enabled == 0 {
+        return Ok(());
+    }
+    if proxy.enabled != 1
+        || proxy.comm_base.checked_add(proxy.comm_size).is_none()
+        || proxy.comm_size <= crate::mm_protocol::DATA_OFFSET
+        || cfg!(any(not(target_arch = "x86_64"), feature = "mm"))
+    {
+        return Err(efi::Status::INVALID_PARAMETER);
+    }
+    #[cfg(all(target_arch = "x86_64", not(feature = "mm")))]
+    crate::proxy::configure(proxy.comm_base, proxy.comm_size, proxy.apm_cmd);
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -172,6 +205,7 @@ impl RuntimeState {
             base: handoff.reset.io_or_mmio_base,
         };
         self.boot_bridge = handoff.boot_bridge;
+        configure_mm_proxy(handoff)?;
         self.retained = match (handoff.deferred_buffer_base, handoff.deferred_buffer_size) {
             (0, 0) => None,
             (physical_base, size) => Some(RetainedBuffer {

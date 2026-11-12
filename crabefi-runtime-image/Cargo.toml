@@ -11,6 +11,8 @@ build = "build.rs"
 default = []
 secure-boot = ["dep:sha2", "dep:crabefi-pkcs7"]
 full = ["secure-boot"]
+# Payload MM build: run in coreboot-owned SMRAM as the variable authority.
+mm = ["secure-boot"]
 
 [dependencies]
 crabefi-efi-types = { path = "../crabefi-efi-types" }

@@ -5,7 +5,9 @@ fn main() {
     if target.contains("-linux-") {
         return;
     }
-    let script = if target.starts_with("x86_64") {
+    let script = if target.starts_with("x86_64") && std::env::var_os("CARGO_FEATURE_MM").is_some() {
+        "link/x86_64-mm.ld"
+    } else if target.starts_with("x86_64") {
         "link/x86_64.ld"
     } else if target.starts_with("aarch64") {
         "link/aarch64.ld"
