@@ -1,0 +1,123 @@
+stage 1
+mode s1-initial-setup-mode 1 0
+var s1-PK-absent PK absent
+var s1-KEK-absent KEK absent
+var s1-db-absent db absent
+var s1-dbx-absent dbx absent
+set s1-kek-raw-attrs KEK 0x7 kek.esl INVALID_PARAMETER
+set s1-kek-volatile KEK 0x26 s1-kek-volatile.auth INVALID_PARAMETER
+set s1-db-no-rt db 0x23 s1-db-no-rt.auth INVALID_PARAMETER
+set s1-enroll-kek KEK 0x27 s1-enroll-kek.auth SUCCESS
+var s1-kek-readback KEK equals 0x27 kek.esl
+set s1-enroll-db db 0x27 s1-enroll-db.auth SUCCESS
+var s1-db-readback db equals 0x27 db-ca.esl
+set s1-enroll-dbx dbx 0x27 s1-enroll-dbx.auth SUCCESS
+var s1-dbx-readback dbx equals 0x27 dbx-dummy.esl
+set s1-enroll-pk PK 0x27 s1-enroll-pk.auth SUCCESS
+var s1-pk-readback PK equals 0x27 pk.esl
+mode s1-user-mode 0 1
+set a-append-new db 0x67 a-append-new.auth SUCCESS
+var a-append-new-present db has db-direct.esl
+var a-append-new-kept db has db-ca.esl
+var a-entries-before-dup db count 2
+set a-append-duplicate db 0x67 a-append-duplicate.auth SUCCESS
+var a-append-duplicate-not-added db count 2
+set a-append-older-timestamp db 0x67 a-append-older-timestamp.auth SUCCESS
+var a-append-older-present db has db-hash.esl
+set a-replay-same-envelope db 0x27 s1-enroll-db.auth SECURITY_VIOLATION
+set a-older-than-append-floor db 0x27 a-older-than-append-floor.auth SECURITY_VIOLATION
+set a-equal-timestamp db 0x27 a-equal-timestamp.auth SECURITY_VIOLATION
+set a-signed-other-name db 0x67 a-signed-other-name.auth SECURITY_VIOLATION
+set a-signed-other-guid db 0x67 a-signed-other-guid.auth SECURITY_VIOLATION
+set a-signed-other-attrs db 0x67 a-signed-other-attrs.auth SECURITY_VIOLATION
+set a-tampered-payload db 0x67 a-tampered-payload.auth SECURITY_VIOLATION
+set a-timestamp-nanosecond db 0x67 a-timestamp-nanosecond.auth SECURITY_VIOLATION
+set a-timestamp-timezone db 0x67 a-timestamp-timezone.auth SECURITY_VIOLATION
+set a-unauthenticated-write db 0x7 db-ca.esl ERROR
+set a-delete db 0x27 a-delete.auth SUCCESS
+var a-deleted db absent
+set a-replay-after-delete db 0x27 s1-enroll-db.auth SECURITY_VIOLATION
+var a-replay-after-delete-absent db absent
+set a-recreate db 0x27 a-recreate.auth SUCCESS
+set a-reappend db 0x67 a-reappend.auth SUCCESS
+var a-reappended db has db-direct-hash.esl
+set b-kek-signed-by-kek KEK 0x67 b-kek-signed-by-kek.auth SECURITY_VIOLATION
+set b-kek-signed-by-rogue KEK 0x67 b-kek-signed-by-rogue.auth SECURITY_VIOLATION
+set b-kek-signed-by-db KEK 0x67 b-kek-signed-by-db.auth SECURITY_VIOLATION
+set b-kek-signed-by-pk KEK 0x67 b-kek-signed-by-pk.auth SUCCESS
+var b-kek2-present KEK has kek2.esl
+set b-db-signed-by-kek2 db 0x67 b-db-signed-by-kek2.auth SUCCESS
+set b-db-signed-by-pk db 0x67 b-db-signed-by-pk.auth SUCCESS
+var b-db-signers-present db has db-dummy2.esl
+var b-db-pk-signer-present db has db-dummy3.esl
+set b-db-signed-by-db-key db 0x67 b-db-signed-by-db-key.auth SECURITY_VIOLATION
+set b-db-signed-by-db-chain db 0x67 b-db-signed-by-db-chain.auth SECURITY_VIOLATION
+set b-db-signed-by-rogue db 0x67 b-db-signed-by-rogue.auth SECURITY_VIOLATION
+set b-dbx-signed-by-db-key dbx 0x67 b-dbx-signed-by-db-key.auth SECURITY_VIOLATION
+set b-dbx-signed-by-rogue dbx 0x67 b-dbx-signed-by-rogue.auth SECURITY_VIOLATION
+set b-pk-signed-by-kek PK 0x27 b-pk-signed-by-kek.auth SECURITY_VIOLATION
+set b-pk-signed-by-rogue PK 0x27 b-pk-signed-by-rogue.auth SECURITY_VIOLATION
+set b-pk-signed-by-new-pk PK 0x27 b-pk-signed-by-new-pk.auth SECURITY_VIOLATION
+set b-pk-rotate PK 0x27 b-pk-rotate.auth SUCCESS
+var b-pk-rotated PK equals 0x27 pk2.esl
+set b-pk-signed-by-old-pk PK 0x27 b-pk-signed-by-old-pk.auth SECURITY_VIOLATION
+set b-kek-signed-by-old-pk KEK 0x67 b-kek-signed-by-old-pk.auth SECURITY_VIOLATION
+set b-kek-signed-by-new-pk KEK 0x67 b-kek-signed-by-new-pk.auth SUCCESS
+set b-pk-delete-signed-by-kek PK 0x27 b-pk-delete-signed-by-kek.auth SECURITY_VIOLATION
+mode b-still-user-mode 0 1
+set p1-create-any-signer priv1 0x27 p1-create-any-signer.auth SUCCESS
+set p2-create priv2 0x27 p2-create.auth SUCCESS
+var p2-created priv2 equals 0x27 priv-a.bin
+set p2-update-same-signer priv2 0x27 p2-update-same-signer.auth SUCCESS
+var p2-updated priv2 equals 0x27 priv-b.bin
+set p2-append-older-timestamp priv2 0x67 p2-append-older-timestamp.auth SUCCESS
+set p2-update-other-signer priv2 0x27 p2-update-other-signer.auth SECURITY_VIOLATION
+set p2-replay priv2 0x27 p2-update-same-signer.auth SECURITY_VIOLATION
+set p2-delete priv2 0x27 p2-delete.auth SUCCESS
+var p2-deleted priv2 absent
+digest s1-end
+reset
+stage 2
+digest s2-start
+mode s2-user-mode-after-reset 0 1
+set d-replay-after-reset db 0x27 s1-enroll-db.auth SECURITY_VIOLATION
+set d-pk-replay-after-reset PK 0x27 b-pk-rotate.auth SECURITY_VIOLATION
+load c-db-signed img-db-signed.efi run 0x5b01
+load c-db-direct img-db-direct.efi run 0x5b02
+load c-hash-in-db img-hash-db.efi run 0x5b05
+load c-expired-signer img-expired.efi run 0x5b07
+load c-hash-dbx-before-revocation img-hash-dbx.efi run 0x5b06
+load c-x509sha256-before-revocation img-x509sha256.efi run 0x5b08
+load c-unsigned img-unsigned.efi deny
+load c-rogue img-rogue.efi deny
+load c-tampered img-tampered.efi deny
+loadstatus c-rejection-status img-unsigned.efi
+set c-dbx-revoke dbx 0x67 c-dbx-revoke.auth SUCCESS
+set c-dbx-x509sha256 dbx 0x67 c-dbx-x509sha256.auth SUCCESS
+load c-signer-cert-in-dbx img-db-direct.efi deny
+load c-hash-in-dbx img-hash-dbx.efi deny
+load c-signer-tbs-hash-in-dbx img-x509sha256.efi deny
+load c-db-signed-after-dbx img-db-signed.efi run 0x5b01
+set d-older-than-floor-after-reset db 0x27 d-older-than-floor-after-reset.auth SECURITY_VIOLATION
+set e-pk-delete PK 0x27 e-pk-delete.auth SUCCESS
+var e-pk-deleted PK absent
+mode e-setup-mode-after-pk-delete 1 0
+load e-unsigned-without-secure-boot img-unsigned.efi run 0x5b03
+digest s2-end
+reset
+stage 3
+digest s3-start
+mode s3-setup-mode-after-reset 1 0
+var s3-pk-absent PK absent
+set e-pk-reenroll PK 0x27 e-pk-reenroll.auth SUCCESS
+mode e-user-mode-after-reenroll 0 1
+load e-unsigned-after-reenroll img-unsigned.efi deny
+load e-dbx-persisted img-hash-dbx.efi deny
+set s3-db-append-drops-rt db 0x63 s3-db-append-drops-rt.auth INVALID_PARAMETER
+set s3-kek-volatile KEK 0x26 s3-kek-volatile.auth INVALID_PARAMETER
+set f-securebootenable-write SecureBootEnable 0x7 u8-0.bin ERROR
+mode f-still-enforcing 0 1
+load f-unsigned-still-denied img-unsigned.efi deny
+set f-securebootenable-restore SecureBootEnable 0x7 u8-1.bin ANY
+digest s3-end
+end
