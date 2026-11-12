@@ -498,7 +498,8 @@ fn utc_seconds(time: &EfiTime) -> i64 {
     }
 }
 
-/// UTC `EfiTime` for Unix seconds (civil-from-days, Howard Hinnant).
+/// UTC `EfiTime` for Unix seconds (civil-from-days, Howard Hinnant), with
+/// TimeZone 0 like every EFI_VARIABLE_AUTHENTICATION_2 TimeStamp.
 fn efi_time_from_unix(seconds: i64) -> EfiTime {
     let days = seconds.div_euclid(86_400);
     let second_of_day = seconds.rem_euclid(86_400);
@@ -523,7 +524,6 @@ fn efi_time_from_unix(seconds: i64) -> EfiTime {
         hour: (second_of_day / 3_600) as u8,
         minute: (second_of_day / 60 % 60) as u8,
         second: (second_of_day % 60) as u8,
-        timezone: EFI_UNSPECIFIED_TIMEZONE,
         ..EfiTime::zero()
     }
 }
@@ -775,6 +775,7 @@ mod tests {
             let time = efi_time_from_unix(seconds);
             assert_eq!(date(&time), expected);
             assert!(time.is_valid());
+            assert!(time.has_zero_authentication_fields());
             assert_eq!(utc_seconds(&time), seconds);
         }
     }
