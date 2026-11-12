@@ -13,7 +13,7 @@ pub const HEADER_SIZE: usize = 48;
 /// so a stale bundled runtime image (or a newer boot image) is rejected
 /// with a clear error instead of silently misinterpreting the other
 /// side's bytes. Pre-versioning images read as version 0 and are rejected.
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
 pub const SECTION_SIZE: usize = 32;
 pub const RELOCATION_SIZE: usize = 24;
 /// Byte size of the export table: one image-relative `u32` per export.
