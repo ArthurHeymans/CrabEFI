@@ -12,6 +12,11 @@ mod arch;
 mod auth;
 mod deferred;
 mod efi;
+#[cfg(all(feature = "mm", target_arch = "x86_64", target_os = "none"))]
+mod mm;
+mod mm_protocol;
+#[cfg(all(target_arch = "x86_64", not(feature = "mm")))]
+mod proxy;
 mod services;
 mod state;
 mod store;
@@ -320,6 +325,13 @@ pub unsafe extern "C" fn runtime_image_prepare_ebs(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn runtime_image_seal() -> usize {
+    // MM must switch to the runtime view first: otherwise the OS could still
+    // write boot-services-only variables through it. Failure is fatal like any
+    // seal failure.
+    #[cfg(all(target_arch = "x86_64", not(feature = "mm")))]
+    if proxy::active() && proxy::exit_boot_services() != efi::Status::SUCCESS {
+        return export_status(Err(efi::Status::DEVICE_ERROR));
+    }
     export_status(state::lease_in(Phase::BOOT_SERVICES).map(|mut lease| {
         let runtime = lease.state_mut();
         runtime.tables.seal();

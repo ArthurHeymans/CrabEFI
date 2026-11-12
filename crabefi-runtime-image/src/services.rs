@@ -178,6 +178,10 @@ pub extern "efiapi" fn get_variable(
     data_size: *mut usize,
     data: *mut c_void,
 ) -> efi::Status {
+    #[cfg(all(target_arch = "x86_64", not(feature = "mm")))]
+    if crate::proxy::active() {
+        return crate::proxy::get_variable(variable_name, vendor_guid, attributes, data_size, data);
+    }
     efi::status(read_variable(
         variable_name,
         vendor_guid,
@@ -262,6 +266,14 @@ pub extern "efiapi" fn get_next_variable_name(
     variable_name: *mut u16,
     vendor_guid: *mut efi::Guid,
 ) -> efi::Status {
+    #[cfg(all(target_arch = "x86_64", not(feature = "mm")))]
+    if crate::proxy::active() {
+        return crate::proxy::get_next_variable_name(
+            variable_name_size,
+            variable_name,
+            vendor_guid,
+        );
+    }
     efi::status(next_variable_name(
         variable_name_size,
         variable_name,
@@ -362,6 +374,10 @@ pub extern "efiapi" fn set_variable(
     data_size: usize,
     data: *mut c_void,
 ) -> efi::Status {
+    #[cfg(all(target_arch = "x86_64", not(feature = "mm")))]
+    if crate::proxy::active() {
+        return crate::proxy::set_variable(variable_name, vendor_guid, attributes, data_size, data);
+    }
     efi::status(write_variable(
         variable_name,
         vendor_guid,
@@ -530,7 +546,7 @@ fn apply_variable(
         mut deferred,
     } = context;
     validate_set_arguments(request.attributes, request.data.len())?;
-    if !phase.boot_services() {
+    if phase.runtime() {
         check_runtime_target(store, &request)?;
     }
     if !phase.boot_services() && request.nonvolatile(store) {
@@ -562,7 +578,7 @@ fn apply_variable(
     if verified.payload.len() > MAX_VARIABLE_DATA_SIZE {
         return Err(efi::Status::OUT_OF_RESOURCES);
     }
-    if !phase.boot_services() {
+    if phase.runtime() {
         check_runtime_access(store, &request, verified.payload.is_empty())?;
     }
 
@@ -1152,6 +1168,15 @@ pub extern "efiapi" fn query_variable_info(
     remaining_variable_storage_size: *mut u64,
     maximum_variable_size: *mut u64,
 ) -> efi::Status {
+    #[cfg(all(target_arch = "x86_64", not(feature = "mm")))]
+    if crate::proxy::active() {
+        return crate::proxy::query_variable_info(
+            attributes,
+            maximum_variable_storage_size,
+            remaining_variable_storage_size,
+            maximum_variable_size,
+        );
+    }
     efi::status(variable_info(
         attributes,
         maximum_variable_storage_size,
@@ -1172,7 +1197,8 @@ fn variable_info(
     {
         return Err(efi::Status::INVALID_PARAMETER);
     }
-    validate_query_attributes(attributes, Phase::current().boot_services())?;
+    let phase = Phase::current();
+    validate_query_attributes(attributes, phase.boot_services() && !phase.runtime())?;
     let lease = state::lease()?;
     // Without retained staging the RAM store still answers: runtime-visible
     // volatile variables stay readable (they are writable only before
