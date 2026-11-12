@@ -477,16 +477,17 @@ fn cmd_build_payload(
     if target_dir != "target" {
         cmd.arg("--target-dir").arg(&target_dir);
     }
-    // CRABEFI_PAYLOAD_MM=1: also build crabefi-mm and load it into coreboot's
+    // CRABEFI_PAYLOAD_MM=1: also build the runtime image as payload MM and load it into coreboot's
     // payload MM SMRAM (needs a coreboot base ROM with PAYLOAD_MM_INTERFACE,
     // see CRABEFI_Q35_ROM).
     if std::env::var_os("CRABEFI_PAYLOAD_MM").is_some() && matches!(arch, Arch::X86_64) {
-        let output = std::process::Command::new(project_root.join("crabefi-mm/build.sh"))
-            .stderr(std::process::Stdio::inherit())
-            .output()
-            .context("Failed to run crabefi-mm/build.sh")?;
+        let output =
+            std::process::Command::new(project_root.join("crabefi-runtime-image/mm-build.sh"))
+                .stderr(std::process::Stdio::inherit())
+                .output()
+                .context("Failed to run crabefi-runtime-image/mm-build.sh")?;
         if !output.status.success() {
-            bail!("crabefi-mm build failed");
+            bail!("payload MM runtime image build failed");
         }
         let elf = String::from_utf8_lossy(&output.stdout)
             .lines()

@@ -1,5 +1,7 @@
-//! Load crabefi-mm into the SMRAM area coreboot reserves for the payload
-//! (coreboot `drivers/payload_mm_interface`, `PAYLOAD_MM_CMD_LOAD_AND_CALL_CORE`).
+//! Load the payload MM build of the runtime image into the SMRAM area coreboot
+//! reserves for the payload (coreboot `drivers/payload_mm_interface`,
+//! `PAYLOAD_MM_CMD_LOAD_AND_CALL_CORE`). It then owns the variable store and
+//! the ring-0 runtime image forwards variable services to it.
 //!
 //! coreboot accepts exactly one load per boot. This runs before any third-party
 //! code, so nothing else can claim the payload MM area first.
@@ -47,17 +49,66 @@ struct InitConfig {
 
 const INIT_MAGIC: u64 = 0x4749_4643_4d4d_4243; // "CBMMCFIG"
 
-const STAGING_SIZE: usize = 512 * 1024;
-const COMM_SIZE: usize = 64 * 1024 + 4096;
+const STAGING_SIZE: usize = 1024 * 1024;
 
 #[repr(C, align(4096))]
 struct Staging([u8; STAGING_SIZE]);
-#[repr(C, align(4096))]
-struct Comm([u8; COMM_SIZE]);
 
 // Payload .bss lies below 4 GiB, where coreboot's SMM can reach it.
 static mut STAGING: Staging = Staging([0; STAGING_SIZE]);
-static mut COMM: Comm = Comm([0; COMM_SIZE]);
+
+unsafe extern "C" {
+    static _mm_comm_start: u8;
+    static _mm_comm_end: u8;
+}
+
+/// Request buffer shared with MM (linker region, see x86_64-coreboot.ld).
+fn comm_buffer() -> (u64, u64) {
+    let start = core::ptr::addr_of!(_mm_comm_start) as u64;
+    let end = core::ptr::addr_of!(_mm_comm_end) as u64;
+    (start, end - start)
+}
+
+/// APM command used for variable requests; coreboot enters payload MM on any
+/// software SMI and 0 is its no-op command.
+const REQUEST_APM_CMD: u8 = 0;
+
+static LOADED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Keep the request buffer across ExitBootServices (after allocator init).
+pub fn reserve_buffer() {
+    if !LOADED.load(core::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    let (base, size) = comm_buffer();
+    if crabefi::efi::allocator::carve_out_region(
+        base,
+        size / 4096,
+        crabefi::efi::allocator::MemoryType::RuntimeServicesData,
+    )
+    .is_err()
+    {
+        log::error!(
+            "payload MM: cannot reserve the request buffer at {:#x}",
+            base
+        );
+    }
+}
+
+/// Proxy configuration for the ring-0 runtime image.
+pub fn runtime_config() -> crabefi::MmProxyConfig {
+    if !LOADED.load(core::sync::atomic::Ordering::Acquire) {
+        return Default::default();
+    }
+    let (base, size) = comm_buffer();
+    crabefi::MmProxyConfig {
+        comm_base: base,
+        comm_size: size,
+        apm_cmd: REQUEST_APM_CMD,
+        enabled: 1,
+        reserved: [0; 6],
+    }
+}
+
 static mut LOAD_CONTEXT: LoadContext = LoadContext {
     header_size: 0,
     header_revision: 0,
@@ -118,9 +169,9 @@ fn fmap_area(flash_base: u64, fmap_offset: u64, name: &[u8]) -> Option<(u64, u64
     None
 }
 
-/// Load the MM image and route flash writes through it. Returns an error string
-/// when payload MM is not available or the load fails; flash access then stays
-/// as before (direct, and read-only if the platform locked writes to SMM).
+/// Load the MM image into SMRAM; it then owns the variable store. Returns an
+/// error string when payload MM is not available or the load fails; variables
+/// then stay with the boot-time store (read-only if writes are locked to SMM).
 pub fn load(mm: &PayloadMmInfo, boot_media: Option<BootMediaInfo>) -> Result<(), &'static str> {
     let (Some(apm_cmd), Some((smram_base, smram_size)), Some((shared_base, _))) =
         (mm.apm_cmd, mm.smram, mm.shared_mem)
@@ -171,16 +222,16 @@ pub fn load(mm: &PayloadMmInfo, boot_media: Option<BootMediaInfo>) -> Result<(),
             slot.copy_from_slice(&(addend + smram_base).to_le_bytes());
         }
 
-        let comm = addr_of_mut!(COMM) as u64;
-        (*addr_of_mut!(COMM)).0.fill(0);
+        let (comm, comm_size) = comm_buffer();
+        core::ptr::write_bytes(comm as *mut u8, 0, comm_size as usize);
         *addr_of_mut!(INIT_CONFIG) = InitConfig {
             magic: INIT_MAGIC,
-            version: 1,
+            version: 2,
             size: core::mem::size_of::<InitConfig>() as u32,
             mm_area_base: shared_base,
             mm_area_size: smram_base + smram_size - shared_base,
             comm_base: comm,
-            comm_size: COMM_SIZE as u64,
+            comm_size,
             flash_base,
             flash_size,
             store_offset,
@@ -215,21 +266,10 @@ pub fn load(mm: &PayloadMmInfo, boot_media: Option<BootMediaInfo>) -> Result<(),
             log::error!("payload MM load failed: coreboot returned {:#x}", eax);
             return Err("coreboot rejected the payload MM image");
         }
-
-        crabefi::drivers::spi::mm::register(crabefi::drivers::spi::mm::MmFlashConfig {
-            comm_base: comm,
-            comm_size: COMM_SIZE as u64,
-            apm_cmd: 0, // any software SMI enters payload MM; 0 is coreboot's no-op command
-            flash_base,
-            flash_size: flash_size as u32,
-        });
     }
-    let controller = crabefi::drivers::spi::mm::controller().ok_or("MM flash not registered")?;
-    controller
-        .ping()
-        .map_err(|_| "payload MM does not answer")?;
+    LOADED.store(true, core::sync::atomic::Ordering::Release);
     log::info!(
-        "payload MM loaded at {:#x} ({} KiB); flash writes go through SMM (store {:#x}+{:#x})",
+        "payload MM loaded at {:#x} ({} KiB); it owns the variable store ({:#x}+{:#x})",
         smram_base,
         mem_size / 1024,
         store_offset,

@@ -548,6 +548,7 @@ fn actual_loader_seal_svam_and_runtime_services_with_and_without_retained_stagin
             },
             external_ranges: &[],
             deferred_buffer,
+            mm_proxy: Default::default(),
         };
         #[cfg(feature = "secure-boot")]
         if !retained {

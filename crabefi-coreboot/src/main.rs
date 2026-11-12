@@ -173,11 +173,16 @@ fn runtime_platform_config() -> crabefi::RuntimePlatformConfig<'static> {
             io_or_mmio_base: 0,
         },
     );
+    #[cfg(feature = "payload-mm")]
+    let mm_proxy = payload_mm::runtime_config();
+    #[cfg(not(feature = "payload-mm"))]
+    let mm_proxy = Default::default();
     crabefi::RuntimePlatformConfig {
         time,
         reset,
         external_ranges: &[],
         deferred_buffer,
+        mm_proxy,
     }
 }
 
@@ -1153,6 +1158,8 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     // call is a no-op.
     // ================================================================
     crabefi::efi::allocator::init_from_platform(config.memory_map);
+    #[cfg(feature = "payload-mm")]
+    payload_mm::reserve_buffer();
     match crabefi::heap::init() {
         Ok(()) | Err(crabefi::heap::HeapInitError::AlreadyInitialized) => {
             config.heap_pre_initialized = true;

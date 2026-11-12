@@ -1060,6 +1060,9 @@ pub struct RuntimePlatformConfig<'a> {
     pub external_ranges: &'a [crabefi_runtime_abi::RuntimeExternalRange],
     /// Optional, exclusively owned warm-reset-preserved deferred storage.
     pub deferred_buffer: DeferredBufferConfig,
+    /// Variables served by a payload MM image in SMM (disabled by default). Its
+    /// buffer must be RuntimeServicesData.
+    pub mm_proxy: crabefi_runtime_abi::MmProxyConfig,
 }
 
 /// Result of the UEFI boot manager.

@@ -148,11 +148,16 @@ fn embed_payload_mm_image() {
     assert_eq!(vaddr, 0, "payload MM image must be linked at 0");
     let mut image = elf[offset..offset + filesz].to_vec();
 
+    let shstrtab = shoff + u16_at(62) as usize * shentsize;
+    let names = u64_at(shstrtab + 24) as usize;
     let mut relocations = Vec::new();
     for i in 0..shnum {
         let sh = shoff + i * shentsize;
-        if u32_at(sh + 4) != 4 {
-            continue; // SHT_RELA
+        let name_at = names + u32_at(sh) as usize;
+        let name_end = name_at + elf[name_at..].iter().position(|&b| b == 0).unwrap();
+        // --emit-relocs also keeps link-time .rela.* sections; only .rela.dyn applies at load.
+        if u32_at(sh + 4) != 4 || &elf[name_at..name_end] != b".rela.dyn" {
+            continue;
         }
         let (rel_off, rel_size) = (u64_at(sh + 24) as usize, u64_at(sh + 32) as usize);
         for r in (rel_off..rel_off + rel_size).step_by(24) {

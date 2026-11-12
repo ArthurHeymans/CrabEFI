@@ -119,6 +119,7 @@ pub fn load(
         u64::try_from(platform.deferred_buffer.size).map_err(|_| LoadError::InvalidLayout)?;
     handoff.time = platform.time;
     handoff.reset = platform.reset;
+    handoff.mm_proxy = platform.mm_proxy;
     (0..usize::from(header.section_count)).try_for_each(|index| {
         let section = image.section(index).map_err(LoadError::InvalidFormat)?;
         handoff.sections[index] = LoadedSection {
