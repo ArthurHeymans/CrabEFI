@@ -158,6 +158,11 @@ pub fn identify_key_database(guid: &[u8; 16], name: &[u16]) -> Option<SecureBoot
     None
 }
 
+/// Return whether a variable is CrabEFI's SecureBootEnable preference.
+pub fn is_secure_boot_enable(guid: &[u8; 16], name: &[u16]) -> bool {
+    guid == &EFI_GLOBAL_VARIABLE_GUID && name_matches(name, SECURE_BOOT_ENABLE_NAME)
+}
+
 /// Return whether a variable is an image-synthesized Secure Boot status value.
 pub fn is_status_variable(guid: &[u8; 16], name: &[u16]) -> bool {
     guid == &EFI_GLOBAL_VARIABLE_GUID
