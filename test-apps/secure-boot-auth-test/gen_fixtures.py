@@ -362,6 +362,8 @@ def generate(out):
     put("priv-c.bin", b"CrabEFI TEST ONLY private C")
     put("u8-0.bin", b"\x00")
     put("u8-1.bin", b"\x01")
+    put("stress-a.bin", b"A" * 2048)
+    put("stress-b.bin", b"B" * 2048)
 
     # Images.
     with tempfile.TemporaryDirectory() as tmp:
@@ -569,6 +571,19 @@ def generate(out):
     load_deny("f-unsigned-still-denied", "img-unsigned")
     step(f"set f-securebootenable-restore SecureBootEnable {NV | BS | RT:#x} u8-1.bin ANY")
     step("digest s3-end")
+    step("end")
+
+    # ---- Opt-in power loss (host kills QEMU during stage 4, then boots 5) ----
+    step("stage 4")
+    step("digest s4-start")
+    step("stress w-stress stress stress-a.bin stress-b.bin 1000")
+    step("end")
+    step("stage 5")
+    step("digest s5-check")
+    step("mode w-still-enforcing 0 1")
+    load_deny("w-unsigned-still-denied", "img-unsigned")
+    step("var w-value-intact stress oneof stress-a.bin stress-b.bin")
+    step(f"set w-store-writable stress {NV | BS | RT:#x} stress-a.bin SUCCESS")
     step("end")
 
     if out.exists():

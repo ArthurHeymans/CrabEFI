@@ -80,16 +80,18 @@ fn seed_setup_mode(flash: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Boot once with persistent flash and return the serial log when QEMU exits.
+/// Boot once with persistent flash and return the serial log when QEMU exits,
+/// or right after `kill_at` appears on serial, killing QEMU like a power cut.
 fn boot(
     config: &QemuConfig,
     flash: &Path,
     disk: &Path,
     report: &Path,
-    stage: usize,
+    label: &str,
+    kill_at: Option<&str>,
 ) -> Result<String> {
-    let serial = report.join(format!("stage{stage}.serial.log"));
-    let stderr = fs::File::create(report.join(format!("stage{stage}.stderr.log")))?;
+    let serial = report.join(format!("{label}.serial.log"));
+    let stderr = fs::File::create(report.join(format!("{label}.stderr.log")))?;
     let mut cmd = Command::new("qemu-system-x86_64");
     cmd.args([
         "-machine",
@@ -115,7 +117,7 @@ fn boot(
         cmd.arg(arg);
     }
     fs::write(
-        report.join(format!("stage{stage}.command.txt")),
+        report.join(format!("{label}.command.txt")),
         format!("{cmd:?}\n"),
     )?;
     let mut child = cmd
@@ -125,13 +127,68 @@ fn boot(
         .spawn()?;
     let deadline = Instant::now() + Duration::from_secs(config.timeout_secs.unwrap_or(120));
     while child.try_wait()?.is_none() {
+        if kill_at
+            .is_some_and(|marker| fs::read_to_string(&serial).is_ok_and(|log| log.contains(marker)))
+        {
+            cleanup_child(&mut child);
+            break;
+        }
         if Instant::now() >= deadline {
             cleanup_child(&mut child);
-            bail!("stage {stage} timed out; see {}", serial.display());
+            bail!("{label} timed out; see {}", serial.display());
         }
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(10));
     }
     Ok(fs::read_to_string(&serial).unwrap_or_default())
+}
+
+/// Select the plan stage of the next boot through `\\sbtest\\stage.txt`.
+fn set_stage(disk: &Path, stage: usize) -> Result<()> {
+    let file = tempfile::NamedTempFile::new()?;
+    fs::write(file.path(), stage.to_string())?;
+    let status = Command::new("mcopy")
+        .args(["-o", "-i", &crate::disk::mtools_esp_image(disk)])
+        .arg(file.path())
+        .arg("::/sbtest/stage.txt")
+        .status()?;
+    if !status.success() {
+        bail!("mcopy stage.txt failed");
+    }
+    Ok(())
+}
+
+/// Kill QEMU after `writes` completed NV writes, then check on the next boot
+/// that the keys are unchanged and the written variable is old or new.
+fn power_loss_trial(
+    config: &QemuConfig,
+    flash: &Path,
+    disk: &Path,
+    report: &Path,
+    writes: usize,
+) -> Result<bool> {
+    set_stage(disk, 4)?;
+    let marker = format!("SBAUTH WRITE {writes}\r");
+    let label = format!("power-loss-{writes}");
+    let stress = boot(config, flash, disk, report, &label, Some(&marker))?;
+    set_stage(disk, 5)?;
+    let check = boot(config, flash, disk, report, &format!("{label}-check"), None)?;
+    let logs = [stress, check];
+    let keys = state(&logs, "s4-start").is_some_and(|keys| state(&logs, "s5-check") == Some(keys));
+    let checks = logs[1]
+        .lines()
+        .filter(|line| line.starts_with("SBAUTH PASS ") || line.starts_with("SBAUTH FAIL "))
+        .collect::<Vec<_>>();
+    let ok = keys
+        && logs[1].contains("SBAUTH COMPLETE")
+        && !checks.is_empty()
+        && checks.iter().all(|line| line.starts_with("SBAUTH PASS "));
+    println!(
+        "[{}] power-loss-after-write-{writes}: keys {}, {}",
+        if ok { "PASS" } else { "FAIL" },
+        if keys { "unchanged" } else { "CHANGED" },
+        checks.join("; ")
+    );
+    Ok(ok)
 }
 
 /// `SBSTATE <label> ...` digest line printed by the app.
@@ -156,7 +213,14 @@ pub(super) fn run(config: &QemuConfig, disk: &Path) -> Result<()> {
     let mut logs = Vec::new();
     for stage in 1..=MAX_STAGES {
         println!("Booting stage {stage}...");
-        let log = boot(config, flash.path(), disk, &report, stage)?;
+        let log = boot(
+            config,
+            flash.path(),
+            disk,
+            &report,
+            &format!("stage{stage}"),
+            None,
+        )?;
         let ended = log.contains(&format!("SBAUTH STAGE {stage} END"));
         let complete = log.contains("SBAUTH COMPLETE");
         logs.push(log);
@@ -198,6 +262,24 @@ pub(super) fn run(config: &QemuConfig, disk: &Path) -> Result<()> {
             passed += 1;
         } else {
             println!("[FAIL] persist-{after}: {before} {old:?} != {after} {new:?}");
+            failed += 1;
+        }
+    }
+
+    // Opt-in: CrabEFI does not claim power-fail-safe SMMSTORE updates yet.
+    let trials = std::env::var("CRABEFI_SB_POWER_LOSS_TRIALS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    let baseline = fs::read(flash.path())?;
+    for trial in 1..=trials {
+        // Each cut starts from the post-stage-3 flash. 2 KiB records fill the
+        // 64 KiB store within ~30 writes, so this crosses a compaction.
+        fs::write(flash.path(), &baseline)?;
+        let writes = 1 + (trial - 1) * 3;
+        if power_loss_trial(config, flash.path(), disk, &report, writes)? {
+            passed += 1;
+        } else {
             failed += 1;
         }
     }

@@ -310,6 +310,11 @@ python3 -I test-apps/secure-boot-auth-test/fetch_ubuntu_shim.py /tmp/ubuntu-shim
 CRABEFI_SB_SHIM_DIR=/tmp/ubuntu-shim ./crabefi test --app secure-boot-auth-test
 ```
 
+`CRABEFI_SB_POWER_LOSS_TRIALS=<n>` adds n opt-in trials that kill QEMU while
+the app rewrites a 2 KiB NV variable, then check on the next boot that
+PK/KEK/db/dbx are unchanged and the variable holds the old or the new value.
+SMMSTORE updates are not claimed to be power-fail safe, so CI does not run them.
+
 ### Interactive QEMU
 
 ```bash
