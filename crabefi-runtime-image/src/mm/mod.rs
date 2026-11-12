@@ -95,6 +95,8 @@ static mut CONTEXT: Context = Context {
     ready: false,
 };
 static mut STORE: NvStore = NvStore::empty();
+/// Flash access chosen at init (coreboot services or QEMU pflash commands).
+static mut FLASH: Flash = Flash::empty();
 static READY_TO_BOOT: AtomicBool = AtomicBool::new(false);
 /// Setup authorization opened by the firmware (bridge operation), 0 if none.
 static SETUP_AUTHORIZATION: AtomicU32 = AtomicU32::new(0);
@@ -195,12 +197,12 @@ fn init(context: *const CallContext) -> Result<(), ()> {
 
     // SAFETY: single-threaded SMM init.
     let store = unsafe { &mut *addr_of_mut!(STORE) };
+    let flash = Flash::new(config.flash_base, config.flash_size)
+        .with_coreboot_services(config.mm_area_base, config.store_offset);
+    // SAFETY: single-threaded SMM init.
+    unsafe { *addr_of_mut!(FLASH) = flash };
     store
-        .open(
-            Flash::new(config.flash_base, config.flash_size),
-            config.store_offset,
-            config.store_size as u32,
-        )
+        .open(flash, config.store_offset, config.store_size as u32)
         .map_err(drop)?;
 
     {
@@ -420,7 +422,8 @@ fn firmware_flash(
     {
         return efi::Status::ACCESS_DENIED;
     }
-    let flash = Flash::new(config.flash_base, config.flash_size);
+    // SAFETY: single-threaded SMM; set once at init.
+    let flash = unsafe { *addr_of!(FLASH) };
     let done = if request.command == command::FIRMWARE_ERASE {
         flash.erase(offset, length)
     } else {
@@ -491,7 +494,12 @@ fn dispatch(config: &InitConfig, request: &mut Request) -> efi::Status {
     let (name, data) = unsafe { (&mut *addr_of_mut!(NAME), &mut *addr_of_mut!(DATA)) };
     let mut guid = efi::Guid::from_bytes(&request.guid);
     match request.command {
-        command::PING => efi::Status::SUCCESS,
+        command::PING => {
+            // Report the flash path: 1 = coreboot's flash services.
+            // SAFETY: single-threaded SMM; set once at init.
+            request.attributes = u32::from(unsafe { (*addr_of!(FLASH)).uses_coreboot_services() });
+            efi::Status::SUCCESS
+        }
         command::READY_TO_BOOT => {
             end_firmware_phase();
             efi::Status::SUCCESS

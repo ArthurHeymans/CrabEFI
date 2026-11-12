@@ -172,8 +172,14 @@ pub extern "efiapi" fn efi_main(_image_handle: Handle, system_table: *mut System
         return Status::SUCCESS;
     };
     unsafe {
-        // Positive control: MM answers.
+        // Positive control: MM answers, and says which flash path it uses.
         result(mm_call(comm, request(CMD_PING), &[], &[]) == 0, "ping");
+        let services = read_volatile(core::ptr::addr_of!((*(comm as *const Request)).attributes));
+        serial(if services == 1 {
+            "MMGATE INFO flash path: coreboot flash services\r\n"
+        } else {
+            "MMGATE INFO flash path: MM drives the flash itself\r\n"
+        });
 
         // Firmware-only commands after READY_TO_BOOT.
         let mut write = request(CMD_FIRMWARE_WRITE);
