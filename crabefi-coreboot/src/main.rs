@@ -36,6 +36,8 @@ mod fmap;
 mod framebuffer;
 mod memory;
 mod memory_map;
+#[cfg(feature = "payload-mm")]
+mod payload_mm;
 #[cfg(feature = "external-runtime-image")]
 mod runtime_blob;
 mod tables;
@@ -957,6 +959,12 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     // Phase 4: Calibrate timer (needs serial for logging)
     // ================================================================
     crabefi::time::init(cb_info.acpi_rsdp);
+
+    // Before any flash access: from here on the flash may only be writable from SMM.
+    #[cfg(feature = "payload-mm")]
+    if let Err(error) = payload_mm::load(&cb_info.payload_mm, cb_info.boot_media) {
+        log::warn!("payload MM not used: {error}");
+    }
 
     // ================================================================
     // Phase 5: Build PlatformConfig

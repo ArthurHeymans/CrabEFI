@@ -29,6 +29,9 @@ fn main() {
         }
         (false, false) => panic!("select either bundled-runtime-image or external-runtime-image"),
     }
+    if std::env::var_os("CARGO_FEATURE_PAYLOAD_MM").is_some() {
+        embed_payload_mm_image();
+    }
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let manifest_path = std::path::Path::new(&manifest_dir);
 
@@ -96,4 +99,91 @@ fn embed_runtime_image(expected_architecture: u16) {
     let digest_source = format!("pub const RUNTIME_IMAGE_SHA256: [u8; 32] = {digest:?};\n");
     std::fs::write(out.join("runtime_digest.rs"), digest_source)
         .expect("write runtime image digest source");
+}
+
+/// Flatten the payload MM ELF (crabefi-mm/build.sh) into `payload_mm.img`:
+/// "CRABMMI\0", u32 file size, u32 memory size, u32 entry, u32 relocation count,
+/// u32 R_X86_64_RELATIVE offsets (addends already stored in place), image bytes.
+fn embed_payload_mm_image() {
+    println!("cargo:rerun-if-env-changed=CRABEFI_MM_ELF");
+    let source = std::env::var("CRABEFI_MM_ELF")
+        .expect("the payload-mm feature needs CRABEFI_MM_ELF (crabefi-mm/build.sh prints it)");
+    println!("cargo:rerun-if-changed={source}");
+    let elf = std::fs::read(&source).expect("read payload MM ELF");
+    let u16_at = |o: usize| u16::from_le_bytes(elf[o..o + 2].try_into().unwrap());
+    let u32_at = |o: usize| u32::from_le_bytes(elf[o..o + 4].try_into().unwrap());
+    let u64_at = |o: usize| u64::from_le_bytes(elf[o..o + 8].try_into().unwrap());
+    assert!(
+        elf.starts_with(b"\x7fELF\x02\x01") && u16_at(18) == 62,
+        "not an x86-64 ELF64"
+    );
+    let entry = u64_at(24);
+    let (phoff, phentsize, phnum) = (
+        u64_at(32) as usize,
+        u16_at(54) as usize,
+        u16_at(56) as usize,
+    );
+    let (shoff, shentsize, shnum) = (
+        u64_at(40) as usize,
+        u16_at(58) as usize,
+        u16_at(60) as usize,
+    );
+
+    let loads: Vec<usize> = (0..phnum)
+        .map(|i| phoff + i * phentsize)
+        .filter(|&ph| u32_at(ph) == 1)
+        .collect();
+    assert_eq!(
+        loads.len(),
+        1,
+        "payload MM image must have exactly one PT_LOAD"
+    );
+    let ph = loads[0];
+    let (offset, vaddr, filesz, memsz) = (
+        u64_at(ph + 8) as usize,
+        u64_at(ph + 16),
+        u64_at(ph + 32) as usize,
+        u64_at(ph + 40),
+    );
+    assert_eq!(vaddr, 0, "payload MM image must be linked at 0");
+    let mut image = elf[offset..offset + filesz].to_vec();
+
+    let mut relocations = Vec::new();
+    for i in 0..shnum {
+        let sh = shoff + i * shentsize;
+        if u32_at(sh + 4) != 4 {
+            continue; // SHT_RELA
+        }
+        let (rel_off, rel_size) = (u64_at(sh + 24) as usize, u64_at(sh + 32) as usize);
+        for r in (rel_off..rel_off + rel_size).step_by(24) {
+            let (r_offset, r_info, addend) = (u64_at(r) as usize, u64_at(r + 8), u64_at(r + 16));
+            assert_eq!(
+                r_info & 0xffff_ffff,
+                8,
+                "only R_X86_64_RELATIVE is supported"
+            );
+            assert!(
+                r_offset + 8 <= image.len(),
+                "relocation outside the file image"
+            );
+            image[r_offset..r_offset + 8].copy_from_slice(&addend.to_le_bytes());
+            relocations.push(r_offset as u32);
+        }
+    }
+
+    let mut blob = b"CRABMMI\0".to_vec();
+    for value in [
+        filesz as u32,
+        memsz as u32,
+        entry as u32,
+        relocations.len() as u32,
+    ] {
+        blob.extend_from_slice(&value.to_le_bytes());
+    }
+    for r in &relocations {
+        blob.extend_from_slice(&r.to_le_bytes());
+    }
+    blob.extend_from_slice(&image);
+    let out = std::path::Path::new(&std::env::var("OUT_DIR").unwrap()).join("payload_mm.img");
+    std::fs::write(out, blob).expect("write payload MM blob");
 }

@@ -40,6 +40,9 @@ pub mod tags {
     pub const CB_TAG_CBMEM_CONSOLE: u32 = 0x0017;
     pub const CB_TAG_SPI_FLASH: u32 = 0x0029;
     pub const CB_TAG_BOOT_MEDIA_PARAMS: u32 = 0x0030;
+    pub const CB_TAG_PAYLOAD_MM_INTERFACE_INFO: u32 = 0x003b;
+    pub const CB_TAG_PAYLOAD_MM_SMRAM_REGION: u32 = 0x003c;
+    pub const CB_TAG_PAYLOAD_MM_SHARED_MEM: u32 = 0x003d;
     pub const CB_TAG_CBMEM_ENTRY: u32 = 0x0031;
     pub const CB_TAG_SMMSTOREV2: u32 = 0x0039;
     pub const CB_TAG_FMAP: u32 = 0x0037;
@@ -158,6 +161,28 @@ struct CbAcpiRsdp {
     tag: u32,
     size: u32,
     rsdp_pointer: u64,
+}
+
+/// coreboot `struct lb_payload_mm_interface_info`
+#[repr(C, packed)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
+struct CbPayloadMmInterfaceInfo {
+    tag: u32,
+    size: u32,
+    revision: u8,
+    bootloader_smm_is_64bit: u8,
+    apm_cmd: u8,
+    pad: u8,
+}
+
+/// coreboot `struct lb_payload_mm_smram_region` / `struct lb_payload_mm_shared_mem`
+#[repr(C, packed)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
+struct CbPayloadMmRange {
+    tag: u32,
+    size: u32,
+    physical_start: u64,
+    physical_size: u64,
 }
 
 /// Devicetree (FDT) pointer
@@ -419,6 +444,16 @@ pub struct CapsuleRegion {
     pub size: u32,
 }
 
+/// coreboot payload MM interface: SMI command, SMRAM area for the MM image and
+/// the shared page (start of the payload MM area) where it registers its entry.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PayloadMmInfo {
+    pub apm_cmd: Option<u8>,
+    pub smm_is_64bit: bool,
+    pub smram: Option<(u64, u64)>,
+    pub shared_mem: Option<(u64, u64)>,
+}
+
 /// Information extracted from coreboot tables
 pub struct CorebootInfo {
     /// Memory map
@@ -439,6 +474,8 @@ pub struct CorebootInfo {
     pub cbmem_console: Option<u64>,
     /// Timestamp table address (from CB_TAG_TIMESTAMPS)
     pub timestamps: Option<u64>,
+    /// coreboot-mediated payload MM interface (CB_TAG_PAYLOAD_MM_*)
+    pub payload_mm: PayloadMmInfo,
     /// SMBIOS tables address (from CBMEM entry)
     pub smbios: Option<u64>,
     /// SMMSTORE v2 information for UEFI variable storage
@@ -488,6 +525,7 @@ impl CorebootInfo {
             version: None,
             cbmem_console: None,
             timestamps: None,
+            payload_mm: PayloadMmInfo::default(),
             smbios: None,
             smmstorev2: None,
             spi_flash: None,
@@ -799,6 +837,22 @@ fn parse_record(record_bytes: &[u8], info: &mut CorebootInfo, depth: usize) {
         }
         tags::CB_TAG_TIMESTAMPS => {
             parse_timestamps(record_bytes, info);
+        }
+        tags::CB_TAG_PAYLOAD_MM_INTERFACE_INFO => {
+            if let Ok((mm, _)) = CbPayloadMmInterfaceInfo::read_from_prefix(record_bytes) {
+                info.payload_mm.apm_cmd = Some(mm.apm_cmd);
+                info.payload_mm.smm_is_64bit = mm.bootloader_smm_is_64bit != 0;
+            }
+        }
+        tags::CB_TAG_PAYLOAD_MM_SMRAM_REGION | tags::CB_TAG_PAYLOAD_MM_SHARED_MEM => {
+            if let Ok((range, _)) = CbPayloadMmRange::read_from_prefix(record_bytes) {
+                let value = Some((range.physical_start, range.physical_size));
+                if tag == tags::CB_TAG_PAYLOAD_MM_SMRAM_REGION {
+                    info.payload_mm.smram = value;
+                } else {
+                    info.payload_mm.shared_mem = value;
+                }
+            }
         }
         tags::CB_TAG_CBMEM_CONSOLE => {
             parse_cbmem_console(record_bytes, info);
