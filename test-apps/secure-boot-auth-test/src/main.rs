@@ -652,14 +652,21 @@ fn step_load(results: &mut Results, id: &str, args: &[&str]) {
                 ),
             );
         }
+        ("verify", None) => {
+            // Verification only: never start third-party images such as shim.
+            if status == Status::SUCCESS {
+                (boot_services().unload_image)(handle);
+            }
+            results.check(
+                id,
+                status == Status::SUCCESS,
+                format_args!("LoadImage {} (want SUCCESS)", Name(status)),
+            );
+        }
         ("deny", None) => {
             if status == Status::SUCCESS {
-                let exit = start_image(handle);
-                return results.check(
-                    id,
-                    false,
-                    format_args!("LoadImage SUCCESS, image ran and returned {}", Name(exit)),
-                );
+                (boot_services().unload_image)(handle);
+                return results.check(id, false, format_args!("LoadImage SUCCESS"));
             }
             // SECURITY_VIOLATION may come with a loaded, never-startable image.
             let started = if status == Status::SECURITY_VIOLATION && usable(handle) {
@@ -793,6 +800,17 @@ fn run() -> Status {
                 reset(efi::RESET_SHUTDOWN);
             }
             ["digest", label] => step_digest(label),
+            // Optional assets, such as a downloaded shim, may be absent.
+            ["opt", "load", id, file, args @ ..] => {
+                if read_file(file).is_none() {
+                    say!("SBAUTH SKIP {}: {} not on the ESP", id, file);
+                } else {
+                    let mut all = [""; 4];
+                    all[0] = file;
+                    all[1..=args.len().min(3)].copy_from_slice(&args[..args.len().min(3)]);
+                    step_load(&mut results, id, &all[..=args.len().min(3)]);
+                }
+            }
             [command, id, args @ ..] => match *command {
                 "set" => step_set(&mut results, id, args),
                 "var" => step_var(&mut results, id, args),

@@ -527,11 +527,13 @@ pub fn create_secure_boot_auth_disk(
         bail!("sbsign failed for {efi_app}");
     }
     create_test_disk(output, Some(&signed.path().to_string_lossy()), arch)?;
-    copy_tree_to_esp(
-        &mtools_esp_image(Path::new(output)),
-        &fixtures.join("esp"),
-        "::",
-    )
+    let image = mtools_esp_image(Path::new(output));
+    copy_tree_to_esp(&image, &fixtures.join("esp"), "::")?;
+    // Opt-in Ubuntu shim from fetch_ubuntu_shim.py; not redistributed here.
+    if let Some(shim) = std::env::var_os("CRABEFI_SB_SHIM_DIR") {
+        copy_tree_to_esp(&image, Path::new(&shim), "::/sbtest/ubuntu")?;
+    }
+    Ok(())
 }
 
 /// Create a disk image for the GRUB + Linux boot-chain test.

@@ -303,6 +303,13 @@ The fixtures and the plan the app executes come from
 `test-apps/secure-boot-auth-test/gen_fixtures.py` (python3-cryptography,
 sbsign). Its keys under `fixtures/keys` are test-only.
 
+Ubuntu 24.04's signed shim is opt-in, as it is not redistributed here:
+
+```bash
+python3 -I test-apps/secure-boot-auth-test/fetch_ubuntu_shim.py /tmp/ubuntu-shim
+CRABEFI_SB_SHIM_DIR=/tmp/ubuntu-shim ./crabefi test --app secure-boot-auth-test
+```
+
 ### Interactive QEMU
 
 ```bash
