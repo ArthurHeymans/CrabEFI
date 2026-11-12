@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 use crabefi_efi_types::{
     authentication::{EfiSignatureList, EfiTime, SignatureIterator, SignatureListIterator},
     constant_time_eq,
-    secure_boot::{EFI_CERT_SHA256_GUID, EFI_CERT_X509_GUID},
+    secure_boot::{EFI_CERT_SHA256_GUID, EFI_CERT_X509_GUID, EFI_CERT_X509_SHA256_GUID},
 };
 
 use super::AuthError;
@@ -202,6 +202,18 @@ impl KeyDatabase {
         })
     }
 
+    /// Check for an EFI_CERT_X509_SHA256 entry with this TBSCertificate hash.
+    ///
+    /// TimeOfRevocation is ignored: without dbt timestamp support every
+    /// listed certificate is revoked, which is the spec's no-timestamp case.
+    pub fn contains_x509_tbs_sha256(&self, hash: &[u8; 32]) -> bool {
+        self.entries.iter().any(|e| {
+            e.cert_type == EFI_CERT_X509_SHA256_GUID
+                && e.data.len() == 48
+                && constant_time_eq(&e.data[..32], hash)
+        })
+    }
+
     /// Get all SHA-256 hash entries in the database
     pub fn sha256_hashes(&self) -> impl Iterator<Item = &[u8]> {
         let sha256_guid = EFI_CERT_SHA256_GUID;
@@ -268,6 +280,24 @@ pub fn dbx_database() -> spin::MutexGuard<'static, KeyDatabase> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn x509_tbs_sha256_entries_are_found_by_hash() {
+        let hash = [0x5a; 32];
+        let mut list = Vec::new();
+        list.extend_from_slice(&EFI_CERT_X509_SHA256_GUID);
+        list.extend_from_slice(&(28u32 + 64).to_le_bytes());
+        list.extend_from_slice(&0u32.to_le_bytes());
+        list.extend_from_slice(&64u32.to_le_bytes());
+        list.extend_from_slice(&[0; 16]); // owner
+        list.extend_from_slice(&hash);
+        list.extend_from_slice(&[0; 16]); // TimeOfRevocation
+        let mut dbx = KeyDatabase::new();
+        dbx.load_from_signature_lists(&list).unwrap();
+        assert!(dbx.contains_x509_tbs_sha256(&hash));
+        assert!(!dbx.contains_x509_tbs_sha256(&[0xa5; 32]));
+        assert!(!dbx.contains_sha256_hash(&hash));
+    }
 
     #[test]
     fn malformed_inventory_is_not_silently_accepted_as_empty() {
