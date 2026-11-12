@@ -1,9 +1,16 @@
 //! EDK2 authenticated variable store in flash, written from SMM without a heap.
 //!
-//! Same on-flash format and protocol as crabefi-core's boot-time writer
-//! (`efi/varstore/edk2.rs`, `persistence.rs`): records are appended with state
-//! 0xFF, then VAR_HEADER_VALID_ONLY, then VAR_ADDED; predecessors are retired
-//! afterwards; a full store is compacted by rebuilding the live records.
+//! Records use the same format and protocol as crabefi-core's boot-time writer
+//! (`efi/varstore/edk2.rs`, `persistence.rs`): appended with state 0xFF, then
+//! VAR_HEADER_VALID_ONLY, then VAR_ADDED; predecessors are retired afterwards.
+//!
+//! The region is split into a primary half at offset 0 (the store other
+//! readers such as coreboot see) and a spare half. Compaction survives power
+//! loss: live records go to the spare first (header last), then the primary is
+//! erased header-first and rebuilt from the spare (header last), then the spare
+//! is erased. Opening the store finishes an interrupted compaction. A region
+//! that is neither a store nor blank is reported as corrupt, never reformatted:
+//! the caller must fail closed.
 
 use core::ptr::addr_of_mut;
 
@@ -28,6 +35,8 @@ pub enum Error {
     Device,
     Full,
     Invalid,
+    /// Neither a valid store nor blank flash.
+    Corrupt,
 }
 
 /// One record header as found in the store.
@@ -53,6 +62,8 @@ pub struct NvStore {
     /// Flash offset and size of the store region.
     region: u64,
     size: u32,
+    /// Size of each half; the primary store spans [0, half), the spare [half, size).
+    half: u32,
     /// End of the variable data area (region-relative).
     data_end: u32,
     /// First free byte (region-relative).
@@ -197,6 +208,7 @@ impl NvStore {
             flash: Flash::empty(),
             region: 0,
             size: 0,
+            half: 0,
             data_end: 0,
             write_offset: 0,
         }
@@ -206,39 +218,127 @@ impl NvStore {
         self.flash.read(self.region + offset as u64, buf)
     }
 
-    /// Open the store, formatting the region when it holds no valid store.
+    fn read_at(&self, base: u32, offset: u32, buf: &mut [u8]) -> bool {
+        self.flash
+            .read(self.region + base as u64 + offset as u64, buf)
+    }
+
+    /// End of the data area if a valid authenticated store of `size` bytes starts at `base`.
+    fn store_at(&self, base: u32, size: u32) -> Option<u32> {
+        let mut headers = [0u8; HEADERS];
+        if !self.read_at(base, 0, &mut headers) {
+            return None;
+        }
+        varstore::validate(&headers, size)
+            .filter(|valid| valid.auth_format)
+            .map(|valid| VARIABLE_DATA_OFFSET + valid.data_size)
+    }
+
+    fn blank(&self, base: u32, len: u32) -> bool {
+        let mut chunk = [0u8; 256];
+        let mut offset = 0;
+        while offset < len {
+            let n = ((len - offset) as usize).min(chunk.len());
+            if !self.read_at(base, offset, &mut chunk[..n]) || chunk[..n].iter().any(|&b| b != 0xff)
+            {
+                return false;
+            }
+            offset += n as u32;
+        }
+        true
+    }
+
+    /// First free byte after the records of the store at `base`.
+    fn scan_end(&self, base: u32, data_end: u32) -> u32 {
+        walk(&mut |o, b| self.read_at(base, o, b), data_end, &mut |_| {
+            true
+        })
+    }
+
+    fn erase_half(&self, base: u32) -> bool {
+        // Ascending block order erases the header block first, so an
+        // interrupted erase never leaves a valid header over missing records.
+        self.flash
+            .erase(self.region + base as u64, self.half as u64)
+    }
+
+    /// Open the store: finish an interrupted compaction, migrate a full-region
+    /// store from the boot-time writer, or format blank flash.
     pub fn open(&mut self, flash: Flash, region: u64, size: u32) -> Result<(), Error> {
+        let half = size / 2;
         if size as usize > MAX_STORE_SIZE
-            || (size as u64) % ERASE_BLOCK != 0
-            || (size as usize) < HEADERS
+            || (half as u64) % ERASE_BLOCK != 0
+            || half == 0
+            || (half as usize) < HEADERS + RECORD_MAX
         {
             return Err(Error::Invalid);
         }
         self.flash = flash;
         self.region = region;
         self.size = size;
-        let mut headers = [0u8; HEADERS];
-        if !self.read(0, &mut headers) {
-            return Err(Error::Device);
-        }
-        match varstore::validate(&headers, size) {
-            Some(valid) if valid.auth_format => {
-                self.data_end = VARIABLE_DATA_OFFSET + valid.data_size
+        self.half = half;
+        if let Some(end) = self.store_at(0, half) {
+            self.data_end = end;
+            if !self.blank(half, half) && !self.erase_half(half) {
+                return Err(Error::Device);
             }
-            _ => self.format()?,
+        } else if let Some(end) = self.store_at(0, size) {
+            self.data_end = end;
+            self.write_offset = self.scan_end(0, end);
+            self.migrate()?;
+        } else if self.store_at(half, half).is_some() {
+            self.copy_spare_to_primary()?;
+        } else if self.blank(0, size) {
+            self.format()?;
+        } else {
+            return Err(Error::Corrupt);
         }
-        let store = &*self;
-        self.write_offset = walk(&mut |o, b| store.read(o, b), self.data_end, &mut |_| true);
+        self.write_offset = self.scan_end(0, self.data_end);
         Ok(())
     }
 
     fn format(&mut self) -> Result<(), Error> {
         if !self.flash.erase(self.region, self.size as u64)
-            || !self.flash.program(self.region, &fv_headers(self.size))
+            || !self.flash.program(self.region, &fv_headers(self.half))
         {
             return Err(Error::Device);
         }
-        self.data_end = self.size;
+        self.data_end = self.half;
+        Ok(())
+    }
+
+    /// Move a full-region store (boot-time writer) into the primary half.
+    fn migrate(&mut self) -> Result<(), Error> {
+        if self.write_offset > self.half {
+            // Records reach into the spare half, so it cannot hold the copy.
+            return self.compact_in_place();
+        }
+        self.compact()
+    }
+
+    /// Rebuild the primary from a complete spare, then clear the spare.
+    fn copy_spare_to_primary(&mut self) -> Result<(), Error> {
+        let half = self.half;
+        let spare_end = self.store_at(half, half).ok_or(Error::Corrupt)?;
+        let end = self.scan_end(half, spare_end);
+        if !self.erase_half(0) {
+            return Err(Error::Device);
+        }
+        let mut chunk = [0u8; 256];
+        let mut offset = VARIABLE_DATA_OFFSET;
+        while offset < end {
+            let n = ((end - offset) as usize).min(chunk.len());
+            if !self.read_at(half, offset, &mut chunk[..n])
+                || !self.flash.program(self.region + offset as u64, &chunk[..n])
+            {
+                return Err(Error::Device);
+            }
+            offset += n as u32;
+        }
+        if !self.flash.program(self.region, &fv_headers(half)) || !self.erase_half(half) {
+            return Err(Error::Device);
+        }
+        self.data_end = half;
         Ok(())
     }
 
@@ -415,9 +515,73 @@ impl NvStore {
         true
     }
 
-    /// Rebuild the store with only its live records. Not power-fail atomic:
-    /// one erasable region, same as the boot-time writer.
+    /// Rebuild the primary with only its live records through the spare half.
     fn compact(&mut self) -> Result<(), Error> {
+        let half = self.half;
+        if !self.erase_half(half) {
+            return Err(Error::Device);
+        }
+        let mut offset = VARIABLE_DATA_OFFSET;
+        let mut result = Ok(());
+        let mut reader = |o: u32, b: &mut [u8]| self.read(o, b);
+        walk(&mut reader, self.data_end, &mut |record| {
+            if record.state != VAR_ADDED {
+                return true;
+            }
+            let units = record.name_size as usize / 2;
+            let mut name = [0u16; MAX_VARIABLE_NAME_LEN + 1];
+            let mut bytes = [0u8; NAME_BYTES_MAX];
+            if units == 0
+                || units > name.len()
+                || !self.read(record.name_offset, &mut bytes[..units * 2])
+            {
+                result = Err(Error::Device);
+                return false;
+            }
+            for (unit, b) in name[..units].iter_mut().zip(bytes.chunks_exact(2)) {
+                *unit = u16::from_le_bytes([b[0], b[1]]);
+            }
+            if self.superseded(record, &name[..units]) {
+                return true;
+            }
+            let len = record.next - record.offset;
+            if offset + len > half {
+                result = Err(Error::Full);
+                return false;
+            }
+            let mut chunk = [0u8; 256];
+            let mut done = 0;
+            while done < len {
+                let n = ((len - done) as usize).min(chunk.len());
+                if !self.read(record.offset + done, &mut chunk[..n])
+                    || !self
+                        .flash
+                        .program(self.region + (half + offset + done) as u64, &chunk[..n])
+                {
+                    result = Err(Error::Device);
+                    return false;
+                }
+                done += n as u32;
+            }
+            offset += len;
+            true
+        });
+        result?;
+        // The spare becomes the authoritative copy once its header is written.
+        if !self
+            .flash
+            .program(self.region + half as u64, &fv_headers(half))
+        {
+            return Err(Error::Device);
+        }
+        self.copy_spare_to_primary()?;
+        self.write_offset = offset;
+        Ok(())
+    }
+
+    /// Rewrite a full-region store's live records into a fresh primary (one-time
+    /// migration only; not power-fail safe, like the boot-time writer).
+    fn compact_in_place(&mut self) -> Result<(), Error> {
         // SAFETY: single-threaded SMM; COMPACT is only used here.
         let copy = unsafe { &mut (&mut *addr_of_mut!(COMPACT))[..self.size as usize] };
         if !self.read(0, copy) {
@@ -481,6 +645,10 @@ impl NvStore {
                 return true;
             }
             let bytes = &copy_ro[record.offset as usize..record.next as usize];
+            if offset as usize + bytes.len() > self.half as usize {
+                failed = true;
+                return false;
+            }
             if !self.flash.program(self.region + offset as u64, bytes) {
                 failed = true;
                 return false;
