@@ -180,6 +180,20 @@ pub struct RuntimeResetConfig {
     pub io_or_mmio_base: u64,
 }
 
+/// Variable services owned by a payload MM image in SMM; the ring-0 image
+/// forwards them through a communication buffer instead of using its own store.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MmProxyConfig {
+    /// Physical communication buffer in RuntimeServicesData memory.
+    pub comm_base: u64,
+    pub comm_size: u64,
+    /// Value written to the APM control port to enter SMM.
+    pub apm_cmd: u8,
+    pub enabled: u8,
+    pub reserved: [u8; 6],
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RuntimeHandoff {
@@ -200,6 +214,7 @@ pub struct RuntimeHandoff {
     pub reset: RuntimeResetConfig,
     pub sections: [LoadedSection; MAX_SECTIONS],
     pub ranges: [RuntimeExternalRange; MAX_EXTERNAL_RANGES],
+    pub mm_proxy: MmProxyConfig,
 }
 
 impl RuntimeHandoff {
@@ -237,6 +252,13 @@ impl RuntimeHandoff {
                 byte_len: 0,
                 attributes: 0,
             }; MAX_EXTERNAL_RANGES],
+            mm_proxy: MmProxyConfig {
+                comm_base: 0,
+                comm_size: 0,
+                apm_cmd: 0,
+                enabled: 0,
+                reserved: [0; 6],
+            },
         }
     }
 
@@ -507,7 +529,8 @@ const _: () = assert!(core::mem::size_of::<LoadedSection>() == 24);
 const _: () = assert!(core::mem::size_of::<RuntimeExternalRange>() == 24);
 const _: () = assert!(core::mem::size_of::<RuntimeTimeConfig>() == 16);
 const _: () = assert!(core::mem::size_of::<RuntimeResetConfig>() == 16);
-const _: () = assert!(core::mem::size_of::<RuntimeHandoff>() == 464);
+const _: () = assert!(core::mem::size_of::<MmProxyConfig>() == 24);
+const _: () = assert!(core::mem::size_of::<RuntimeHandoff>() == 488);
 const _: () = assert!(core::mem::size_of::<RelocationImport>() == 24);
 const _: () = assert!(core::mem::size_of::<VariableTimestamp>() == 16);
 const _: () = assert!(core::mem::size_of::<VariableImport>() == 64);
