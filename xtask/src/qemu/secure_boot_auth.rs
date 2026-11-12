@@ -102,6 +102,10 @@ fn boot(
         "none",
         "-no-reboot",
     ]);
+    // Payload MM runs: like AMD ROM Armor 3, only SMM may write the flash.
+    if std::env::var_os("CRABEFI_PAYLOAD_MM").is_some() {
+        cmd.args(["-global", "driver=cfi.pflash01,property=secure,value=on"]);
+    }
     cmd.args([
         "-drive",
         &format!("if=pflash,format=raw,file={}", flash.display()),
