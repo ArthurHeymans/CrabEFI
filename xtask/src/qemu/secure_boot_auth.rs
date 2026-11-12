@@ -180,6 +180,8 @@ pub(super) fn run(config: &QemuConfig, disk: &Path) -> Result<()> {
         } else if let Some(rest) = line.strip_prefix("SBAUTH FAIL ") {
             println!("[FAIL] {rest}");
             failed += 1;
+        } else if let Some(rest) = line.strip_prefix("SBAUTH SKIP ") {
+            println!("[SKIP] {rest}");
         }
     }
     if !logs
