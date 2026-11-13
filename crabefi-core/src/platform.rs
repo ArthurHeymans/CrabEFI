@@ -1202,6 +1202,13 @@ pub struct PlatformConfig<'a> {
     /// Backend used to validate and apply pending firmware capsules.
     pub capsule_backend: Option<&'a mut dyn CapsuleBackend>,
 
+    /// Accept capsules only as files on the ESP, for platforms whose DRAM
+    /// does not survive a warm reset. The retained deferred buffer is not
+    /// used: `UpdateCapsule()` returns `UNSUPPORTED`, so do NV writes after
+    /// ExitBootServices unless payload MM serves variables. No
+    /// `CapsuleUpdateData*` variable is written; stale ones are deleted.
+    pub capsule_on_disk_only: bool,
+
     /// Optional platform lifecycle callbacks.
     pub hooks: Option<&'a dyn PlatformHooks>,
 
@@ -1297,6 +1304,7 @@ pub struct PlatformConfigBuilder<'a> {
     firmware_info: Option<FirmwareInfo>,
     capsule_regions: &'a [CapsuleRegion],
     capsule_backend: Option<&'a mut dyn CapsuleBackend>,
+    capsule_on_disk_only: bool,
     hooks: Option<&'a dyn PlatformHooks>,
     rng: Option<&'a dyn Rng>,
     ecam_regions: &'a [PciEcamRegion],
@@ -1337,6 +1345,7 @@ impl<'a> PlatformConfigBuilder<'a> {
             firmware_info: None,
             capsule_regions: &[],
             capsule_backend: None,
+            capsule_on_disk_only: false,
             hooks: None,
             rng: None,
             ecam_regions: &[],
@@ -1439,6 +1448,12 @@ impl<'a> PlatformConfigBuilder<'a> {
         self
     }
 
+    /// Accept capsules only from the ESP; see [`PlatformConfig::capsule_on_disk_only`].
+    pub fn capsule_on_disk_only(mut self, value: bool) -> Self {
+        self.capsule_on_disk_only = value;
+        self
+    }
+
     /// Platform lifecycle callbacks.
     pub fn hooks(mut self, value: &'a dyn PlatformHooks) -> Self {
         self.hooks = Some(value);
@@ -1499,6 +1514,7 @@ impl<'a> PlatformConfigBuilder<'a> {
             firmware_info: self.firmware_info,
             capsule_regions: self.capsule_regions,
             capsule_backend: self.capsule_backend,
+            capsule_on_disk_only: self.capsule_on_disk_only,
             hooks: self.hooks,
             rng: self.rng,
             ecam_regions: self.ecam_regions,

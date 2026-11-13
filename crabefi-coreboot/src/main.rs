@@ -810,6 +810,7 @@ fn riscv_fdt_only_boot(fdt_ptr: u64, fdt_size: u32) -> ! {
         firmware_info: None,
         capsule_regions: &[],
         capsule_backend: None,
+        capsule_on_disk_only: cfg!(feature = "capsule-on-disk-only"),
         hooks: Some(&hooks),
         rng: None,
         ecam_regions: &[],
@@ -1154,6 +1155,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         firmware_info,
         capsule_regions: &capsule_regions[..capsule_count],
         capsule_backend: Some(&mut capsule_backend),
+        capsule_on_disk_only: cfg!(feature = "capsule-on-disk-only"),
         hooks: Some(&hooks),
         rng: None,
         ecam_regions: &[], // ACPI/FDT discovery is selected by the library below.

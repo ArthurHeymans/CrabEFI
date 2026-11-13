@@ -199,6 +199,7 @@ fn init_persistence_and_boot(
     capsule_backend: Option<&mut dyn platform::CapsuleBackend>,
     retained_staging: bool,
     mm_variables: bool,
+    capsule_on_disk_only: bool,
 ) -> ! {
     // ---- Variable persistence ----
     // SAFETY: init_platform and this tail never return, so the caller's borrowed
@@ -284,6 +285,15 @@ fn init_persistence_and_boot(
             journal_drained = false;
             log::warn!("Runtime image deferred replay failed: {:?}", status);
         }
+    }
+    // Capsule-on-disk does not need retained staging.
+    let file_capsules_usable = if capsule_on_disk_only {
+        persistence_writable && capsule_backend_available
+    } else {
+        capsule_delivery_usable
+    };
+    if capsule_on_disk_only && persistence_writable {
+        efi::capsule::delete_capsule_update_data();
     }
 
     // Only capsule processing below waits for the journal.
@@ -380,7 +390,7 @@ fn init_persistence_and_boot(
         drivers::serial::supports_console_input(),
     );
     efi::capsule::disk::install_os_indications_supported(
-        capsule_delivery_usable,
+        file_capsules_usable,
         firmware_ui_supported,
     );
     let boot_var_state = boot_vars::read_boot_var_state();
@@ -607,6 +617,11 @@ pub fn init_platform(mut config: PlatformConfig) -> ! {
 
     boot_policy::configure(config.boot_policy);
 
+    if config.capsule_on_disk_only {
+        // coreboot retains this buffer only as a capsule in CapsuleUpdateData.
+        config.runtime.deferred_buffer = DeferredBufferConfig::disabled();
+    }
+
     // ---- 8. Initialize keyboard subsystem ----
     drivers::keyboard_common::init();
     if let Some(input) = config.console_input.take() {
@@ -721,5 +736,6 @@ pub fn init_platform(mut config: PlatformConfig) -> ! {
         config.capsule_backend,
         config.runtime.deferred_buffer.size != 0,
         mm_variables,
+        config.capsule_on_disk_only,
     );
 }
