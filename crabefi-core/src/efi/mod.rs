@@ -411,10 +411,10 @@ fn init_tcg2_protocol_platform_tpm(
 /// - Secure Boot variables into PCR 7 (with separator)
 #[cfg(feature = "tpm")]
 pub(crate) fn measure_initial_boot() {
-    // Measure S-CRTM version (firmware version string) into PCR 0, unless
-    // the platform firmware that started the log is the S-CRTM.
+    // Measure S-CRTM version (build identifier, see build.rs) into PCR 0,
+    // unless the platform firmware that started the log is the S-CRTM.
     if !PLATFORM_MEASURED.load(core::sync::atomic::Ordering::Relaxed) {
-        tcg::measured_boot::measure_s_crtm_version_all(env!("CARGO_PKG_VERSION"));
+        tcg::measured_boot::measure_s_crtm_version_all(env!("CRABEFI_SCRTM_VERSION"));
     }
 
     // Measure Secure Boot policy variables into PCR 7.
