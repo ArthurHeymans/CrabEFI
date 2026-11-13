@@ -439,6 +439,7 @@ fn execute_bootloader(
     }
 
     log::info!("Executing bootloader...");
+    crate::timestamp::record(crate::timestamp::TS_CRABEFI_START_BOOT_LOADER);
     // No exit-data consumer at this level; StartImage frees any returned data.
     // SAFETY: image_handle came from a successful LoadImage; no exit data is requested.
     let status = unsafe { (bs.start_image)(image_handle, ptr::null_mut(), ptr::null_mut()) };
