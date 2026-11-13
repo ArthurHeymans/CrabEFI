@@ -40,7 +40,59 @@ pub struct DiskCapsule {
     /// File name (for logging).
     pub filename: heapless::String<256>,
     /// Raw capsule file contents.
-    pub data: Vec<u8>,
+    pub data: PageBuffer,
+}
+
+/// Boot-services pages holding a capsule file. Firmware images are larger
+/// than the global heap, so they get their own pages, freed on drop.
+pub struct PageBuffer {
+    address: u64,
+    pages: u64,
+    len: usize,
+}
+
+impl PageBuffer {
+    fn new(len: usize) -> Option<Self> {
+        use crate::efi::allocator::{AllocateType, MemoryType, allocate_pages};
+        let pages = (len as u64).div_ceil(4096).max(1);
+        let mut address = 0;
+        let status = allocate_pages(
+            AllocateType::AllocateAnyPages,
+            MemoryType::BootServicesData,
+            pages,
+            &mut address,
+        );
+        (status == r_efi::efi::Status::SUCCESS).then_some(Self {
+            address,
+            pages,
+            len,
+        })
+    }
+
+    fn truncate(&mut self, len: usize) {
+        self.len = self.len.min(len);
+    }
+}
+
+impl core::ops::Deref for PageBuffer {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        // SAFETY: `pages` pages at `address` belong to this buffer until drop.
+        unsafe { core::slice::from_raw_parts(self.address as *const u8, self.len) }
+    }
+}
+
+impl core::ops::DerefMut for PageBuffer {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as above, and `&mut self` makes the access exclusive.
+        unsafe { core::slice::from_raw_parts_mut(self.address as *mut u8, self.len) }
+    }
+}
+
+impl Drop for PageBuffer {
+    fn drop(&mut self) {
+        let _ = crate::efi::allocator::free_pages(self.address, self.pages);
+    }
 }
 
 /// Check if file-based capsule delivery was requested via `OsIndications`.
@@ -170,13 +222,11 @@ fn scan_device_for_capsules(
             }
 
             // Read the file
-            let mut buffer = Vec::new();
-            if buffer.try_reserve_exact(file_size as usize).is_err() {
+            let Some(mut buffer) = PageBuffer::new(file_size as usize) else {
                 log::error!("Out of memory loading capsule file {}", path);
                 continue;
-            }
-            buffer.resize(file_size as usize, 0);
-            match fat_fs.read_file_all(&path, buffer.as_mut_slice()) {
+            };
+            match fat_fs.read_file_all(&path, &mut buffer) {
                 Ok(bytes_read) => {
                     buffer.truncate(bytes_read);
                     log::info!("Loaded capsule file: {} ({} bytes)", name, bytes_read);
