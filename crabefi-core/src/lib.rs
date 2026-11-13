@@ -274,6 +274,11 @@ fn init_persistence_and_boot(
         }
     }
 
+    // Capsule-on-disk reads the ESP, so bind the storage drivers first. This
+    // also enumerates input devices before publishing or accepting an
+    // indefinite setup session; a framebuffer by itself is only an output device.
+    boot_manager::init_storage_subsystem();
+
     #[cfg(feature = "capsule-update")]
     if persistence_writable {
         if let Some(backend) = capsule_backend {
@@ -309,9 +314,6 @@ fn init_persistence_and_boot(
     #[cfg(all(feature = "platform-entry", target_arch = "x86_64"))]
     log_stack_usage("before_boot_manager");
 
-    // Enumerate input devices before publishing or accepting an indefinite
-    // setup session. A framebuffer by itself is only an output device.
-    boot_manager::init_storage_subsystem();
     #[cfg(feature = "ui")]
     let graphical_pointer =
         drivers::mouse_cursor::is_initialized() && drivers::pointer::is_available();
