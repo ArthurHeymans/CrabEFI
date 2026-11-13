@@ -10,6 +10,7 @@
 #![deny(unsafe_code)]
 
 pub mod capsule;
+pub mod event_log;
 pub mod exports;
 pub mod format;
 pub mod handoff;
