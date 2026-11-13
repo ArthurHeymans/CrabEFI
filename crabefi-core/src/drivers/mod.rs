@@ -144,6 +144,8 @@ pub mod block;
 pub(crate) mod elan;
 #[cfg(feature = "hid-i2c")]
 pub(crate) mod hid_i2c;
+#[cfg(feature = "ui")]
+pub(crate) mod hid_report;
 #[cfg(target_arch = "x86_64")]
 mod i8042;
 #[cfg(target_arch = "x86_64")]

@@ -43,11 +43,11 @@ global-allocator = []
 fb-log = []
 # Enable graphical UI with mouse support (PS/2 and USB HID mouse drivers,
 # cursor rendering, SimplePointerProtocol, and graphical setup utility)
-ui = ["crabefi-ui/screens"]
+ui = ["crabefi-ui/screens", "dep:hidreport"]
 # Native ELAN I2C touchpads described by the platform as peripherals.
 elan-i2c = ["ui"]
 # HID-over-I2C touchpads, mice and keyboards described by the platform.
-hid-i2c = ["ui", "dep:hidreport"]
+hid-i2c = ["ui"]
 
 [dependencies]
 crabefi-ui = { path = "../crabefi-ui" }

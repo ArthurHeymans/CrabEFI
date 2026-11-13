@@ -138,6 +138,7 @@ impl Tracking {
             dy,
             dz: 0,
             buttons: u32::from(buttons & 7),
+            absolute: None,
         }
     }
 }

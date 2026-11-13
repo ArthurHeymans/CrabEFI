@@ -129,10 +129,16 @@ pub fn poll() {
         dy: total_dy,
         dz: total_dz,
         buttons: combined_buttons,
+        absolute,
     } = super::pointer::take();
     let mut cursor = CURSOR.lock();
 
-    if total_dx == 0 && total_dy == 0 && total_dz == 0 && combined_buttons == cursor.buttons {
+    if absolute.is_none()
+        && total_dx == 0
+        && total_dy == 0
+        && total_dz == 0
+        && combined_buttons == cursor.buttons
+    {
         return;
     }
 
@@ -151,8 +157,13 @@ pub fn poll() {
     let scaled_dy = (total_dy * multiplier as i32) / BASE_SPEED as i32;
 
     // Update absolute position with clamping
-    cursor.abs_x = (cursor.abs_x + scaled_dx).clamp(0, cursor.screen_w as i32 - 1);
-    cursor.abs_y = (cursor.abs_y + scaled_dy).clamp(0, cursor.screen_h as i32 - 1);
+    if let Some((x, y)) = absolute {
+        cursor.abs_x = absolute_pixel(x, cursor.screen_w);
+        cursor.abs_y = absolute_pixel(y, cursor.screen_h);
+    } else {
+        cursor.abs_x = (cursor.abs_x + scaled_dx).clamp(0, cursor.screen_w as i32 - 1);
+        cursor.abs_y = (cursor.abs_y + scaled_dy).clamp(0, cursor.screen_h as i32 - 1);
+    }
 
     // Edge detection: record rising edges (0→1) as pending clicks
     let rising = combined_buttons & !cursor.prev_buttons;
@@ -160,6 +171,25 @@ pub fn poll() {
     cursor.prev_buttons = combined_buttons;
     cursor.buttons = combined_buttons;
     cursor.scroll += total_dz;
+}
+
+pub(crate) fn absolute_pixel(value: u16, extent: u32) -> i32 {
+    ((u64::from(value) * u64::from(extent.saturating_sub(1)) + u64::from(u16::MAX / 2))
+        / u64::from(u16::MAX)) as i32
+}
+
+#[cfg(test)]
+mod absolute_tests {
+    use super::absolute_pixel;
+
+    #[test]
+    fn absolute_coordinates_map_edges_and_center_without_acceleration() {
+        assert_eq!(absolute_pixel(0, 1024), 0);
+        assert_eq!(absolute_pixel(u16::MAX, 1024), 1023);
+        assert_eq!(absolute_pixel(32768, 1024), 512);
+        assert_eq!(absolute_pixel(u16::MAX, 768), 767);
+        assert_eq!(absolute_pixel(u16::MAX, 0), 0);
+    }
 }
 
 /// Get the current absolute cursor position.

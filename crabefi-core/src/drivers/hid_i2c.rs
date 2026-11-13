@@ -6,16 +6,17 @@
 //! key handling as USB boot keyboards. Touchscreens and multi-touch
 //! digitizer reports are not interpreted.
 
+use super::hid_report::{Keyboard, Mouse, matches};
 use super::keyboard_common::KeyboardDevice;
 use super::pointer::{PointerDevice, PointerReport};
 use super::usb::hid_keyboard::{BootKeys, KeyboardReport};
 use crate::peripheral::{I2cBus, I2cPeripheral, Interrupt};
 use crate::platform::{Key, KeyState};
 use crate::time::{Timeout, delay_ms};
-use alloc::{boxed::Box, rc::Rc, vec, vec::Vec};
+use alloc::{boxed::Box, rc::Rc, vec};
 use core::cell::RefCell;
 use embedded_hal::i2c::I2c;
-use hidreport::{Field, FieldAttributes, Report, ReportDescriptor, Usage, VariableField};
+use hidreport::ReportDescriptor;
 use zerocopy::{FromBytes, Immutable, KnownLayout, little_endian::U16};
 
 /// ACPI identifiers of HID-over-I2C devices.
@@ -29,15 +30,6 @@ const POWER_SLEEP: u8 = 0x01;
 const REPORTS_PER_POLL: usize = 8;
 const MAX_REPORT_DESCRIPTOR: usize = 4096;
 const MAX_INPUT: usize = 512;
-
-const GENERIC_DESKTOP: u16 = 0x01;
-const MOUSE: u16 = 0x02;
-const KEYBOARD: u16 = 0x06;
-const X: u16 = 0x30;
-const Y: u16 = 0x31;
-const WHEEL: u16 = 0x38;
-const KEY_CODES: u16 = 0x07;
-const BUTTONS: u16 = 0x09;
 
 /// HID descriptor, HID over I2C specification section 5.1.
 #[repr(C)]
@@ -69,159 +61,6 @@ pub enum Error<E> {
     ReportDescriptor,
     NoUsableCollection,
     InvalidReport,
-}
-
-fn usage(page: u16, id: u16) -> u32 {
-    (u32::from(page) << 16) | u32::from(id)
-}
-
-fn in_collection(field: &VariableField, collection: u32) -> bool {
-    field
-        .collections
-        .iter()
-        .any(|c| c.usages().iter().any(|u| u32::from(u) == collection))
-}
-
-fn variables(report: &impl Report, collection: u32) -> impl Iterator<Item = &VariableField> + '_ {
-    report.fields().iter().filter_map(move |field| match field {
-        Field::Variable(field) if in_collection(field, collection) => Some(field),
-        _ => None,
-    })
-}
-
-fn variable(report: &impl Report, collection: u32, usage: u32) -> Option<VariableField> {
-    variables(report, collection)
-        .find(|field| u32::from(&field.usage) == usage)
-        .cloned()
-}
-
-/// Relative mouse fields of one input report.
-struct Mouse {
-    report_id: Option<u8>,
-    size: usize,
-    x: VariableField,
-    y: VariableField,
-    wheel: Option<VariableField>,
-    buttons: Vec<(u32, VariableField)>,
-}
-
-impl Mouse {
-    fn find(descriptor: &ReportDescriptor) -> Option<Self> {
-        let collection = usage(GENERIC_DESKTOP, MOUSE);
-        descriptor.input_reports().iter().find_map(|report| {
-            let x = variable(report, collection, usage(GENERIC_DESKTOP, X))?;
-            let y = variable(report, collection, usage(GENERIC_DESKTOP, Y))?;
-            if !x.is_relative() || !y.is_relative() {
-                return None;
-            }
-            let buttons = variables(report, collection)
-                .filter_map(|field| {
-                    let Usage {
-                        usage_page,
-                        usage_id,
-                    } = field.usage;
-                    let index = u16::from(usage_id);
-                    (u16::from(usage_page) == BUTTONS && (1..=3).contains(&index))
-                        .then(|| (1 << (index - 1), field.clone()))
-                })
-                .collect();
-            Some(Self {
-                report_id: (*report.report_id()).map(u8::from),
-                size: report.size_in_bytes(),
-                x,
-                y,
-                wheel: variable(report, collection, usage(GENERIC_DESKTOP, WHEEL)),
-                buttons,
-            })
-        })
-    }
-
-    fn read(&self, report: &[u8]) -> Option<PointerReport> {
-        let value = |field: &VariableField| field.extract(report).ok().map(i32::from);
-        Some(PointerReport {
-            dx: value(&self.x)?,
-            dy: value(&self.y)?,
-            // HID wheel up is positive; EFI and the UI scroll down positive.
-            dz: self.wheel.as_ref().and_then(value).map_or(0, |dz| -dz),
-            buttons: self
-                .buttons
-                .iter()
-                .filter(|(_, field)| value(field).is_some_and(|pressed| pressed != 0))
-                .fold(0, |buttons, (bit, _)| buttons | bit),
-        })
-    }
-}
-
-/// Boot-keyboard-like fields of one input report.
-struct Keyboard {
-    report_id: Option<u8>,
-    size: usize,
-    modifiers: Vec<(u8, VariableField)>,
-    keys: hidreport::ArrayField,
-}
-
-impl Keyboard {
-    fn find(descriptor: &ReportDescriptor) -> Option<Self> {
-        let collection = usage(GENERIC_DESKTOP, KEYBOARD);
-        descriptor.input_reports().iter().find_map(|report| {
-            let keys = report.fields().iter().find_map(|field| match field {
-                Field::Array(field)
-                    if field
-                        .collections
-                        .iter()
-                        .any(|c| c.usages().iter().any(|u| u32::from(u) == collection))
-                        && field
-                            .usages()
-                            .first()
-                            .is_some_and(|u| u16::from(u.usage_page) == KEY_CODES) =>
-                {
-                    Some(field.clone())
-                }
-                _ => None,
-            })?;
-            let modifiers = variables(report, collection)
-                .filter_map(|field| {
-                    let id = u16::from(field.usage.usage_id);
-                    (u16::from(field.usage.usage_page) == KEY_CODES && (0xe0..=0xe7).contains(&id))
-                        .then(|| (1 << (id - 0xe0), field.clone()))
-                })
-                .collect();
-            Some(Self {
-                report_id: (*report.report_id()).map(u8::from),
-                size: report.size_in_bytes(),
-                modifiers,
-                keys,
-            })
-        })
-    }
-
-    fn read(&self, report: &[u8]) -> Option<KeyboardReport> {
-        let modifiers = self
-            .modifiers
-            .iter()
-            .filter(|(_, field)| field.extract(report).is_ok_and(|v| u32::from(v) != 0))
-            .fold(0, |modifiers, (bit, _)| modifiers | bit);
-        let mut keys = [0; 6];
-        self.keys
-            .extract(report)
-            .ok()?
-            .iter()
-            .map(|key| u8::try_from(u32::from(key)).unwrap_or(0))
-            .filter(|&key| key > 3)
-            .take(keys.len())
-            .enumerate()
-            .for_each(|(slot, key)| keys[slot] = key);
-        Some(KeyboardReport {
-            modifiers,
-            reserved: 0,
-            keys,
-        })
-    }
-}
-
-/// Whether `report` is the input report with `id` and at least `size` bytes.
-fn matches(report: &[u8], id: Option<u8>, size: usize) -> bool {
-    report.len() >= size.max(1) && id.is_none_or(|id| report[0] == id)
 }
 
 /// One HID-over-I2C device, shared by its pointer and keyboard functions.
@@ -376,6 +215,7 @@ impl<I: I2c> HidI2c<I> {
                 pending.dx = pending.dx.saturating_add(motion.dx);
                 pending.dy = pending.dy.saturating_add(motion.dy);
                 pending.dz = pending.dz.saturating_add(motion.dz);
+                pending.absolute = motion.absolute.or(pending.absolute);
             } else {
                 self.reports
                     .push_back(motion)
