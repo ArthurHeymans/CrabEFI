@@ -15,6 +15,14 @@ const GLOBAL: Guid = Guid::from_fields(
     0x0d,
     &[0, 0xe0, 0x98, 0x03, 0x2b, 0x8c],
 );
+const SETTINGS: Guid = Guid::from_fields(
+    0x9e80634c,
+    0xcdc7,
+    0x41d5,
+    0xa3,
+    0x45,
+    &[0x4a, 0x29, 0x7f, 0x9c, 0x7d, 0x1a],
+);
 const TEST: Guid = Guid::from_fields(0x54dbdb16, 0x1970, 0x40e2, 0x93, 0xf0, &[1, 2, 3, 4, 5, 6]);
 const OTHER_BIT: u64 = 1 << 63;
 
@@ -148,6 +156,8 @@ pub extern "efiapi" fn efi_main(image: Handle, system: *mut SystemTable) -> Stat
             set(rt, &GLOBAL, "BootNext", &0xffffu16.to_le_bytes());
             set(rt, &GLOBAL, "BootOrder", &0xfffeu16.to_le_bytes());
             set(rt, &GLOBAL, "Timeout", &2u16.to_le_bytes());
+            // The host matches the firmware's Info-level boot menu messages.
+            set(rt, &SETTINGS, "CrabEFILogLevel", &[3]);
             set(rt, &TEST, "FwUiTestPhase", &[1]);
             let previous = get(rt, &GLOBAL, "OsIndications")
                 .map_or(0, |(_, data, _)| u64::from_le_bytes(data));
