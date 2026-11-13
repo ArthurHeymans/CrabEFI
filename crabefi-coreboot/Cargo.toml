@@ -18,6 +18,14 @@ ui = ["crabefi/ui", "crabefi/elan-i2c", "crabefi/hid-i2c"]
 # invalid, instead of failing startup with no memory map. Useful only for
 # table-less QEMU experiments; never enable for real hardware.
 fallback-memory-map = []
+# Bring up USB only when nothing boots without it, for the boot menu, or for a
+# firmware UI request. USB keyboards then do not work in GRUB or shim.
+usb-on-demand = []
+# Never boot USB or removable media automatically (BootNext, BootOrder, menu
+# timeout); a user may still select them in the boot menu.
+external-boot-menu-only = []
+# Never boot USB or removable media; takes precedence over menu-only.
+external-boot-deny = []
 
 [dependencies]
 crabefi = { package = "crabefi-core", path = "../crabefi-core", features = [

@@ -92,6 +92,24 @@ fn runtime_image_source() -> crabefi::RuntimeImageSource<'static> {
     }
 }
 
+/// Boot device policy selected by Cargo features.
+fn boot_policy() -> crabefi::BootPolicy {
+    crabefi::BootPolicy {
+        usb_init: if cfg!(feature = "usb-on-demand") {
+            crabefi::UsbInit::OnDemand
+        } else {
+            crabefi::UsbInit::Always
+        },
+        external_boot: if cfg!(feature = "external-boot-deny") {
+            crabefi::ExternalBoot::Deny
+        } else if cfg!(feature = "external-boot-menu-only") {
+            crabefi::ExternalBoot::MenuOnly
+        } else {
+            crabefi::ExternalBoot::Allow
+        },
+    }
+}
+
 fn runtime_platform_config() -> crabefi::RuntimePlatformConfig<'static> {
     unsafe extern "C" {
         static _deferred_buffer_start: u8;
@@ -743,6 +761,7 @@ fn riscv_fdt_only_boot(fdt_ptr: u64, fdt_size: u32) -> ! {
         runtime_image: runtime_image_source(),
         runtime: runtime_platform_config(),
         tpm_event_log: None,
+        boot_policy: boot_policy(),
         heap_pre_initialized: false,
     };
 
@@ -1112,6 +1131,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
                 tpm1_tis_base: None,
             }
         }),
+        boot_policy: boot_policy(),
         heap_pre_initialized: false, // Set to true after Phase 6
     };
 

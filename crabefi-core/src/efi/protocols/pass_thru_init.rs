@@ -277,7 +277,7 @@ fn init_ahci_pass_thru() {
 }
 
 /// Initialize USB SCSI pass-through protocols
-fn init_usb_pass_thru() {
+pub(crate) fn init_usb_pass_thru() {
     log::info!("Scanning for USB mass storage devices...");
     let devices = usb::find_mass_storage_devices();
     if devices.is_empty() {

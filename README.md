@@ -64,6 +64,31 @@ supported. `--features ui` enables the graphical menu, not additional touchpad
 protocols. When reporting a non-working replacement trackpad, include its model,
 Linux input-device identification, and CrabEFI's PS/2/USB initialization logs.
 
+## Boot device policy
+
+Platforms set `PlatformConfig::boot_policy`; the coreboot payload maps Cargo
+features onto it.
+
+`usb-on-demand` (`UsbInit::OnDemand`) leaves USB controllers untouched while
+BootNext or BootOrder starts an image from other storage. USB comes up when
+BootNext or every BootOrder option failed (they are then retried on USB only),
+for the boot menu and the removable-media path `\EFI\BOOT\BOOTX64.EFI`, and for
+a pending firmware UI or shim MokManager request. BootOrder options on internal storage therefore
+win over USB options, and USB keyboards do not reach GRUB or shim during such a
+boot; the serial console does. The boot menu appears when nothing starts
+without USB, or after `systemctl reboot --firmware-setup` (OsIndications
+`BOOT_TO_FW_UI`); USB keyboards work in it. There is no pre-boot hotkey.
+
+`external-boot-menu-only` (`ExternalBoot::MenuOnly`) keeps USB and removable
+media out of BootNext, BootOrder and menu timeouts; the menu lists them after
+internal entries and waits for the user when its default entry is external.
+`external-boot-deny` (`ExternalBoot::Deny`) never boots them and hides them in
+the menu. CrabEFI has no network boot.
+
+The variable `CrabEFIExternalBoot` (GUID `9e80634c-cdc7-41d5-a345-4a297f9c7d1a`,
+attributes NV+BS, one byte: 0 allow, 1 menu-only, 2 deny) tightens the build
+setting and can never loosen it. Only boot-time code can write it, not the OS.
+
 ## Workspace Structure
 
 | Crate | Description |

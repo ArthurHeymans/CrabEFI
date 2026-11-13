@@ -16,6 +16,7 @@ pub(crate) mod barrier;
 pub mod bls;
 pub mod boot;
 mod boot_manager;
+pub mod boot_policy;
 pub mod boot_vars;
 #[cfg(feature = "bundled-runtime-image")]
 mod bundled_runtime;
@@ -70,6 +71,7 @@ pub fn reset_system() -> ! {
 }
 
 // Re-export the public platform API at the crate root for ergonomic access.
+pub use boot_policy::{BootPolicy, ExternalBoot, UsbInit};
 #[cfg(feature = "bundled-runtime-image")]
 pub use bundled_runtime::BUNDLED_RUNTIME_IMAGE;
 pub use crabefi_runtime_abi::{
@@ -311,7 +313,12 @@ fn init_persistence_and_boot(
 
     // Enumerate input devices before publishing or accepting an indefinite
     // setup session. A framebuffer by itself is only an output device.
-    boot_manager::init_storage_subsystem();
+    boot_policy::apply_variable();
+    let usb_init = boot_policy::get().usb_init;
+    boot_manager::init_storage_subsystem(usb_init == boot_policy::UsbInit::Always);
+    if !boot_manager::usb_ready() && os_indications::firmware_ui_request_pending() {
+        boot_manager::ensure_usb("firmware UI requested");
+    }
     #[cfg(feature = "ui")]
     let graphical_pointer =
         drivers::mouse_cursor::is_initialized() && drivers::pointer::is_available();
@@ -321,7 +328,8 @@ fn init_persistence_and_boot(
         persistence_writable,
         retained_staging_ready,
         handoff::framebuffer().is_some(),
-        drivers::keyboard_common::is_available(),
+        // Deferred USB comes up before a requested setup session.
+        drivers::keyboard_common::is_available() || boot_manager::usb_deferred(),
         graphical_pointer,
         drivers::serial::supports_console_input(),
     );
@@ -550,6 +558,8 @@ pub fn init_platform(mut config: PlatformConfig) -> ! {
         .map(|r| r.size)
         .sum();
     log::info!("Total RAM: {} MB", total_ram / (1024 * 1024));
+
+    boot_policy::configure(config.boot_policy);
 
     // ---- 8. Initialize keyboard subsystem ----
     drivers::keyboard_common::init();

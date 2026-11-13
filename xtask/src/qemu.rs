@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{Arch, Machine};
 
+pub(crate) mod boot_policy;
 mod filesystem;
 mod fwui;
 pub(crate) mod sct;
@@ -790,6 +791,9 @@ fn storage_security_test_passed(output: &str) -> bool {
 pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Result<()> {
     if app_name == "fwui-test" {
         return fwui::run(config, disk_path);
+    }
+    if app_name == "boot-policy-test" {
+        return boot_policy::run(config, disk_path);
     }
     RUNTIME_IMAGE_TWO_BOOT.store(app_name == "runtime-image-test", Ordering::Relaxed);
     // Every x86 integration run advertises SMMSTORE to the payload. Boot it

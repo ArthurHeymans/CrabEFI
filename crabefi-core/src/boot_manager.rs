@@ -2,7 +2,7 @@
 //!
 //! Implements the UEFI boot dispatch sequence (Specification Section 3.1):
 //!
-//! 1. Initialize storage subsystem (PCI drivers)
+//! 1. Initialize storage subsystem (PCI drivers; USB possibly on demand)
 //! 2. Honor a consumed firmware-UI request, bypassing automatic boot
 //! 3. **BootNext** — try the designated one-shot boot option
 //! 4. **BootOrder** — iterate Boot#### entries in order
@@ -11,17 +11,25 @@
 //! The individual boot paths (UEFI, direct Linux, payload chainload) are
 //! dispatched from [`boot_selected_entry`].
 
+use crate::boot_policy;
 use crate::boot_vars;
+use crate::cell::LocalCell;
 use crate::drivers;
+use crate::drivers::pci::PciDevice;
+use crate::drivers::storage::{StorageDevice, StorageId};
 use crate::efi;
 use crate::menu;
 use crate::timestamp;
+
+/// Set once USB host controllers have been bound.
+static USB_READY: LocalCell<bool> = LocalCell::new(false);
 
 /// Initialize storage subsystem (PCI drivers, USB keyboards, etc.)
 ///
 /// Called once before firmware-UI capability checks and boot dispatch, so USB
 /// input is enumerated before an indefinite setup session can be accepted.
-pub(crate) fn init_storage_subsystem() {
+/// Without `with_usb`, USB controllers stay untouched until [`ensure_usb`].
+pub(crate) fn init_storage_subsystem(with_usb: bool) {
     log::info!("Initializing storage subsystem...");
     timestamp::record(timestamp::TS_CRABEFI_STORAGE_INIT_START);
 
@@ -30,8 +38,23 @@ pub(crate) fn init_storage_subsystem() {
 
     // Bind PCI drivers to discovered devices (NVMe, AHCI, USB, SDHCI)
     // This uses the table-driven driver model instead of hardcoded init calls
-    drivers::pci::bind_drivers();
+    drivers::pci::bind_drivers(|device| with_usb || !device.is_usb_controller());
+    if with_usb {
+        USB_READY.set(true);
+        init_usb_devices();
+    } else {
+        log::info!("USB: initialization deferred");
+    }
 
+    // Initialize pass-through protocols for TCG Opal support
+    efi::protocols::pass_thru_init::init();
+
+    log::info!("Storage subsystem initialized");
+    timestamp::record(timestamp::TS_CRABEFI_STORAGE_INIT_DONE);
+}
+
+/// Enumerate input devices behind freshly bound USB controllers.
+fn init_usb_devices() {
     // Rescan UHCI/OHCI companion controller ports for devices that EHCI
     // released after the initial scan (ICH8/9/10 chipsets initialize UHCI
     // before EHCI due to PCI BDF ordering)
@@ -43,12 +66,79 @@ pub(crate) fn init_storage_subsystem() {
     // Initialize USB mice (needs to happen after USB controllers are bound)
     #[cfg(feature = "ui")]
     drivers::usb::init_mice();
+}
 
-    // Initialize pass-through protocols for TCG Opal support
-    efi::protocols::pass_thru_init::init();
+/// Whether USB controllers have been bound.
+pub(crate) fn usb_ready() -> bool {
+    USB_READY.get()
+}
 
-    log::info!("Storage subsystem initialized");
-    timestamp::record(timestamp::TS_CRABEFI_STORAGE_INIT_DONE);
+/// Whether deferred USB controllers could still provide input devices.
+pub(crate) fn usb_deferred() -> bool {
+    !usb_ready()
+        && drivers::pci::with_devices(|devices| devices.iter().any(PciDevice::is_usb_controller))
+}
+
+/// Bring up USB controllers, keyboards and mass storage on first need.
+pub(crate) fn ensure_usb(reason: &str) {
+    if usb_ready() {
+        return;
+    }
+    USB_READY.set(true);
+    log::info!("USB: initializing on demand ({})", reason);
+    drivers::pci::bind_drivers(PciDevice::is_usb_controller);
+    init_usb_devices();
+    efi::protocols::pass_thru_init::init_usb_pass_thru();
+}
+
+/// Variables that make shim start MokManager, which needs a keyboard.
+const SHIM_MOK_REQUESTS: [&str; 9] = [
+    "MokNew",
+    "MokDel",
+    "MokSB",
+    "MokPW",
+    "MokAuth",
+    "MokDB",
+    "MokXNew",
+    "MokXDel",
+    "MokListTrustedNew",
+];
+
+/// Whether shim will start MokManager on this boot.
+fn shim_mok_request_pending() -> bool {
+    use crate::efi::runtime_image::client::variables;
+
+    let shim_lock = r_efi::efi::Guid::from_fields(
+        0x605dab50,
+        0xe046,
+        0x4300,
+        0xab,
+        0xb6,
+        &[0x3d, 0xd8, 0x10, 0xdd, 0x8b, 0x23],
+    );
+    SHIM_MOK_REQUESTS.iter().any(|name| {
+        let name: alloc::vec::Vec<u16> = name.encode_utf16().chain(core::iter::once(0)).collect();
+        variables::get(&shim_lock, &name).is_some()
+    })
+}
+
+/// Devices an automatic boot pass may start an image from.
+#[derive(Clone, Copy)]
+enum Scope {
+    /// Every device found so far.
+    Available,
+    /// Only USB devices, after on-demand USB initialization.
+    Usb,
+}
+
+impl Scope {
+    fn includes(self, device: &StorageDevice) -> bool {
+        let in_scope = match self {
+            Scope::Available => true,
+            Scope::Usb => matches!(device.id, StorageId::Usb { .. }),
+        };
+        in_scope && boot_policy::automatic_boot_allowed(device)
+    }
 }
 
 /// Keep ordinary headless boot bounded. An explicit setup request has already
@@ -84,13 +174,26 @@ pub(crate) fn run(boot_var_state: boot_vars::BootVarState, firmware_ui_requested
     let timeout_seconds = boot_var_state.timeout.unwrap_or(5) as u32;
 
     if !firmware_ui_requested {
+        if !usb_ready() && shim_mok_request_pending() {
+            ensure_usb("shim MokManager request pending");
+        }
         try_automatic_boot(&boot_var_state);
     }
 
+    // The menu and the removable-media path need USB keyboards and disks.
+    ensure_usb(if firmware_ui_requested {
+        "firmware UI requested"
+    } else {
+        "no boot option started"
+    });
     show_boot_menu(timeout_seconds, firmware_ui_requested);
 }
 
 /// Automatic boot is deliberately separate: setup must not even delete BootNext.
+///
+/// With USB deferred, BootOrder runs over the other devices first; USB only
+/// comes up when none of them started an image, and then only USB devices
+/// are searched again.
 fn try_automatic_boot(boot_var_state: &boot_vars::BootVarState) {
     // ---- Phase 1: BootNext ----
     if let Some(boot_next_num) = boot_var_state.boot_next {
@@ -110,7 +213,15 @@ fn try_automatic_boot(boot_var_state: &boot_vars::BootVarState) {
                 );
             } else if let Some(file_path) = boot_vars::extract_file_path(&load_option) {
                 log::info!("BootNext: '{}' -> {}", load_option.description, file_path);
-                let result = try_boot_load_option(&load_option, &file_path);
+                let mut result = try_boot_load_option(&load_option, &file_path, Scope::Available);
+                // BootNext is one-shot: retry it on USB before BootOrder runs.
+                if result != boot_vars::BootAttemptResult::Success
+                    && !usb_ready()
+                    && boot_policy::automatic_external_allowed()
+                {
+                    ensure_usb("BootNext did not start");
+                    result = try_boot_load_option(&load_option, &file_path, Scope::Usb);
+                }
                 if result == boot_vars::BootAttemptResult::Success {
                     log::info!("BootNext succeeded, returning to boot manager");
                     // edk2 would show BootManagerMenu here; we fall through to menu
@@ -127,59 +238,76 @@ fn try_automatic_boot(boot_var_state: &boot_vars::BootVarState) {
     }
 
     // ---- Phase 2: BootOrder ----
-    if !boot_var_state.boot_order.is_empty() {
+    if boot_var_state.boot_order.is_empty() {
+        return;
+    }
+    log::info!(
+        "=== BootOrder: trying {} entries ===",
+        boot_var_state.boot_order.len()
+    );
+    if try_boot_order(boot_var_state, Scope::Available) || usb_ready() {
+        return;
+    }
+    if !boot_policy::automatic_external_allowed() {
+        log::info!("Boot policy: not retrying BootOrder on USB");
+        return;
+    }
+    ensure_usb("no BootOrder option started");
+    log::info!("=== BootOrder: retrying on USB ===");
+    try_boot_order(boot_var_state, Scope::Usb);
+}
+
+/// Try each active BootOrder option on the devices in `scope`.
+///
+/// Returns whether an image started (and returned).
+fn try_boot_order(boot_var_state: &boot_vars::BootVarState, scope: Scope) -> bool {
+    for &option_num in boot_var_state.boot_order.iter() {
+        let Some(load_option) = boot_vars::read_boot_option(option_num) else {
+            log::debug!("Boot{:04X}: not found, skipping", option_num);
+            continue;
+        };
+
+        if !load_option.should_boot() {
+            log::debug!(
+                "Boot{:04X}: skipped (active={}, category_boot={})",
+                option_num,
+                load_option.is_active(),
+                load_option.is_boot_category()
+            );
+            continue;
+        }
+
+        let Some(file_path) = boot_vars::extract_file_path(&load_option) else {
+            log::debug!("Boot{:04X}: no file path, skipping", option_num);
+            continue;
+        };
+
         log::info!(
-            "=== BootOrder: trying {} entries ===",
-            boot_var_state.boot_order.len()
+            "BootOrder: trying Boot{:04X} '{}' -> {}",
+            option_num,
+            load_option.description,
+            file_path
         );
 
-        for &option_num in boot_var_state.boot_order.iter() {
-            let Some(load_option) = boot_vars::read_boot_option(option_num) else {
-                log::debug!("Boot{:04X}: not found, skipping", option_num);
-                continue;
-            };
-
-            if !load_option.should_boot() {
-                log::debug!(
-                    "Boot{:04X}: skipped (active={}, category_boot={})",
+        let result = try_boot_load_option(&load_option, &file_path, scope);
+        match result {
+            boot_vars::BootAttemptResult::Success => {
+                log::info!("Boot{:04X} succeeded", option_num);
+                // edk2 retries the whole loop if boot succeeded then returned;
+                // we fall through to the menu instead
+                return true;
+            }
+            boot_vars::BootAttemptResult::Failed => {
+                log::warn!(
+                    "Boot{:04X} '{}' failed, trying next",
                     option_num,
-                    load_option.is_active(),
-                    load_option.is_boot_category()
+                    load_option.description
                 );
-                continue;
             }
-
-            let Some(file_path) = boot_vars::extract_file_path(&load_option) else {
-                log::debug!("Boot{:04X}: no file path, skipping", option_num);
-                continue;
-            };
-
-            log::info!(
-                "BootOrder: trying Boot{:04X} '{}' -> {}",
-                option_num,
-                load_option.description,
-                file_path
-            );
-
-            let result = try_boot_load_option(&load_option, &file_path);
-            match result {
-                boot_vars::BootAttemptResult::Success => {
-                    log::info!("Boot{:04X} succeeded", option_num);
-                    // edk2 retries the whole loop if boot succeeded then returned;
-                    // we fall through to the menu instead
-                    break;
-                }
-                boot_vars::BootAttemptResult::Failed => {
-                    log::warn!(
-                        "Boot{:04X} '{}' failed, trying next",
-                        option_num,
-                        load_option.description
-                    );
-                }
-                boot_vars::BootAttemptResult::Skipped => {}
-            }
+            boot_vars::BootAttemptResult::Skipped => {}
         }
     }
+    false
 }
 
 /// Discover boot entries and show setup indefinitely only on an explicit request.
@@ -205,6 +333,16 @@ fn show_boot_menu(timeout_seconds: u32, firmware_ui_requested: bool) {
         firmware_ui_requested,
     );
     boot_menu.set_timeout(timeout_seconds);
+    // A timeout is an automatic boot; make the user pick external media.
+    if timeout_seconds != 0
+        && !boot_policy::automatic_external_allowed()
+        && boot_menu
+            .get_entry(boot_menu.selected)
+            .is_some_and(|entry| boot_policy::storage_is_external(entry.storage))
+    {
+        log::info!("Boot policy: default entry is external; disabling the menu timeout");
+        boot_menu.set_timeout(0);
+    }
 
     log::info!(
         "Showing {}boot menu (autoboot timeout: {}s)",
@@ -306,12 +444,13 @@ mod menu_configuration_tests {
 fn try_boot_load_option(
     load_option: &boot_vars::LoadOption,
     file_path: &str,
+    scope: Scope,
 ) -> boot_vars::BootAttemptResult {
     // Set BootCurrent before attempting boot
     boot_vars::set_boot_current(load_option.option_number);
 
     // Try to find this file on any discovered ESP
-    let result = try_boot_file_from_esps(file_path);
+    let result = try_boot_file_from_esps(file_path, scope);
 
     // Clear BootCurrent after boot returns
     boot_vars::clear_boot_current();
@@ -319,12 +458,12 @@ fn try_boot_load_option(
     result
 }
 
-/// Try to boot a specific file path from any discovered ESP.
+/// Try to boot a specific file path from any ESP on the devices in `scope`.
 ///
-/// Scans all storage devices, looks for ESPs, and tries to find and boot
+/// Scans the storage devices, looks for ESPs, and tries to find and boot
 /// the specified file. This is the fallback path when we don't have full
 /// device path resolution yet.
-fn try_boot_file_from_esps(file_path: &str) -> boot_vars::BootAttemptResult {
+fn try_boot_file_from_esps(file_path: &str, scope: Scope) -> boot_vars::BootAttemptResult {
     // Convert forward slashes to backslashes for FAT
     let fat_path = if file_path.contains('/') {
         match crate::fs::linux_path_to_fat(file_path) {
@@ -347,6 +486,7 @@ fn try_boot_file_from_esps(file_path: &str) -> boot_vars::BootAttemptResult {
 
     if crate::drivers::storage::devices()
         .iter()
+        .filter(|device| scope.includes(device))
         .any(|device| try_boot_file_on_device(device, &fat_path))
     {
         return boot_vars::BootAttemptResult::Success;

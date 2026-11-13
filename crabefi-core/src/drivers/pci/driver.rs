@@ -357,7 +357,7 @@ async fn init_device(device: &PciDevice) -> Option<(usize, Registration)> {
     None
 }
 
-/// Bind drivers to all discovered PCI devices.
+/// Bind drivers to the given PCI devices.
 ///
 /// Hardware bring-up of all devices runs concurrently, since it is dominated
 /// by waiting on the hardware. Controllers are then registered in device
@@ -365,7 +365,7 @@ async fn init_device(device: &PciDevice) -> Option<(usize, Registration)> {
 ///
 /// # Returns
 /// The number of devices bound to a driver
-pub fn bind_all(devices: &[PciDevice]) -> usize {
+pub fn bind_all(devices: &[&PciDevice]) -> usize {
     let initialized = exec::block_on(exec::join_all(
         devices
             .iter()
