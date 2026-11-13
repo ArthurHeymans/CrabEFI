@@ -32,6 +32,17 @@ fn consume_request(data: &[u8], persist_clear: impl FnOnce(&[u8; 8]) -> bool) ->
     cleared_request(data).is_some_and(|cleared| persist_clear(&cleared))
 }
 
+/// Whether a well-formed request is pending, without consuming it.
+pub(crate) fn firmware_ui_request_pending() -> bool {
+    use crate::efi::runtime_image::client::variables;
+    use crabefi_efi_types::secure_boot::EFI_GLOBAL_VARIABLE_GUID;
+
+    let guid = r_efi::efi::Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID);
+    let name: alloc::vec::Vec<u16> = "OsIndications\0".encode_utf16().collect();
+    variables::get(&guid, &name)
+        .is_some_and(|(attributes, data)| attributes == 7 && cleared_request(&data).is_some())
+}
+
 /// Consume only our bit, through the authoritative runtime variable facade,
 /// after import is complete. Never enter setup unless the clear was durable:
 /// a failed write must not turn every later reset into another setup request.
