@@ -243,6 +243,22 @@ fn init_tcg_protocols(config: &mut crate::platform::TpmEventLogConfig) {
             Tpm2DeviceConfig::TisMmio { base } => {
                 init_tcg2_protocol_tis(existing_log, area, base, enable_sha1)
             }
+            Tpm2DeviceConfig::Crb {
+                control_area,
+                start,
+            } => {
+                // SAFETY: the platform describes a CRB TPM no one else drives
+                // during boot services.
+                match unsafe { tcg::tpm_crb::TpmCrb::probe(control_area, start) } {
+                    Ok(tpm) => init_tcg2_protocol_platform_tpm(
+                        existing_log,
+                        area,
+                        alloc::boxed::Box::leak(alloc::boxed::Box::new(tpm)),
+                        enable_sha1,
+                    ),
+                    Err(_) => Err("CRB TPM probe failed"),
+                }
+            }
             Tpm2DeviceConfig::Driver(driver) => {
                 init_tcg2_protocol_platform_tpm(existing_log, area, driver, enable_sha1)
             }

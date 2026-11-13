@@ -866,6 +866,9 @@ pub enum Tpm2DeviceConfig {
     /// This is useful for coreboot/QEMU x86 payloads where firmware can safely
     /// access the standard TIS MMIO window directly.
     TisMmio { base: u64 },
+    /// Use the TPM 2.0 Command Response Buffer interface whose control area
+    /// is at `control_area`, as the ACPI `TPM2` table describes it.
+    Crb { control_area: u64, start: CrbStart },
     /// Use a platform-provided TPM 2.0 driver.
     ///
     /// This is the preferred library abstraction for non-TIS hardware, firmware
@@ -877,6 +880,17 @@ pub enum Tpm2DeviceConfig {
     /// until ExitBootServices. Shorter-lived platform drivers should be placed
     /// in static storage by the embedding firmware before being passed here.
     Driver(&'static mut dyn Tpm2Device),
+}
+
+/// How a CRB TPM is told to run a command, from the ACPI `TPM2` start method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrbStart {
+    /// Start method 7: the full CRB register set, with locality and idle
+    /// control.
+    Crb,
+    /// Start methods 2 and 8, firmware TPMs such as AMD's: only the start
+    /// doorbell, the error bit and the buffer registers exist.
+    Acpi,
 }
 
 impl Tpm2DeviceConfig {
