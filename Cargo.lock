@@ -341,8 +341,7 @@ dependencies = [
 [[package]]
 name = "hidreport"
 version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6bba4f2ebef8032ef0125a72c7052481c9d63e50f1d48d35c0933ae11aa58c6d"
+source = "git+https://github.com/ArthurHeymans/hidreport?rev=d25ffa58a92201c5387d564c933180cdd48f4398#d25ffa58a92201c5387d564c933180cdd48f4398"
 dependencies = [
  "thiserror",
 ]

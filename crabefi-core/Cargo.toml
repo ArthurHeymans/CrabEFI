@@ -47,12 +47,13 @@ ui = ["crabefi-ui/screens"]
 # Native ELAN I2C touchpads described by the platform as peripherals.
 elan-i2c = ["ui"]
 # HID-over-I2C touchpads, mice and keyboards described by the platform.
-hid-i2c = ["ui", "dep:hidreport"]
+hid-i2c = ["ui"]
 
 [dependencies]
 crabefi-ui = { path = "../crabefi-ui" }
 embedded-hal = "1"
-hidreport = { version = "0.6", default-features = false, optional = true }
+# Unsigned absolute ranges (e.g. 0..65535): https://github.com/hidutils/hidreport/pull/65
+hidreport = { git = "https://github.com/ArthurHeymans/hidreport", rev = "d25ffa58a92201c5387d564c933180cdd48f4398", default-features = false }
 crabefi-efi-types = { workspace = true }
 crabefi-pkcs7 = { workspace = true, optional = true }
 crabefi-runtime-bundle = { workspace = true, optional = true }

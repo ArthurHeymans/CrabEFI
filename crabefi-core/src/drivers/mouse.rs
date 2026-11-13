@@ -678,6 +678,7 @@ impl super::pointer::PointerDevice for Ps2Mouse {
             dy,
             dz,
             buttons: get_buttons(),
+            absolute: None,
         })
     }
 }

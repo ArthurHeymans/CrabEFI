@@ -142,8 +142,10 @@ impl<T, const N: usize> ControllerRegistry<T, N> {
 pub mod block;
 #[cfg(feature = "elan-i2c")]
 pub(crate) mod elan;
+pub(crate) mod hid_descriptor;
 #[cfg(feature = "hid-i2c")]
 pub(crate) mod hid_i2c;
+pub(crate) mod hid_report;
 #[cfg(target_arch = "x86_64")]
 mod i8042;
 #[cfg(target_arch = "x86_64")]
