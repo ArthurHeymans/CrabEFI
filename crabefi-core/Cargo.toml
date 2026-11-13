@@ -22,6 +22,8 @@ external-boot-setting = ["cfr"]
 secure-boot-enforced = ["secure-boot"]
 # Cap logging at Error whatever CrabEFILogLevel says (production builds).
 max-log-level-error = []
+# Keep a boot event log in the CrabEFIEventLog variable (one write per boot).
+boot-event-log = ["variable-store"]
 # Start at the Error log level when no CrabEFILogLevel variable exists.
 default-log-level-error = ["crabefi-ui/default-log-level-error"]
 # Signed firmware capsule application requires durable result persistence.

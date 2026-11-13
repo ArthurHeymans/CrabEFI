@@ -15,6 +15,7 @@ pub mod arch;
 pub(crate) mod barrier;
 pub mod bls;
 pub mod boot;
+pub mod boot_event_log;
 mod boot_manager;
 pub mod boot_policy;
 pub mod boot_vars;
@@ -285,6 +286,10 @@ fn init_persistence_and_boot(
 
     if persistence_available {
         logger::apply_persisted_level();
+    }
+    // Also record boots that apply a capsule and reset below.
+    if cfg!(feature = "boot-event-log") && persistence_writable {
+        boot_event_log::record_boot();
     }
 
     // Bring up storage (and input devices, before any indefinite setup session)
@@ -563,6 +568,12 @@ pub fn init_platform(mut config: PlatformConfig) -> ! {
             }
         } else {
             log::warn!("Platform memory map exceeds direct-Linux handoff capacity");
+        }
+        h.boot_events.clear();
+        if let Some(events) = config.boot_events {
+            let events = boot_event_log::platform_events(events);
+            // platform_events() stays within the capacity.
+            let _ = h.boot_events.extend_from_slice(&events);
         }
         h.capsule_regions.clear();
         for region in config.capsule_regions {

@@ -408,6 +408,7 @@ fn test_payload_features(app: &str) -> Vec<&'static str> {
     let mut features = match app {
         "boot-policy-test" => vec!["usb-on-demand"],
         "fwui-test" => vec!["external-boot-setting"],
+        "boot-events-test" => vec!["boot-event-log"],
         _ => Vec::new(),
     };
     if capsule_on_disk_only() {

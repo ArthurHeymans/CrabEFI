@@ -33,6 +33,9 @@ pub struct Handoff {
     /// Capsule regions provided by the platform.
     pub capsule_regions: Vec<CapsuleRegion, MAX_CAPSULES>,
 
+    /// Valid platform events of this boot, see [`crate::boot_event_log`].
+    pub boot_events: Vec<u8, { crate::boot_event_log::MAX_BOOT_EVENTS_SIZE }>,
+
     /// Platform info from FDT (PCIe, GIC, etc.)
     pub fdt_info: crate::fdt::PlatformInfo,
 
@@ -55,6 +58,7 @@ impl Handoff {
             acpi_rsdp: None,
             efi_fw_info: None,
             capsule_regions: Vec::new(),
+            boot_events: Vec::new(),
             fdt_info: crate::fdt::PlatformInfo::new(),
             acpi_info: crate::fdt::PlatformInfo::new(),
         }

@@ -37,6 +37,8 @@ payload-mm = []
 secure-boot-enforced = ["crabefi/secure-boot-enforced"]
 max-log-level-error = ["crabefi/max-log-level-error"]
 default-log-level-error = ["crabefi/default-log-level-error"]
+# CrabEFIEventLog with coreboot's boot events (ELOG_BOOT_EVENTS) when present.
+boot-event-log = ["crabefi/boot-event-log"]
 
 [dependencies]
 crabefi = { package = "crabefi-core", path = "../crabefi-core", features = [
