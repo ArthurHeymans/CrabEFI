@@ -185,6 +185,12 @@ fn cleanup_child(child: &mut Child) {
 
 /// Spawn a swtpm process and return the QEMU arguments to connect to it.
 fn spawn_swtpm() -> Result<(SwtpmProcess, Vec<String>)> {
+    // CRABEFI_TPM=crb: the CRB interface of firmware TPMs instead of TIS.
+    let interface = match std::env::var("CRABEFI_TPM").as_deref() {
+        Ok("crb") => "tpm-crb",
+        Ok("tis") | Err(_) => "tpm-tis",
+        Ok(other) => bail!("CRABEFI_TPM must be tis or crb, not {other}"),
+    };
     let state_dir = tempfile::tempdir().context("failed to create swtpm state dir")?;
     let sock_path = state_dir.path().join("swtpm-sock");
 
@@ -236,8 +242,9 @@ fn spawn_swtpm() -> Result<(SwtpmProcess, Vec<String>)> {
         "-tpmdev".into(),
         "emulator,id=tpm0,chardev=chrtpm".into(),
         "-device".into(),
-        "tpm-tis,tpmdev=tpm0".into(),
+        format!("{interface},tpmdev=tpm0"),
     ];
+    println!("TPM 2.0 interface: {interface}");
 
     Ok((
         SwtpmProcess {
@@ -1149,6 +1156,30 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
                 println!(
                     "[FAIL] tcg2_submit_command: SubmitCommand did not return an expected status"
                 );
+                failed += 1;
+            }
+
+            if result.output.contains("[PASS] tcg2_log_replay") {
+                println!("[PASS] tcg2_log_replay: event log replays TPM PCRs 0-7");
+                passed += 1;
+            } else {
+                println!("[FAIL] tcg2_log_replay: event log does not match TPM PCRs 0-7");
+                failed += 1;
+            }
+
+            if result.output.contains("[PASS] tcg2_boot_measurements") {
+                println!("[PASS] tcg2_boot_measurements: firmware boot events measured");
+                passed += 1;
+            } else {
+                println!("[FAIL] tcg2_boot_measurements: firmware boot events missing");
+                failed += 1;
+            }
+
+            if result.output.contains("[PASS] tcg2_acpi_log") {
+                println!("[PASS] tcg2_acpi_log: ACPI TPM2 log area holds the event log");
+                passed += 1;
+            } else {
+                println!("[FAIL] tcg2_acpi_log: ACPI TPM2 log area is not the event log");
                 failed += 1;
             }
 
