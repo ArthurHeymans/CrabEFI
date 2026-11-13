@@ -175,7 +175,7 @@ pub extern "efiapi" fn efi_main(_image_handle: Handle, system_table: *mut System
         // Positive control: MM answers, and says which flash path it uses.
         result(mm_call(comm, request(CMD_PING), &[], &[]) == 0, "ping");
         let services = read_volatile(core::ptr::addr_of!((*(comm as *const Request)).attributes));
-        serial(if services == 1 {
+        serial(if services & 1 != 0 {
             "MMGATE INFO flash path: coreboot flash services\r\n"
         } else {
             "MMGATE INFO flash path: MM drives the flash itself\r\n"

@@ -424,6 +424,9 @@ fn firmware_flash(
     }
     // SAFETY: single-threaded SMM; set once at init.
     let flash = unsafe { *addr_of!(FLASH) };
+    if flash.uses_coreboot_services() && !flash.firmware_writable() {
+        return efi::Status::WRITE_PROTECTED; // Not a firmware-update boot.
+    }
     let done = if request.command == command::FIRMWARE_ERASE {
         flash.erase(offset, length)
     } else {
@@ -495,9 +498,12 @@ fn dispatch(config: &InitConfig, request: &mut Request) -> efi::Status {
     let mut guid = efi::Guid::from_bytes(&request.guid);
     match request.command {
         command::PING => {
-            // Report the flash path: 1 = coreboot's flash services.
+            // Report the flash path: bit 0 = coreboot's flash services,
+            // bit 1 = firmware writable through them in this boot.
             // SAFETY: single-threaded SMM; set once at init.
-            request.attributes = u32::from(unsafe { (*addr_of!(FLASH)).uses_coreboot_services() });
+            let flash = unsafe { *addr_of!(FLASH) };
+            request.attributes = u32::from(flash.uses_coreboot_services())
+                | u32::from(flash.firmware_writable()) << 1;
             efi::Status::SUCCESS
         }
         command::READY_TO_BOOT => {
