@@ -64,6 +64,8 @@ pub(crate) mod cbmem_ids {
     pub const CBMEM_ID_TCPA_TCG_LOG: u32 = 0x54445041;
     /// TPM log per TPM 2.0 specification (ASCII "TPM2")
     pub const CBMEM_ID_TPM2_TCG_LOG: u32 = 0x54504d32;
+    /// Events of this boot in the event log format (ASCII "ELGB")
+    pub const CBMEM_ID_ELOG_BOOT: u32 = 0x454c4742;
 }
 
 /// LB_TAG for TPM CB log (only the coreboot-specific format is exported via CB tables)
@@ -516,6 +518,8 @@ pub struct CorebootInfo {
     /// - `CBMEM_ID_TCPA_TCG_LOG` (0x54445041): TCG 1.2 SHA1-only format
     /// - `CBMEM_ID_TPM2_TCG_LOG` (0x54504d32): TCG 2.0 crypto-agile format
     pub tpm_log: Option<TpmLogInfo>,
+    /// Events of this boot from CBMEM (address, size), ELOG format
+    pub boot_events: Option<(u64, u32)>,
 }
 
 /// Information about a TPM event log found in CBMEM.
@@ -552,6 +556,7 @@ impl CorebootInfo {
             efi_fw_info: None,
             capsules: heapless::Vec::new(),
             tpm_log: None,
+            boot_events: None,
         }
     }
 }
@@ -1413,6 +1418,10 @@ fn parse_cbmem_entry(record_bytes: &[u8], info: &mut CorebootInfo) {
                 address,
                 entry_size
             );
+        }
+        cbmem_ids::CBMEM_ID_ELOG_BOOT => {
+            info.boot_events = Some((address, entry_size));
+            log::info!("Boot events found at {:#x} ({} bytes)", address, entry_size);
         }
         cbmem_ids::CBMEM_ID_TPM_CB_LOG
         | cbmem_ids::CBMEM_ID_TCPA_TCG_LOG

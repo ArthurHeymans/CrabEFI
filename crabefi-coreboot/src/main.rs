@@ -1002,6 +1002,7 @@ fn riscv_fdt_only_boot(fdt_ptr: u64, fdt_size: u32) -> ! {
         capsule_regions: &[],
         capsule_backend: None,
         capsule_on_disk_only: cfg!(feature = "capsule-on-disk-only"),
+        boot_events: None,
         hooks: Some(&hooks),
         rng: None,
         ecam_regions: &[],
@@ -1358,6 +1359,10 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         capsule_regions: &capsule_regions[..capsule_count],
         capsule_backend: Some(&mut capsule_backend),
         capsule_on_disk_only: cfg!(feature = "capsule-on-disk-only"),
+        // SAFETY: coreboot's CBMEM region persists for the entire boot.
+        boot_events: cb_info.boot_events.map(|(address, size)| unsafe {
+            core::slice::from_raw_parts(address as *const u8, size as usize)
+        }),
         hooks: Some(&hooks),
         rng: None,
         ecam_regions: &[], // ACPI/FDT discovery is selected by the library below.
