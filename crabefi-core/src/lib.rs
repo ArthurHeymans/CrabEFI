@@ -71,7 +71,7 @@ pub fn reset_system() -> ! {
 }
 
 // Re-export the public platform API at the crate root for ergonomic access.
-pub use boot_policy::{BootPolicy, UsbInit};
+pub use boot_policy::{BootPolicy, ExternalBoot, UsbInit};
 #[cfg(feature = "bundled-runtime-image")]
 pub use bundled_runtime::BUNDLED_RUNTIME_IMAGE;
 pub use crabefi_runtime_abi::{
@@ -313,6 +313,7 @@ fn init_persistence_and_boot(
 
     // Enumerate input devices before publishing or accepting an indefinite
     // setup session. A framebuffer by itself is only an output device.
+    boot_policy::apply_variable();
     let usb_init = boot_policy::get().usb_init;
     boot_manager::init_storage_subsystem(usb_init == boot_policy::UsbInit::Always);
     if !boot_manager::usb_ready() && os_indications::firmware_ui_request_pending() {
