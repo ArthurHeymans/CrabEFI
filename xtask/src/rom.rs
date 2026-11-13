@@ -303,10 +303,15 @@ fn prepare_rom_riscv64(crabefi_elf: &Path, output_dir: &Path) -> Result<Prepared
 
 /// Get the path to the CrabEFI ELF
 pub fn get_crabefi_elf(arch: Arch) -> PathBuf {
+    get_crabefi_elf_in("target", arch)
+}
+
+/// Release payload ELF built into `target_dir` (relative to the project root).
+pub fn get_crabefi_elf_in(target_dir: &str, arch: Arch) -> PathBuf {
     let target_triple = match arch {
         Arch::X86_64 => "x86_64-unknown-none",
         Arch::Aarch64 => "aarch64-unknown-none",
         Arch::Riscv64 => "riscv64gc-unknown-none-elf",
     };
-    project_root().join(format!("target/{}/release/crabefi", target_triple))
+    project_root().join(format!("{}/{}/release/crabefi", target_dir, target_triple))
 }
