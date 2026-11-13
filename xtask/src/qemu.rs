@@ -22,12 +22,17 @@ enum CaptureScenario {
     BootSmoke,
     Integration,
     RuntimeImageReplay,
+    /// capsule-test with capsule-on-disk-only: the firmware applies the
+    /// capsule and resets once.
+    CapsuleOnDiskReplay,
 }
 
 impl CaptureScenario {
     fn for_test_app(app: &str) -> Self {
         if app == "runtime-image-test" || app == "runtime-replay-interrupt-test" {
             Self::RuntimeImageReplay
+        } else if app == "capsule-test" && crate::capsule_on_disk_only() {
+            Self::CapsuleOnDiskReplay
         } else {
             Self::Integration
         }
@@ -40,7 +45,7 @@ impl CaptureScenario {
     }
 
     fn allows_reboot(self) -> bool {
-        self == Self::RuntimeImageReplay
+        matches!(self, Self::RuntimeImageReplay | Self::CapsuleOnDiskReplay)
     }
 }
 
@@ -1455,14 +1460,28 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
             }
 
             // Check individual test results from the EFI app
-            for test_name in [
-                "os_ind_supported_read",
-                "os_ind_fmp_capsule_bit",
-                "os_ind_file_capsule_bit",
-                "query_caps_call",
-                "query_caps_max_size",
-                "update_capsule_null_rejected",
-            ] {
+            let test_names: &[&str] = if crate::capsule_on_disk_only() {
+                &[
+                    "os_ind_supported_read",
+                    "os_ind_fmp_capsule_bit",
+                    "os_ind_file_capsule_bit",
+                    "query_caps_persist_unsupported",
+                    "update_capsule_null_rejected",
+                    "update_capsule_runtime_unsupported",
+                    "query_caps_runtime_unsupported",
+                    "capsule_update_data_deleted",
+                ]
+            } else {
+                &[
+                    "os_ind_supported_read",
+                    "os_ind_fmp_capsule_bit",
+                    "os_ind_file_capsule_bit",
+                    "query_caps_call",
+                    "query_caps_max_size",
+                    "update_capsule_null_rejected",
+                ]
+            };
+            for test_name in test_names {
                 let pass_marker = format!("[PASS] {}", test_name);
                 let fail_marker = format!("[FAIL] {}", test_name);
                 if result.output.contains(&pass_marker) {
