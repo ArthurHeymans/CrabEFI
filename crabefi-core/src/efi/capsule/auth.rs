@@ -53,12 +53,15 @@ pub fn verify_capsule_signature(
     // Try each trusted certificate in the trust store.
     // The signature is valid if it chains to any of them.
     for (i, cert_der) in trust_store.iter().enumerate() {
-        match crate::efi::auth::verify_pkcs7_signature(
+        // UEFI 23.1: the signature covers the image followed by MonotonicCount.
+        match crate::efi::auth::verify_pkcs7_signature_chain_parts(
             auth.pkcs7_data.as_slice(),
-            image_data,
+            &[image_data, &auth.monotonic_count.to_le_bytes()],
             cert_der,
             true,
-        ) {
+        )
+        .map(|chain| chain.is_some())
+        {
             Ok(true) => {
                 log::info!("Capsule signature verified against trust store cert #{}", i);
                 return Ok(());

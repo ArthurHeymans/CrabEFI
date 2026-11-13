@@ -107,8 +107,15 @@ impl CertificateChain {
 
 /// Compute SHA-256 hash of data
 pub fn sha256(data: &[u8]) -> [u8; 32] {
+    sha256_parts(&[data])
+}
+
+/// SHA-256 over the concatenation of `parts`.
+pub fn sha256_parts(parts: &[&[u8]]) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(data);
+    for part in parts {
+        hasher.update(part);
+    }
     hasher.finalize().into()
 }
 
@@ -166,6 +173,17 @@ pub fn verify_pkcs7_signature_chain(
     trusted_cert: &[u8],
     require_detached: bool,
 ) -> Result<Option<CertificateChain>, AuthError> {
+    verify_pkcs7_signature_chain_parts(pkcs7_data, &[signed_data], trusted_cert, require_detached)
+}
+
+/// [`verify_pkcs7_signature_chain`] for detached content that is the
+/// concatenation of `signed_parts`.
+pub fn verify_pkcs7_signature_chain_parts(
+    pkcs7_data: &[u8],
+    signed_parts: &[&[u8]],
+    trusted_cert: &[u8],
+    require_detached: bool,
+) -> Result<Option<CertificateChain>, AuthError> {
     // WIN_CERTIFICATE is 8-byte aligned, so the parser ignores alignment
     // padding after the ContentInfo.
     let pkcs7 = SignedData::parse(pkcs7_data).map_err(|e| {
@@ -220,7 +238,7 @@ pub fn verify_pkcs7_signature_chain(
     let computed_hash = match pkcs7.encapsulated_content.content {
         Some(_) if require_detached => return Err(AuthError::InvalidHeader),
         Some(econtent) => sha256(econtent.value),
-        None => sha256(signed_data),
+        None => sha256_parts(signed_parts),
     };
 
     if signers.is_empty() {
