@@ -347,7 +347,8 @@ fn init_persistence_and_boot(
     let graphical_pointer = false;
     let firmware_ui_supported = os_indications::firmware_ui_supported(
         persistence_writable,
-        retained_staging_ready,
+        // Payload MM persists OS runtime writes without the retained journal.
+        retained_staging_ready || mm_variables,
         handoff::framebuffer().is_some(),
         // Deferred USB comes up before a requested setup session.
         drivers::keyboard_common::is_available() || boot_manager::usb_deferred(),
