@@ -202,6 +202,53 @@ pub(super) fn matches(report: &[u8], id: Option<u8>, size: usize) -> bool {
 pub(super) mod tests {
     use super::*;
 
+    // Ordinary relative wheel mouse, independent of BMC/vendor identity.
+    pub const RELATIVE_MOUSE: &[u8] = &[
+        0x05, 0x01, 0x09, 0x02, 0xa1, 0x01, 0x09, 0x01, 0xa1, 0x00, 0x05, 0x09, 0x19, 0x01, 0x29,
+        0x03, 0x15, 0x00, 0x25, 0x01, 0x95, 0x03, 0x75, 0x01, 0x81, 0x02, 0x95, 0x01, 0x75, 0x05,
+        0x81, 0x03, 0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x38, 0x15, 0x81, 0x25, 0x7f, 0x75,
+        0x08, 0x95, 0x03, 0x81, 0x06, 0xc0, 0xc0,
+    ];
+
+    #[test]
+    fn absolute_mouse_ranges_and_ids_come_from_the_descriptor() {
+        for (minimum, maximum) in [(100i32, 10100i32), (-500, 500), (0, 4095), (0, 65535)] {
+            let mut bytes = ABSOLUTE_MOUSE.to_vec();
+            let range = bytes
+                .windows(6)
+                .position(|w| w == [0x16, 0, 0, 0x26, 0xff, 0x7f])
+                .unwrap();
+            bytes[range + 1..range + 3].copy_from_slice(&(minimum as i16).to_le_bytes());
+            bytes[range + 4..range + 6].copy_from_slice(&(maximum as u16).to_le_bytes());
+            bytes.splice(6..6, [0x85, 7]);
+            let descriptor = ReportDescriptor::try_from(bytes.as_slice()).unwrap();
+            let mouse = Mouse::find(&descriptor)
+                .unwrap_or_else(|| panic!("absolute axis range {minimum}..{maximum}"));
+            assert_eq!((mouse.report_id, mouse.size), (Some(7), 7));
+            let mut report = [7, 1, 0, 0, 0, 0, 0];
+            report[2..4].copy_from_slice(&(minimum as i16).to_le_bytes());
+            report[4..6].copy_from_slice(&(maximum as u16).to_le_bytes());
+            let pointer = mouse.read(&report).unwrap();
+            assert_eq!(pointer.absolute, Some((0, u16::MAX)));
+            assert_eq!((pointer.dx, pointer.dy, pointer.buttons), (0, 0, 1));
+            assert!(mouse.read(&report[..6]).is_none());
+            report[0] = 8;
+            assert!(mouse.read(&report).is_none());
+        }
+    }
+
+    #[test]
+    fn degenerate_absolute_ranges_are_rejected_before_normalization() {
+        let mut bytes = ABSOLUTE_MOUSE.to_vec();
+        let maximum = bytes
+            .windows(3)
+            .position(|w| w == [0x26, 0xff, 0x7f])
+            .unwrap();
+        bytes[maximum + 1..maximum + 3].fill(0);
+        let descriptor = ReportDescriptor::try_from(bytes.as_slice()).unwrap();
+        assert!(Mouse::find(&descriptor).is_none());
+    }
+
     // Insyde 0b1f:03e9: three buttons, two absolute u16 axes (0..32767), wheel.
     pub const ABSOLUTE_MOUSE: &[u8] = &[
         0x05, 0x01, 0x09, 0x02, 0xa1, 0x01, 0x09, 0x01, 0xa1, 0x00, 0x05, 0x09, 0x19, 0x01, 0x29,

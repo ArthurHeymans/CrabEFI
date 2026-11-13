@@ -178,20 +178,6 @@ pub(crate) fn absolute_pixel(value: u16, extent: u32) -> i32 {
         / u64::from(u16::MAX)) as i32
 }
 
-#[cfg(test)]
-mod absolute_tests {
-    use super::absolute_pixel;
-
-    #[test]
-    fn absolute_coordinates_map_edges_and_center_without_acceleration() {
-        assert_eq!(absolute_pixel(0, 1024), 0);
-        assert_eq!(absolute_pixel(u16::MAX, 1024), 1023);
-        assert_eq!(absolute_pixel(32768, 1024), 512);
-        assert_eq!(absolute_pixel(u16::MAX, 768), 767);
-        assert_eq!(absolute_pixel(u16::MAX, 0), 0);
-    }
-}
-
 /// Get the current absolute cursor position.
 ///
 /// Returns `(x, y)` in pixel coordinates.
@@ -270,4 +256,19 @@ pub fn set_position(x: i32, y: i32) {
 pub fn screen_size() -> (u32, u32) {
     let cursor = CURSOR.lock();
     (cursor.screen_w, cursor.screen_h)
+}
+
+#[cfg(test)]
+mod absolute_tests {
+    use super::absolute_pixel;
+
+    #[test]
+    fn absolute_coordinates_map_edges_and_center_without_acceleration() {
+        for extent in [1, 640, 768, 800, 1024, 1280, 1365, 1920, 3840] {
+            assert_eq!(absolute_pixel(0, extent), 0);
+            assert_eq!(absolute_pixel(u16::MAX, extent), extent as i32 - 1);
+            assert_eq!(absolute_pixel(32768, extent), extent as i32 / 2);
+        }
+        assert_eq!(absolute_pixel(u16::MAX, 0), 0);
+    }
 }
