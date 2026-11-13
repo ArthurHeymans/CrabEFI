@@ -1212,6 +1212,18 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         } else {
             log::info!("No ACPI MMIO TIS TPM resource; skipping unsafe probe");
         }
+
+        // Linux reads the TPM2 table's log area before the EFI log.
+        #[cfg(target_arch = "x86_64")]
+        if let Some(ref mut tpm) = config.tpm_event_log
+            && tpm.tpm2_device.is_some()
+        {
+            // SAFETY: coreboot's ACPI tables are identity mapped RAM.
+            tpm.log_area = unsafe {
+                acpi::take_tpm2_log_area(rsdp, crabefi::efi::tcg::event_log::DEFAULT_EVENT_LOG_SIZE)
+            }
+            .map(|area| crabefi::PlatformEventLog { area, used: 0 });
+        }
     }
 
     // init_platform() parses the FDT before adding its MMIO windows, including
