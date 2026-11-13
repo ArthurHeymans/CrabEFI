@@ -1219,7 +1219,7 @@ pub struct PlatformConfig<'a> {
     pub tpm_event_log: Option<TpmEventLogConfig<'a>>,
 
     // ---- Boot ----
-    /// When USB comes up; see [`crate::boot_policy`].
+    /// When USB comes up and which media may boot; see [`crate::boot_policy`].
     pub boot_policy: crate::boot_policy::BootPolicy,
 
     // ---- Pre-initialization ----

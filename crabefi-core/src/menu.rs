@@ -236,7 +236,13 @@ pub fn discover_boot_entries() -> BootMenu {
 
     log::info!("Discovering boot entries...");
 
-    for device in storage::devices() {
+    let mut devices = storage::devices();
+    devices.retain(crate::boot_policy::menu_boot_allowed);
+    if !crate::boot_policy::automatic_external_allowed() {
+        // Internal entries first, so the default entry is internal.
+        devices.sort_by_key(crate::boot_policy::device_is_external);
+    }
+    for device in devices {
         let partitions = storage::with_disk(device.id, |disk| gpt::read_partitions_auto(disk).ok())
             .ok()
             .flatten();

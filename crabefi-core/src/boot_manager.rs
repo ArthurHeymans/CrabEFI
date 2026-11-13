@@ -11,6 +11,7 @@
 //! The individual boot paths (UEFI, direct Linux, payload chainload) are
 //! dispatched from [`boot_selected_entry`].
 
+use crate::boot_policy;
 use crate::boot_vars;
 use crate::cell::LocalCell;
 use crate::drivers;
@@ -101,10 +102,11 @@ enum Scope {
 
 impl Scope {
     fn includes(self, device: &StorageDevice) -> bool {
-        match self {
+        let in_scope = match self {
             Scope::Available => true,
             Scope::Usb => matches!(device.id, StorageId::Usb { .. }),
-        }
+        };
+        in_scope && boot_policy::automatic_boot_allowed(device)
     }
 }
 
@@ -179,7 +181,10 @@ fn try_automatic_boot(boot_var_state: &boot_vars::BootVarState) {
                 log::info!("BootNext: '{}' -> {}", load_option.description, file_path);
                 let mut result = try_boot_load_option(&load_option, &file_path, Scope::Available);
                 // BootNext is one-shot: retry it on USB before BootOrder runs.
-                if result != boot_vars::BootAttemptResult::Success && !usb_ready() {
+                if result != boot_vars::BootAttemptResult::Success
+                    && !usb_ready()
+                    && boot_policy::automatic_external_allowed()
+                {
                     ensure_usb("BootNext did not start");
                     result = try_boot_load_option(&load_option, &file_path, Scope::Usb);
                 }
@@ -207,6 +212,10 @@ fn try_automatic_boot(boot_var_state: &boot_vars::BootVarState) {
         boot_var_state.boot_order.len()
     );
     if try_boot_order(boot_var_state, Scope::Available) || usb_ready() {
+        return;
+    }
+    if !boot_policy::automatic_external_allowed() {
+        log::info!("Boot policy: not retrying BootOrder on USB");
         return;
     }
     ensure_usb("no BootOrder option started");
@@ -290,6 +299,16 @@ fn show_boot_menu(timeout_seconds: u32, firmware_ui_requested: bool) {
         firmware_ui_requested,
     );
     boot_menu.set_timeout(timeout_seconds);
+    // A timeout is an automatic boot; make the user pick external media.
+    if timeout_seconds != 0
+        && !boot_policy::automatic_external_allowed()
+        && boot_menu
+            .get_entry(boot_menu.selected)
+            .is_some_and(|entry| boot_policy::storage_is_external(entry.storage))
+    {
+        log::info!("Boot policy: default entry is external; disabling the menu timeout");
+        boot_menu.set_timeout(0);
+    }
 
     log::info!(
         "Showing {}boot menu (autoboot timeout: {}s)",
