@@ -428,13 +428,16 @@ impl CorebootCapsuleBackend {
     }
 }
 
+// Capsule signing roots from CRABEFI_CAPSULE_TRUST_CERTS (build.rs).
+include!(concat!(env!("OUT_DIR"), "/capsule_trust.rs"));
+
 impl crabefi::CapsuleBackend for CorebootCapsuleBackend {
     fn firmware_info(&self) -> Option<&crabefi::FirmwareInfo> {
         self.firmware_info.as_ref()
     }
 
     fn capsule_trust_store(&self) -> &[&[u8]] {
-        &[]
+        CAPSULE_TRUST_STORE
     }
 
     fn write_firmware_region(

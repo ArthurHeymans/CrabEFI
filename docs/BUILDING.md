@@ -137,6 +137,10 @@ wrapper with `--no-default-features` when embedding a freshly audited artifact.
 The `entry64` feature is off by default, applies only to x86-64, and changes
 only the payload entry contract for u-root/LinuxBoot.
 
+`CRABEFI_CAPSULE_TRUST_CERTS` names the DER certificates (`:`-separated paths)
+that firmware capsule signatures must chain to; the coreboot payload embeds them
+at build time. Without it the trust store is empty and every capsule is refused.
+
 ### Platform peripherals
 
 A platform hands CrabEFI the devices on buses it owns. It keeps the
