@@ -100,6 +100,13 @@ fn boot_policy() -> crabefi::BootPolicy {
         } else {
             crabefi::UsbInit::Always
         },
+        external_boot: if cfg!(feature = "external-boot-deny") {
+            crabefi::ExternalBoot::Deny
+        } else if cfg!(feature = "external-boot-menu-only") {
+            crabefi::ExternalBoot::MenuOnly
+        } else {
+            crabefi::ExternalBoot::Allow
+        },
     }
 }
 
