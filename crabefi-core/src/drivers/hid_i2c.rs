@@ -16,6 +16,7 @@ use crate::time::{Timeout, delay_ms};
 use alloc::{boxed::Box, rc::Rc, vec};
 use core::cell::RefCell;
 use embedded_hal::i2c::I2c;
+#[cfg(test)]
 use hidreport::ReportDescriptor;
 use zerocopy::{FromBytes, Immutable, KnownLayout, little_endian::U16};
 
@@ -144,8 +145,8 @@ impl<I: I2c> HidI2c<I> {
                 &mut report_descriptor,
             )
             .map_err(Error::Bus)?;
-        let report_descriptor = ReportDescriptor::try_from(report_descriptor.as_slice())
-            .map_err(|_| Error::ReportDescriptor)?;
+        let report_descriptor =
+            super::hid_descriptor::parse(&report_descriptor).ok_or(Error::ReportDescriptor)?;
         device.mouse = Mouse::find(&report_descriptor);
         device.keyboard = Keyboard::find(&report_descriptor);
         if device.mouse.is_none() && device.keyboard.is_none() {

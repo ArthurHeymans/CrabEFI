@@ -3,18 +3,26 @@
 //! Shared by USB HID and HID-over-I2C. The descriptor, not the transport or
 //! vendor identity, defines field locations, report IDs and coordinate ranges.
 
+#[cfg(feature = "ui")]
 use super::pointer::PointerReport;
 use super::usb::hid_keyboard::KeyboardReport;
 use alloc::vec::Vec;
-use hidreport::{Field, FieldAttributes, Report, ReportDescriptor, Usage, VariableField};
+use hidreport::{Field, Report, ReportDescriptor, VariableField};
+#[cfg(feature = "ui")]
+use hidreport::{FieldAttributes, Usage};
 
 const GENERIC_DESKTOP: u16 = 0x01;
+#[cfg(feature = "ui")]
 const MOUSE: u16 = 0x02;
 const KEYBOARD: u16 = 0x06;
+#[cfg(feature = "ui")]
 const X: u16 = 0x30;
+#[cfg(feature = "ui")]
 const Y: u16 = 0x31;
+#[cfg(feature = "ui")]
 const WHEEL: u16 = 0x38;
 const KEY_CODES: u16 = 0x07;
+#[cfg(feature = "ui")]
 const BUTTONS: u16 = 0x09;
 
 fn usage(page: u16, id: u16) -> u32 {
@@ -30,11 +38,16 @@ fn in_collection(field: &VariableField, collection: u32) -> bool {
 
 fn variables(report: &impl Report, collection: u32) -> impl Iterator<Item = &VariableField> + '_ {
     report.fields().iter().filter_map(move |field| match field {
-        Field::Variable(field) if in_collection(field, collection) => Some(field),
+        Field::Variable(field)
+            if in_collection(field, collection) && (1..=32).contains(&field.bits.len()) =>
+        {
+            Some(field)
+        }
         _ => None,
     })
 }
 
+#[cfg(feature = "ui")]
 fn variable(report: &impl Report, collection: u32, usage: u32) -> Option<VariableField> {
     variables(report, collection)
         .find(|field| u32::from(&field.usage) == usage)
@@ -42,6 +55,7 @@ fn variable(report: &impl Report, collection: u32, usage: u32) -> Option<Variabl
 }
 
 /// Mouse fields of one input report, in relative or absolute mode.
+#[cfg(feature = "ui")]
 pub(super) struct Mouse {
     pub report_id: Option<u8>,
     pub size: usize,
@@ -51,6 +65,7 @@ pub(super) struct Mouse {
     buttons: Vec<(u32, VariableField)>,
 }
 
+#[cfg(feature = "ui")]
 impl Mouse {
     pub fn find(descriptor: &ReportDescriptor) -> Option<Self> {
         let collection = usage(GENERIC_DESKTOP, MOUSE);
@@ -67,7 +82,7 @@ impl Mouse {
             {
                 return None;
             }
-            let buttons = variables(report, collection)
+            let buttons: Vec<_> = variables(report, collection)
                 .filter_map(|field| {
                     let Usage {
                         usage_page,
@@ -78,6 +93,11 @@ impl Mouse {
                         .then(|| (1 << (index - 1), field.clone()))
                 })
                 .collect();
+            // Do not select movement alone when button reports use another ID.
+            // Unsupported split layouts can still use USB boot protocol.
+            if buttons.is_empty() {
+                return None;
+            }
             Some(Self {
                 report_id: (*report.report_id()).map(u8::from),
                 size: report.size_in_bytes(),
@@ -104,7 +124,11 @@ impl Mouse {
         Some(PointerReport {
             dx: if absolute.is_none() { x } else { 0 },
             dy: if absolute.is_none() { y } else { 0 },
-            dz: self.wheel.as_ref().and_then(value).map_or(0, |dz| -dz),
+            dz: self
+                .wheel
+                .as_ref()
+                .and_then(value)
+                .map_or(0, i32::saturating_neg),
             buttons: self
                 .buttons
                 .iter()
@@ -116,6 +140,7 @@ impl Mouse {
 }
 
 /// Normalize a validated absolute field to the full u16 coordinate range.
+#[cfg(feature = "ui")]
 fn normalize(field: &VariableField, value: i32) -> u16 {
     let minimum = i64::from(i32::from(field.logical_minimum));
     let maximum = i64::from(i32::from(field.logical_maximum));
@@ -137,10 +162,13 @@ impl Keyboard {
         descriptor.input_reports().iter().find_map(|report| {
             let keys = report.fields().iter().find_map(|field| match field {
                 Field::Array(field)
-                    if field
-                        .collections
-                        .iter()
-                        .any(|c| c.usages().iter().any(|u| u32::from(u) == collection))
+                    if usize::from(field.report_count) > 0
+                        && (1..=32)
+                            .contains(&(field.bits.len() / usize::from(field.report_count)))
+                        && field
+                            .collections
+                            .iter()
+                            .any(|c| c.usages().iter().any(|u| u32::from(u) == collection))
                         && field
                             .usages()
                             .first()
@@ -180,7 +208,14 @@ impl Keyboard {
             .extract(report)
             .ok()?
             .iter()
-            .map(|key| u8::try_from(u32::from(key)).unwrap_or(0))
+            .filter_map(|selector| {
+                let index = i64::from(i32::from(selector))
+                    - i64::from(i32::from(self.keys.logical_minimum));
+                let usage = self.keys.usages().get(usize::try_from(index).ok()?)?;
+                (u16::from(usage.usage_page) == KEY_CODES)
+                    .then(|| u8::try_from(u16::from(usage.usage_id)).ok())
+                    .flatten()
+            })
             .filter(|&key| key > 3)
             .take(keys.len())
             .enumerate()
@@ -198,7 +233,7 @@ pub(super) fn matches(report: &[u8], id: Option<u8>, size: usize) -> bool {
     report.len() >= size.max(1) && id.is_none_or(|id| report[0] == id)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "ui"))]
 pub(super) mod tests {
     use super::*;
 

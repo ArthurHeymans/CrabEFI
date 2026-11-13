@@ -142,27 +142,24 @@ pub fn poll() {
         return;
     }
 
-    // Apply acceleration (use i64 to avoid i32 overflow on large deltas)
+    // Descriptor-defined axes can span all of i32. Their squared sum fits
+    // u64, but not signed i64; do not truncate it before choosing acceleration.
     let distance_sq =
-        (total_dx as i64 * total_dx as i64 + total_dy as i64 * total_dy as i64) as u32;
-    let threshold_sq = cursor.acceleration * cursor.acceleration;
+        u64::from(total_dx.unsigned_abs()).pow(2) + u64::from(total_dy.unsigned_abs()).pow(2);
+    let threshold_sq = u64::from(cursor.acceleration).pow(2);
     let multiplier = if distance_sq > threshold_sq {
         cursor.speed
     } else {
         BASE_SPEED
     };
 
-    // Scale deltas by multiplier (1/256 fixed-point → integer pixels)
-    let scaled_dx = (total_dx * multiplier as i32) / BASE_SPEED as i32;
-    let scaled_dy = (total_dy * multiplier as i32) / BASE_SPEED as i32;
-
     // Update absolute position with clamping
     if let Some((x, y)) = absolute {
         cursor.abs_x = absolute_pixel(x, cursor.screen_w);
         cursor.abs_y = absolute_pixel(y, cursor.screen_h);
     } else {
-        cursor.abs_x = (cursor.abs_x + scaled_dx).clamp(0, cursor.screen_w as i32 - 1);
-        cursor.abs_y = (cursor.abs_y + scaled_dy).clamp(0, cursor.screen_h as i32 - 1);
+        cursor.abs_x = relative_pixel(cursor.abs_x, total_dx, multiplier, cursor.screen_w);
+        cursor.abs_y = relative_pixel(cursor.abs_y, total_dy, multiplier, cursor.screen_h);
     }
 
     // Edge detection: record rising edges (0→1) as pending clicks
@@ -170,7 +167,12 @@ pub fn poll() {
     cursor.click_pending |= rising;
     cursor.prev_buttons = combined_buttons;
     cursor.buttons = combined_buttons;
-    cursor.scroll += total_dz;
+    cursor.scroll = cursor.scroll.saturating_add(total_dz);
+}
+
+fn relative_pixel(position: i32, delta: i32, multiplier: u32, extent: u32) -> i32 {
+    let scaled = i64::from(delta) * i64::from(multiplier) / i64::from(BASE_SPEED);
+    (i64::from(position) + scaled).clamp(0, i64::from(extent.saturating_sub(1))) as i32
 }
 
 pub(crate) fn absolute_pixel(value: u16, extent: u32) -> i32 {
@@ -260,7 +262,14 @@ pub fn screen_size() -> (u32, u32) {
 
 #[cfg(test)]
 mod absolute_tests {
-    use super::absolute_pixel;
+    use super::{absolute_pixel, relative_pixel};
+
+    #[test]
+    fn full_width_relative_reports_cannot_overflow_cursor_scaling() {
+        assert_eq!(relative_pixel(10, i32::MAX, u32::MAX, 1920), 1919);
+        assert_eq!(relative_pixel(10, i32::MIN, u32::MAX, 1920), 0);
+        assert_eq!(relative_pixel(10, 4, 512, 1920), 18);
+    }
 
     #[test]
     fn absolute_coordinates_map_edges_and_center_without_acceleration() {

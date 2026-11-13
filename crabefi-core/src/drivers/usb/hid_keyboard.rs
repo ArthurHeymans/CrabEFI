@@ -1,14 +1,14 @@
 //! USB HID Keyboard Driver
 //!
-//! This module implements USB HID keyboard support using the boot protocol.
-//! The boot protocol is simpler than the report protocol and is supported by
-//! all HID-compliant keyboards.
+//! Prefer boot protocol, with descriptor-defined decoding for keyboards that
+//! reject the boot protocol request (including some BMC KVM gadgets).
 //!
 //! # References
 //! - USB HID Specification 1.11
 //! - libpayload usbhid.c
 
 use super::controller::{UsbController, UsbError, hid_request, req_type};
+use crate::drivers::hid_descriptor::{input_capacity, input_size, parse};
 use crate::time::Timeout;
 use alloc::vec::Vec;
 
@@ -110,7 +110,6 @@ pub struct UsbHidKeyboard {
     /// Earliest time of the next poll
     next_poll: Option<Timeout>,
     report_buffer: Vec<u8>,
-    #[cfg(feature = "ui")]
     report: Option<crate::drivers::hid_report::Keyboard>,
 }
 
@@ -159,7 +158,6 @@ impl UsbHidKeyboard {
             keys: BootKeys::default(),
             next_poll: None,
             report_buffer: alloc::vec![0; 8],
-            #[cfg(feature = "ui")]
             report: None,
         }
     }
@@ -171,6 +169,7 @@ impl UsbHidKeyboard {
     ) -> Result<(), UsbError> {
         self.interface_number =
             controller.hid_interface_number(self.device_address, self.endpoint)?;
+        self.report = None;
         // Fetch the descriptor even for boot keyboards. BMC gadgets may reject
         // SET_PROTOCOL and retain report protocol; use their actual layout then.
         if let Ok(bytes) =
@@ -181,14 +180,12 @@ impl UsbHidKeyboard {
                 self.device_address,
                 bytes.len()
             );
-            #[cfg(feature = "ui")]
+            if let Some(descriptor) = parse(&bytes)
+                && let Some(capacity) = input_capacity(self.max_packet, input_size(&descriptor))
             {
-                self.report = hidreport::ReportDescriptor::try_from(bytes.as_slice())
-                    .ok()
-                    .and_then(|descriptor| crate::drivers::hid_report::Keyboard::find(&descriptor))
-                    .filter(|report| (1..=512).contains(&report.size));
-                if let Some(report) = &self.report {
-                    self.report_buffer.resize(report.size, 0);
+                self.report = crate::drivers::hid_report::Keyboard::find(&descriptor);
+                if self.report.is_some() {
+                    self.report_buffer.resize(capacity, 0);
                 }
             }
         }
@@ -202,11 +199,9 @@ impl UsbHidKeyboard {
             None,
         )?;
         // A successful switch means reports now have the fixed boot layout.
-        self.report_buffer.resize(8, 0);
-        #[cfg(feature = "ui")]
-        {
-            self.report = None;
-        }
+        let capacity = input_capacity(self.max_packet, 8).ok_or(UsbError::NotSupported)?;
+        self.report_buffer.resize(capacity, 0);
+        self.report = None;
         Ok(())
     }
 
@@ -718,7 +713,12 @@ pub fn init_keyboard<C: UsbController + ?Sized>(
     );
 
     if let Err(e) = keyboard.set_boot_protocol(controller) {
-        log::warn!("Failed to set boot protocol: {:?}", e);
+        // Never guess boot layout after a failed switch unless the descriptor
+        // supplies a usable report-protocol fallback.
+        if keyboard.report.is_none() {
+            return Err(e);
+        }
+        log::debug!("Boot protocol rejected: {:?}; using report descriptor", e);
     }
     // Set idle rate (30ms)
     if let Err(e) = keyboard.set_idle(controller, 30) {
@@ -746,14 +746,11 @@ impl UsbHidKeyboard {
     fn poll_report<C: UsbController + ?Sized>(&mut self, controller: &mut C) {
         // Most real keyboards require interrupt IN; GET_REPORT is only a legacy
         // controller fallback. A pending interrupt TD is not an all-keys-up report.
-        #[cfg(feature = "ui")]
         let report_id = self
             .report
             .as_ref()
             .and_then(|report| report.report_id)
             .map_or(0, u16::from);
-        #[cfg(not(feature = "ui"))]
-        let report_id = 0;
         let result = match controller.interrupt_transfer(
             self.device_address,
             self.endpoint,
@@ -783,7 +780,6 @@ impl UsbHidKeyboard {
 
 impl UsbHidKeyboard {
     fn decode_report(&self, length: usize) -> Option<KeyboardReport> {
-        #[cfg(feature = "ui")]
         if let Some(report) = &self.report {
             return report.read(&self.report_buffer[..length]);
         }

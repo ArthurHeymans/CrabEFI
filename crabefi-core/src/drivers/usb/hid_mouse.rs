@@ -5,11 +5,11 @@
 //! packet, then babbles because that next packet cannot fit the remaining TD.
 
 use super::controller::{UsbController, UsbError, hid_request, req_type};
+use crate::drivers::hid_descriptor::{input_capacity, input_size, parse};
 use crate::drivers::hid_report::Mouse;
 use crate::drivers::pointer::{PointerDevice, PointerReport};
 use crate::time::Timeout;
 use alloc::vec::Vec;
-use hidreport::ReportDescriptor;
 
 /// USB HID mouse, owned by the common pointer registry.
 pub struct UsbHidMouse {
@@ -129,16 +129,6 @@ impl UsbHidMouse {
     }
 }
 
-/// Poll capacity is a whole number of packets, never a partially filled final
-/// packet that a subsequent full-sized HID report could overflow.
-fn input_capacity(packet: u16, report_size: usize) -> Result<usize, UsbError> {
-    let packet = usize::from(packet & 0x7ff);
-    if packet == 0 || report_size > 4096 {
-        return Err(UsbError::NotSupported);
-    }
-    Ok(report_size.max(1).div_ceil(packet) * packet)
-}
-
 /// Register a mouse in report protocol when its descriptor can be decoded,
 /// otherwise require a successful switch to the fixed boot mouse protocol.
 pub fn init_mouse<C: UsbController + ?Sized>(
@@ -150,11 +140,17 @@ pub fn init_mouse<C: UsbController + ?Sized>(
         .get_mouse_interrupt_endpoint(device_addr)
         .ok_or(UsbError::DeviceNotFound)?;
     let interface = controller.hid_interface_number(device_addr, ep.number)?;
-    let report = controller
+    let descriptor = controller
         .hid_report_descriptor(device_addr, interface)
         .ok()
-        .and_then(|bytes| ReportDescriptor::try_from(bytes.as_slice()).ok())
-        .and_then(|descriptor| Mouse::find(&descriptor));
+        .and_then(|bytes| parse(&bytes));
+    let report = descriptor.as_ref().and_then(Mouse::find);
+    let size = if report.is_some() {
+        input_size(descriptor.as_ref().unwrap())
+    } else {
+        3
+    };
+    let capacity = input_capacity(ep.max_packet_size, size).ok_or(UsbError::NotSupported)?;
     let protocol = u16::from(report.is_some()); // 1 = descriptor-defined report protocol
     if let Err(error) = controller.control_transfer(
         device_addr,
@@ -183,10 +179,6 @@ pub fn init_mouse<C: UsbController + ?Sized>(
         u16::from(interface),
         None,
     );
-    let capacity = input_capacity(
-        ep.max_packet_size,
-        report.as_ref().map_or(3, |report| report.size),
-    )?;
     log::info!(
         "USB HID mouse: device {}, interface {}, EP {}, packet {}, input {}, report protocol {}",
         device_addr,

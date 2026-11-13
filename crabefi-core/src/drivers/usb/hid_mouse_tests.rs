@@ -244,11 +244,54 @@ fn legacy_controller_get_report_uses_the_interface_and_report_id() {
 }
 
 #[test]
+fn unrelated_report_ids_fit_and_do_not_prevent_later_pointer_input() {
+    let mut descriptor = ABSOLUTE_MOUSE.to_vec();
+    descriptor.splice(6..6, [0x85, 7]);
+    descriptor.extend_from_slice(&[
+        0x06, 0, 0xff, 0x09, 1, 0xa1, 1, 0x85, 8, 0x75, 8, 0x95, 32, 0x09, 1, 0x81, 2, 0xc0,
+    ]);
+    let mut vendor = [0; 33];
+    vendor[0] = 8;
+    let mut controller = Controller::new(&descriptor, &vendor, 8, 40);
+    let mut mouse = init_mouse(&mut controller, 0, 2).unwrap();
+    mouse.poll_controller(&mut controller);
+    assert!(mouse.pending.is_none());
+    controller.report = Some(alloc::vec![7, 1, 0xff, 0x7f, 0, 0, 0]);
+    mouse.next_poll = None;
+    mouse.poll_controller(&mut controller);
+    assert_eq!(mouse.pending.take().unwrap().absolute, Some((u16::MAX, 0)));
+}
+
+#[test]
+fn split_mouse_reports_and_oversized_axes_require_boot_fallback() {
+    let mut split = RELATIVE_MOUSE.to_vec();
+    split.splice(6..6, [0x85, 1]);
+    let axes = split
+        .windows(4)
+        .position(|w| w == [0x05, 1, 0x09, 0x30])
+        .unwrap();
+    split.splice(axes..axes, [0x85, 2]);
+    let mut wide = RELATIVE_MOUSE.to_vec();
+    let size = wide.windows(2).position(|w| w == [0x75, 8]).unwrap();
+    wide[size + 1] = 64;
+    for descriptor in [split, wide] {
+        let mut controller = Controller::new(&descriptor, &[0; 3], 8, 8);
+        assert!(matches!(
+            init_mouse(&mut controller, 0, 2),
+            Err(UsbError::Stall)
+        ));
+        controller.class_stalls = false;
+        let mouse = init_mouse(&mut controller, 0, 2).unwrap();
+        assert!(mouse.report.is_none());
+    }
+}
+
+#[test]
 fn interrupt_capacity_never_leaves_a_partial_packet() {
     assert_eq!(input_capacity(6, 6).unwrap(), 6);
     assert_eq!(input_capacity(6, 8).unwrap(), 12);
     assert_eq!(input_capacity(8, 3).unwrap(), 8);
     assert_eq!(input_capacity(64, 65).unwrap(), 128);
-    assert!(input_capacity(0, 6).is_err());
-    assert!(input_capacity(8, 4097).is_err());
+    assert!(input_capacity(0, 6).is_none());
+    assert!(input_capacity(8, 4097).is_none());
 }
