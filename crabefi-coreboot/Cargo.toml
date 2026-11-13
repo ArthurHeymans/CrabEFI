@@ -28,6 +28,9 @@ external-boot-menu-only = []
 external-boot-deny = []
 # Offer the external-boot policy in the setup menu (stricter values only).
 external-boot-setting = ["crabefi/external-boot-setting"]
+# DRAM does not survive a warm reset: accept capsules only as files on the
+# ESP, no runtime UpdateCapsule (PlatformConfig::capsule_on_disk_only).
+capsule-on-disk-only = []
 # Load crabefi-mm into coreboot-owned SMRAM (coreboot PAYLOAD_MM_INTERFACE);
 # needs CRABEFI_MM_ELF at build time.
 payload-mm = []

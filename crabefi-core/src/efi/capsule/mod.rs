@@ -136,6 +136,40 @@ pub fn process_pending_capsules(backend: &mut dyn CapsuleBackend) -> usize {
     applied_count
 }
 
+/// `EFI_CAPSULE_VENDOR_GUID`, the GUID of the `CapsuleUpdateData*` variables.
+const CAPSULE_VENDOR_GUID: r_efi::efi::Guid = r_efi::efi::Guid::from_fields(
+    0x711c703f,
+    0xc285,
+    0x4b10,
+    0xa3,
+    0xb0,
+    &[0x36, 0xec, 0xbd, 0x3c, 0x8b, 0xe2],
+);
+
+/// Delete `CapsuleUpdateData`, `CapsuleUpdateData1`, ... up to the first
+/// missing one, where coreboot stops collecting capsules to coalesce.
+pub fn delete_capsule_update_data() {
+    use crate::efi::runtime_image::client::variables;
+
+    for index in 0u32.. {
+        let name = if index == 0 {
+            alloc::string::String::from("CapsuleUpdateData")
+        } else {
+            alloc::format!("CapsuleUpdateData{index}")
+        };
+        let name16: alloc::vec::Vec<u16> = name.encode_utf16().chain([0]).collect();
+        if variables::get(&CAPSULE_VENDOR_GUID, &name16).is_none() {
+            return;
+        }
+        let status = variables::delete(&CAPSULE_VENDOR_GUID, &name16);
+        if status != r_efi::efi::Status::SUCCESS {
+            log::warn!("Failed to delete stale {}: {:?}", name, status);
+            return;
+        }
+        log::info!("Deleted stale {}", name);
+    }
+}
+
 #[cfg(any(feature = "capsule-update", test))]
 fn is_retained_reservation_capsule(data: &[u8]) -> bool {
     let Ok(wrapper) = header::parse_capsule_header(data) else {
