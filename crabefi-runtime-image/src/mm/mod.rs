@@ -417,14 +417,14 @@ fn firmware_flash(
     let Some(end) = offset.checked_add(length) else {
         return efi::Status::INVALID_PARAMETER;
     };
+    // SAFETY: single-threaded SMM; set once at init.
+    let flash = unsafe { *addr_of!(FLASH) };
     if length == 0
-        || end > config.flash_size
+        || end > flash.limit()
         || ranges_overlap(offset, length, config.store_offset, config.store_size)
     {
         return efi::Status::ACCESS_DENIED;
     }
-    // SAFETY: single-threaded SMM; set once at init.
-    let flash = unsafe { *addr_of!(FLASH) };
     if flash.uses_coreboot_services() && !flash.firmware_writable() {
         return efi::Status::WRITE_PROTECTED; // Not a firmware-update boot.
     }

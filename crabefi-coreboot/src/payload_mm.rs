@@ -8,7 +8,7 @@
 
 use core::ptr::{addr_of, addr_of_mut, read_volatile};
 
-use crate::tables::{BootMediaInfo, PayloadMmInfo};
+use crate::tables::{BootMediaInfo, PayloadMmInfo, SpiFlashInfo};
 
 static MM_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/payload_mm.img"));
 
@@ -74,6 +74,27 @@ fn comm_buffer() -> (u64, u64) {
 const REQUEST_APM_CMD: u8 = 0;
 
 static LOADED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Host address of flash offset 0 once loaded (see `flash_mapping`).
+static MAPPED_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Host address of flash offset 0 and the size mapped from there: the SPI
+/// mmap window that starts at flash offset 0 and holds the FMAP (AMD maps the
+/// first 16 MiB of a larger flash below 4 GiB), else the whole boot media
+/// ending at 4 GiB.
+fn flash_mapping(
+    boot_media: BootMediaInfo,
+    spi_flash: Option<&SpiFlashInfo>,
+) -> Option<(u64, u64)> {
+    if let Some(window) = spi_flash.and_then(|spi| {
+        spi.mmap_windows.iter().find(|window| {
+            window.flash_base == 0 && boot_media.fmap_offset < u64::from(window.size)
+        })
+    }) {
+        return Some((u64::from(window.host_base), u64::from(window.size)));
+    }
+    let size = boot_media.boot_media_size;
+    (size != 0 && size <= 16 * 1024 * 1024).then(|| ((1u64 << 32) - size, size))
+}
 /// Keep the request buffer across ExitBootServices (after allocator init).
 pub fn reserve_buffer() {
     if !LOADED.load(core::sync::atomic::Ordering::Acquire) {
@@ -147,11 +168,11 @@ pub fn for_each_fmap_area(
     boot_media: BootMediaInfo,
     mut f: impl FnMut(&str, u32, u32),
 ) -> Option<()> {
-    let flash_size = boot_media.boot_media_size;
-    if flash_size == 0 || flash_size > 16 * 1024 * 1024 {
-        return None;
-    }
-    let fmap = ((1u64 << 32) - flash_size + boot_media.fmap_offset) as *const u8;
+    let base = match MAPPED_BASE.load(core::sync::atomic::Ordering::Acquire) {
+        0 => flash_mapping(boot_media, None)?.0,
+        base => base,
+    };
+    let fmap = (base + boot_media.fmap_offset) as *const u8;
     let read = |offset: usize, buf: &mut [u8]| {
         for (i, byte) in buf.iter_mut().enumerate() {
             // SAFETY: the FMAP lies in the memory-mapped flash coreboot described.
@@ -206,7 +227,11 @@ fn fmap_area(flash_base: u64, fmap_offset: u64, name: &[u8]) -> Option<(u64, u64
 /// Load the MM image into SMRAM; it then owns the variable store. Returns an
 /// error string when payload MM is not available or the load fails; variables
 /// then stay with the boot-time store (read-only if writes are locked to SMM).
-pub fn load(mm: &PayloadMmInfo, boot_media: Option<BootMediaInfo>) -> Result<(), &'static str> {
+pub fn load(
+    mm: &PayloadMmInfo,
+    boot_media: Option<BootMediaInfo>,
+    spi_flash: Option<&SpiFlashInfo>,
+) -> Result<(), &'static str> {
     let (Some(apm_cmd), Some((smram_base, smram_size)), Some((shared_base, _))) =
         (mm.apm_cmd, mm.smram, mm.shared_mem)
     else {
@@ -216,11 +241,10 @@ pub fn load(mm: &PayloadMmInfo, boot_media: Option<BootMediaInfo>) -> Result<(),
         return Err("32-bit coreboot SMM is not supported yet");
     }
     let boot_media = boot_media.ok_or("no boot media parameters")?;
-    let flash_size = boot_media.boot_media_size;
-    if flash_size == 0 || flash_size > 16 * 1024 * 1024 {
-        return Err("flash is not fully mapped below 4 GiB");
-    }
-    let flash_base = (1u64 << 32) - flash_size;
+    // MM gets the mapped part; offsets beyond it need coreboot's flash services.
+    let (flash_base, flash_size) =
+        flash_mapping(boot_media, spi_flash).ok_or("flash is not mapped below 4 GiB")?;
+    MAPPED_BASE.store(flash_base, core::sync::atomic::Ordering::Release);
     let (store_offset, store_size) = fmap_area(flash_base, boot_media.fmap_offset, b"SMMSTORE")
         .ok_or("no SMMSTORE FMAP area")?;
 
