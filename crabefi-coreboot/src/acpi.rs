@@ -399,25 +399,22 @@ pub unsafe fn discover_platform(rsdp_addr: u64) -> Discovery {
     Discovery { info, peripherals }
 }
 
-/// Locate a TPM 1.2 event log described by the ACPI TCPA table.
-///
-/// Some coreboot platforms publish the log through ACPI but do not export the
-/// corresponding standard-log CBMEM entry in the coreboot table. Copying this
-/// log into CrabEFI's EFI_TCG_PROTOCOL log keeps the log replayable against the
-/// PCR values coreboot extended before entering the payload.
+#[cfg(target_arch = "x86_64")]
+unsafe fn read_u32(address: u64) -> u32 {
+    unsafe { core::ptr::read_unaligned(address as *const u32) }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn read_u64(address: u64) -> u64 {
+    unsafe { core::ptr::read_unaligned(address as *const u64) }
+}
+
+/// The address of the first ACPI table with `signature`.
 ///
 /// # Safety
-/// `rsdp_addr` and all referenced ACPI/log memory must be identity mapped and
-/// remain valid for the firmware boot-services lifetime.
+/// `rsdp_addr` and the tables it references must be identity mapped.
 #[cfg(target_arch = "x86_64")]
-pub unsafe fn find_tcpa_event_log(rsdp_addr: u64) -> Option<&'static [u8]> {
-    unsafe fn read_u32(address: u64) -> u32 {
-        unsafe { core::ptr::read_unaligned(address as *const u32) }
-    }
-    unsafe fn read_u64(address: u64) -> u64 {
-        unsafe { core::ptr::read_unaligned(address as *const u64) }
-    }
-
+unsafe fn find_table(rsdp_addr: u64, signature: &[u8; 4]) -> Option<u64> {
     let rsdp = rsdp_addr as *const u8;
     if unsafe { core::slice::from_raw_parts(rsdp, 8) } != b"RSD PTR " {
         return None;
@@ -437,41 +434,80 @@ pub unsafe fn find_tcpa_event_log(rsdp_addr: u64) -> Option<&'static [u8]> {
         return None;
     }
     let entry_count = (root_length - 36) / entry_size;
-    for index in 0..entry_count {
+    (0..entry_count).find_map(|index| {
         let entry_address = root + 36 + (index * entry_size) as u64;
         let table = if entry_size == 8 {
             unsafe { read_u64(entry_address) }
         } else {
             (unsafe { read_u32(entry_address) }) as u64
         };
-        if table == 0 || unsafe { core::slice::from_raw_parts(table as *const u8, 4) } != b"TCPA" {
-            continue;
-        }
+        (table != 0 && unsafe { core::slice::from_raw_parts(table as *const u8, 4) } == signature)
+            .then_some(table)
+    })
+}
 
-        // ACPI TCPA client table: header(36), platform_class(2),
-        // log_area_minimum_length(4), log_area_start_address(8).
-        let table_length = unsafe { read_u32(table + 4) } as usize;
-        if table_length < 50 {
-            return None;
-        }
-        let maximum_length = unsafe { read_u32(table + 38) } as usize;
-        let log_address = unsafe { read_u64(table + 42) };
-        if maximum_length == 0 || log_address == 0 {
-            return None;
-        }
+/// Locate a TPM 1.2 event log described by the ACPI TCPA table.
+///
+/// Some coreboot platforms publish the log through ACPI but do not export the
+/// corresponding standard-log CBMEM entry in the coreboot table. Copying this
+/// log into CrabEFI's EFI_TCG_PROTOCOL log keeps the log replayable against the
+/// PCR values coreboot extended before entering the payload.
+///
+/// # Safety
+/// `rsdp_addr` and all referenced ACPI/log memory must be identity mapped and
+/// remain valid for the firmware boot-services lifetime.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn find_tcpa_event_log(rsdp_addr: u64) -> Option<&'static [u8]> {
+    let table = unsafe { find_table(rsdp_addr, b"TCPA") }?;
 
-        let allocation =
-            unsafe { core::slice::from_raw_parts(log_address as *const u8, maximum_length) };
-        let used = tcpa_log_used_length(allocation)?;
-        log::info!(
-            "ACPI TCPA event log found at {:#x} ({} used of {} bytes)",
-            log_address,
-            used,
-            maximum_length
-        );
-        return Some(&allocation[..used]);
+    // ACPI TCPA client table: header(36), platform_class(2),
+    // log_area_minimum_length(4), log_area_start_address(8).
+    let table_length = unsafe { read_u32(table + 4) } as usize;
+    if table_length < 50 {
+        return None;
     }
-    None
+    let maximum_length = unsafe { read_u32(table + 38) } as usize;
+    let log_address = unsafe { read_u64(table + 42) };
+    if maximum_length == 0 || log_address == 0 {
+        return None;
+    }
+
+    let allocation =
+        unsafe { core::slice::from_raw_parts(log_address as *const u8, maximum_length) };
+    let used = tcpa_log_used_length(allocation)?;
+    log::info!(
+        "ACPI TCPA event log found at {:#x} ({} used of {} bytes)",
+        log_address,
+        used,
+        maximum_length
+    );
+    Some(&allocation[..used])
+}
+
+/// The TPM interface the ACPI TPM2 table describes.
+#[cfg(target_arch = "x86_64")]
+pub struct Tpm2Table {
+    pub start_method: u32,
+    pub control_area: u64,
+}
+
+/// Read the ACPI TPM2 table.
+///
+/// # Safety
+/// `rsdp_addr` and the tables it references must be identity mapped.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn find_tpm2_table(rsdp_addr: u64) -> Option<Tpm2Table> {
+    let table = unsafe { find_table(rsdp_addr, b"TPM2") }?;
+
+    // header(36), platform_class(2), reserved(2), control_area(8),
+    // start_method(4).
+    if unsafe { read_u32(table + 4) } < 52 {
+        return None;
+    }
+    Some(Tpm2Table {
+        start_method: unsafe { read_u32(table + 48) },
+        control_area: unsafe { read_u64(table + 40) },
+    })
 }
 
 #[cfg(target_arch = "x86_64")]
