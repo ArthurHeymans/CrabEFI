@@ -11,8 +11,8 @@ use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crabefi_runtime_abi::mm::{
-    COMM_MAGIC, COMM_VERSION, DATA_OFFSET, NAME_CAPACITY, NAME_OFFSET, Request, STATUS_PENDING,
-    command,
+    COMM_MAGIC, COMM_VERSION, DATA_MAX, DATA_OFFSET, NAME_CAPACITY, NAME_OFFSET, Request,
+    STATUS_PENDING, command,
 };
 use r_efi::efi::{Guid, Status};
 
@@ -37,9 +37,10 @@ pub fn active() -> bool {
 }
 
 fn data_capacity() -> usize {
-    COMM_SIZE
+    (COMM_SIZE
         .load(Ordering::Relaxed)
-        .saturating_sub(DATA_OFFSET) as usize
+        .saturating_sub(DATA_OFFSET) as usize)
+        .min(DATA_MAX)
 }
 
 fn call(mut request: Request, name: &[u16], data: &[u8]) -> Status {

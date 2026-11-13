@@ -71,7 +71,8 @@ struct InitConfig {
 const INIT_MAGIC: u64 = 0x4749_4643_4d4d_4243; // "CBMMCFIG"
 const INIT_VERSION: u32 = 2;
 
-const DATA_CAPACITY: usize = crate::auth::MAX_AUTHENTICATED_ENVELOPE_SIZE;
+const DATA_CAPACITY: usize = crabefi_runtime_abi::mm::DATA_MAX;
+const _: () = assert!(DATA_CAPACITY >= crate::auth::MAX_AUTHENTICATED_ENVELOPE_SIZE);
 
 struct Context {
     config: InitConfig,
