@@ -1398,8 +1398,9 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
                 failed += 1;
             }
 
-            // Check OsIndicationsSupported was set by firmware
-            if result.output.contains("OsIndicationsSupported set:") {
+            // Check OsIndicationsSupported was set by firmware (as read by
+            // the app; the firmware's own Info message is off by default)
+            if result.output.contains("OsIndicationsSupported = ") {
                 println!("[PASS] firmware_os_ind: Firmware set OsIndicationsSupported");
                 passed += 1;
             } else {
