@@ -32,8 +32,9 @@ pub const DATA_OFFSET: u64 = NAME_OFFSET + NAME_CAPACITY as u64;
 pub const STATUS_PENDING: u64 = u64::MAX;
 
 pub mod command {
-    /// Reply `attributes`: 1 when MM writes the flash through coreboot's
-    /// flash services, 0 when it drives the flash itself.
+    /// Reply `attributes`: bit 0 when MM writes the flash through coreboot's
+    /// flash services (else it drives the flash itself), bit 1 when those
+    /// services also cover firmware in this boot (capsule update).
     pub const PING: u32 = 1;
     pub const GET_VARIABLE: u32 = 2;
     pub const GET_NEXT_VARIABLE_NAME: u32 = 3;

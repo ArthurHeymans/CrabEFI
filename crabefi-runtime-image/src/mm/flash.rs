@@ -1,8 +1,9 @@
 //! Flash access from SMM.
 //!
 //! Preferred: the flash services coreboot publishes in the payload MM shared
-//! page (variable store region only), which work on any platform coreboot's
-//! SMM can write, e.g. AMD ROM Armor 3 through the PSP. Fallback: QEMU's
+//! page (the variable store region, plus the whole flash in boots that allow
+//! firmware updates), which work on any platform coreboot's SMM can write,
+//! e.g. AMD ROM Armor 3 through the PSP. Fallback: QEMU's
 //! `cfi.pflash01` command set; with `secure=on` QEMU accepts flash writes
 //! only from SMM.
 
@@ -28,7 +29,15 @@ struct ServicesTable {
     read: u64,
     write: u64,
     erase: u64,
+    // Revision 2
+    flash_size: u64,
+    flash_read: u64,
+    flash_write: u64,
+    flash_erase: u64,
 }
+
+/// Size of the revision 1 table.
+const SERVICES_V1_SIZE: usize = 48;
 
 const SERVICES_OFFSET: u64 = 3072;
 const SERVICES_MAGIC: u64 = 0x5346_4d4d_444c_505f; // "_PLDMMFS"
@@ -37,15 +46,36 @@ type ReadFn = unsafe extern "sysv64" fn(u64, *mut u8, u64) -> u32;
 type WriteFn = unsafe extern "sysv64" fn(u64, *const u8, u64) -> u32;
 type EraseFn = unsafe extern "sysv64" fn(u64, u64) -> u32;
 
-/// coreboot's flash services for the variable store region.
 #[derive(Clone, Copy)]
-struct Services {
-    /// Flash offset of the region the services address.
-    region: u64,
-    region_size: u64,
+struct Fns {
     read: ReadFn,
     write: WriteFn,
     erase: EraseFn,
+}
+
+impl Fns {
+    /// SAFETY: the values must be coreboot SMM functions with these ABIs.
+    unsafe fn from(read: u64, write: u64, erase: u64) -> Option<Self> {
+        (read != 0 && write != 0 && erase != 0).then(|| unsafe {
+            Self {
+                read: core::mem::transmute::<u64, ReadFn>(read),
+                write: core::mem::transmute::<u64, WriteFn>(write),
+                erase: core::mem::transmute::<u64, EraseFn>(erase),
+            }
+        })
+    }
+}
+
+/// coreboot's flash services: the variable store region, and the whole flash
+/// when this boot may update firmware.
+#[derive(Clone, Copy)]
+struct Services {
+    /// Flash offset of the region the store functions address.
+    region: u64,
+    region_size: u64,
+    store: Fns,
+    flash_size: u64,
+    flash: Option<Fns>,
 }
 
 #[derive(Clone, Copy)]
@@ -77,26 +107,33 @@ impl Flash {
     /// region at flash offset `region` (the variable store).
     pub fn with_coreboot_services(mut self, shared_page: u64, region: u64) -> Self {
         // SAFETY: the shared page is MM-mapped SMRAM coreboot filled before calling us.
-        let table = unsafe {
+        let mut table = unsafe {
             core::ptr::read_unaligned((shared_page + SERVICES_OFFSET) as *const ServicesTable)
         };
-        if table.header_magic == SERVICES_MAGIC
-            && table.size as usize >= core::mem::size_of::<ServicesTable>()
-            && table.read != 0
-            && table.write != 0
-            && table.erase != 0
-        {
-            // SAFETY: coreboot published these as functions of its SMM handler.
-            self.services = Some(unsafe {
-                Services {
-                    region,
-                    region_size: table.region_size,
-                    read: core::mem::transmute::<u64, ReadFn>(table.read),
-                    write: core::mem::transmute::<u64, WriteFn>(table.write),
-                    erase: core::mem::transmute::<u64, EraseFn>(table.erase),
-                }
-            });
+        if table.header_magic != SERVICES_MAGIC || (table.size as usize) < SERVICES_V1_SIZE {
+            return self;
         }
+        if (table.revision as u32) < 2
+            || (table.size as usize) < core::mem::size_of::<ServicesTable>()
+        {
+            table.flash_size = 0;
+        }
+        // SAFETY: coreboot published these as functions of its SMM handler.
+        let Some(store) = (unsafe { Fns::from(table.read, table.write, table.erase) }) else {
+            return self;
+        };
+        // SAFETY: as above.
+        let flash = match table.flash_size {
+            0 => None,
+            _ => unsafe { Fns::from(table.flash_read, table.flash_write, table.flash_erase) },
+        };
+        self.services = Some(Services {
+            region,
+            region_size: table.region_size,
+            store,
+            flash_size: table.flash_size,
+            flash,
+        });
         self
     }
 
@@ -104,11 +141,24 @@ impl Flash {
         self.services.is_some()
     }
 
-    /// Region-relative offset of `offset..offset+len` when coreboot serves it.
-    fn service_range(&self, offset: u64, len: u64) -> Option<(Services, u64)> {
+    /// Whether coreboot lets MM write firmware outside the store in this boot.
+    pub fn firmware_writable(&self) -> bool {
+        self.services
+            .is_some_and(|services| services.flash.is_some())
+    }
+
+    /// The service functions and offset for `offset..offset+len`: the store
+    /// functions (region-relative) inside the store, else the whole-flash ones.
+    fn service_range(&self, offset: u64, len: u64) -> Option<(Fns, u64)> {
         let services = self.services?;
-        let relative = offset.checked_sub(services.region)?;
-        (relative.checked_add(len)? <= services.region_size).then_some((services, relative))
+        let end = offset.checked_add(len)?;
+        if let Some(relative) = offset.checked_sub(services.region)
+            && relative.checked_add(len)? <= services.region_size
+        {
+            return Some((services.store, relative));
+        }
+        let flash = services.flash?;
+        (end <= services.flash_size).then_some((flash, offset))
     }
 
     fn in_range(&self, offset: u64, len: u64) -> bool {
@@ -145,7 +195,7 @@ impl Flash {
         }
         if self.services.is_some() {
             let Some((services, relative)) = self.service_range(offset, len) else {
-                return false; // Firmware regions are not offered through the services yet.
+                return false;
             };
             // SAFETY: coreboot SMM function.
             return unsafe { (services.erase)(relative, len) } == 0;
