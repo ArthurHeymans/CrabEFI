@@ -1152,6 +1152,22 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
                 failed += 1;
             }
 
+            if result.output.contains("[PASS] tcg2_log_replay") {
+                println!("[PASS] tcg2_log_replay: event log replays TPM PCRs 0-7");
+                passed += 1;
+            } else {
+                println!("[FAIL] tcg2_log_replay: event log does not match TPM PCRs 0-7");
+                failed += 1;
+            }
+
+            if result.output.contains("[PASS] tcg2_boot_measurements") {
+                println!("[PASS] tcg2_boot_measurements: firmware boot events measured");
+                passed += 1;
+            } else {
+                println!("[FAIL] tcg2_boot_measurements: firmware boot events missing");
+                failed += 1;
+            }
+
             if result.output.contains("[PASS] tcg1_locate") {
                 println!("[PASS] tcg1_locate: TCG (TPM 1.2) protocol found");
                 passed += 1;
