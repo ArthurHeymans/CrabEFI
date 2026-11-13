@@ -504,6 +504,39 @@ pub fn create_directory_test_disk(output: &str, efi_app: &str, arch: Arch) -> Re
     Ok(())
 }
 
+/// Create the boot policy test's internal (NVMe) and external (USB) disks.
+///
+/// Both start `efi_app` from the removable-media default path. The internal
+/// disk adds an unloadable `\EFI\POLICY\BROKEN.EFI`, the external disk the
+/// app again as `\EFI\POLICY\USB.EFI`.
+pub fn create_boot_policy_disks(
+    internal: &Path,
+    external: &Path,
+    efi_app: &str,
+    arch: Arch,
+) -> Result<()> {
+    let broken = tempfile::NamedTempFile::new()?;
+    std::fs::write(broken.path(), b"not a PE image")?;
+    for (disk, extra, name) in [
+        (internal, broken.path(), "BROKEN.EFI"),
+        (external, Path::new(efi_app), "USB.EFI"),
+    ] {
+        create_test_disk(&disk.to_string_lossy(), Some(efi_app), arch)?;
+        let image = mtools_esp_image(disk);
+        create_mtools_dir(&image, "::/EFI/POLICY")?;
+        let status = Command::new("mcopy")
+            .args(["-i", &image])
+            .arg(extra)
+            .arg(format!("::/EFI/POLICY/{name}"))
+            .status()
+            .context("Failed to run mcopy")?;
+        if !status.success() {
+            bail!("Failed to install {name}");
+        }
+    }
+    Ok(())
+}
+
 /// Create a disk image for the GRUB + Linux boot-chain test.
 ///
 /// Disk layout:

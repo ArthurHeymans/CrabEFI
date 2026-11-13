@@ -394,6 +394,36 @@ fn cmd_build_with_entry(
     machine: Machine,
     entry64: bool,
 ) -> Result<()> {
+    cmd_build_payload(release, ui, arch, machine, entry64, &[])
+}
+
+/// Payload Cargo features a test app needs beyond the default build.
+fn test_payload_features(app: &str) -> &'static [&'static str] {
+    match app {
+        "boot-policy-test" => &["usb-on-demand"],
+        _ => &[],
+    }
+}
+
+/// Target directory of a payload build; variants never overwrite the default.
+fn payload_target_dir(entry64: bool, features: &[&str]) -> String {
+    if entry64 {
+        "target/entry64".to_string()
+    } else if features.is_empty() {
+        "target".to_string()
+    } else {
+        format!("target/{}", features.join("+"))
+    }
+}
+
+fn cmd_build_payload(
+    release: bool,
+    ui: bool,
+    arch: Arch,
+    machine: Machine,
+    entry64: bool,
+    extra_features: &[&str],
+) -> Result<()> {
     if entry64 && arch != Arch::X86_64 {
         bail!("--entry64 is only supported on x86-64");
     }
@@ -427,14 +457,18 @@ fn cmd_build_with_entry(
         cmd.arg("--release");
     }
     let mut features = vec!["external-runtime-image"];
+    features.extend_from_slice(extra_features);
     if ui {
         features.push("ui");
     }
     if entry64 {
         features.push("entry64");
-        // Do not overwrite the default coreboot payload with an incompatible
-        // entry: regular run/test commands must still find the 32-bit build.
-        cmd.arg("--target-dir").arg("target/entry64");
+    }
+    // Do not overwrite the default coreboot payload with an incompatible
+    // entry or feature set: regular run/test commands must still find it.
+    let target_dir = payload_target_dir(entry64, extra_features);
+    if target_dir != "target" {
+        cmd.arg("--target-dir").arg(&target_dir);
     }
     cmd.arg("--features").arg(features.join(","));
 
@@ -484,7 +518,6 @@ fn cmd_build_with_entry(
     }
 
     let mode = if release { "release" } else { "debug" };
-    let target_dir = if entry64 { "target/entry64" } else { "target" };
     println!("Built: {target_dir}/{target_triple}/{mode}/crabefi");
     Ok(())
 }
@@ -711,10 +744,11 @@ fn cmd_test(
         }
     } else {
         // Build CrabEFI first
-        cmd_build(true, ui, arch, machine)?;
+        let features = test_payload_features(app);
+        cmd_build_payload(true, ui, arch, machine, false, features)?;
 
         // Prepare ROM with CrabEFI payload
-        let crabefi_elf = rom::get_crabefi_elf(arch);
+        let crabefi_elf = rom::get_crabefi_elf_in(&payload_target_dir(false, features), arch);
         rom::prepare_rom(&crabefi_elf, temp_dir.path(), arch, machine)?
     };
 
@@ -872,6 +906,13 @@ fn cmd_test(
         if app == "directory-test" {
             disk::create_directory_test_disk(
                 disk_path.to_string_lossy().as_ref(),
+                &efi_path,
+                arch,
+            )?;
+        } else if app == "boot-policy-test" {
+            disk::create_boot_policy_disks(
+                &disk_path,
+                &qemu::boot_policy::usb_disk_path(&disk_path),
                 &efi_path,
                 arch,
             )?;
