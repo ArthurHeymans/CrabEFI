@@ -11,6 +11,7 @@ use std::process::{Child, Command, Stdio};
 
 use crate::{Arch, Machine};
 
+mod boot_events;
 pub(crate) mod boot_policy;
 mod filesystem;
 mod fwui;
@@ -25,6 +26,8 @@ enum CaptureScenario {
     /// capsule-test with capsule-on-disk-only: the firmware applies the
     /// capsule and resets once.
     CapsuleOnDiskReplay,
+    /// boot-events-test: 33 boots with resets in one QEMU process.
+    BootEventLog,
 }
 
 impl CaptureScenario {
@@ -45,7 +48,10 @@ impl CaptureScenario {
     }
 
     fn allows_reboot(self) -> bool {
-        matches!(self, Self::RuntimeImageReplay | Self::CapsuleOnDiskReplay)
+        matches!(
+            self,
+            Self::RuntimeImageReplay | Self::CapsuleOnDiskReplay | Self::BootEventLog
+        )
     }
 }
 
@@ -887,6 +893,9 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
     }
     if app_name == "boot-policy-test" {
         return boot_policy::run(config, disk_path);
+    }
+    if app_name == "boot-events-test" {
+        return boot_events::run(config, disk_path);
     }
     if app_name == "secure-boot-auth-test" {
         return secure_boot_auth::run(config, disk_path);
