@@ -28,6 +28,14 @@ const SETTINGS: Guid = Guid::from_fields(
     0x45,
     &[0x4a, 0x29, 0x7f, 0x9c, 0x7d, 0x1a],
 );
+const SHIM_LOCK: Guid = Guid::from_fields(
+    0x605dab50,
+    0xe046,
+    0x4300,
+    0xab,
+    0xb6,
+    &[0x3d, 0xd8, 0x10, 0xdd, 0x8b, 0x23],
+);
 const TEST: Guid = Guid::from_fields(0x0b9d1c3e, 0x5a2f, 0x4e61, 0x9c, 0x4d, &[1, 2, 3, 4, 5, 6]);
 /// Installed only for USB mass storage.
 const EXT_SCSI_PASS_THRU: Guid = Guid::from_fields(
@@ -274,11 +282,14 @@ pub extern "efiapi" fn efi_main(image: Handle, system: *mut SystemTable) -> Stat
         3 => {
             check(media == Media::Nvme, "Deny policy booted external media");
             set(rt, &SETTINGS, "CrabEFIExternalBoot", NV_BS, &[1]);
+            // A pending MokManager request needs USB before automatic boot.
+            set(rt, &SHIM_LOCK, "MokSB", NV_BS_RT, &[0]);
             set(rt, &TEST, "BootPolicyTestPhase", NV_BS_RT, &[4]);
             serial("BPOL DENY PASSED\r\n");
             reset(rt);
         }
-        // MenuOnly: Boot0003 is refused and the menu times out into NVMe.
+        // MenuOnly: USB is up for MokManager, Boot0003 on USB is refused and
+        // the menu times out into NVMe.
         4 => {
             check(
                 media == Media::Nvme,
