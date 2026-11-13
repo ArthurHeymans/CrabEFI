@@ -161,8 +161,19 @@ impl Flash {
         (end <= services.flash_size).then_some((flash, offset))
     }
 
+    /// End of the flash MM can address: the mapped window, or the whole
+    /// flash when coreboot's services cover it (it may exceed the window).
+    pub fn limit(&self) -> u64 {
+        match self.services {
+            Some(services) if services.flash.is_some() => self.size.max(services.flash_size),
+            _ => self.size,
+        }
+    }
+
     fn in_range(&self, offset: u64, len: u64) -> bool {
-        offset.checked_add(len).is_some_and(|end| end <= self.size)
+        offset
+            .checked_add(len)
+            .is_some_and(|end| end <= self.limit())
     }
 
     fn ptr(&self, offset: u64) -> *mut u8 {

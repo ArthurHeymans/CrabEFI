@@ -1014,7 +1014,11 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     // Fail closed: without the MM variable authority (or with a corrupt store)
     // Secure Boot keys are missing or unprotected, so nothing may be booted.
     #[cfg(feature = "payload-mm")]
-    if let Err(error) = payload_mm::load(&cb_info.payload_mm, cb_info.boot_media) {
+    if let Err(error) = payload_mm::load(
+        &cb_info.payload_mm,
+        cb_info.boot_media,
+        cb_info.spi_flash.as_ref(),
+    ) {
         log::error!("payload MM unavailable ({error}): refusing to boot");
         loop {
             crabefi::arch::halt();
