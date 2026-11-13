@@ -285,6 +285,8 @@ fn init_persistence_and_boot(
             let applied = efi::capsule::process_pending_capsules(backend);
             if applied != 0 {
                 log::info!("Applied {} pending firmware capsule(s)", applied);
+                // Run the new firmware; the OS must not boot on the old one.
+                reset_system();
             }
         }
     } else if capsule_backend_available {
