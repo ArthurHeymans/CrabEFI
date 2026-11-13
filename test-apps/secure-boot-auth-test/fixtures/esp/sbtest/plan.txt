@@ -7,6 +7,8 @@ var s1-dbx-absent dbx absent
 set s1-kek-raw-attrs KEK 0x7 kek.esl INVALID_PARAMETER
 set s1-kek-volatile KEK 0x26 s1-kek-volatile.auth INVALID_PARAMETER
 set s1-db-no-rt db 0x23 s1-db-no-rt.auth INVALID_PARAMETER
+set s1-kek-truncated-envelope KEK 0x27 garbage.bin SECURITY_VIOLATION
+set s1-pk-no-envelope PK 0x27 empty.bin SECURITY_VIOLATION
 set s1-enroll-kek KEK 0x27 s1-enroll-kek.auth SUCCESS
 var s1-kek-readback KEK equals 0x27 kek.esl
 set s1-enroll-db db 0x27 s1-enroll-db.auth SUCCESS
@@ -33,6 +35,14 @@ set a-signed-other-attrs db 0x67 a-signed-other-attrs.auth SECURITY_VIOLATION
 set a-tampered-payload db 0x67 a-tampered-payload.auth SECURITY_VIOLATION
 set a-timestamp-nanosecond db 0x67 a-timestamp-nanosecond.auth SECURITY_VIOLATION
 set a-timestamp-timezone db 0x67 a-timestamp-timezone.auth SECURITY_VIOLATION
+set a-truncated-envelope db 0x27 garbage.bin SECURITY_VIOLATION
+set a-pk-delete-no-envelope PK 0x27 empty.bin SECURITY_VIOLATION
+set a-cert-length-past-end db 0x67 a-cert-length-past-end.auth SECURITY_VIOLATION
+set a-cert-length-below-header db 0x67 a-cert-length-below-header.auth SECURITY_VIOLATION
+set a-cert-type-not-efi-guid db 0x67 a-cert-type-not-efi-guid.auth SECURITY_VIOLATION
+set a-cert-guid-not-pkcs7 db 0x67 a-cert-guid-not-pkcs7.auth SECURITY_VIOLATION
+set a-empty-pkcs7 db 0x67 a-empty-pkcs7.auth SECURITY_VIOLATION
+set a-pkcs7-sha384 db 0x67 a-pkcs7-sha384.auth SECURITY_VIOLATION
 set a-unauthenticated-write db 0x7 db-ca.esl ERROR
 set a-delete db 0x27 a-delete.auth SUCCESS
 var a-deleted db absent
@@ -66,6 +76,7 @@ set b-kek-signed-by-new-pk KEK 0x67 b-kek-signed-by-new-pk.auth SUCCESS
 set b-pk-delete-signed-by-kek PK 0x27 b-pk-delete-signed-by-kek.auth SECURITY_VIOLATION
 mode b-still-user-mode 0 1
 set p1-create-any-signer priv1 0x27 p1-create-any-signer.auth SUCCESS
+set p1-garbage-pkcs7 priv1 0x27 p1-garbage-pkcs7.auth SECURITY_VIOLATION
 set p2-create priv2 0x27 p2-create.auth SUCCESS
 var p2-created priv2 equals 0x27 priv-a.bin
 set p2-update-same-signer priv2 0x27 p2-update-same-signer.auth SUCCESS
