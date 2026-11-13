@@ -20,6 +20,8 @@ secure-boot = ["pkcs7", "crabefi-runtime-bundle?/secure-boot", "crabefi-ui/secur
 payload-mm-test-lose-ready-to-boot = []
 # Offer CrabEFIExternalBoot (stricter external-boot policy) in the setup menu.
 external-boot-setting = ["cfr"]
+# Production builds: turn Secure Boot on at every boot, also after a setup action turned it off.
+secure-boot-enforced = ["secure-boot"]
 # Signed firmware capsule application requires durable result persistence.
 capsule-update = ["pkcs7", "variable-store"]
 # Shared verification implementation, not a runtime policy switch.

@@ -36,6 +36,7 @@ external-boot-setting = ["crabefi/external-boot-setting"]
 payload-mm = []
 # Test only: payload MM never confirms READY_TO_BOOT, which must stop the boot.
 payload-mm-test-lose-ready-to-boot = ["crabefi/payload-mm-test-lose-ready-to-boot"]
+secure-boot-enforced = ["crabefi/secure-boot-enforced"]
 
 [dependencies]
 crabefi = { package = "crabefi-core", path = "../crabefi-core", features = [
