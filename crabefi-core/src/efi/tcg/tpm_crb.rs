@@ -274,6 +274,7 @@ impl TpmTransport for CrbMmio {
         if response.len() < HEADER_SIZE {
             return Err(TcgError::EventTooLarge);
         }
+        let start_us = crate::logger::get_us_since_boot();
         let result = self
             .execute(cmd)
             .and_then(|()| self.read_response(response));
@@ -282,6 +283,11 @@ impl TpmTransport for CrbMmio {
             // The OS reads the response buffer size from here.
             CrbStart::Acpi => self.write(CTRL_RSP_SIZE, self.response_size),
         }
+        log::debug!(
+            "TPM CRB: command {:02x?} took {} us",
+            &cmd[6..10],
+            crate::logger::get_us_since_boot().saturating_sub(start_us)
+        );
         result
     }
 }
