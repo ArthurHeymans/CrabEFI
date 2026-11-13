@@ -29,6 +29,8 @@ pub const COMM_VERSION: u32 = 2;
 pub const NAME_OFFSET: u64 = 0x100;
 pub const NAME_CAPACITY: usize = 0x200;
 pub const DATA_OFFSET: u64 = NAME_OFFSET + NAME_CAPACITY as u64;
+/// Largest data payload MM accepts in one request, whatever the buffer size.
+pub const DATA_MAX: usize = 48 * 1024;
 pub const STATUS_PENDING: u64 = u64::MAX;
 
 pub mod command {
