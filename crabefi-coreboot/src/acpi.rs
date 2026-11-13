@@ -510,6 +510,57 @@ pub unsafe fn find_tpm2_table(rsdp_addr: u64) -> Option<Tpm2Table> {
     })
 }
 
+/// Point the ACPI TPM2 table's log area at a new, empty area of `size` bytes
+/// in memory the OS keeps, and return it for the TCG2 event log.
+///
+/// Linux reads the log there before the EFI one. An area coreboot described
+/// holds only its own events, which the payload continues from CBMEM, and
+/// has no room for the payload's.
+///
+/// # Safety
+/// `rsdp_addr` and the tables it references must be identity mapped and the
+/// TPM2 table writable.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn take_tpm2_log_area(rsdp_addr: u64, size: usize) -> Option<&'static mut [u8]> {
+    use crabefi::efi::allocator::{AllocateType, MemoryType, allocate_pages};
+
+    let table = unsafe { find_table(rsdp_addr, b"TPM2") }?;
+    let length = unsafe { read_u32(table + 4) } as usize;
+    // Revision 4 tables end with LAML(4) at 64 and LASA(8) at 68.
+    if length < 76 {
+        return None;
+    }
+    let mut address = 0;
+    let pages = size.div_ceil(4096) as u64;
+    if allocate_pages(
+        AllocateType::AllocateAnyPages,
+        MemoryType::AcpiMemoryNvs,
+        pages,
+        &mut address,
+    ) != r_efi::efi::Status::SUCCESS
+    {
+        log::warn!("No memory for the ACPI TPM2 log area");
+        return None;
+    }
+    // SAFETY: freshly allocated pages, owned from here on.
+    let area = unsafe { core::slice::from_raw_parts_mut(address as *mut u8, size) };
+    area.fill(0);
+
+    // SAFETY: the caller's contract; `length` bytes are the table.
+    let table = unsafe { core::slice::from_raw_parts_mut(table as *mut u8, length) };
+    table[64..68].copy_from_slice(&(size as u32).to_le_bytes());
+    table[68..76].copy_from_slice(&address.to_le_bytes());
+    table[9] = 0;
+    let sum = table.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte));
+    table[9] = sum.wrapping_neg();
+    log::info!(
+        "ACPI TPM2 log area moved to {:#x} ({} bytes)",
+        address,
+        size
+    );
+    Some(area)
+}
+
 #[cfg(target_arch = "x86_64")]
 fn tcpa_log_used_length(log: &[u8]) -> Option<usize> {
     const HEADER_SIZE: usize = 4 + 4 + 20 + 4;
