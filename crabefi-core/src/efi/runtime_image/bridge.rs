@@ -43,6 +43,62 @@ pub(crate) fn delete_pk_from_setup() -> Status {
     }
 }
 
+/// SecureBootEnable value the physical-presence setup action is writing.
+#[cfg(feature = "variable-store")]
+static SETUP_SECURE_BOOT_ENABLE: crate::cell::LocalCell<Option<u8>> =
+    crate::cell::LocalCell::new(None);
+
+#[cfg(feature = "variable-store")]
+const SECURE_BOOT_ENABLE_ATTRIBUTES: u32 = r_efi::efi::VARIABLE_NON_VOLATILE
+    | r_efi::efi::VARIABLE_BOOTSERVICE_ACCESS
+    | r_efi::efi::VARIABLE_RUNTIME_ACCESS;
+
+/// Write the SecureBootEnable preference chosen by the physical-presence
+/// setup action. Outside Setup Mode the runtime image accepts it only while
+/// this synchronous scope names the same value; it is never retained.
+#[cfg(feature = "secure-boot")]
+#[cfg_attr(not(feature = "variable-store"), allow(unused_variables))]
+pub(crate) fn set_secure_boot_enable_from_setup(enabled: bool) -> Status {
+    #[cfg(not(feature = "variable-store"))]
+    return Status::UNSUPPORTED;
+
+    #[cfg(feature = "variable-store")]
+    {
+        if SETUP_SECURE_BOOT_ENABLE.get().is_some() {
+            return Status::ACCESS_DENIED;
+        }
+        struct ResetAuthorization;
+        impl Drop for ResetAuthorization {
+            fn drop(&mut self) {
+                SETUP_SECURE_BOOT_ENABLE.set(None);
+            }
+        }
+        let value = u8::from(enabled);
+        SETUP_SECURE_BOOT_ENABLE.set(Some(value));
+        let _scope = ResetAuthorization;
+        super::client::variables::set(
+            &Guid::from_bytes(&crabefi_efi_types::secure_boot::EFI_GLOBAL_VARIABLE_GUID),
+            crabefi_efi_types::secure_boot::SECURE_BOOT_ENABLE_NAME,
+            SECURE_BOOT_ENABLE_ATTRIBUTES,
+            &[value],
+        )
+    }
+}
+
+#[cfg(feature = "variable-store")]
+fn setup_secure_boot_enable_authorized(
+    request: &BridgeRequest,
+    name: &[u16],
+    data: &[u8],
+    active: Option<u8>,
+) -> bool {
+    active.is_some_and(|value| data == [value])
+        && crabefi_efi_types::secure_boot::is_secure_boot_enable(&request.guid, name)
+        && request.attributes == SECURE_BOOT_ENABLE_ATTRIBUTES
+        && request.timestamp_valid == 0
+        && request.reserved == 0
+}
+
 #[cfg(feature = "variable-store")]
 fn setup_pk_delete_authorized(request: &BridgeRequest, name: &[u16], active: bool) -> bool {
     use crabefi_efi_types::secure_boot::{EFI_GLOBAL_VARIABLE_GUID, PK_NAME, name_matches};
@@ -124,6 +180,14 @@ unsafe fn persist(request: &BridgeRequest) -> Result<(), Status> {
                 Err(Status::ACCESS_DENIED)
             };
         }
+        bridge_operation::AUTHORIZE_SETUP_SECURE_BOOT_ENABLE => {
+            let active = SETUP_SECURE_BOOT_ENABLE.get();
+            return if setup_secure_boot_enable_authorized(request, name, data, active) {
+                Ok(())
+            } else {
+                Err(Status::ACCESS_DENIED)
+            };
+        }
         bridge_operation::PERSIST_WRITE => {
             crate::efi::varstore::persistence::write_variable_to_storage_internal(
                 &guid,
@@ -197,6 +261,64 @@ mod tests {
             },
         ] {
             assert!(!setup_pk_delete_authorized(&invalid, PK_NAME, true));
+        }
+        // An ordinary bridge caller cannot grant itself setup authorization.
+        assert_eq!(
+            unsafe { dispatch(&request) },
+            Status::ACCESS_DENIED.as_usize()
+        );
+    }
+
+    #[test]
+    fn setup_authorization_only_accepts_the_active_secure_boot_enable_value() {
+        use crabefi_efi_types::secure_boot::{
+            EFI_GLOBAL_VARIABLE_GUID, SECURE_BOOT_ENABLE_NAME, SECURE_BOOT_NAME,
+        };
+        let value = [0u8];
+        let request = BridgeRequest {
+            operation: bridge_operation::AUTHORIZE_SETUP_SECURE_BOOT_ENABLE,
+            attributes: SECURE_BOOT_ENABLE_ATTRIBUTES,
+            guid: EFI_GLOBAL_VARIABLE_GUID,
+            name_address: SECURE_BOOT_ENABLE_NAME.as_ptr() as u64,
+            name_len: SECURE_BOOT_ENABLE_NAME.len() as u32,
+            data_address: value.as_ptr() as u64,
+            data_len: 1,
+            ..BridgeRequest::default()
+        };
+        let name = SECURE_BOOT_ENABLE_NAME;
+        let authorized = |name, data: &[u8], active| {
+            setup_secure_boot_enable_authorized(&request, name, data, active)
+        };
+        assert!(!authorized(name, &value, None));
+        assert!(authorized(name, &value, Some(0)));
+        assert!(!authorized(name, &value, Some(1)));
+        assert!(!authorized(name, &[0, 0], Some(0)));
+        assert!(!authorized(name, &[], Some(0)));
+        assert!(!authorized(SECURE_BOOT_NAME, &value, Some(0)));
+        for invalid in [
+            BridgeRequest {
+                guid: [0x42; 16],
+                ..request
+            },
+            BridgeRequest {
+                attributes: SECURE_BOOT_ENABLE_ATTRIBUTES | 0x20,
+                ..request
+            },
+            BridgeRequest {
+                timestamp_valid: 1,
+                ..request
+            },
+            BridgeRequest {
+                reserved: 1,
+                ..request
+            },
+        ] {
+            assert!(!setup_secure_boot_enable_authorized(
+                &invalid,
+                name,
+                &value,
+                Some(0)
+            ));
         }
         // An ordinary bridge caller cannot grant itself setup authorization.
         assert_eq!(

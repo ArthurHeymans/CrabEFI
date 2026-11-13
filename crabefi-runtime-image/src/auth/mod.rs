@@ -1,5 +1,6 @@
 //! Image-local UEFI time-based authenticated-variable enforcement.
 
+pub mod cert_db;
 mod crypto;
 mod limits;
 mod signature;
@@ -64,15 +65,18 @@ pub enum AuthError {
 impl From<AuthError> for efi::Status {
     fn from(error: AuthError) -> Self {
         match error {
+            AuthError::InvalidVariableName | AuthError::InvalidSignatureList => {
+                efi::Status::INVALID_PARAMETER
+            }
+            // EDK2: any envelope that does not authenticate, also a truncated
+            // one, a foreign certificate type or a non-SHA-256 PKCS#7.
             AuthError::InvalidHeader
             | AuthError::CertificateParseError
-            | AuthError::InvalidVariableName
-            | AuthError::InvalidSignatureList => efi::Status::INVALID_PARAMETER,
-            AuthError::InvalidTimestamp
+            | AuthError::CryptoError
+            | AuthError::InvalidTimestamp
             | AuthError::SignatureVerificationFailed
             | AuthError::NoSuitableKey
             | AuthError::ChainTooDeep => efi::Status::SECURITY_VIOLATION,
-            AuthError::CryptoError => efi::Status::DEVICE_ERROR,
             AuthError::OutOfResources => efi::Status::OUT_OF_RESOURCES,
         }
     }

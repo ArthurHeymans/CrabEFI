@@ -78,13 +78,18 @@ read-only status variables. PK, KEK, db, and dbx time-based authenticated
 updates, appends, and deletions are verified inside the runtime image using its
 authoritative key databases, replay timestamps, and fixed stack RSA buffers.
 Boot enrollment uses the same standard `SetVariable` entry point.
+SecureBootEnable changes only in Setup Mode or while CrabEFI's
+physical-presence setup action authorizes that exact value through the boot
+bridge, and never after ExitBootServices.
 
 Appends to PK, KEK, db, and dbx follow UEFI: signatures the database already
 holds are skipped, and the envelope's timestamp may be older than the
 variable's. Microsoft stamps every dbx update 2010, so successive updates only
 apply this way. An older append never lowers the recorded timestamp, which
 replacements and deletions must still exceed. Appends to other authenticated
-variables keep requiring a newer timestamp.
+variables may carry an older timestamp too. Those are private authenticated
+variables: any signer creates one, and later writes need the same signer CN
+and top-level issuer, recorded in EDK2's certdb/certdbv layout.
 
 Both sides verify certificates with the shared allocation-free
 `crabefi-pkcs7` crate (DER/X.509/CMS views and stack-backed schoolbook

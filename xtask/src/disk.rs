@@ -504,6 +504,38 @@ pub fn create_directory_test_disk(output: &str, efi_app: &str, arch: Arch) -> Re
     Ok(())
 }
 
+/// Install the Secure Boot test app, signed with the test-only db signing key
+/// so it still boots once Secure Boot enforces, and copy `fixtures/esp`.
+pub fn create_secure_boot_auth_disk(
+    output: &str,
+    efi_app: &str,
+    fixtures: &Path,
+    arch: Arch,
+) -> Result<()> {
+    let signed = tempfile::NamedTempFile::new()?;
+    let status = Command::new("sbsign")
+        .arg("--key")
+        .arg(fixtures.join("keys/test-only-db-signer.key.pem"))
+        .arg("--cert")
+        .arg(fixtures.join("certs/db-signer.pem"))
+        .arg("--output")
+        .arg(signed.path())
+        .arg(efi_app)
+        .status()
+        .context("failed to run sbsign (sbsigntool)")?;
+    if !status.success() {
+        bail!("sbsign failed for {efi_app}");
+    }
+    create_test_disk(output, Some(&signed.path().to_string_lossy()), arch)?;
+    let image = mtools_esp_image(Path::new(output));
+    copy_tree_to_esp(&image, &fixtures.join("esp"), "::")?;
+    // Opt-in Ubuntu shim from fetch_ubuntu_shim.py; not redistributed here.
+    if let Some(shim) = std::env::var_os("CRABEFI_SB_SHIM_DIR") {
+        copy_tree_to_esp(&image, Path::new(&shim), "::/sbtest/ubuntu")?;
+    }
+    Ok(())
+}
+
 /// Create a disk image for the GRUB + Linux boot-chain test.
 ///
 /// Disk layout:

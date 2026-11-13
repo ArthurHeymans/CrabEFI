@@ -420,6 +420,11 @@ fn execute_bootloader(
     let _ = free_pool(image.buffer);
     let _ = free_pool(full_path.cast());
     if status != Status::SUCCESS {
+        // SECURITY_VIOLATION still returns a loaded, never-startable image.
+        if !image_handle.is_null() {
+            // SAFETY: LoadImage wrote this handle for the rejected image.
+            let _ = unsafe { (bs.unload_image)(image_handle) };
+        }
         return Err(status);
     }
 

@@ -54,6 +54,15 @@ impl EfiTime {
             && self.pad2 == 0
     }
 
+    /// Return whether Pad1, Nanosecond, TimeZone, Daylight and Pad2 are zero,
+    /// as UEFI 2.10 8.2 (SetVariable) requires of an
+    /// EFI_VARIABLE_AUTHENTICATION_2 TimeStamp.
+    pub fn has_zero_authentication_fields(&self) -> bool {
+        let nanosecond = self.nanosecond;
+        let timezone = self.timezone;
+        self.pad1 == 0 && nanosecond == 0 && timezone == 0 && self.daylight == 0 && self.pad2 == 0
+    }
+
     /// Return whether this timestamp has greater nanosecond-precision UTC units.
     pub fn is_after(&self, other: &Self) -> bool {
         self.to_utc_units() > other.to_utc_units()
@@ -322,6 +331,34 @@ mod tests {
         assert!(!time(1900, 2, 29).is_valid());
         assert!(time(2000, 2, 29).is_valid());
         assert!(!time(2025, 4, 31).is_valid());
+    }
+
+    #[test]
+    fn authentication_timestamps_have_only_date_and_time() {
+        let base = time(2026, 1, 1);
+        assert!(base.has_zero_authentication_fields());
+        for timestamp in [
+            EfiTime { pad1: 1, ..base },
+            EfiTime {
+                nanosecond: 1,
+                ..base
+            },
+            EfiTime {
+                timezone: 60,
+                ..base
+            },
+            EfiTime {
+                timezone: 0x7ff,
+                ..base
+            },
+            EfiTime {
+                daylight: 1,
+                ..base
+            },
+            EfiTime { pad2: 1, ..base },
+        ] {
+            assert!(!timestamp.has_zero_authentication_fields());
+        }
     }
 
     #[test]

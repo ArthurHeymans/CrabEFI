@@ -26,6 +26,10 @@ use crate::{
 #[cfg(feature = "secure-boot")]
 use crate::auth;
 
+const KEY_DATABASE_ATTRIBUTES: VariableAttributes = VariableAttributes::NON_VOLATILE
+    .union(VariableAttributes::BOOTSERVICE_ACCESS)
+    .union(VariableAttributes::RUNTIME_ACCESS)
+    .union(VariableAttributes::TIME_BASED_AUTHENTICATED_WRITE_ACCESS);
 const MAX_CAPSULE_SIZE: u64 = 16 * 1024 * 1024;
 const CAPSULE_FLAGS_PERSIST_ACROSS_RESET: u32 = 0x0001_0000;
 const CAPSULE_UPDATE_GUID: efi::Guid = efi::Guid::from_fields(
@@ -468,6 +472,11 @@ impl VariableRequest<'_> {
         self.attributes.contains(VariableAttributes::APPEND_WRITE)
     }
 
+    /// A deletion without an authentication envelope.
+    fn raw_delete(&self) -> bool {
+        self.attributes.is_empty() || (self.data.is_empty() && !self.append())
+    }
+
     /// The request creates, updates or deletes a non-volatile variable.
     fn nonvolatile(&self, store: &VariableStore) -> bool {
         self.attributes.contains(VariableAttributes::NON_VOLATILE)
@@ -515,6 +524,9 @@ struct Verified<'a> {
     payload: &'a [u8],
     timestamp: Option<VariableTimestamp>,
     secure_variable: Option<SecureBootVariable>,
+    /// Signer binding of a private authenticated variable.
+    #[cfg(feature = "secure-boot")]
+    private_signer: Option<[u8; auth::cert_db::DIGEST_SIZE]>,
 }
 
 /// Validate, authenticate, persist and commit one variable write.
@@ -548,21 +560,57 @@ fn apply_variable(
                 payload: &[],
                 timestamp: store.auth_history_timestamp(&request.guid, request.name),
                 secure_variable: Some(SecureBootVariable::PK),
+                #[cfg(feature = "secure-boot")]
+                private_signer: None,
             },
         )
     } else {
         (
-            check_write_policy(store, &request)?,
+            check_write_policy(store, &request, phase, bridge)?,
             verify(store, &request)?,
         )
     };
     if verified.payload.len() > MAX_VARIABLE_DATA_SIZE {
         return Err(efi::Status::OUT_OF_RESOURCES);
     }
+    let delete = verified.payload.is_empty() && !request.append();
     if !phase.boot_services() {
-        let delete = verified.payload.is_empty() && !request.append();
         check_runtime_access(store, &request, delete)?;
     }
+    // Before ExitBootServices (and always in MM) bindings persist at once;
+    // after it, replaying the journalled envelope rebuilds them.
+    #[cfg(feature = "secure-boot")]
+    let persist = phase.boot_services().then_some(bridge);
+    // A private authenticated variable is bound to the signer of its first
+    // write. Record the binding before the variable exists, so none ever
+    // lacks one; a binding left by a failed write is replaced on creation.
+    #[cfg(feature = "secure-boot")]
+    let unbind = match verified.private_signer {
+        Some(signer) => match store
+            .find(&request.guid, request.name, false)
+            .map(|slot| slot.attributes.contains(VariableAttributes::NON_VOLATILE))
+        {
+            // EDK2: an empty append to an absent variable creates nothing.
+            None if verified.payload.is_empty() && request.append() => return Ok(()),
+            None if !delete => {
+                let nonvolatile = request
+                    .attributes
+                    .contains(VariableAttributes::NON_VOLATILE);
+                bind_signer(
+                    store,
+                    transaction,
+                    persist,
+                    nonvolatile,
+                    &request,
+                    Some(&signer),
+                )?;
+                None
+            }
+            Some(nonvolatile) if delete => Some(nonvolatile),
+            _ => None,
+        },
+        None => None,
+    };
 
     let mut prepared = store.prepare(
         request.guid,
@@ -619,7 +667,48 @@ fn apply_variable(
         store.commit_auth_timestamp(variable, timestamp);
     }
     store.refresh_policy();
+    #[cfg(feature = "secure-boot")]
+    if let Some(nonvolatile) = unbind {
+        // The variable is gone either way. A binding that stays behind is
+        // harmless: creating the variable again replaces it.
+        let _ = bind_signer(store, transaction, persist, nonvolatile, &request, None);
+    }
     Ok(())
+}
+
+/// Bind the private authenticated variable of `owner` to `signer`, or drop
+/// its binding, in the signer database (EDK2 certdb layout). It is written
+/// like any variable, but never journalled: after ExitBootServices
+/// replaying the variable's envelope rebuilds it.
+#[cfg(feature = "secure-boot")]
+fn bind_signer(
+    store: &mut VariableStore,
+    transaction: &mut VariableTransaction,
+    persist: Option<u64>,
+    nonvolatile: bool,
+    owner: &VariableRequest<'_>,
+    signer: Option<&[u8; auth::cert_db::DIGEST_SIZE]>,
+) -> Result<(), efi::Status> {
+    let name = auth::cert_db::name(nonvolatile);
+    let attributes = auth::cert_db::attributes(nonvolatile);
+    let current = store
+        .find(&auth::cert_db::GUID, name, false)
+        .and_then(|slot| store.data(slot))
+        .unwrap_or_default();
+    let length = auth::cert_db::stage(transaction, current, &owner.guid, owner.name, signer)?;
+    let mut prepared = store.prepare(auth::cert_db::GUID, name, attributes, length)?;
+    store.accept_staged(&mut prepared, length)?;
+    if let (true, Some(bridge)) = (nonvolatile, persist) {
+        let request = VariableRequest {
+            guid: auth::cert_db::GUID,
+            name,
+            attributes,
+            data: &[],
+        };
+        let staged = transaction.data(length).ok_or(efi::Status::DEVICE_ERROR)?;
+        persist_through_bridge(bridge, &request, &prepared, staged, None)?;
+    }
+    store.commit(transaction, prepared, name)
 }
 
 /// Timestamp to record for an authenticated write: the envelope's own, unless
@@ -687,24 +776,82 @@ fn setup_pk_delete_authorized(
         .is_ok()
 }
 
+/// Ask boot setup whether its physical-presence action is writing exactly
+/// this SecureBootEnable value. Never consulted after ExitBootServices.
+fn setup_secure_boot_enable_authorized(
+    request: &VariableRequest<'_>,
+    phase: Phase,
+    bridge: u64,
+) -> bool {
+    phase == Phase::BootActive
+        && !phase.runtime()
+        && !request.authenticated()
+        && call_boot_bridge(
+            bridge,
+            &BridgeRequest {
+                operation: bridge_operation::AUTHORIZE_SETUP_SECURE_BOOT_ENABLE,
+                attributes: request.attributes.bits(),
+                guid: request.guid,
+                name_address: request.name.as_ptr() as u64,
+                name_len: request.name.len() as u32,
+                data_len: request.data.len() as u32,
+                data_address: request.data.as_ptr() as u64,
+                ..BridgeRequest::default()
+            },
+        )
+        .is_ok()
+}
+
+/// SecureBootEnable switches enforcement off, so outside Setup Mode only
+/// CrabEFI's physical-presence setup action may change it, and nothing may
+/// after ExitBootServices.
+fn check_secure_boot_enable(
+    store: &VariableStore,
+    request: &VariableRequest<'_>,
+    phase: Phase,
+    bridge: u64,
+) -> Result<(), efi::Status> {
+    if phase.runtime() || !phase.boot_services() {
+        Err(efi::Status::WRITE_PROTECTED)
+    } else if store.setup_mode() || setup_secure_boot_enable_authorized(request, phase, bridge) {
+        Ok(())
+    } else {
+        Err(efi::Status::SECURITY_VIOLATION)
+    }
+}
+
+/// Signer bindings are firmware-owned, as EDK2 makes certdb read-only.
+fn is_signer_database(guid: &[u8; 16], name: &[u16]) -> bool {
+    #[cfg(feature = "secure-boot")]
+    return auth::cert_db::is_cert_db(guid, name);
+    #[cfg(not(feature = "secure-boot"))]
+    {
+        let _ = (guid, name);
+        false
+    }
+}
+
 /// Reject writes to protected variables and raw writes to authenticated ones.
 fn check_write_policy(
     store: &VariableStore,
     request: &VariableRequest<'_>,
+    phase: Phase,
+    bridge: u64,
 ) -> Result<Option<SecureBootVariable>, efi::Status> {
     let (guid, name) = (&request.guid, request.name);
     if secure_boot::is_status_variable(guid, name)
         || capsule::is_esrt_last_attempt_variable(guid, name)
+        || is_signer_database(guid, name)
     {
         return Err(efi::Status::WRITE_PROTECTED);
     }
     let secure_variable = secure_boot::identify_key_database(guid, name);
     #[cfg(not(feature = "secure-boot"))]
-    if secure_variable.is_some()
-        || (*guid == secure_boot::EFI_GLOBAL_VARIABLE_GUID
-            && secure_boot::name_matches(name, secure_boot::SECURE_BOOT_ENABLE_NAME))
-    {
+    if secure_variable.is_some() || secure_boot::is_secure_boot_enable(guid, name) {
         return Err(efi::Status::UNSUPPORTED);
+    }
+    if secure_boot::is_secure_boot_enable(guid, name) {
+        check_secure_boot_enable(store, request, phase, bridge)?;
     }
     if secure_variable.is_some() && !request.authenticated() && !store.setup_mode() {
         return Err(efi::Status::SECURITY_VIOLATION);
@@ -716,6 +863,20 @@ fn check_write_policy(
     // deleted variable cannot be silently re-created with raw content.
     if !request.authenticated() && store.auth_history_timestamp(guid, name).is_some() {
         return Err(efi::Status::WRITE_PROTECTED);
+    }
+    // UEFI 2.10 3.3 (Table 3-1) and 8.2: PK, KEK, db and dbx are
+    // NV|BS|RT|TIME_BASED_AUTHENTICATED_WRITE_ACCESS; APPEND_WRITE may be
+    // added. Raw deletions are left to the checks above, as in EDK2's
+    // VarCheck. EDK2 checks attributes first; checking them last keeps
+    // CrabEFI's statuses for raw writes in User Mode and over history.
+    if secure_variable.is_some()
+        && !request.raw_delete()
+        && request
+            .attributes
+            .difference(VariableAttributes::APPEND_WRITE)
+            != KEY_DATABASE_ATTRIBUTES
+    {
+        return Err(efi::Status::INVALID_PARAMETER);
     }
     Ok(secure_variable)
 }
@@ -730,6 +891,7 @@ fn verify<'a>(
             payload: request.data,
             timestamp: None,
             secure_variable: None,
+            private_signer: None,
         });
     }
     let verified = auth::verify_authenticated_variable(
@@ -743,6 +905,7 @@ fn verify<'a>(
         payload: verified.payload,
         timestamp: Some(auth::timestamp_from_efi_time(verified.timestamp)),
         secure_variable: verified.secure_variable,
+        private_signer: verified.private_signer,
     })
 }
 
@@ -906,12 +1069,19 @@ fn replay_record(
         return Err(efi::Status::DEVICE_ERROR);
     }
     let name = &record.name[..name_len];
+    if secure_boot::is_secure_boot_enable(&record.guid.bytes, name) {
+        // Never writable after ExitBootServices, so a journalled request comes
+        // from an older image or forged retained memory: consume it unapplied.
+        return Ok(());
+    }
     let secure_variable = secure_boot::identify_key_database(&record.guid.bytes, name);
-    // An append to a signature database may carry any timestamp, so the
-    // floor says nothing about whether it was applied. Replaying one is
-    // harmless: signatures the database already holds are skipped.
-    let replayable =
-        secure_variable.is_some() && record.attributes & efi::VARIABLE_APPEND_WRITE != 0;
+    // An append may carry any timestamp, so the floor says nothing about
+    // whether it was applied. Replaying one to a signature database is
+    // harmless, as signatures it already holds are skipped. Another
+    // variable can get the data twice if power fails between persisting and
+    // acknowledging it; skipping instead would lose appends whose timestamp
+    // equals the floor.
+    let replayable = record.attributes & efi::VARIABLE_APPEND_WRITE != 0;
     if authenticated && !replayable {
         let secure_floor = secure_variable.map(|variable| store.auth_timestamp(variable));
         let already_applied = secure_floor == Some(record.timestamp)
@@ -1169,6 +1339,8 @@ fn validate_query_attributes(attributes: u32, boot_services: bool) -> Result<(),
     Ok(())
 }
 
+// The image audit allows a single register call site for the bridge.
+#[inline(never)]
 fn call_boot_bridge(address: u64, request: &BridgeRequest) -> Result<(), efi::Status> {
     if address == 0 {
         return Err(efi::Status::WRITE_PROTECTED);
@@ -1323,6 +1495,31 @@ mod tests {
         }
     }
 
+    extern "C" fn secure_boot_enable_bridge(request: *const BridgeRequest) -> usize {
+        // SAFETY: same immediate-call contract as successful_bridge.
+        let Some(request) = (unsafe { request.as_ref() }) else {
+            return efi::Status::INVALID_PARAMETER.as_usize();
+        };
+        if request.operation != bridge_operation::AUTHORIZE_SETUP_SECURE_BOOT_ENABLE {
+            return successful_bridge(request);
+        }
+        // SAFETY: the runtime image passes its live request data.
+        let data = unsafe {
+            core::slice::from_raw_parts(
+                request.data_address as *const u8,
+                request.data_len as usize,
+            )
+        };
+        if request.guid == secure_boot::EFI_GLOBAL_VARIABLE_GUID
+            && request.attributes == RAW_ATTRIBUTES.bits()
+            && data == [0]
+        {
+            efi::Status::SUCCESS.as_usize()
+        } else {
+            efi::Status::ACCESS_DENIED.as_usize()
+        }
+    }
+
     fn fixture_payload(data: &'static [u8]) -> &'static [u8] {
         EfiVariableAuthentication2::from_bytes(data)
             .and_then(|authentication| authentication.variable_data(data))
@@ -1433,8 +1630,11 @@ mod tests {
                 .unwrap();
         }
 
-        fn enroll_raw(&mut self) {
-            let pk = include_bytes!("../tests/fixtures/pk.esl");
+        /// Enroll the test certificate as KEK, db, dbx and PK with unsigned
+        /// Setup Mode envelopes.
+        fn enroll(&mut self) {
+            let mut envelope = unsigned_envelope(2024);
+            envelope.extend_from_slice(include_bytes!("../tests/fixtures/pk.esl"));
             for variable in [
                 SecureBootVariable::Kek,
                 SecureBootVariable::Db,
@@ -1442,7 +1642,7 @@ mod tests {
                 SecureBootVariable::PK,
             ] {
                 assert_eq!(
-                    self.apply(Phase::BootActive, variable, RAW_ATTRIBUTES, pk),
+                    self.apply(Phase::BootActive, variable, AUTH_ATTRIBUTES, &envelope),
                     efi::Status::SUCCESS
                 );
             }
@@ -1511,7 +1711,7 @@ mod tests {
         // verification, which rejects the truncated envelope.
         assert_eq!(
             fixture.write(Phase::BootActive, guid, &name, AUTH_ATTRIBUTES, b"garbage"),
-            efi::Status::INVALID_PARAMETER
+            efi::Status::SECURITY_VIOLATION
         );
 
         // The authenticated content is untouched by every rejected attempt.
@@ -1614,7 +1814,8 @@ mod tests {
             efi::Status::SECURITY_VIOLATION
         );
 
-        // Variables that are not signature databases keep the strict rule.
+        // Appends to other variables are exempt too (UEFI 2.10 8.2): the
+        // older envelope gets past the floor and fails on its empty signature.
         let (guid, name) = ([0x42; 16], [b'A' as u16]);
         fixture.import(guid, &name, AUTH_ATTRIBUTES, b"x", Some(timestamp(2025)));
         assert!(matches!(
@@ -1625,8 +1826,414 @@ mod tests {
                 append.bits(),
                 &unsigned_envelope(2010),
             ),
+            Err(auth::AuthError::InvalidHeader)
+        ));
+        assert!(matches!(
+            auth::verify_authenticated_variable(
+                &fixture.store,
+                &name,
+                &guid,
+                AUTH_ATTRIBUTES.bits(),
+                &unsigned_envelope(2010),
+            ),
             Err(auth::AuthError::InvalidTimestamp)
         ));
+    }
+
+    /// EDK2 answers EFI_SECURITY_VIOLATION for any envelope that does not
+    /// authenticate, in every mode (Variable.c SetVariable, AuthService.c
+    /// VerifyTimeBasedPayload). Linux reports it as EACCES.
+    #[test]
+    fn malformed_envelopes_are_security_violations() {
+        let valid = dbx_envelope(2026, &[1]);
+        let patched = |offset: usize, value: &[u8]| {
+            let mut envelope = valid.clone();
+            envelope[offset..offset + value.len()].copy_from_slice(value);
+            envelope
+        };
+        let header_errors = [
+            Vec::new(),
+            b"garbage".to_vec(),
+            patched(16, &u32::MAX.to_le_bytes()), // dwLength past the end
+            patched(16, &23u32.to_le_bytes()),    // dwLength below the header
+            patched(22, &2u16.to_le_bytes()),     // wCertificateType
+            patched(24, &[0; 16]),                // CertType
+        ];
+        let mut garbage_signature = patched(16, &31u32.to_le_bytes());
+        garbage_signature.splice(40..40, *b"garbage");
+        let mut sha384 = include_bytes!("../tests/fixtures/db-update.bin").to_vec();
+        let sha256 = [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
+        let oid = sha384
+            .windows(sha256.len())
+            .position(|window| window == sha256)
+            .unwrap();
+        sha384[oid + sha256.len() - 1] = 0x02;
+        let signature_errors = [valid.clone(), garbage_signature, sha384];
+
+        let mut fixture = Fixture::new();
+        for user_mode in [false, true] {
+            if user_mode {
+                fixture.enroll();
+            }
+            let mut targets = [
+                SecureBootVariable::PK,
+                SecureBootVariable::Kek,
+                SecureBootVariable::Db,
+                SecureBootVariable::Dbx,
+            ]
+            .map(|variable| (*variable.guid(), variable.name().to_vec(), user_mode))
+            .to_vec();
+            targets.push(([0x42; 16], utf16("Auth"), true));
+            // Setup Mode skips signatures of the Secure Boot databases only.
+            for (guid, name, signed) in targets {
+                let signature_errors = signature_errors.iter().filter(|_| signed);
+                for data in header_errors.iter().chain(signature_errors) {
+                    assert_eq!(
+                        fixture.write(Phase::BootActive, guid, &name, AUTH_ATTRIBUTES, data),
+                        efi::Status::SECURITY_VIOLATION
+                    );
+                }
+            }
+        }
+        assert!(!fixture.store.setup_mode());
+    }
+
+    /// GUID of the private authenticated variables in tests/fixtures.
+    const PRIVATE_GUID: [u8; 16] = [
+        0x5e, 0x7c, 0x7c, 0x2b, 0x0a, 0x0d, 0x8e, 0x4b, 0x9a, 0x59, 0x5c, 0xe0, 0xc3, 0xa0, 0xe7,
+        0xd1,
+    ];
+
+    fn utf16(name: &str) -> Vec<u16> {
+        name.encode_utf16().collect()
+    }
+
+    /// Timestamp of the tests/fixtures envelopes of `year`.
+    fn fixture_timestamp(year: u16) -> VariableTimestamp {
+        VariableTimestamp {
+            year,
+            month: 2,
+            day: 3,
+            hour: 4,
+            minute: 5,
+            second: 6,
+            ..VariableTimestamp::default()
+        }
+    }
+
+    fn binding(store: &VariableStore, nonvolatile: bool, name: &[u16]) -> Option<Vec<u8>> {
+        let db = store.find(
+            &auth::cert_db::GUID,
+            auth::cert_db::name(nonvolatile),
+            false,
+        )?;
+        auth::cert_db::find(store.data(db)?, &PRIVATE_GUID, name).map(<[u8]>::to_vec)
+    }
+
+    fn value(store: &VariableStore, name: &[u16]) -> Option<Vec<u8>> {
+        store
+            .find(&PRIVATE_GUID, name, false)
+            .and_then(|slot| store.data(slot))
+            .map(<[u8]>::to_vec)
+    }
+
+    #[test]
+    fn private_variables_bind_to_the_signer_of_their_first_write() {
+        let mut fixture = Fixture::retained();
+        fixture.enroll();
+        let name = utf16("CrabEfiPrivate");
+        let append = AUTH_ATTRIBUTES | VariableAttributes::APPEND_WRITE;
+        let mut write = |attributes, data: &[u8]| {
+            fixture.write(Phase::BootActive, PRIVATE_GUID, &name, attributes, data)
+        };
+        // db-direct is in no key database; any signer creates the variable.
+        for (attributes, data, expected) in [
+            (
+                AUTH_ATTRIBUTES,
+                include_bytes!("../tests/fixtures/private-create.bin").as_slice(),
+                efi::Status::SUCCESS,
+            ),
+            (
+                AUTH_ATTRIBUTES,
+                include_bytes!("../tests/fixtures/private-update-rogue.bin"),
+                efi::Status::SECURITY_VIOLATION,
+            ),
+            (
+                append,
+                include_bytes!("../tests/fixtures/private-append-older.bin"),
+                efi::Status::SUCCESS,
+            ),
+        ] {
+            assert_eq!(write(attributes, data), expected);
+        }
+        let store = &fixture.store;
+        assert_eq!(value(store, &name), Some(b"AC".to_vec()));
+        assert_eq!(
+            binding(store, true, &name).as_deref(),
+            Some(include_bytes!("../tests/fixtures/private-binding.bin").as_slice())
+        );
+        // The older append does not lower the floor.
+        assert_eq!(
+            store.auth_history_timestamp(&PRIVATE_GUID, &name),
+            Some(fixture_timestamp(2025))
+        );
+
+        let update = include_bytes!("../tests/fixtures/private-update.bin");
+        let mut write = |attributes, data: &[u8]| {
+            fixture.write(Phase::BootActive, PRIVATE_GUID, &name, attributes, data)
+        };
+        for (data, expected) in [
+            (update.as_slice(), efi::Status::SUCCESS),
+            (update, efi::Status::SECURITY_VIOLATION),
+            (
+                include_bytes!("../tests/fixtures/private-delete.bin"),
+                efi::Status::SUCCESS,
+            ),
+        ] {
+            assert_eq!(write(AUTH_ATTRIBUTES, data), expected);
+        }
+        assert_eq!(value(&fixture.store, &name), None);
+        assert_eq!(binding(&fixture.store, true, &name), None);
+
+        // Once deleted, another signer may create it again.
+        assert_eq!(
+            fixture.write(
+                Phase::BootActive,
+                PRIVATE_GUID,
+                &name,
+                AUTH_ATTRIBUTES,
+                include_bytes!("../tests/fixtures/private-recreate-rogue.bin"),
+            ),
+            efi::Status::SUCCESS
+        );
+        assert_eq!(value(&fixture.store, &name), Some(b"R".to_vec()));
+        assert_eq!(
+            binding(&fixture.store, true, &name).as_deref(),
+            Some(include_bytes!("../tests/fixtures/rogue-binding.bin").as_slice())
+        );
+    }
+
+    #[test]
+    fn private_variables_bind_the_signer_name_and_the_top_level_issuer() {
+        let mut fixture = Fixture::retained();
+        let name = utf16("CrabEfiPrivateChain");
+        let mut write = |data: &[u8]| {
+            fixture.write(
+                Phase::BootActive,
+                PRIVATE_GUID,
+                &name,
+                AUTH_ATTRIBUTES,
+                data,
+            )
+        };
+        for (data, expected) in [
+            (
+                include_bytes!("../tests/fixtures/chain-create.bin").as_slice(),
+                efi::Status::SUCCESS,
+            ),
+            // Same issuer, other subject.
+            (
+                include_bytes!("../tests/fixtures/chain-update-sibling.bin"),
+                efi::Status::SECURITY_VIOLATION,
+            ),
+            // Same signer without its issuer: the top level differs.
+            (
+                include_bytes!("../tests/fixtures/chain-update-leaf.bin"),
+                efi::Status::SECURITY_VIOLATION,
+            ),
+            (
+                include_bytes!("../tests/fixtures/chain-update.bin"),
+                efi::Status::SUCCESS,
+            ),
+        ] {
+            assert_eq!(write(data), expected);
+        }
+        assert_eq!(value(&fixture.store, &name), Some(b"B".to_vec()));
+        assert_eq!(
+            binding(&fixture.store, true, &name).as_deref(),
+            Some(include_bytes!("../tests/fixtures/chain-binding.bin").as_slice())
+        );
+    }
+
+    /// Requests, names and data a bridge persisted.
+    type Persisted = Vec<(BridgeRequest, Vec<u16>, Vec<u8>)>;
+
+    std::thread_local! {
+        static PERSISTED: core::cell::RefCell<Persisted> =
+            const { core::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// A successful bridge that records what it persists.
+    extern "C" fn recording_bridge(request: *const BridgeRequest) -> usize {
+        // SAFETY: same immediate-call contract as successful_bridge.
+        let Some(request) = (unsafe { request.as_ref() }) else {
+            return efi::Status::INVALID_PARAMETER.as_usize();
+        };
+        if request.operation == bridge_operation::PERSIST_WRITE {
+            // SAFETY: the runtime image passes live name and data buffers.
+            let (name, data) = unsafe {
+                (
+                    core::slice::from_raw_parts(
+                        request.name_address as *const u16,
+                        request.name_len as usize,
+                    ),
+                    core::slice::from_raw_parts(
+                        request.data_address as *const u8,
+                        request.data_len as usize,
+                    ),
+                )
+            };
+            PERSISTED.with_borrow_mut(|persisted| {
+                persisted.push((*request, name.to_vec(), data.to_vec()))
+            });
+        }
+        successful_bridge(request)
+    }
+
+    #[test]
+    fn private_variable_bindings_persist_and_survive_a_reboot() {
+        PERSISTED.with_borrow_mut(Vec::clear);
+        let mut fixture = Fixture::retained();
+        let (name, volatile) = (utf16("CrabEfiPrivate"), utf16("CrabEfiPrivateVolatile"));
+        let bridge = recording_bridge as *const () as u64;
+        for (name, attributes, data) in [
+            (
+                &name,
+                AUTH_ATTRIBUTES,
+                include_bytes!("../tests/fixtures/private-create.bin").as_slice(),
+            ),
+            (
+                &volatile,
+                AUTH_ATTRIBUTES.difference(VariableAttributes::NON_VOLATILE),
+                include_bytes!("../tests/fixtures/volatile-create.bin"),
+            ),
+        ] {
+            assert_eq!(
+                fixture.write_using_bridge(
+                    Phase::BootActive,
+                    PRIVATE_GUID,
+                    name,
+                    attributes,
+                    data,
+                    bridge
+                ),
+                efi::Status::SUCCESS
+            );
+        }
+        // Volatile variables bind in the volatile database only.
+        assert!(binding(&fixture.store, false, &volatile).is_some());
+        assert_eq!(binding(&fixture.store, true, &volatile), None);
+
+        // The binding reached storage before the variable, and only that one.
+        let persisted = PERSISTED.take();
+        let names: Vec<_> = persisted.iter().map(|(_, name, _)| name.clone()).collect();
+        assert_eq!(names, [auth::cert_db::name(true).to_vec(), name.clone()]);
+
+        let mut reboot = Fixture::new();
+        for (request, name, data) in &persisted {
+            reboot.import(
+                request.guid,
+                name,
+                VariableAttributes::from_bits(request.attributes).unwrap(),
+                data,
+                (request.timestamp_valid != 0).then_some(request.timestamp),
+            );
+        }
+        let mut write = |data: &[u8]| {
+            reboot.write(
+                Phase::BootActive,
+                PRIVATE_GUID,
+                &name,
+                AUTH_ATTRIBUTES,
+                data,
+            )
+        };
+        assert_eq!(
+            write(include_bytes!("../tests/fixtures/private-update-rogue.bin")),
+            efi::Status::SECURITY_VIOLATION
+        );
+        assert_eq!(
+            write(include_bytes!("../tests/fixtures/private-update.bin")),
+            efi::Status::SUCCESS
+        );
+    }
+
+    #[test]
+    fn runtime_private_variable_writes_rebuild_their_binding_on_replay() {
+        let mut fixture = Fixture::retained();
+        let name = utf16("CrabEfiPrivate");
+        assert_eq!(
+            fixture.write(
+                Phase::SealedPhysical,
+                PRIVATE_GUID,
+                &name,
+                AUTH_ATTRIBUTES,
+                include_bytes!("../tests/fixtures/private-create.bin"),
+            ),
+            efi::Status::SUCCESS
+        );
+        // The live store enforces the binding at once.
+        assert!(binding(&fixture.store, true, &name).is_some());
+        assert_eq!(
+            fixture.write(
+                Phase::SealedPhysical,
+                PRIVATE_GUID,
+                &name,
+                AUTH_ATTRIBUTES,
+                include_bytes!("../tests/fixtures/private-update-rogue.bin"),
+            ),
+            efi::Status::SECURITY_VIOLATION
+        );
+
+        // Only the envelope is journalled; replay rebuilds the binding.
+        let mut reboot = Fixture::new();
+        let processed = replay_into(&mut fixture, &mut reboot, |record, authenticated, _| {
+            assert!(authenticated);
+            assert_eq!(record.guid.bytes, PRIVATE_GUID);
+        });
+        assert_eq!(processed, 1);
+        assert_eq!(value(&reboot.store, &name), Some(b"A".to_vec()));
+        assert_eq!(
+            binding(&reboot.store, true, &name).as_deref(),
+            Some(include_bytes!("../tests/fixtures/private-binding.bin").as_slice())
+        );
+    }
+
+    #[test]
+    fn signer_databases_are_read_only() {
+        let mut fixture = Fixture::retained();
+        let name = utf16("CrabEfiPrivate");
+        assert_eq!(
+            fixture.write(
+                Phase::BootActive,
+                PRIVATE_GUID,
+                &name,
+                AUTH_ATTRIBUTES,
+                include_bytes!("../tests/fixtures/private-create.bin"),
+            ),
+            efi::Status::SUCCESS
+        );
+        let mut envelope = unsigned_envelope(2099);
+        envelope.extend_from_slice(&4u32.to_le_bytes());
+        for nonvolatile in [true, false] {
+            for (attributes, data) in [
+                (RAW_ATTRIBUTES, &4u32.to_le_bytes()[..]),
+                (AUTH_ATTRIBUTES, &envelope[..]),
+                (VariableAttributes::empty(), &[][..]),
+            ] {
+                assert_eq!(
+                    fixture.write(
+                        Phase::BootActive,
+                        auth::cert_db::GUID,
+                        auth::cert_db::name(nonvolatile),
+                        attributes,
+                        data
+                    ),
+                    efi::Status::WRITE_PROTECTED
+                );
+            }
+        }
+        assert!(binding(&fixture.store, true, &name).is_some());
     }
 
     #[test]
@@ -1889,7 +2496,7 @@ mod tests {
     #[test]
     fn setup_pk_delete_is_transactional_and_preserves_the_authentication_floor() {
         let mut fixture = Fixture::retained();
-        fixture.enroll_raw();
+        fixture.enroll();
         let pk = include_bytes!("../tests/fixtures/pk.esl");
         let floor = timestamp(2030);
         fixture.import(
@@ -1899,15 +2506,12 @@ mod tests {
             pk,
             Some(floor),
         );
-        assert_eq!(
-            fixture.write(
-                Phase::BootActive,
-                secure_boot::EFI_GLOBAL_VARIABLE_GUID,
-                secure_boot::SECURE_BOOT_ENABLE_NAME,
-                RAW_ATTRIBUTES,
-                &[1]
-            ),
-            efi::Status::SUCCESS
+        fixture.import(
+            secure_boot::EFI_GLOBAL_VARIABLE_GUID,
+            secure_boot::SECURE_BOOT_ENABLE_NAME,
+            RAW_ATTRIBUTES,
+            &[1],
+            None,
         );
         assert!(fixture.store.secure_boot_enabled());
 
@@ -1967,7 +2571,7 @@ mod tests {
     #[test]
     fn setup_authorization_cannot_bypass_other_authentication_or_runtime_checks() {
         let mut fixture = Fixture::retained();
-        fixture.enroll_raw();
+        fixture.enroll();
         let bridge = setup_bridge as *const () as u64;
         for variable in [
             SecureBootVariable::Kek,
@@ -2013,9 +2617,153 @@ mod tests {
     }
 
     #[test]
+    fn secure_databases_require_their_attributes() {
+        let mut fixture = Fixture::retained();
+        let mut envelope = unsigned_envelope(2024);
+        envelope.extend_from_slice(include_bytes!("../tests/fixtures/pk.esl"));
+        let without = |attribute| AUTH_ATTRIBUTES.difference(attribute);
+        for variable in [
+            SecureBootVariable::PK,
+            SecureBootVariable::Kek,
+            SecureBootVariable::Db,
+            SecureBootVariable::Dbx,
+        ] {
+            // Setup Mode skips signatures, not the attribute rule.
+            for (attributes, data) in [
+                (RAW_ATTRIBUTES, &envelope[16 + 24..]),
+                (without(VariableAttributes::NON_VOLATILE), &envelope[..]),
+                (without(VariableAttributes::RUNTIME_ACCESS), &envelope[..]),
+                (
+                    AUTH_ATTRIBUTES | VariableAttributes::HARDWARE_ERROR_RECORD,
+                    &envelope[..],
+                ),
+            ] {
+                assert_eq!(
+                    fixture.apply(Phase::BootActive, variable, attributes, data),
+                    efi::Status::INVALID_PARAMETER
+                );
+                assert_eq!(fixture.store.key_database_data(variable), None);
+            }
+        }
+        fixture.enroll();
+
+        // Appends and replacements of enrolled databases keep them too.
+        let update = include_bytes!("../tests/fixtures/db-update.bin");
+        for attributes in [
+            without(VariableAttributes::RUNTIME_ACCESS) | VariableAttributes::APPEND_WRITE,
+            without(VariableAttributes::NON_VOLATILE),
+        ] {
+            assert_eq!(
+                fixture.apply(
+                    Phase::BootActive,
+                    SecureBootVariable::Db,
+                    attributes,
+                    update
+                ),
+                efi::Status::INVALID_PARAMETER
+            );
+        }
+        assert_eq!(
+            fixture.apply(
+                Phase::BootActive,
+                SecureBootVariable::Db,
+                AUTH_ATTRIBUTES,
+                update
+            ),
+            efi::Status::SUCCESS
+        );
+        let slot = fixture
+            .store
+            .find(
+                SecureBootVariable::Db.guid(),
+                SecureBootVariable::Db.name(),
+                false,
+            )
+            .unwrap();
+        assert_eq!(slot.attributes, AUTH_ATTRIBUTES);
+    }
+
+    #[test]
+    fn secure_boot_enable_needs_setup_mode_or_physical_presence() {
+        let guid = secure_boot::EFI_GLOBAL_VARIABLE_GUID;
+        let name = secure_boot::SECURE_BOOT_ENABLE_NAME;
+        let mut fixture = Fixture::retained();
+        assert_eq!(
+            fixture.write(Phase::BootActive, guid, name, RAW_ATTRIBUTES, &[1]),
+            efi::Status::SUCCESS
+        );
+        for phase in [Phase::SealedPhysical, Phase::Virtual] {
+            assert_eq!(
+                fixture.write(phase, guid, name, RAW_ATTRIBUTES, &[0]),
+                efi::Status::WRITE_PROTECTED
+            );
+        }
+        fixture.enroll();
+        assert!(fixture.store.secure_boot_enabled());
+
+        let envelope = unsigned_envelope(2099);
+        for (attributes, data) in [
+            (RAW_ATTRIBUTES, &[0][..]),
+            (VariableAttributes::empty(), &[][..]),
+            (AUTH_ATTRIBUTES, &envelope[..]),
+        ] {
+            assert_eq!(
+                fixture.write(Phase::BootActive, guid, name, attributes, data),
+                efi::Status::SECURITY_VIOLATION
+            );
+        }
+        // The setup action authorizes its exact value, and only at boot.
+        let bridge = secure_boot_enable_bridge as *const () as u64;
+        assert_eq!(
+            fixture.write_using_bridge(Phase::BootActive, guid, name, RAW_ATTRIBUTES, &[1], bridge),
+            efi::Status::SECURITY_VIOLATION
+        );
+        for phase in [Phase::SealedPhysical, Phase::Virtual] {
+            assert_eq!(
+                fixture.write_using_bridge(phase, guid, name, RAW_ATTRIBUTES, &[0], bridge),
+                efi::Status::WRITE_PROTECTED
+            );
+        }
+        assert!(fixture.store.secure_boot_enabled());
+        assert_eq!(
+            fixture.write_using_bridge(Phase::BootActive, guid, name, RAW_ATTRIBUTES, &[0], bridge),
+            efi::Status::SUCCESS
+        );
+        assert!(!fixture.store.secure_boot_enabled());
+        assert!(!fixture.store.setup_mode());
+    }
+
+    #[test]
+    fn journalled_secure_boot_enable_is_consumed_unapplied() {
+        let guid = secure_boot::EFI_GLOBAL_VARIABLE_GUID;
+        let name = secure_boot::SECURE_BOOT_ENABLE_NAME;
+        let mut fixture = Fixture::retained();
+        DeferredRegion::new(&mut fixture.buffer)
+            .queue_write(
+                &mut fixture.deferred_transaction,
+                deferred::DeferredWrite {
+                    guid,
+                    name,
+                    attributes: RAW_ATTRIBUTES,
+                    data: &[0],
+                    timestamp: VariableTimestamp::default(),
+                    authenticated: false,
+                    deletion: false,
+                },
+            )
+            .unwrap();
+        // Setup Mode would accept the same write at boot.
+        let mut reboot = Fixture::new();
+        reboot.import(guid, name, RAW_ATTRIBUTES, &[1], None);
+        assert_eq!(replay_into(&mut fixture, &mut reboot, |_, _, _| ()), 1);
+        let slot = reboot.store.find(&guid, name, false).unwrap();
+        assert_eq!(reboot.store.data(slot), Some([1].as_slice()));
+    }
+
+    #[test]
     fn real_service_path_covers_all_secure_databases() {
         let mut fixture = Fixture::retained();
-        fixture.enroll_raw();
+        fixture.enroll();
 
         assert_eq!(
             fixture.apply(
@@ -2209,7 +2957,7 @@ mod tests {
     #[test]
     fn authenticated_post_ebs_write_replays_once_through_service_logic() {
         let mut fixture = Fixture::retained();
-        fixture.enroll_raw();
+        fixture.enroll();
         assert_eq!(
             fixture.apply(
                 Phase::SealedPhysical,
@@ -2221,7 +2969,7 @@ mod tests {
         );
 
         let mut reboot = Fixture::new();
-        reboot.enroll_raw();
+        reboot.enroll();
         let processed = replay_into(&mut fixture, &mut reboot, |_, authenticated, _| {
             assert!(authenticated)
         });

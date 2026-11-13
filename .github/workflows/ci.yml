@@ -371,7 +371,7 @@ jobs:
       - name: Install test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 mtools dosfstools zstd coreboot-utils
+          sudo apt-get install -y qemu-system-x86 mtools dosfstools zstd coreboot-utils sbsigntool
       - name: Download CrabEFI ELF
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
@@ -379,6 +379,8 @@ jobs:
           path: target/x86_64-unknown-none/release/
       - name: Run Secure Boot variable tests
         run: ./crabefi test --app secure-boot-test --disable-kvm --timeout 120
+      - name: Run Secure Boot key hierarchy and image verification tests
+        run: ./crabefi test --app secure-boot-auth-test --disable-kvm --timeout 300
   test-device-path:
     name: Test x86_64 (Device Path test app)
     runs-on: ubuntu-latest

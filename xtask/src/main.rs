@@ -875,6 +875,13 @@ fn cmd_test(
                 &efi_path,
                 arch,
             )?;
+        } else if app == "secure-boot-auth-test" {
+            disk::create_secure_boot_auth_disk(
+                disk_path.to_string_lossy().as_ref(),
+                &efi_path,
+                &project_root().join("test-apps/secure-boot-auth-test/fixtures"),
+                arch,
+            )?;
         } else {
             disk::create_test_disk(disk_path.to_string_lossy().as_ref(), Some(&efi_path), arch)?;
         }
