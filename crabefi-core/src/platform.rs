@@ -1218,6 +1218,10 @@ pub struct PlatformConfig<'a> {
     #[cfg(feature = "tpm")]
     pub tpm_event_log: Option<TpmEventLogConfig<'a>>,
 
+    // ---- Boot ----
+    /// When USB comes up; see [`crate::boot_policy`].
+    pub boot_policy: crate::boot_policy::BootPolicy,
+
     // ---- Pre-initialization ----
     /// Whether the page allocator and heap were initialized before entry.
     ///
@@ -1277,6 +1281,7 @@ pub struct PlatformConfigBuilder<'a> {
     ecam_regions: &'a [PciEcamRegion],
     #[cfg(feature = "tpm")]
     tpm_event_log: Option<TpmEventLogConfig<'a>>,
+    boot_policy: crate::boot_policy::BootPolicy,
     heap_pre_initialized: bool,
 }
 
@@ -1316,6 +1321,7 @@ impl<'a> PlatformConfigBuilder<'a> {
             ecam_regions: &[],
             #[cfg(feature = "tpm")]
             tpm_event_log: None,
+            boot_policy: crate::boot_policy::BootPolicy::default(),
             heap_pre_initialized: false,
         }
     }
@@ -1437,6 +1443,12 @@ impl<'a> PlatformConfigBuilder<'a> {
         self
     }
 
+    /// Boot device policy.
+    pub fn boot_policy(mut self, value: crate::boot_policy::BootPolicy) -> Self {
+        self.boot_policy = value;
+        self
+    }
+
     /// Skip heap setup because the caller already initialized it.
     ///
     /// See [`PlatformConfig::heap_pre_initialized`] for the contract.
@@ -1473,6 +1485,7 @@ impl<'a> PlatformConfigBuilder<'a> {
             runtime: self.runtime,
             #[cfg(feature = "tpm")]
             tpm_event_log: self.tpm_event_log,
+            boot_policy: self.boot_policy,
             heap_pre_initialized: self.heap_pre_initialized,
         }
     }
