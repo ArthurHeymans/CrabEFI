@@ -91,6 +91,37 @@ pub(crate) fn ensure_usb(reason: &str) {
     efi::protocols::pass_thru_init::init_usb_pass_thru();
 }
 
+/// Variables that make shim start MokManager, which needs a keyboard.
+const SHIM_MOK_REQUESTS: [&str; 9] = [
+    "MokNew",
+    "MokDel",
+    "MokSB",
+    "MokPW",
+    "MokAuth",
+    "MokDB",
+    "MokXNew",
+    "MokXDel",
+    "MokListTrustedNew",
+];
+
+/// Whether shim will start MokManager on this boot.
+fn shim_mok_request_pending() -> bool {
+    use crate::efi::runtime_image::client::variables;
+
+    let shim_lock = r_efi::efi::Guid::from_fields(
+        0x605dab50,
+        0xe046,
+        0x4300,
+        0xab,
+        0xb6,
+        &[0x3d, 0xd8, 0x10, 0xdd, 0x8b, 0x23],
+    );
+    SHIM_MOK_REQUESTS.iter().any(|name| {
+        let name: alloc::vec::Vec<u16> = name.encode_utf16().chain(core::iter::once(0)).collect();
+        variables::get(&shim_lock, &name).is_some()
+    })
+}
+
 /// Devices an automatic boot pass may start an image from.
 #[derive(Clone, Copy)]
 enum Scope {
@@ -143,6 +174,9 @@ pub(crate) fn run(boot_var_state: boot_vars::BootVarState, firmware_ui_requested
     let timeout_seconds = boot_var_state.timeout.unwrap_or(5) as u32;
 
     if !firmware_ui_requested {
+        if !usb_ready() && shim_mok_request_pending() {
+            ensure_usb("shim MokManager request pending");
+        }
         try_automatic_boot(&boot_var_state);
     }
 

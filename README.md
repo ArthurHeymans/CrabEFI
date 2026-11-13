@@ -73,7 +73,7 @@ features onto it.
 BootNext or BootOrder starts an image from other storage. USB comes up when
 BootNext or every BootOrder option failed (they are then retried on USB only),
 for the boot menu and the removable-media path `\EFI\BOOT\BOOTX64.EFI`, and for
-a pending firmware UI request. BootOrder options on internal storage therefore
+a pending firmware UI or shim MokManager request. BootOrder options on internal storage therefore
 win over USB options, and USB keyboards do not reach GRUB or shim during such a
 boot; the serial console does. The boot menu appears when nothing starts
 without USB, or after `systemctl reboot --firmware-setup` (OsIndications

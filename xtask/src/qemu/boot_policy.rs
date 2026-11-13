@@ -155,10 +155,12 @@ pub(super) fn run(config: &QemuConfig, disk: &Path) -> Result<()> {
     let log = boot("menu-only")?;
     expect(
         &log,
-        "MenuOnly refuses the USB boot option, lists USB, and is not writable by the OS",
+        "MokManager request brings up USB; MenuOnly refuses the USB boot option, \
+         lists USB, and is not writable by the OS",
         &[
             "external boot MenuOnly",
-            "Boot policy: not retrying BootOrder on USB",
+            "USB: initializing on demand (shim MokManager request pending)",
+            "xHCI USB is external; not booting it automatically",
             "Found 2 boot entries",
             "BPOL MENU ONLY PASSED",
             "BPOL TEST PASSED",
