@@ -216,6 +216,8 @@ jobs:
           sudo apt-get install -y qemu-system-x86 mtools dosfstools zstd coreboot-utils
       - name: Validate runtime image boundary and variable services
         run: ./crabefi test --app runtime-image-test --disable-kvm --timeout 120
+      - name: Test on-demand USB and the external boot policy
+        run: ./crabefi test --app boot-policy-test --disable-kvm --timeout 120
   test-ahci:
     name: Test x86_64 (AHCI Storage)
     runs-on: ubuntu-latest
