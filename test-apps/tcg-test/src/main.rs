@@ -14,6 +14,7 @@
 //! - "[PASS] tcg2_submit_command" -- SubmitCommand reaches the TPM
 //! - "[PASS] tcg2_log_replay" -- the event log replays TPM PCRs 0-7
 //! - "[PASS] tcg2_boot_measurements" -- firmware measured its boot events
+//! - "[PASS] tcg2_acpi_log" -- the ACPI TPM2 table points at the event log
 //! - "[PASS] tcg1_locate" -- TCG (1.2) protocol found
 //! - "All TCG tests passed!" -- all tests passed
 
@@ -141,6 +142,39 @@ fn read_pcr_sha256(protocol: *mut Tcg2Protocol, index: u8) -> Option<[u8; 32]> {
     (status == Status::SUCCESS)
         .then(|| tpm::pcr_sha256(&response, index))
         .flatten()
+}
+
+const ACPI_20_TABLE_GUID: Guid = Guid::from_fields(
+    0x8868e871,
+    0xe4f1,
+    0x11d3,
+    0xbc,
+    0x22,
+    &[0x00, 0x80, 0xc7, 0x3c, 0x88, 0x81],
+);
+
+/// The log area (LASA) of the ACPI TPM2 table, where Linux reads the log.
+fn acpi_tpm2_log_area(system_table: *mut SystemTable) -> Option<u64> {
+    // SAFETY: the firmware's configuration table and the ACPI tables it
+    // names stay mapped during boot services.
+    let read32 = |address: u64| unsafe { core::ptr::read_unaligned(address as *const u32) };
+    let read64 = |address: u64| unsafe { core::ptr::read_unaligned(address as *const u64) };
+    let tables = unsafe {
+        core::slice::from_raw_parts(
+            (*system_table).configuration_table,
+            (*system_table).number_of_table_entries,
+        )
+    };
+    let rsdp = tables
+        .iter()
+        .find(|table| table.vendor_guid == ACPI_20_TABLE_GUID)?
+        .vendor_table as u64;
+    let xsdt = read64(rsdp + 24);
+    let entries = u64::from(read32(xsdt + 4)).checked_sub(36)? / 8;
+    (0..entries)
+        .map(|index| read64(xsdt + 36 + index * 8))
+        .find(|&table| read32(table) == u32::from_le_bytes(*b"TPM2") && read32(table + 4) >= 76)
+        .map(|table| read64(table + 68))
 }
 
 const EV_SEPARATOR: u32 = 0x4;
@@ -544,6 +578,26 @@ pub unsafe extern "efiapi" fn efi_main(
                 print(
                     con_out,
                     b"[FAIL] tcg2_log_replay: event log does not match TPM PCRs 0-7\r\n",
+                )
+            };
+            fail_count += 1;
+        }
+        let (mut first, mut last, mut truncated) = (0, 0, 0);
+        let status =
+            unsafe { ((*tcg2).get_event_log)(tcg2, 2, &mut first, &mut last, &mut truncated) };
+        if status == Status::SUCCESS && acpi_tpm2_log_area(system_table) == Some(first) {
+            unsafe {
+                print(
+                    con_out,
+                    b"[PASS] tcg2_acpi_log: the ACPI TPM2 log area holds the event log\r\n",
+                )
+            };
+            _pass_count += 1;
+        } else {
+            unsafe {
+                print(
+                    con_out,
+                    b"[FAIL] tcg2_acpi_log: the ACPI TPM2 log area is not the event log\r\n",
                 )
             };
             fail_count += 1;

@@ -1175,6 +1175,14 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
                 failed += 1;
             }
 
+            if result.output.contains("[PASS] tcg2_acpi_log") {
+                println!("[PASS] tcg2_acpi_log: ACPI TPM2 log area holds the event log");
+                passed += 1;
+            } else {
+                println!("[FAIL] tcg2_acpi_log: ACPI TPM2 log area is not the event log");
+                failed += 1;
+            }
+
             if result.output.contains("[PASS] tcg1_locate") {
                 println!("[PASS] tcg1_locate: TCG (TPM 1.2) protocol found");
                 passed += 1;
