@@ -29,6 +29,7 @@ fn main() {
         }
         (false, false) => panic!("select either bundled-runtime-image or external-runtime-image"),
     }
+    embed_capsule_trust_store();
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let manifest_path = std::path::Path::new(&manifest_dir);
 
@@ -96,4 +97,32 @@ fn embed_runtime_image(expected_architecture: u16) {
     let digest_source = format!("pub const RUNTIME_IMAGE_SHA256: [u8; 32] = {digest:?};\n");
     std::fs::write(out.join("runtime_digest.rs"), digest_source)
         .expect("write runtime image digest source");
+}
+
+/// Embed the capsule signing roots listed in CRABEFI_CAPSULE_TRUST_CERTS
+/// (`:`-separated DER certificate files). Without it every capsule is refused.
+fn embed_capsule_trust_store() {
+    println!("cargo:rerun-if-env-changed=CRABEFI_CAPSULE_TRUST_CERTS");
+    let mut source = String::from("pub static CAPSULE_TRUST_STORE: &[&[u8]] = &[\n");
+    for path in std::env::var("CRABEFI_CAPSULE_TRUST_CERTS")
+        .unwrap_or_default()
+        .split(':')
+        .filter(|path| !path.is_empty())
+    {
+        let path = std::fs::canonicalize(path).expect("read capsule trust certificate");
+        let der = std::fs::read(&path).expect("read capsule trust certificate");
+        assert!(
+            der.first() == Some(&0x30),
+            "{} is not a DER certificate",
+            path.display()
+        );
+        println!("cargo:rerun-if-changed={}", path.display());
+        source.push_str(&format!(
+            "    include_bytes!({:?}),\n",
+            path.display().to_string()
+        ));
+    }
+    source.push_str("];\n");
+    let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
+    std::fs::write(out.join("capsule_trust.rs"), source).expect("write capsule trust store");
 }
