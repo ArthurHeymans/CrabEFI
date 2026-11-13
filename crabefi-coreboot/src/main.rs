@@ -937,7 +937,18 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     // ================================================================
     // Phase 4: Calibrate timer (needs serial for logging)
     // ================================================================
-    crabefi::time::init(cb_info.acpi_rsdp);
+    // coreboot advertises the TSC rate only when it is constant; using it skips
+    // the 50 ms ACPI PM timer calibration window.
+    #[cfg(target_arch = "x86_64")]
+    let tsc_from_coreboot = cb_info.tsc_freq_khz;
+    #[cfg(not(target_arch = "x86_64"))]
+    let tsc_from_coreboot: Option<u32> = None;
+    if let Some(freq_khz) = tsc_from_coreboot {
+        crabefi::time::set_counter_frequency(u64::from(freq_khz) * 1000);
+        log::info!("TSC frequency from coreboot: {} kHz", freq_khz);
+    } else {
+        crabefi::time::init(cb_info.acpi_rsdp);
+    }
 
     // ================================================================
     // Phase 5: Build PlatformConfig

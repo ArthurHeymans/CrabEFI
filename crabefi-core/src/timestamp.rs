@@ -26,6 +26,8 @@ pub const TS_CRABEFI_STORAGE_INIT_START: u32 = 1506;
 pub const TS_CRABEFI_STORAGE_INIT_DONE: u32 = 1507;
 /// `ExitBootServices` succeeded; handing off to the OS.
 pub const TS_CRABEFI_EXIT_BOOT_SERVICES: u32 = 1508;
+/// Starting the selected boot loader image.
+pub const TS_CRABEFI_START_BOOT_LOADER: u32 = 1509;
 
 /// Record a boot milestone with the current platform timestamp.
 ///
