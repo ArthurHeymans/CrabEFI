@@ -115,12 +115,22 @@ pub fn setup_authorize(operation: u32, open: bool) -> Status {
     call(setup, &[], &[])
 }
 
-/// Erase a flash range outside the variable store (firmware phase only).
+/// Erase a flash range outside the variable store (firmware phase only), in
+/// 64 KiB requests so no single SMI holds all CPUs for long.
 pub fn firmware_erase(offset: u64, length: u64) -> Status {
-    let mut erase = request(command::FIRMWARE_ERASE);
-    erase.offset = offset;
-    erase.data_size = length;
-    call(erase, &[], &[])
+    const CHUNK: u64 = 64 * 1024;
+    let mut done = 0;
+    while done < length {
+        let mut erase = request(command::FIRMWARE_ERASE);
+        erase.offset = offset + done;
+        erase.data_size = (length - done).min(CHUNK);
+        let status = call(erase, &[], &[]);
+        if status != Status::SUCCESS {
+            return status;
+        }
+        done += erase.data_size;
+    }
+    Status::SUCCESS
 }
 
 /// Program flash outside the variable store (firmware phase only).
