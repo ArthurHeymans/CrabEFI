@@ -82,7 +82,7 @@ impl Default for SecureBootConfig {
     fn default() -> Self {
         Self {
             auto_enroll_defaults: true,
-            enable_secure_boot: false, // Don't enable by default, let user decide
+            enable_secure_boot: cfg!(feature = "secure-boot-enforced"),
         }
     }
 }
