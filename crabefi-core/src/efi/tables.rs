@@ -228,6 +228,8 @@ pub struct LoadedImageEntry {
     pub parent_handle: Handle,
     /// PE subsystem value from the optional header.
     pub subsystem: u16,
+    /// LoadImage returned SECURITY_VIOLATION; StartImage must refuse it.
+    pub security_violation: bool,
     /// Pending PCR index for deferred application image measurement.
     #[cfg(feature = "tpm")]
     pub measurement_pcr: u32,
@@ -259,6 +261,7 @@ impl LoadedImageEntry {
             num_pages: 0,
             parent_handle: core::ptr::null_mut(),
             subsystem: 0,
+            security_violation: false,
             #[cfg(feature = "tpm")]
             measurement_pcr: 0,
             #[cfg(feature = "tpm")]
