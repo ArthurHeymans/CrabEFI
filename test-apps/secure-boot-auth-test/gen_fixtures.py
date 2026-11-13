@@ -42,6 +42,7 @@ CERT_X509 = uuid.UUID("a5c059a1-94e4-4aa7-87b5-ab155c2bf072").bytes_le
 CERT_SHA256 = uuid.UUID("c1c41626-504c-4092-aca9-41f936934328").bytes_le
 CERT_X509_SHA256 = uuid.UUID("3bd2a492-96c0-4079-b420-fcf98ef103ed").bytes_le
 CERT_TYPE_PKCS7 = uuid.UUID("4aafd29d-68df-49ee-8aa9-347d375665a7").bytes_le
+CERT_TYPE_RSA2048_SHA256 = uuid.UUID("a7717414-c616-4977-9420-844712a735bf").bytes_le
 OWNER = uuid.UUID("c4b10b3e-5e57-4f2a-9d8e-0123456789ab").bytes_le
 
 NV, BS, RT, AT, APPEND = 0x1, 0x2, 0x4, 0x20, 0x40
@@ -188,11 +189,11 @@ def signed_data(contentinfo):
     return content(explicit)
 
 
-def pkcs7_detached(signer, data):
+def pkcs7_detached(signer, data, digest=hashes.SHA256()):
     contentinfo = (
         pkcs7.PKCS7SignatureBuilder()
         .set_data(data)
-        .add_signer(signer[0], signer[1], hashes.SHA256())
+        .add_signer(signer[0], signer[1], digest)
         .sign(
             serialization.Encoding.DER,
             [
@@ -206,7 +207,7 @@ def pkcs7_detached(signer, data):
 
 
 def auth2(var, attrs, payload, signer, n, *, sign_var=None, sign_guid=None,
-          sign_attrs=None, nanosecond=0, timezone=0):
+          sign_attrs=None, nanosecond=0, timezone=0, digest=hashes.SHA256()):
     """EFI_VARIABLE_AUTHENTICATION_2 || payload, signed over
     VariableName || VendorGuid || Attributes || TimeStamp || Data."""
     name, guid = VARS[sign_var or var]
@@ -219,7 +220,7 @@ def auth2(var, attrs, payload, signer, n, *, sign_var=None, sign_guid=None,
         + timestamp
         + payload
     )
-    signature = pkcs7_detached(signer, message) if signer else b""
+    signature = pkcs7_detached(signer, message, digest) if signer else b""
     header = struct.pack("<IHH", 24 + len(signature), 0x0200, 0x0EF1) + CERT_TYPE_PKCS7
     return timestamp + header + signature + payload
 
@@ -362,6 +363,8 @@ def generate(out):
     put("priv-c.bin", b"CrabEFI TEST ONLY private C")
     put("u8-0.bin", b"\x00")
     put("u8-1.bin", b"\x01")
+    put("empty.bin", b"")
+    put("garbage.bin", b"garbage")
     put("stress-a.bin", b"A" * 2048)
     put("stress-b.bin", b"B" * 2048)
 
@@ -420,6 +423,10 @@ def generate(out):
     step(f"set s1-kek-raw-attrs KEK {NV | BS | RT:#x} kek.esl INVALID_PARAMETER")
     auth("s1-kek-volatile", "KEK", BS | RT | AT, "kek.esl", "pk", 1, "INVALID_PARAMETER")
     auth("s1-db-no-rt", "db", NV | BS | AT, "db-ca.esl", "kek", 1, "INVALID_PARAMETER")
+    # No complete EFI_VARIABLE_AUTHENTICATION_2: EDK2 answers
+    # SECURITY_VIOLATION in every mode (Linux: EACCES, not EINVAL).
+    step(f"set s1-kek-truncated-envelope KEK {AUTH:#x} garbage.bin SECURITY_VIOLATION")
+    step(f"set s1-pk-no-envelope PK {AUTH:#x} empty.bin SECURITY_VIOLATION")
     # Enrollment: KEK, db, dbx, then self-signed PK.
     auth("s1-enroll-kek", "KEK", AUTH, "kek.esl", "pk", 2, "SUCCESS")
     step(f"var s1-kek-readback KEK equals {AUTH:#x} kek.esl")
@@ -458,6 +465,23 @@ def generate(out):
          "SECURITY_VIOLATION", nanosecond=1)
     auth("a-timestamp-timezone", "db", AUTH | APPEND, "db-ca.esl", "kek", 1,
          "SECURITY_VIOLATION", timezone=60)
+    # Malformed envelopes fail authentication: SECURITY_VIOLATION as in EDK2.
+    step(f"set a-truncated-envelope db {AUTH:#x} garbage.bin SECURITY_VIOLATION")
+    step(f"set a-pk-delete-no-envelope PK {AUTH:#x} empty.bin SECURITY_VIOLATION")
+    signed = auth2("db", AUTH | APPEND, files["db-ca.esl"], signers["kek"], 20)
+    for case, offset, value in [
+        ("a-cert-length-past-end", 16, struct.pack("<I", len(signed))),
+        ("a-cert-length-below-header", 16, struct.pack("<I", 23)),
+        ("a-cert-type-not-efi-guid", 22, struct.pack("<H", 0x0002)),
+        ("a-cert-guid-not-pkcs7", 24, CERT_TYPE_RSA2048_SHA256),
+    ]:
+        envelope = bytearray(signed)
+        envelope[offset : offset + len(value)] = value
+        put(f"{case}.auth", bytes(envelope))
+        step(f"set {case} db {AUTH | APPEND:#x} {case}.auth SECURITY_VIOLATION")
+    auth("a-empty-pkcs7", "db", AUTH | APPEND, "db-ca.esl", None, 20, "SECURITY_VIOLATION")
+    auth("a-pkcs7-sha384", "db", AUTH | APPEND, "db-ca.esl", "kek", 20, "SECURITY_VIOLATION",
+         digest=hashes.SHA384())
     step(f"set a-unauthenticated-write db {NV | BS | RT:#x} db-ca.esl ERROR")
     auth("a-delete", "db", AUTH, None, "kek", 5, "SUCCESS")
     step("var a-deleted db absent")
@@ -502,6 +526,9 @@ def generate(out):
     # A (private authenticated variables, UEFI 2.10 8.2.6 step 7: the first
     # signer owns the variable; later updates need the same signer).
     auth("p1-create-any-signer", "priv1", AUTH, "priv-a.bin", "rogue", 1, "SUCCESS")
+    garbage = efi_time(2) + struct.pack("<IHH", 24 + 7, 0x0200, 0x0EF1) + CERT_TYPE_PKCS7
+    put("p1-garbage-pkcs7.auth", garbage + b"garbage" + files["priv-b.bin"])
+    step(f"set p1-garbage-pkcs7 priv1 {AUTH:#x} p1-garbage-pkcs7.auth SECURITY_VIOLATION")
     auth("p2-create", "priv2", AUTH, "priv-a.bin", "db-direct", 1, "SUCCESS")
     step(f"var p2-created priv2 equals {AUTH:#x} priv-a.bin")
     auth("p2-update-same-signer", "priv2", AUTH, "priv-b.bin", "db-direct", 2, "SUCCESS")
