@@ -357,6 +357,8 @@ jobs:
           path: target/x86_64-unknown-none/release/
       - name: Run TCG protocol tests
         run: ./crabefi test --app tcg-test --disable-kvm --timeout 120
+      - name: Run TCG protocol tests over CRB
+        run: CRABEFI_TPM=crb ./crabefi test --app tcg-test --disable-kvm --timeout 120
   test-secure-boot:
     name: Test x86_64 (Secure Boot test app)
     runs-on: ubuntu-latest

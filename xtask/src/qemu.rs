@@ -185,6 +185,12 @@ fn cleanup_child(child: &mut Child) {
 
 /// Spawn a swtpm process and return the QEMU arguments to connect to it.
 fn spawn_swtpm() -> Result<(SwtpmProcess, Vec<String>)> {
+    // CRABEFI_TPM=crb: the CRB interface of firmware TPMs instead of TIS.
+    let interface = match std::env::var("CRABEFI_TPM").as_deref() {
+        Ok("crb") => "tpm-crb",
+        Ok("tis") | Err(_) => "tpm-tis",
+        Ok(other) => bail!("CRABEFI_TPM must be tis or crb, not {other}"),
+    };
     let state_dir = tempfile::tempdir().context("failed to create swtpm state dir")?;
     let sock_path = state_dir.path().join("swtpm-sock");
 
@@ -236,8 +242,9 @@ fn spawn_swtpm() -> Result<(SwtpmProcess, Vec<String>)> {
         "-tpmdev".into(),
         "emulator,id=tpm0,chardev=chrtpm".into(),
         "-device".into(),
-        "tpm-tis,tpmdev=tpm0".into(),
+        format!("{interface},tpmdev=tpm0"),
     ];
+    println!("TPM 2.0 interface: {interface}");
 
     Ok((
         SwtpmProcess {
