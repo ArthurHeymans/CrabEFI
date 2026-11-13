@@ -404,12 +404,22 @@ fn cmd_build_with_entry(
 }
 
 /// Payload Cargo features a test app needs beyond the default build.
-fn test_payload_features(app: &str) -> &'static [&'static str] {
-    match app {
-        "boot-policy-test" => &["usb-on-demand"],
-        "fwui-test" => &["external-boot-setting"],
-        _ => &[],
+fn test_payload_features(app: &str) -> Vec<&'static str> {
+    let mut features = match app {
+        "boot-policy-test" => vec!["usb-on-demand"],
+        "fwui-test" => vec!["external-boot-setting"],
+        _ => Vec::new(),
+    };
+    if capsule_on_disk_only() {
+        features.push("capsule-on-disk-only");
     }
+    features
+}
+
+/// CRABEFI_CAPSULE_ON_DISK_ONLY=1: test a payload that accepts capsules only
+/// from the ESP; capsule-test, built with the same variable, then checks it.
+pub(crate) fn capsule_on_disk_only() -> bool {
+    std::env::var_os("CRABEFI_CAPSULE_ON_DISK_ONLY").is_some()
 }
 
 /// Target directory of a payload build; variants never overwrite the default.
@@ -776,10 +786,10 @@ fn cmd_test(
     } else {
         // Build CrabEFI first
         let features = test_payload_features(app);
-        cmd_build_payload(true, ui, arch, machine, false, features)?;
+        cmd_build_payload(true, ui, arch, machine, false, &features)?;
 
         // Prepare ROM with CrabEFI payload
-        let crabefi_elf = rom::get_crabefi_elf_in(&payload_target_dir(false, features), arch);
+        let crabefi_elf = rom::get_crabefi_elf_in(&payload_target_dir(false, &features), arch);
         rom::prepare_rom(&crabefi_elf, temp_dir.path(), arch, machine)?
     };
 
