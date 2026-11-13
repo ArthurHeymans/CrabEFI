@@ -1711,7 +1711,7 @@ mod tests {
         // verification, which rejects the truncated envelope.
         assert_eq!(
             fixture.write(Phase::BootActive, guid, &name, AUTH_ATTRIBUTES, b"garbage"),
-            efi::Status::INVALID_PARAMETER
+            efi::Status::SECURITY_VIOLATION
         );
 
         // The authenticated content is untouched by every rejected attempt.
@@ -1838,6 +1838,64 @@ mod tests {
             ),
             Err(auth::AuthError::InvalidTimestamp)
         ));
+    }
+
+    /// EDK2 answers EFI_SECURITY_VIOLATION for any envelope that does not
+    /// authenticate, in every mode (Variable.c SetVariable, AuthService.c
+    /// VerifyTimeBasedPayload). Linux reports it as EACCES.
+    #[test]
+    fn malformed_envelopes_are_security_violations() {
+        let valid = dbx_envelope(2026, &[1]);
+        let patched = |offset: usize, value: &[u8]| {
+            let mut envelope = valid.clone();
+            envelope[offset..offset + value.len()].copy_from_slice(value);
+            envelope
+        };
+        let header_errors = [
+            Vec::new(),
+            b"garbage".to_vec(),
+            patched(16, &u32::MAX.to_le_bytes()), // dwLength past the end
+            patched(16, &23u32.to_le_bytes()),    // dwLength below the header
+            patched(22, &2u16.to_le_bytes()),     // wCertificateType
+            patched(24, &[0; 16]),                // CertType
+        ];
+        let mut garbage_signature = patched(16, &31u32.to_le_bytes());
+        garbage_signature.splice(40..40, *b"garbage");
+        let mut sha384 = include_bytes!("../tests/fixtures/db-update.bin").to_vec();
+        let sha256 = [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
+        let oid = sha384
+            .windows(sha256.len())
+            .position(|window| window == sha256)
+            .unwrap();
+        sha384[oid + sha256.len() - 1] = 0x02;
+        let signature_errors = [valid.clone(), garbage_signature, sha384];
+
+        let mut fixture = Fixture::new();
+        for user_mode in [false, true] {
+            if user_mode {
+                fixture.enroll();
+            }
+            let mut targets = [
+                SecureBootVariable::PK,
+                SecureBootVariable::Kek,
+                SecureBootVariable::Db,
+                SecureBootVariable::Dbx,
+            ]
+            .map(|variable| (*variable.guid(), variable.name().to_vec(), user_mode))
+            .to_vec();
+            targets.push(([0x42; 16], utf16("Auth"), true));
+            // Setup Mode skips signatures of the Secure Boot databases only.
+            for (guid, name, signed) in targets {
+                let signature_errors = signature_errors.iter().filter(|_| signed);
+                for data in header_errors.iter().chain(signature_errors) {
+                    assert_eq!(
+                        fixture.write(Phase::BootActive, guid, &name, AUTH_ATTRIBUTES, data),
+                        efi::Status::SECURITY_VIOLATION
+                    );
+                }
+            }
+        }
+        assert!(!fixture.store.setup_mode());
     }
 
     /// GUID of the private authenticated variables in tests/fixtures.
