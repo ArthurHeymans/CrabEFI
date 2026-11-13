@@ -1275,6 +1275,10 @@ pub struct PlatformConfig<'a> {
     /// ExitBootServices unless payload MM serves variables. No
     /// `CapsuleUpdateData*` variable is written; stale ones are deleted.
     pub capsule_on_disk_only: bool,
+    /// Events of this boot from the platform firmware, as a coreboot event
+    /// log image (`commonlib/bsd/elog.h`), appended to the boot event log;
+    /// see [`crate::boot_event_log`].
+    pub boot_events: Option<&'a [u8]>,
 
     /// Optional platform lifecycle callbacks.
     pub hooks: Option<&'a dyn PlatformHooks>,
@@ -1372,6 +1376,7 @@ pub struct PlatformConfigBuilder<'a> {
     capsule_regions: &'a [CapsuleRegion],
     capsule_backend: Option<&'a mut dyn CapsuleBackend>,
     capsule_on_disk_only: bool,
+    boot_events: Option<&'a [u8]>,
     hooks: Option<&'a dyn PlatformHooks>,
     rng: Option<&'a dyn Rng>,
     ecam_regions: &'a [PciEcamRegion],
@@ -1413,6 +1418,7 @@ impl<'a> PlatformConfigBuilder<'a> {
             capsule_regions: &[],
             capsule_backend: None,
             capsule_on_disk_only: false,
+            boot_events: None,
             hooks: None,
             rng: None,
             ecam_regions: &[],
@@ -1521,6 +1527,12 @@ impl<'a> PlatformConfigBuilder<'a> {
         self
     }
 
+    /// See [`PlatformConfig::boot_events`].
+    pub fn boot_events(mut self, value: &'a [u8]) -> Self {
+        self.boot_events = Some(value);
+        self
+    }
+
     /// Platform lifecycle callbacks.
     pub fn hooks(mut self, value: &'a dyn PlatformHooks) -> Self {
         self.hooks = Some(value);
@@ -1582,6 +1594,7 @@ impl<'a> PlatformConfigBuilder<'a> {
             capsule_regions: self.capsule_regions,
             capsule_backend: self.capsule_backend,
             capsule_on_disk_only: self.capsule_on_disk_only,
+            boot_events: self.boot_events,
             hooks: self.hooks,
             rng: self.rng,
             ecam_regions: self.ecam_regions,

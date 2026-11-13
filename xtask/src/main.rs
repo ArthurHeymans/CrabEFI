@@ -411,6 +411,7 @@ fn test_payload_features(app: &str) -> Vec<&'static str> {
         "fwui-test" => vec!["external-boot-setting"],
         "mm-seal-test" => vec!["payload-mm-test-lose-ready-to-boot"],
         "runtime-replay-interrupt-test" => vec!["replay-test-reset-after-persist"],
+        "boot-events-test" => vec!["boot-event-log"],
         _ => Vec::new(),
     };
     if capsule_on_disk_only() {
