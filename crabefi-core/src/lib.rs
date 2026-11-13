@@ -265,6 +265,15 @@ fn init_persistence_and_boot(
         }
 
         logger::apply_persisted_level();
+    }
+
+    // Bring up storage (and input devices, before any indefinite setup session)
+    // before Secure Boot init and capsule-on-disk look for files on the ESP.
+    boot_policy::apply_variable();
+    let usb_init = boot_policy::get().usb_init;
+    boot_manager::init_storage_subsystem(usb_init == boot_policy::UsbInit::Always);
+
+    if persistence_available {
         #[cfg(feature = "secure-boot")]
         match efi::auth::boot::init_secure_boot_default() {
             Ok(status) => log::info!(
@@ -311,11 +320,6 @@ fn init_persistence_and_boot(
     #[cfg(all(feature = "platform-entry", target_arch = "x86_64"))]
     log_stack_usage("before_boot_manager");
 
-    // Enumerate input devices before publishing or accepting an indefinite
-    // setup session. A framebuffer by itself is only an output device.
-    boot_policy::apply_variable();
-    let usb_init = boot_policy::get().usb_init;
-    boot_manager::init_storage_subsystem(usb_init == boot_policy::UsbInit::Always);
     if !boot_manager::usb_ready() && os_indications::firmware_ui_request_pending() {
         boot_manager::ensure_usb("firmware UI requested");
     }
