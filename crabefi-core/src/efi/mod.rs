@@ -236,15 +236,32 @@ fn init_tcg_protocols(config: &mut crate::platform::TpmEventLogConfig) {
         let enable_sha1 = matches!(config.format, TpmLogFormat::Both);
         let tpm2_device = core::mem::replace(&mut config.tpm2_device, Tpm2DeviceConfig::None);
         let has_hardware_tpm = tpm2_device.is_some();
-        let area = log_area.take().map(|log| log.area);
+        let mut area = log_area.take().map(|log| log.area);
         let had_area = area.is_some();
         let tcg2_result = match tpm2_device {
-            Tpm2DeviceConfig::None => init_tcg2_protocol(existing_log, area, enable_sha1),
+            Tpm2DeviceConfig::None => init_tcg2_protocol(existing_log, area.take(), enable_sha1),
             Tpm2DeviceConfig::TisMmio { base } => {
-                init_tcg2_protocol_tis(existing_log, area, base, enable_sha1)
+                init_tcg2_protocol_tis(existing_log, area.take(), base, enable_sha1)
+            }
+            Tpm2DeviceConfig::Crb {
+                control_area,
+                start,
+            } => {
+                // SAFETY: the platform describes a CRB TPM no one else drives
+                // during boot services.
+                match unsafe { tcg::tpm_crb::TpmCrb::probe(control_area, start) } {
+                    Ok(tpm) => init_tcg2_protocol_platform_tpm(
+                        existing_log,
+                        area.take(),
+                        alloc::boxed::Box::leak(alloc::boxed::Box::new(tpm)),
+                        enable_sha1,
+                    ),
+                    // The log area stays for the log-only fallback.
+                    Err(_) => Err("CRB TPM probe failed"),
+                }
             }
             Tpm2DeviceConfig::Driver(driver) => {
-                init_tcg2_protocol_platform_tpm(existing_log, area, driver, enable_sha1)
+                init_tcg2_protocol_platform_tpm(existing_log, area.take(), driver, enable_sha1)
             }
         };
 
@@ -257,14 +274,14 @@ fn init_tcg_protocols(config: &mut crate::platform::TpmEventLogConfig) {
                     "Hardware TPM not available: {}; installing TCG2 log-only protocol",
                     e
                 );
-                // The log-only copy is reachable through GetEventLog only:
-                // the platform's (ACPI) log area stops here.
-                if had_area {
+                // Without the area the log-only copy is reachable through
+                // GetEventLog only: the platform's (ACPI) log area stops here.
+                if had_area && area.is_none() {
                     log::error!(
                         "Platform event log area abandoned; ACPI log readers miss later events"
                     );
                 }
-                if let Err(e2) = init_tcg2_protocol(existing_log, None, enable_sha1) {
+                if let Err(e2) = init_tcg2_protocol(existing_log, area.take(), enable_sha1) {
                     log::error!("TCG2 log-only fallback failed: {}", e2);
                 }
             } else {
