@@ -11,7 +11,7 @@ use crabefi_efi_types::{
 };
 use crabefi_runtime_abi::{
     BridgeRequest, MAX_VARIABLE_DATA_SIZE, MAX_VARIABLE_NAME_LEN, TimeMechanism, VariableTimestamp,
-    bridge_operation, capsule,
+    bridge_operation, capsule, event_log,
 };
 
 use crate::{
@@ -910,6 +910,7 @@ fn check_write_policy(
     let (guid, name) = (&request.guid, request.name);
     if secure_boot::is_status_variable(guid, name)
         || capsule::is_esrt_last_attempt_variable(guid, name)
+        || event_log::is_event_log_variable(guid, name)
         || is_signer_database(guid, name)
     {
         return Err(efi::Status::WRITE_PROTECTED);
@@ -1842,6 +1843,33 @@ mod tests {
                 fixture.write(Phase::BootActive, guid, name, attributes, value),
                 efi::Status::WRITE_PROTECTED
             );
+        }
+
+        let slot = fixture.store.find(&guid, name, false).unwrap();
+        assert_eq!(fixture.store.data(slot), Some(b"firmware".as_slice()));
+    }
+
+    #[test]
+    fn firmware_imports_the_event_log_but_public_writes_cannot_change_it() {
+        let mut fixture = Fixture::retained();
+        let guid = event_log::SETTINGS_VARIABLE_GUID;
+        let name = event_log::EVENT_LOG_VARIABLE_NAME;
+        fixture.import(guid, name, RAW_ATTRIBUTES, b"firmware", None);
+
+        for phase in [Phase::BootActive, Phase::SealedPhysical, Phase::Virtual] {
+            for (attributes, value) in [
+                (RAW_ATTRIBUTES, b"forged".as_slice()),
+                (
+                    RAW_ATTRIBUTES | VariableAttributes::APPEND_WRITE,
+                    b"append".as_slice(),
+                ),
+                (VariableAttributes::empty(), b"".as_slice()),
+            ] {
+                assert_eq!(
+                    fixture.write(phase, guid, name, attributes, value),
+                    efi::Status::WRITE_PROTECTED
+                );
+            }
         }
 
         let slot = fixture.store.find(&guid, name, false).unwrap();
