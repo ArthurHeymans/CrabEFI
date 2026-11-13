@@ -92,8 +92,25 @@ fn flash_mapping(
     }) {
         return Some((u64::from(window.host_base), u64::from(window.size)));
     }
+    // No windows (e.g. AMD ROM Armor 3: no SPI flash device): the first
+    // 16 MiB end at 4 GiB (AMD ROM2; the whole boot media when it is no
+    // larger). Accept it only if the FMAP shows up there.
     let size = boot_media.boot_media_size;
-    (size != 0 && size <= 16 * 1024 * 1024).then(|| ((1u64 << 32) - size, size))
+    let window = size.min(16 * 1024 * 1024);
+    let base = (1u64 << 32).checked_sub(window)?;
+    (window != 0
+        && boot_media.fmap_offset + 8 <= window
+        && fmap_signature_at(base + boot_media.fmap_offset))
+    .then_some((base, window))
+}
+
+fn fmap_signature_at(address: u64) -> bool {
+    let mut signature = [0u8; 8];
+    for (i, byte) in signature.iter_mut().enumerate() {
+        // SAFETY: inside the flash window mapped right below 4 GiB.
+        *byte = unsafe { read_volatile((address + i as u64) as *const u8) };
+    }
+    &signature == b"__FMAP__"
 }
 /// Keep the request buffer across ExitBootServices (after allocator init).
 pub fn reserve_buffer() {
