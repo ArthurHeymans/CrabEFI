@@ -75,10 +75,10 @@ pub extern "C" fn _start() -> ! {
                 reset: runtime_reset_config(),
                 external_ranges: &[],
                 deferred_buffer: DeferredBufferConfig {
-                mm_proxy: Default::default(),
                     base: deferred_base,
                     size: 4096,
                 },
+                mm_proxy: Default::default(),
             },
         )
         .build(),
