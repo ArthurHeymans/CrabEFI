@@ -17,6 +17,10 @@ use crabefi_runtime_abi::mm::{
 use r_efi::efi::{Guid, Status};
 
 static COMM: AtomicU64 = AtomicU64::new(0);
+/// SMIs raised per request, and the time outside SMM to wait for each.
+const SMI_ATTEMPTS: u64 = 3;
+const SMI_WAIT_US: u64 = 50_000;
+const SMI_POLL_US: u64 = 10;
 static COMM_SIZE: AtomicU64 = AtomicU64::new(0);
 static APM_CMD: AtomicU64 = AtomicU64::new(0);
 static READY_TO_BOOT_SENT: AtomicBool = AtomicBool::new(false);
@@ -68,12 +72,30 @@ fn call(mut request: Request, name: &[u16], data: &[u8]) -> Status {
         request.status = STATUS_PENDING;
         write_volatile(base as *mut Request, request);
         let apm = APM_CMD.load(Ordering::Relaxed) as u8;
-        core::arch::asm!("out 0xb2, al", in("al") apm, options(nostack, preserves_flags));
-        let status = read_volatile(core::ptr::addr_of!((*(base as *const Request)).status));
-        if status == STATUS_PENDING {
-            return Status::DEVICE_ERROR;
+        let status = core::ptr::addr_of!((*(base as *const Request)).status);
+        // The SMI normally completes before the OUT retires. If it comes late or is
+        // lost, wait and raise it again: MM skips a request that is no longer pending,
+        // so a late SMI cannot run it twice.
+        for attempt in 1..=SMI_ATTEMPTS {
+            core::arch::asm!("out 0xb2, al", in("al") apm, options(nostack, preserves_flags));
+            for waited in 0..=SMI_WAIT_US / SMI_POLL_US {
+                let now = read_volatile(status);
+                if now != STATUS_PENDING {
+                    if attempt > 1 || waited > 0 {
+                        log::warn!(
+                            "payload MM: command {} done after SMI {} and {} us",
+                            request.command,
+                            attempt,
+                            waited * SMI_POLL_US
+                        );
+                    }
+                    return Status::from_usize(now as usize);
+                }
+                crate::time::delay_us(SMI_POLL_US);
+            }
         }
-        Status::from_usize(status as usize)
+        log::error!("payload MM: command {} not handled", request.command);
+        Status::DEVICE_ERROR
     }
 }
 
