@@ -406,6 +406,7 @@ fn execute_bootloader(
     // lifecycle as subsequently loaded children. LoadImage copies both buffers.
     let bs = unsafe { &*boot_services::get_boot_services() };
     let mut image_handle = ptr::null_mut();
+    crate::timestamp::record(crate::timestamp::TS_CRABEFI_OS_LOADER_LOAD);
     // SAFETY: both buffers are live for this call; LoadImage receives a valid
     // firmware handle and writes the new handle to image_handle.
     let status = unsafe {

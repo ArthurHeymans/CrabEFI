@@ -535,6 +535,72 @@ unsafe fn find_table(rsdp_addr: u64, signature: &[u8; 4]) -> Option<(u64, usize)
     }
 }
 
+/// ACPI FPDT performance record header (ACPI 6.5, 5.2.24.1).
+#[cfg(target_arch = "x86_64")]
+#[repr(C)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
+struct PerformanceRecordHeader {
+    kind: U16,
+    length: u8,
+    revision: u8,
+}
+
+/// Firmware Basic Boot Performance Pointer Record (FPDT record type 0).
+#[cfg(target_arch = "x86_64")]
+#[repr(C)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
+struct FbptPointerRecord {
+    header: PerformanceRecordHeader,
+    reserved: U32,
+    fbpt_address: U64,
+}
+
+/// Header of the Firmware Basic Boot Performance Table.
+#[cfg(target_arch = "x86_64")]
+#[repr(C)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
+struct FbptHeader {
+    signature: [u8; 4],
+    length: U32,
+}
+
+/// Bytes of an FBPT that holds the basic boot performance record.
+#[cfg(target_arch = "x86_64")]
+const FBPT_MIN_LENGTH: u32 = 56;
+
+/// The Firmware Basic Boot Performance Table that the FPDT points to.
+///
+/// # Safety
+/// `rsdp_addr` and the tables it references must be identity mapped.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn find_fbpt(rsdp_addr: u64) -> Option<u64> {
+    let (fpdt, length) = unsafe { find_table(rsdp_addr, b"FPDT") }?;
+    let table = unsafe { core::slice::from_raw_parts(fpdt as *const u8, length) };
+    let mut records = table.get(size_of::<SdtHeader>()..)?;
+    while let Ok((header, _)) = PerformanceRecordHeader::ref_from_prefix(records) {
+        let length = usize::from(header.length);
+        if length < size_of::<PerformanceRecordHeader>() || length > records.len() {
+            return None;
+        }
+        if header.kind.get() == 0 {
+            let (pointer, _) = FbptPointerRecord::ref_from_prefix(&records[..length]).ok()?;
+            let fbpt = pointer.fbpt_address.get();
+            if fbpt == 0 {
+                return None;
+            }
+            let fbpt_header = FbptHeader::ref_from_bytes(unsafe {
+                core::slice::from_raw_parts(fbpt as *const u8, size_of::<FbptHeader>())
+            })
+            .ok()?;
+            return (&fbpt_header.signature == b"FBPT"
+                && fbpt_header.length.get() >= FBPT_MIN_LENGTH)
+                .then_some(fbpt);
+        }
+        records = &records[length..];
+    }
+    None
+}
+
 /// Locate a TPM 1.2 event log described by the ACPI TCPA table.
 ///
 /// Some coreboot platforms publish the log through ACPI but do not export the
