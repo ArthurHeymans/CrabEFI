@@ -16,6 +16,8 @@ xhci = ["dep:xhci"]
 tpm = ["dep:sha1"]
 # UEFI image/key authentication, independent of a host firmware's signed FFS.
 secure-boot = ["pkcs7", "crabefi-runtime-bundle?/secure-boot", "crabefi-ui/secure-boot"]
+# Offer CrabEFIExternalBoot (stricter external-boot policy) in the setup menu.
+external-boot-setting = ["cfr"]
 # Signed firmware capsule application requires durable result persistence.
 capsule-update = ["pkcs7", "variable-store"]
 # Shared verification implementation, not a runtime policy switch.

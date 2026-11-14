@@ -108,6 +108,9 @@ fn is_changed(item: &MenuItem) -> bool {
             current_level,
             original_level,
         } => current_level != original_level,
+        MenuItem::CrabExternalBoot {
+            current, original, ..
+        } => current != original,
         _ => false,
     }
 }
@@ -300,9 +303,21 @@ fn row_parts(
             true,
             None,
         )),
+        MenuItem::CrabExternalBoot {
+            current, original, ..
+        } => Some((
+            String::from("External boot"),
+            String::from(external_boot_name(*current)),
+            String::from(external_boot_name(*original)),
+            true,
+            None,
+        )),
         _ => None,
     }
 }
+
+const EXTERNAL_BOOT_HELP: &str =
+    "Whether USB and removable media may boot. Menu only: only when picked in the boot menu.";
 
 fn changed_count(items: &[MenuItem]) -> usize {
     items.iter().filter(|item| is_changed(item)).count()
@@ -320,6 +335,13 @@ fn changed_items<'a>(cfr: &'a CfrInfo, items: &'a [MenuItem]) -> Vec<(String, St
                 String::from("CrabEFI log level"),
                 String::from(crate::cfr::level_name(*original_level)),
                 String::from(crate::cfr::level_name(*current_level)),
+            )),
+            MenuItem::CrabExternalBoot {
+                current, original, ..
+            } => Some((
+                String::from("External boot"),
+                String::from(external_boot_name(*original)),
+                String::from(external_boot_name(*current)),
             )),
             MenuItem::Option {
                 form_idx,
@@ -897,6 +919,29 @@ fn paint_help(
             (
                 String::from("CrabEFI log level"),
                 String::from("How much CrabEFI writes to the serial console."),
+                facts,
+                None,
+                "When saved",
+            )
+        }
+        MenuItem::CrabExternalBoot {
+            current,
+            original,
+            floor,
+        } => {
+            let mut facts = Vec::new();
+            if changed {
+                facts.push(("Unsaved", String::from(external_boot_name(*current))));
+            }
+            facts.push(("Saved", String::from(external_boot_name(*original))));
+            facts.push(("Default", String::from(external_boot_name(*floor))));
+            let names: Vec<&str> = external_boot_choices(*floor)
+                .map(external_boot_name)
+                .collect();
+            facts.push(("Choices", names.join(", ")));
+            (
+                String::from("External boot"),
+                String::from(EXTERNAL_BOOT_HELP),
                 facts,
                 None,
                 "When saved",
@@ -1548,6 +1593,9 @@ fn discard_graphical_changes(items: &mut [MenuItem]) {
                 current_level,
                 original_level,
             } => *current_level = *original_level,
+            MenuItem::CrabExternalBoot {
+                current, original, ..
+            } => *current = *original,
             _ => {}
         }
     }
@@ -1767,6 +1815,20 @@ async fn help_graphical_item(
             ));
             String::from("CrabEFI log level")
         }
+        MenuItem::CrabExternalBoot {
+            current,
+            original,
+            floor,
+        } => {
+            content.push(Block::text(EXTERNAL_BOOT_HELP));
+            content.push(Block::text(
+                "Choices looser than the firmware build are not offered. Applies when saved.",
+            ));
+            content.push(Block::fact("Current", external_boot_name(*current)));
+            content.push(Block::fact("Saved", external_boot_name(*original)));
+            content.push(Block::fact("Default", external_boot_name(*floor)));
+            String::from("External boot")
+        }
         _ => return,
     };
     let editable = can_edit_item(cfr, items, state.selected);
@@ -1813,6 +1875,7 @@ fn restore_graphical_default(
         Some(MenuItem::CrabLogLevel { current_level, .. }) => {
             *current_level = crate::cfr::DEFAULT_LEVEL;
         }
+        Some(MenuItem::CrabExternalBoot { current, floor, .. }) => *current = *floor,
         Some(MenuItem::Option {
             form_idx,
             option_idx,
@@ -1931,6 +1994,28 @@ async fn edit_graphical_item(
                 .await
                 .map(EditResult::Level)
             }
+            Some(MenuItem::CrabExternalBoot {
+                current,
+                original,
+                floor,
+            }) => {
+                let choices = external_boot_choices(*floor);
+                let labels: Vec<&str> = choices.clone().map(external_boot_name).collect();
+                let pos = |choice: usize| choice.checked_sub(*floor);
+                let selected = pos(*current).unwrap_or(0);
+                let tags = choice_tags(pos(*original), Some(0), selected);
+                dialog::select(
+                    fb,
+                    &backdrop,
+                    anchor,
+                    "External boot",
+                    &labels,
+                    selected,
+                    &tags,
+                )
+                .await
+                .map(|i| EditResult::ExternalBoot(choices.start + i))
+            }
             Some(MenuItem::Option {
                 form_idx,
                 option_idx,
@@ -2035,6 +2120,9 @@ fn apply_graphical_edit(items: &mut [MenuItem], state: &mut GraphicalState, resu
         (Some(MenuItem::CrabLogLevel { current_level, .. }), EditResult::Level(i)) => {
             replace(current_level, crate::cfr::LEVEL_CHOICES[i])
         }
+        (Some(MenuItem::CrabExternalBoot { current, .. }), EditResult::ExternalBoot(i)) => {
+            replace(current, i)
+        }
         (Some(MenuItem::Option { current_value, .. }), result) => match (current_value, result) {
             (CfrValue::Bool(v), EditResult::Bool(n)) => replace(v, n),
             (CfrValue::Number(v), EditResult::Number(n)) => replace(v, n),
@@ -2051,6 +2139,7 @@ fn apply_graphical_edit(items: &mut [MenuItem], state: &mut GraphicalState, resu
 
 enum EditResult {
     Level(usize),
+    ExternalBoot(usize),
     Bool(bool),
     Number(u32),
     Text(String),
@@ -2232,6 +2321,28 @@ mod graphical_tests {
             if current_level == crate::cfr::DEFAULT_LEVEL && original_level == log::LevelFilter::Trace)
         );
         assert!(state.status_message.is_some_and(|(_, ok)| ok));
+    }
+
+    #[test]
+    fn external_boot_default_is_the_build_policy() {
+        let cfr = CfrInfo::new();
+        let mut items = alloc::vec![MenuItem::CrabExternalBoot {
+            current: 2,
+            original: 2,
+            floor: 1,
+        }];
+        let mut state = GraphicalState::new(0);
+        restore_graphical_default(&cfr, &mut items, &mut state);
+        assert!(matches!(
+            items[0],
+            MenuItem::CrabExternalBoot {
+                current: 1,
+                original: 2,
+                ..
+            }
+        ));
+        apply_graphical_edit(&mut items, &mut state, EditResult::ExternalBoot(2));
+        assert!(!has_changes(&items));
     }
 
     #[test]

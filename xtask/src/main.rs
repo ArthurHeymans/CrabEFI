@@ -407,6 +407,7 @@ fn cmd_build_with_entry(
 fn test_payload_features(app: &str) -> &'static [&'static str] {
     match app {
         "boot-policy-test" => &["usb-on-demand"],
+        "fwui-test" => &["external-boot-setting"],
         _ => &[],
     }
 }
