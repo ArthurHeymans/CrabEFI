@@ -157,9 +157,17 @@ pub fn set_framebuffer(_fb: crate::platform::FramebufferConfig) {
     // Framebuffer logging disabled at compile time
 }
 
+/// Highest level the build allows; `max-log-level-error` (production builds)
+/// keeps the persisted variable and the menu from raising it.
+const MAX_LEVEL: LevelFilter = if cfg!(feature = "max-log-level-error") {
+    LevelFilter::Error
+} else {
+    LevelFilter::Trace
+};
+
 /// Set the maximum log level
 pub fn set_level(level: LevelFilter) {
-    log::set_max_level(level);
+    log::set_max_level(level.min(MAX_LEVEL));
 }
 
 /// Parse a persisted log-level variable payload.
