@@ -454,6 +454,15 @@ pub struct FmapRegion {
     pub size: u32,
 }
 
+/// Firmware slots of a platform that boots one of several copies (A/B).
+#[derive(Debug, Clone)]
+pub struct FirmwareSlots {
+    /// FMAP region of the running copy; a capsule never writes it.
+    pub running: heapless::String<32>,
+    /// FMAP region a capsule writes and then activates.
+    pub inactive: heapless::String<32>,
+}
+
 /// Capsule update backend.
 ///
 /// Implemented by platform firmware to provide the low-level operations
@@ -501,6 +510,18 @@ pub trait CapsuleBackend {
     /// update leaves the running copy intact.
     fn running_firmware_offset(&self) -> Option<u32> {
         None
+    }
+
+    /// A/B firmware slots, if the platform boots by slot. A capsule then
+    /// writes only the inactive slot and activates it; the running copy stays
+    /// as the fallback.
+    fn firmware_slots(&mut self) -> Option<FirmwareSlots> {
+        None
+    }
+
+    /// Boot the slot in `region_name` from the next reset on.
+    fn activate_slot(&mut self, _region_name: &str) -> Result<(), StorageError> {
+        Err(StorageError::NotSupported)
     }
 }
 

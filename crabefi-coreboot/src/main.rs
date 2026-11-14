@@ -22,6 +22,8 @@ static HOST_CHECK_ALLOCATOR: linked_list_allocator::LockedHeap =
 
 #[cfg(not(target_arch = "riscv64"))]
 mod acpi;
+#[cfg(feature = "payload-mm")]
+mod amd_ab;
 #[cfg(target_arch = "aarch64")]
 #[path = "arch/aarch64/entry.rs"]
 mod arch_entry;
@@ -478,6 +480,35 @@ impl CorebootCapsuleBackend {
     }
 }
 
+#[cfg(feature = "payload-mm")]
+impl CorebootCapsuleBackend {
+    /// AMD PSP A/B slot headers and the FMAP region of each slot: the largest
+    /// area holding that slot's PSP L2 directory but not the other's.
+    fn slot_regions(&mut self) -> Option<([amd_ab::Ish; 2], [crabefi::FmapRegion; 2])> {
+        if !crabefi::efi::payload_mm::active() {
+            return None;
+        }
+        let boot_media = self.boot_media?;
+        let ishes = amd_ab::read_ishes(&mut |offset, buf: &mut [u8]| {
+            payload_mm::read_flash(boot_media, offset, buf)
+        })?;
+        self.load_fmap();
+        let holds = |region: &crabefi::FmapRegion, at: u32| {
+            (region.offset..region.offset.saturating_add(region.size)).contains(&at)
+        };
+        let region_of = |mine: u32, other: u32| {
+            self.fmap_regions
+                .iter()
+                .filter(|region| holds(region, mine) && !holds(region, other))
+                .max_by_key(|region| region.size)
+                .cloned()
+        };
+        let a = region_of(ishes[0].pl2, ishes[1].pl2)?;
+        let b = region_of(ishes[1].pl2, ishes[0].pl2)?;
+        Some((ishes, [a, b]))
+    }
+}
+
 // Capsule signing roots from CRABEFI_CAPSULE_TRUST_CERTS (build.rs).
 include!(concat!(env!("OUT_DIR"), "/capsule_trust.rs"));
 
@@ -488,6 +519,65 @@ impl crabefi::CapsuleBackend for CorebootCapsuleBackend {
 
     fn capsule_trust_store(&self) -> &[&[u8]] {
         CAPSULE_TRUST_STORE
+    }
+
+    #[cfg(feature = "payload-mm")]
+    fn firmware_slots(&mut self) -> Option<crabefi::FirmwareSlots> {
+        let (ishes, regions) = self.slot_regions()?;
+        let running = self.running_firmware_offset()?;
+        let index = regions
+            .iter()
+            .position(|region| (region.offset..region.offset + region.size).contains(&running))?;
+        log::info!(
+            "A/B slots: running '{}' (priority {:#x}), inactive '{}' (priority {:#x})",
+            regions[index].name,
+            ishes[index].priority,
+            regions[1 - index].name,
+            ishes[1 - index].priority
+        );
+        Some(crabefi::FirmwareSlots {
+            running: regions[index].name.clone(),
+            inactive: regions[1 - index].name.clone(),
+        })
+    }
+
+    #[cfg(feature = "payload-mm")]
+    fn activate_slot(&mut self, region_name: &str) -> Result<(), crabefi::StorageError> {
+        let (ishes, regions) = self
+            .slot_regions()
+            .ok_or(crabefi::StorageError::NotSupported)?;
+        let target = regions
+            .iter()
+            .position(|region| region.name.as_str() == region_name)
+            .ok_or(crabefi::StorageError::InvalidArgument)?;
+        let boot_media = self
+            .boot_media
+            .ok_or(crabefi::StorageError::NotInitialized)?;
+        for (offset, header) in amd_ab::activation(&ishes[target], &ishes[1 - target]) {
+            // The header has its own sector: rewrite the sector with it.
+            let sector = offset & !0xFFF;
+            let mut data = alloc::vec![0u8; 0x1000];
+            if !payload_mm::read_flash(boot_media, sector, &mut data) {
+                return Err(crabefi::StorageError::IoError);
+            }
+            let at = (offset - sector) as usize;
+            data[at..at + header.len()].copy_from_slice(&header);
+            let status = match crabefi::efi::payload_mm::firmware_erase(u64::from(sector), 0x1000) {
+                r_efi::efi::Status::SUCCESS => {
+                    crabefi::efi::payload_mm::firmware_write(u64::from(sector), &data)
+                }
+                status => status,
+            };
+            if status != r_efi::efi::Status::SUCCESS {
+                log::error!(
+                    "Writing the slot header at {:#x} failed: {:?}",
+                    offset,
+                    status
+                );
+                return Err(crabefi::StorageError::IoError);
+            }
+        }
+        Ok(())
     }
 
     fn running_firmware_offset(&self) -> Option<u32> {

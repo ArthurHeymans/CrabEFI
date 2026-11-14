@@ -223,6 +223,21 @@ pub fn for_each_fmap_area(
     )
 }
 
+/// Read `buf.len()` bytes at flash `offset` from the memory-mapped flash.
+pub fn read_flash(boot_media: BootMediaInfo, offset: u32, buf: &mut [u8]) -> bool {
+    let Some((base, size)) = flash_mapping(boot_media, None) else {
+        return false;
+    };
+    if u64::from(offset) + buf.len() as u64 > size {
+        return false;
+    }
+    for (i, byte) in buf.iter_mut().enumerate() {
+        // SAFETY: inside the flash window mapped below 4 GiB (checked above).
+        *byte = unsafe { read_volatile((base + u64::from(offset) + i as u64) as *const u8) };
+    }
+    true
+}
+
 /// Find an FMAP area (offset, size) in the memory-mapped flash.
 fn fmap_area(flash_base: u64, fmap_offset: u64, name: &[u8]) -> Option<(u64, u64)> {
     let mut found = None;

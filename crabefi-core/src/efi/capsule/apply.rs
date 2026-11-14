@@ -277,12 +277,33 @@ fn apply_fmp_payload_item(
         return CapsuleResult::failure(CapsuleResultStatus::ErrorInvalidImage, attempted_version);
     }
 
+    let slots = backend.firmware_slots();
+    if let Some(slots) = &slots
+        && !approved_regions
+            .iter()
+            .any(|region| region.name == slots.inactive)
+    {
+        log::error!(
+            "Capsule has no image for the inactive slot '{}'",
+            slots.inactive
+        );
+        return CapsuleResult::failure(CapsuleResultStatus::ErrorInvalidImage, attempted_version);
+    }
+
     // Write firmware image to approved flash regions.
     // The signed image is laid out as the concatenation of the approved regions
     // in manifest order; never truncate a region silently.
     let mut total_written = 0usize;
+    let mut regions_written = 0usize;
     for (index, write_start) in write_order(&approved_regions, backend.running_firmware_offset()) {
         let region = &approved_regions[index];
+        if slots
+            .as_ref()
+            .is_some_and(|slots| region.name == slots.running)
+        {
+            log::info!("Keeping region '{}' of the running slot", region.name);
+            continue;
+        }
         if region.offset.checked_add(region.size).is_none() {
             log::error!(
                 "RMAP region '{}' overflows flash address space: offset={:#x}, size={:#x}",
@@ -316,12 +337,24 @@ fn apply_fmp_payload_item(
         }
 
         total_written += write_size;
+        regions_written += 1;
+    }
+
+    if let Some(slots) = &slots {
+        if let Err(e) = backend.activate_slot(slots.inactive.as_str()) {
+            log::error!("Activating slot '{}' failed: {:?}", slots.inactive, e);
+            return CapsuleResult::failure(
+                CapsuleResultStatus::ErrorFlashWriteFailed,
+                attempted_version,
+            );
+        }
+        log::info!("Slot '{}' boots from the next reset", slots.inactive);
     }
 
     log::info!(
         "Capsule applied successfully: {} bytes written to {} region(s)",
         total_written,
-        approved_regions.len()
+        regions_written
     );
 
     CapsuleResult::success(attempted_version)
