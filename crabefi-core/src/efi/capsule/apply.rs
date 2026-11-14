@@ -278,6 +278,10 @@ fn apply_fmp_payload_item(
     }
 
     let slots = backend.firmware_slots();
+    if slots.is_some() && super::trial::pending() {
+        log::error!("The last firmware update is not confirmed yet; refusing another one");
+        return CapsuleResult::failure(CapsuleResultStatus::Error, attempted_version);
+    }
     if let Some(slots) = &slots
         && !approved_regions
             .iter()
@@ -349,6 +353,9 @@ fn apply_fmp_payload_item(
             );
         }
         log::info!("Slot '{}' boots from the next reset", slots.inactive);
+        if !super::trial::start(slots.inactive.as_str(), attempted_version) {
+            log::warn!("No trial record: this update cannot roll back");
+        }
     }
 
     log::info!(

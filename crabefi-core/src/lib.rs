@@ -308,6 +308,10 @@ fn init_persistence_and_boot(
     #[cfg(feature = "capsule-update")]
     if persistence_writable {
         if let Some(backend) = capsule_backend {
+            // Before any capsule: a rollback boot must not re-apply one.
+            if efi::capsule::trial::check(backend) {
+                reset_system();
+            }
             let applied = efi::capsule::process_pending_capsules(backend);
             if applied != 0 {
                 log::info!("Applied {} pending firmware capsule(s)", applied);

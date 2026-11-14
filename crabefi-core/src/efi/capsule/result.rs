@@ -155,6 +155,20 @@ pub fn record_capsule_result(index: usize, result: &CapsuleResult) {
     }
 }
 
+/// Record a failed or rolled back update in the ESRT last-attempt state.
+#[cfg(feature = "capsule-update")]
+pub(crate) fn record_last_attempt(version: u32, status: CapsuleResultStatus) {
+    let attempt = encode_last_attempt(&CapsuleResult::failure(status, version));
+    if let Err(error) = crate::efi::varstore::persistence::persist_firmware_variable(
+        &EFI_CAPSULE_REPORT_GUID,
+        ESRT_LAST_ATTEMPT_VARIABLE_NAME,
+        0x07, // NV | BS | RT
+        &attempt,
+    ) {
+        log::warn!("Failed to persist ESRT last-attempt state: {:?}", error);
+    }
+}
+
 fn encode_last_attempt(result: &CapsuleResult) -> [u8; 12] {
     let mut record = [0u8; 12];
     record[..4].copy_from_slice(&LAST_ATTEMPT_RECORD_VERSION.to_le_bytes());
