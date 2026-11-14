@@ -400,6 +400,11 @@ pub unsafe fn discover_platform(rsdp_addr: u64) -> Discovery {
 }
 
 #[cfg(target_arch = "x86_64")]
+unsafe fn read_u8(address: u64) -> u8 {
+    unsafe { core::ptr::read_unaligned(address as *const u8) }
+}
+
+#[cfg(target_arch = "x86_64")]
 unsafe fn read_u32(address: u64) -> u32 {
     unsafe { core::ptr::read_unaligned(address as *const u32) }
 }
@@ -444,6 +449,33 @@ unsafe fn find_table(rsdp_addr: u64, signature: &[u8; 4]) -> Option<u64> {
         (table != 0 && unsafe { core::slice::from_raw_parts(table as *const u8, 4) } == signature)
             .then_some(table)
     })
+}
+
+/// The Firmware Basic Boot Performance Table that the FPDT points to.
+///
+/// # Safety
+/// `rsdp_addr` and the tables it references must be identity mapped.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn find_fbpt(rsdp_addr: u64) -> Option<u64> {
+    let fpdt = unsafe { find_table(rsdp_addr, b"FPDT") }?;
+    let end = fpdt + u64::from(unsafe { read_u32(fpdt + 4) });
+    let mut record = fpdt + 36;
+    while record + 4 <= end {
+        let kind = u16::from_le_bytes([unsafe { read_u8(record) }, unsafe { read_u8(record + 1) }]);
+        let length = u64::from(unsafe { read_u8(record + 2) });
+        if length < 4 {
+            return None;
+        }
+        // Firmware Basic Boot Performance Pointer Record (type 0).
+        if kind == 0 && length >= 16 {
+            let fbpt = unsafe { read_u64(record + 8) };
+            let header = unsafe { core::slice::from_raw_parts(fbpt as *const u8, 4) };
+            return (fbpt != 0 && header == b"FBPT" && unsafe { read_u32(fbpt + 4) } >= 56)
+                .then_some(fbpt);
+        }
+        record += length;
+    }
+    None
 }
 
 /// Locate a TPM 1.2 event log described by the ACPI TCPA table.

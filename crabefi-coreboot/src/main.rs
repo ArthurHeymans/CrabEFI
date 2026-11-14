@@ -1045,7 +1045,11 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
 
     #[cfg(target_arch = "x86_64")]
     let timestamp_recorder = cb_info.timestamps.and_then(|table_addr| {
-        let recorder = timestamps::CorebootTimestampRecorder::new(table_addr)?;
+        let fbpt = cb_info
+            .acpi_rsdp
+            // SAFETY: coreboot's ACPI tables are identity mapped.
+            .and_then(|rsdp| unsafe { acpi::find_fbpt(rsdp) });
+        let recorder = timestamps::CorebootTimestampRecorder::new(table_addr)?.with_fbpt(fbpt);
         recorder.record_counter(crabefi::timestamp::TS_CRABEFI_START, entry_counter);
         recorder.record_now(crabefi::timestamp::TS_CRABEFI_TABLES_PARSED);
         Some(recorder)

@@ -880,6 +880,7 @@ fn release_image(image_handle: Handle) -> Status {
 }
 
 pub(super) extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> Status {
+    crate::timestamp::record(crate::timestamp::TS_CRABEFI_EXIT_BOOT_SERVICES_ENTRY);
     log::info!(
         "BS.ExitBootServices(handle={:?}, map_key={:#x})",
         image_handle,

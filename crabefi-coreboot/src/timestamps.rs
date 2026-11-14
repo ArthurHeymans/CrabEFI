@@ -36,6 +36,21 @@ struct TimestampEntry {
 #[derive(Clone, Copy)]
 pub(crate) struct CorebootTimestampRecorder {
     table_addr: u64,
+    /// ACPI Firmware Basic Boot Performance Table to fill (coreboot ACPI_FPDT).
+    fbpt: Option<u64>,
+}
+
+/// FBPT field (byte offset) for a CrabEFI milestone: OS loader LoadImage
+/// (1509), StartImage (1100), ExitBootServices entry (1510) and exit (1508).
+/// Literal IDs: ci/run-coreboot-feature-tests.sh compiles this file alone.
+fn fbpt_field(id: u32) -> Option<usize> {
+    match id {
+        1509 => Some(24),
+        1100 => Some(32),
+        1510 => Some(40),
+        1508 => Some(48),
+        _ => None,
+    }
 }
 
 impl CorebootTimestampRecorder {
@@ -68,13 +83,39 @@ impl CorebootTimestampRecorder {
             return None;
         }
 
-        Some(Self { table_addr })
+        Some(Self {
+            table_addr,
+            fbpt: None,
+        })
+    }
+
+    pub(crate) fn with_fbpt(self, fbpt: Option<u64>) -> Self {
+        Self { fbpt, ..self }
+    }
+
+    /// Store milestone `id` in the FBPT in ns since reset (the counter is the
+    /// TSC, which starts at reset like coreboot's timestamp base).
+    fn record_fbpt(&self, id: u32, counter: u64) {
+        let (Some(fbpt), Some(field)) = (self.fbpt, fbpt_field(id)) else {
+            return;
+        };
+        // SAFETY: `table_addr` was accepted by `new()`; the FBPT was found
+        // through the FPDT and lives in reserved coreboot memory.
+        unsafe {
+            let table = self.table_addr as *const TimestampTable;
+            let mhz = u64::from(core::ptr::addr_of!((*table).tick_freq_mhz).read_unaligned());
+            if let Some(ns) = (counter * 1000).checked_div(mhz) {
+                ((fbpt + field as u64) as *mut u64).write_unaligned(ns);
+            }
+        }
     }
 
     /// Append a milestone using the current architecture counter.
     #[cfg(not(test))]
     pub(crate) fn record_now(&self, id: u32) {
-        self.record_counter(id, crabefi::time::read_counter());
+        let counter = crabefi::time::read_counter();
+        self.record_counter(id, counter);
+        self.record_fbpt(id, counter);
     }
 
     /// Append a milestone using an explicit architecture counter value.
