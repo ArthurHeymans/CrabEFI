@@ -450,14 +450,36 @@ pub fn enroll_microsoft_uefi_ca_db() -> Result<(), AuthError> {
 /// 2. Create a self-signed certificate
 /// 3. Use that as the PK
 pub fn enroll_default_pk() -> Result<(), AuthError> {
-    log::info!("Enrolling default Platform Key (using Microsoft KEK CA 2011)");
     let mut db = pk_database();
+    if let Some(cert) = SB_PK {
+        log::info!("Enrolling the build's Platform Key ({} bytes)", cert.len());
+        return add_certificate_entry(&mut db, cert, &CRABEFI_OWNER_GUID);
+    }
+    log::info!("Enrolling default Platform Key (using Microsoft KEK CA 2011)");
 
     // For now, use the Microsoft KEK CA as the PK
     // In a real implementation, this should be the platform owner's certificate
     add_certificate_entry(&mut db, MICROSOFT_KEK_CA_2011, &CRABEFI_OWNER_GUID)?;
 
     log::info!("Default PK enrolled");
+    Ok(())
+}
+
+// Build-time key set (crabefi-core/build.rs).
+include!(concat!(env!("OUT_DIR"), "/secure_boot_keys.rs"));
+
+/// Add the build's Microsoft and platform-owner certificates to `db`.
+fn enroll_build_certificates(
+    db: &mut KeyDatabase,
+    microsoft: &[&[u8]],
+    owner: &[&[u8]],
+) -> Result<(), AuthError> {
+    for cert in microsoft {
+        add_certificate_entry(db, cert, &MICROSOFT_OWNER_GUID)?;
+    }
+    for cert in owner {
+        add_certificate_entry(db, cert, &CRABEFI_OWNER_GUID)?;
+    }
     Ok(())
 }
 
@@ -512,10 +534,12 @@ pub fn enroll_default_keys() -> Result<(), AuthError> {
 
     // Enroll KEK first
     enroll_microsoft_kek()?;
+    enroll_build_certificates(&mut kek_database(), SB_MS_KEK, SB_KEK)?;
 
     // Enroll db certificates
     enroll_microsoft_windows_production_db()?;
     enroll_microsoft_uefi_ca_db()?;
+    enroll_build_certificates(&mut db_database(), SB_MS_DB, SB_DB)?;
 
     // Enroll PK last (this transitions from Setup Mode to User Mode)
     enroll_default_pk()?;
@@ -523,10 +547,16 @@ pub fn enroll_default_keys() -> Result<(), AuthError> {
     // Enter User Mode now that PK is enrolled
     enter_user_mode();
 
-    log::info!("Microsoft default keys enrolled - system in User Mode");
-    log::info!("  KEK: 1 certificate");
-    log::info!("  db:  2 certificates");
-    log::info!("  PK:  1 certificate");
+    log::info!("Default keys enrolled - system in User Mode");
+    log::info!(
+        "  KEK: {} certificate(s)",
+        1 + SB_MS_KEK.len() + SB_KEK.len()
+    );
+    log::info!("  db:  {} certificate(s)", 2 + SB_MS_DB.len() + SB_DB.len());
+    log::info!(
+        "  PK:  1 certificate{}",
+        if SB_PK.is_some() { " (build)" } else { "" }
+    );
 
     Ok(())
 }
