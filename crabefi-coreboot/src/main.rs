@@ -568,6 +568,10 @@ impl crabefi::CapsuleBackend for CorebootCapsuleBackend {
                 }
                 status => status,
             };
+            if status == r_efi::efi::Status::WRITE_PROTECTED {
+                // Not a capsule-update boot.
+                return Err(crabefi::StorageError::WriteProtected);
+            }
             if status != r_efi::efi::Status::SUCCESS {
                 log::error!(
                     "Writing the slot header at {:#x} failed: {:?}",

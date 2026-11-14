@@ -325,6 +325,26 @@ pub fn clear_os_indications_capsule_bits() {
     }
 }
 
+/// Request a capsule-update boot (file capsule delivery) for the next boot.
+#[cfg(feature = "capsule-update")]
+pub fn request_file_capsule_delivery() -> bool {
+    let os_ind_name: &[u16] = &[
+        'O' as u16, 's' as u16, 'I' as u16, 'n' as u16, 'd' as u16, 'i' as u16, 'c' as u16,
+        'a' as u16, 't' as u16, 'i' as u16, 'o' as u16, 'n' as u16, 's' as u16, 0,
+    ];
+    let guid = Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID);
+    let value = crate::efi::runtime_image::client::variables::get(&guid, os_ind_name)
+        .and_then(|(_, data)| data.get(..8).and_then(|bytes| bytes.try_into().ok()))
+        .map_or(0, u64::from_le_bytes);
+    let value = value | EFI_OS_INDICATIONS_FILE_CAPSULE_DELIVERY_SUPPORTED;
+    crate::efi::runtime_image::client::variables::set(
+        &guid,
+        os_ind_name,
+        0x07, // NV | BS | RT
+        &value.to_le_bytes(),
+    ) == r_efi::efi::Status::SUCCESS
+}
+
 fn clear_capsule_bits(value: u64) -> u64 {
     value
         & !(EFI_OS_INDICATIONS_FMP_CAPSULE_SUPPORTED

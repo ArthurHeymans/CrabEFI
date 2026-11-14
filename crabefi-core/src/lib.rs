@@ -330,6 +330,10 @@ fn init_persistence_and_boot(
         log::error!("Skipping pending capsules: the runtime variable journal was not replayed");
     } else if persistence_writable {
         if let Some(backend) = capsule_backend {
+            // Before any capsule: a rollback boot must not re-apply one.
+            if efi::capsule::trial::check(backend) {
+                reset_system();
+            }
             // A capsule file may sit on a USB ESP; scanning without USB would
             // consume the request without finding it.
             if !boot_manager::usb_ready()

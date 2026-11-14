@@ -21,6 +21,8 @@ pub mod fmp;
 pub mod header;
 pub mod result;
 pub mod rmap;
+#[cfg(feature = "capsule-update")]
+pub mod trial;
 
 #[cfg(any(feature = "capsule-update", test))]
 use crabefi_runtime_abi::capsule::{
