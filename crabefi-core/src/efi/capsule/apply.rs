@@ -281,7 +281,8 @@ fn apply_fmp_payload_item(
     // The signed image is laid out as the concatenation of the approved regions
     // in manifest order; never truncate a region silently.
     let mut total_written = 0usize;
-    for region in &approved_regions {
+    for (index, write_start) in write_order(&approved_regions, backend.running_firmware_offset()) {
+        let region = &approved_regions[index];
         if region.offset.checked_add(region.size).is_none() {
             log::error!(
                 "RMAP region '{}' overflows flash address space: offset={:#x}, size={:#x}",
@@ -296,7 +297,6 @@ fn apply_fmp_payload_item(
         }
 
         let write_size = region.size as usize;
-        let write_start = total_written;
         let write_end = write_start + write_size;
         let region_data = &clean_image[write_start..write_end];
 
@@ -325,6 +325,25 @@ fn apply_fmp_payload_item(
     );
 
     CapsuleResult::success(attempted_version)
+}
+
+/// Region indices with their image offsets (manifest order), the regions that
+/// hold `running` moved to the end.
+fn write_order(
+    regions: &[rmap::ApprovedRegion],
+    running: Option<u32>,
+) -> alloc::vec::Vec<(usize, usize)> {
+    let holds_running = |region: &rmap::ApprovedRegion| {
+        running.is_some_and(|at| at >= region.offset && at - region.offset < region.size)
+    };
+    let mut order = alloc::vec::Vec::with_capacity(regions.len());
+    let mut start = 0usize;
+    for (index, region) in regions.iter().enumerate() {
+        order.push((index, start));
+        start += region.size as usize;
+    }
+    order.sort_by_key(|&(index, _)| holds_running(&regions[index]));
+    order
 }
 
 fn version_failure(attempted_version: u32, lowest_supported_version: u32) -> Option<CapsuleResult> {
@@ -374,6 +393,33 @@ mod tests {
         fn fmap_regions(&mut self) -> &[FmapRegion] {
             &[]
         }
+    }
+
+    fn region(name: &str, offset: u32, size: u32) -> rmap::ApprovedRegion {
+        let mut region_name = heapless::String::new();
+        region_name.push_str(name).unwrap();
+        rmap::ApprovedRegion {
+            name: region_name,
+            offset,
+            size,
+        }
+    }
+
+    #[test]
+    fn running_region_is_written_last() {
+        let regions = [
+            region("RECOVERY_B", 0x100_0000, 0x10_0000),
+            region("RECOVERY_A", 0x4_0000, 0x20_0000),
+        ];
+        assert_eq!(write_order(&regions, None), [(0, 0), (1, 0x10_0000)]);
+        assert_eq!(
+            write_order(&regions, Some(0x7_4000)),
+            [(0, 0), (1, 0x10_0000)]
+        );
+        assert_eq!(
+            write_order(&regions, Some(0x101_0000)),
+            [(1, 0x10_0000), (0, 0)]
+        );
     }
 
     /// A capsule of `wrappers` nested capsule-on-disk headers around an

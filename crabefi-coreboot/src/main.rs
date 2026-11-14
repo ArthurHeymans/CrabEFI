@@ -413,7 +413,6 @@ impl crabefi::VariableStoreLocator for CorebootVariableStoreLocator {
 struct CorebootCapsuleBackend {
     firmware_info: Option<crabefi::FirmwareInfo>,
     fmap_offset: Option<u64>,
-    #[cfg(feature = "payload-mm")]
     boot_media: Option<tables::BootMediaInfo>,
     fmap_loaded: bool,
     fmap_regions: alloc::vec::Vec<crabefi::FmapRegion>,
@@ -427,7 +426,6 @@ impl CorebootCapsuleBackend {
         Self {
             firmware_info,
             fmap_offset: boot_media.map(|media| media.fmap_offset),
-            #[cfg(feature = "payload-mm")]
             boot_media,
             fmap_loaded: false,
             fmap_regions: alloc::vec::Vec::new(),
@@ -489,6 +487,11 @@ impl crabefi::CapsuleBackend for CorebootCapsuleBackend {
 
     fn capsule_trust_store(&self) -> &[&[u8]] {
         CAPSULE_TRUST_STORE
+    }
+
+    fn running_firmware_offset(&self) -> Option<u32> {
+        // coreboot reports the CBFS it booted from (COREBOOT or COREBOOT_B with PSP A/B).
+        u32::try_from(self.boot_media?.cbfs_offset).ok()
     }
 
     fn write_firmware_region(
