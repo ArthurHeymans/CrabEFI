@@ -24,8 +24,8 @@ use core::fmt::Write;
 use crabefi_ui::cfr::SettingsModel;
 use crabefi_ui::settings::{
     MenuItem, Session, SettingEdit, apply_edit, build_menu_items, can_edit_item, decrement_option,
-    find_first_selectable, get_option, has_changes, increment_option, is_item_visible,
-    is_selectable, push_truncated, save_all_changes,
+    external_boot_name, find_first_selectable, get_option, has_changes, increment_option,
+    is_item_visible, is_selectable, push_truncated, save_all_changes,
 };
 use heapless::String as StackString;
 
@@ -159,6 +159,12 @@ pub fn show_cfr_menu() {
                         } else if matches!(items.get(selected), Some(MenuItem::CrabLogLevel { .. }))
                         {
                             status_message = Some(("Controls CrabEFI serial log verbosity", true));
+                        } else if matches!(
+                            items.get(selected),
+                            Some(MenuItem::CrabExternalBoot { .. })
+                        ) {
+                            status_message =
+                                Some(("Whether USB and removable media may boot", true));
                         }
                         break;
                     }
@@ -478,7 +484,19 @@ fn draw_item(
             }
         }
         MenuItem::CrabLogLevel { current_level, .. } => {
-            draw_log_level_item(*current_level, is_selected, row, fb_console, cols);
+            let level = crate::logger::level_name(*current_level);
+            draw_crab_item(
+                "CrabEFI log level",
+                level,
+                is_selected,
+                row,
+                fb_console,
+                cols,
+            );
+        }
+        MenuItem::CrabExternalBoot { current, .. } => {
+            let value = external_boot_name(*current);
+            draw_crab_item("External boot", value, is_selected, row, fb_console, cols);
         }
         MenuItem::Comment { text } => {
             draw_comment(text, row, fb_console);
@@ -526,18 +544,18 @@ fn draw_subform_header(name: &str, row: usize, fb_console: &mut Option<Framebuff
     }
 }
 
-/// Draw the CrabEFI log-level item.
-fn draw_log_level_item(
-    level: log::LevelFilter,
+/// Draw a CrabEFI-owned item.
+fn draw_crab_item(
+    name: &str,
+    value: &str,
     is_selected: bool,
     row: usize,
     fb_console: &mut Option<FramebufferConsole>,
     cols: usize,
 ) {
-    let name = "CrabEFI log level";
     let mut value_str = String::new();
     value_str.push('[');
-    value_str.push_str(crate::logger::level_name(level));
+    value_str.push_str(value);
     value_str.push(']');
 
     let ansi_row = row + 1;

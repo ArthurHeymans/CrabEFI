@@ -26,6 +26,8 @@ usb-on-demand = []
 external-boot-menu-only = []
 # Never boot USB or removable media; takes precedence over menu-only.
 external-boot-deny = []
+# Offer the external-boot policy in the setup menu (stricter values only).
+external-boot-setting = ["crabefi/external-boot-setting"]
 
 [dependencies]
 crabefi = { package = "crabefi-core", path = "../crabefi-core", features = [

@@ -45,6 +45,9 @@ static POLICY: LocalCell<BootPolicy> = LocalCell::new(BootPolicy {
     external_boot: ExternalBoot::Allow,
 });
 
+/// The platform's external-boot setting, before `CrabEFIExternalBoot`.
+static PLATFORM_EXTERNAL_BOOT: LocalCell<ExternalBoot> = LocalCell::new(ExternalBoot::Allow);
+
 /// Name of the variable that can tighten [`BootPolicy::external_boot`].
 pub const EXTERNAL_BOOT_VARIABLE_NAME: &str = "CrabEFIExternalBoot";
 
@@ -53,6 +56,7 @@ const EXTERNAL_BOOT_VARIABLE_ATTRS: u32 =
     crate::efi::auth::attributes::NON_VOLATILE | crate::efi::auth::attributes::BOOTSERVICE_ACCESS;
 
 pub(crate) fn configure(policy: BootPolicy) {
+    PLATFORM_EXTERNAL_BOOT.set(policy.external_boot);
     POLICY.set(policy);
 }
 
@@ -78,27 +82,64 @@ fn tightened(platform: ExternalBoot, attributes: u32, data: &[u8]) -> Option<Ext
     parse_external_boot(attributes, data).map(|value| platform.max(value))
 }
 
+fn variable_name() -> alloc::vec::Vec<u16> {
+    EXTERNAL_BOOT_VARIABLE_NAME
+        .encode_utf16()
+        .chain(core::iter::once(0))
+        .collect()
+}
+
 /// Apply `CrabEFIExternalBoot` once the variable store is authoritative.
 pub(crate) fn apply_variable() {
     use crate::efi::runtime_image::client::variables;
 
-    let name: alloc::vec::Vec<u16> = EXTERNAL_BOOT_VARIABLE_NAME
-        .encode_utf16()
-        .chain(core::iter::once(0))
-        .collect();
     let mut policy = get();
-    if let Some((attributes, data)) = variables::get(&crate::logger::CRABEFI_SETTINGS_GUID, &name) {
+    if let Some((attributes, data)) =
+        variables::get(&crate::logger::CRABEFI_SETTINGS_GUID, &variable_name())
+    {
         match tightened(policy.external_boot, attributes, &data) {
             Some(value) => policy.external_boot = value,
             None => log::warn!("Ignoring malformed {}", EXTERNAL_BOOT_VARIABLE_NAME),
         }
     }
-    configure(policy);
+    POLICY.set(policy);
     log::info!(
         "Boot policy: USB {:?}, external boot {:?}",
         policy.usb_init,
         policy.external_boot
     );
+}
+
+/// The setup menu's floor and current value, as variable bytes: the
+/// platform setting and the effective policy.
+pub(crate) fn external_boot_setting() -> (u8, u8) {
+    (
+        PLATFORM_EXTERNAL_BOOT.get() as u8,
+        get().external_boot as u8,
+    )
+}
+
+/// Persist a setup-menu choice and apply it to this boot. Only a byte
+/// [`parse_external_boot`] accepts is written, with its attributes.
+pub(crate) fn set_external_boot(byte: u8) -> Result<(), r_efi::efi::Status> {
+    use crate::efi::runtime_image::client::variables;
+
+    let data = [byte];
+    let value = parse_external_boot(EXTERNAL_BOOT_VARIABLE_ATTRS, &data)
+        .ok_or(r_efi::efi::Status::INVALID_PARAMETER)?;
+    let status = variables::set(
+        &crate::logger::CRABEFI_SETTINGS_GUID,
+        &variable_name(),
+        EXTERNAL_BOOT_VARIABLE_ATTRS,
+        &data,
+    );
+    if status != r_efi::efi::Status::SUCCESS {
+        return Err(status);
+    }
+    let mut policy = get();
+    policy.external_boot = PLATFORM_EXTERNAL_BOOT.get().max(value);
+    POLICY.set(policy);
+    Ok(())
 }
 
 /// USB and removable media count as external.
@@ -181,6 +222,14 @@ mod tests {
         assert_eq!(tightened(Deny, NV_BS, &[0]), Some(Deny));
         assert_eq!(tightened(Deny, NV_BS, &[1]), Some(Deny));
         assert_eq!(tightened(Allow, NV_BS | 4, &[2]), None);
+    }
+
+    #[test]
+    fn setting_bytes_are_the_variable_encoding() {
+        use ExternalBoot::*;
+        for value in [Allow, MenuOnly, Deny] {
+            assert_eq!(parse_external_boot(NV_BS, &[value as u8]), Some(value));
+        }
     }
 
     #[test]

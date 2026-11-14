@@ -9,6 +9,10 @@ pub const CFR_OPTFLAG_SUPPRESS: u32 = 1 << 2;
 pub const CFR_OPTFLAG_VOLATILE: u32 = 1 << 3;
 pub const CFR_OPTFLAG_RUNTIME: u32 = 1 << 4;
 
+/// CrabEFI external-boot choices, least to most restrictive. An index is the
+/// `CrabEFIExternalBoot` byte.
+pub const EXTERNAL_BOOT_CHOICES: [&str; 3] = ["Allow", "Menu only", "Deny"];
+
 #[derive(Debug, Clone)]
 pub struct CfrEnumChoice {
     pub value: u32,
@@ -106,6 +110,14 @@ pub trait SettingsModel {
     }
     fn set_configured_level(&self, _level: LevelFilter) -> Result<(), &'static str> {
         Err("Log level storage unavailable")
+    }
+    /// The build policy and the effective policy as [`EXTERNAL_BOOT_CHOICES`]
+    /// indices; `None` hides the setting.
+    fn external_boot(&self) -> Option<(usize, usize)> {
+        None
+    }
+    fn set_external_boot(&self, _choice: usize) -> Result<(), &'static str> {
+        Err("External boot storage unavailable")
     }
     fn find_numeric_value(&self, object_id: u64) -> Option<u32> {
         if object_id == 0 {

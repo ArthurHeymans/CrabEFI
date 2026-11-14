@@ -242,6 +242,21 @@ impl crabefi_ui::cfr::SettingsModel for CfrInfo {
             "Failed to persist CrabEFI log level"
         })
     }
+    fn external_boot(&self) -> Option<(usize, usize)> {
+        // A setup item only in builds that ask for it.
+        if !cfg!(feature = "external-boot-setting") {
+            return None;
+        }
+        let (floor, current) = crate::boot_policy::external_boot_setting();
+        Some((usize::from(floor), usize::from(current)))
+    }
+    fn set_external_boot(&self, choice: usize) -> Result<(), &'static str> {
+        let byte = u8::try_from(choice).map_err(|_| "Invalid external boot policy")?;
+        crate::boot_policy::set_external_boot(byte).map_err(|status| {
+            log::warn!("Failed to persist external boot policy: {:?}", status);
+            "Failed to persist external boot policy"
+        })
+    }
 }
 
 impl Default for CfrInfo {
