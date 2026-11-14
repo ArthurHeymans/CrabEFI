@@ -553,7 +553,30 @@ impl crabefi::CapsuleBackend for CorebootCapsuleBackend {
         let boot_media = self
             .boot_media
             .ok_or(crabefi::StorageError::NotInitialized)?;
-        for (offset, header) in amd_ab::activation(&ishes[target], &ishes[1 - target]) {
+        let writes = amd_ab::activation(&ishes[target], &ishes[1 - target]);
+        // Both slots share the memory training cache, and the ABL reuses it even
+        // when the other slot's APCB differs (e.g. the UMA size): the next boot
+        // must train again. Erased first, so a power loss before the header
+        // write only costs the old slot one training boot.
+        if let Some(cache) = self
+            .fmap_regions
+            .iter()
+            .find(|region| region.name.as_str() == "RW_MRC_CACHE")
+            .filter(|_| !writes.is_empty())
+        {
+            let status = crabefi::efi::payload_mm::firmware_erase(
+                u64::from(cache.offset),
+                u64::from(cache.size),
+            );
+            if status == r_efi::efi::Status::WRITE_PROTECTED {
+                return Err(crabefi::StorageError::WriteProtected);
+            }
+            if status != r_efi::efi::Status::SUCCESS {
+                log::error!("Erasing RW_MRC_CACHE failed: {:?}", status);
+                return Err(crabefi::StorageError::IoError);
+            }
+        }
+        for (offset, header) in writes {
             // The header has its own sector: rewrite the sector with it.
             let sector = offset & !0xFFF;
             let mut data = alloc::vec![0u8; 0x1000];
