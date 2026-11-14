@@ -396,8 +396,8 @@ pub struct SpiFlashInfo {
 /// Boot media parameters
 ///
 /// Contains information about the boot media layout from coreboot tables.
-// CBFS fields are parsed for handoff completeness; only FMAP offset is
-// consumed so far.
+// CBFS fields are parsed for handoff completeness; only the FMAP and CBFS
+// offsets are consumed so far.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct BootMediaInfo {

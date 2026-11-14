@@ -495,6 +495,13 @@ pub trait CapsuleBackend {
 
     /// Get all FMAP regions for RMAP manifest validation.
     fn fmap_regions(&mut self) -> &[FmapRegion];
+
+    /// Flash offset of the running firmware, if known. The capsule region
+    /// holding it is written last, so with A/B copies a power loss during the
+    /// update leaves the running copy intact.
+    fn running_firmware_offset(&self) -> Option<u32> {
+        None
+    }
 }
 
 // ============================================================================
