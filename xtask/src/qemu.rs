@@ -8,7 +8,6 @@ use regex::Regex;
 use std::fs;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{Arch, Machine};
 
@@ -16,25 +15,46 @@ mod filesystem;
 mod fwui;
 pub(crate) mod sct;
 
-static RUNTIME_IMAGE_TWO_BOOT: AtomicBool = AtomicBool::new(false);
-static WRITABLE_TEST_FLASH: AtomicBool = AtomicBool::new(false);
-
-fn is_runtime_image_two_boot(disk_path: &Path) -> bool {
-    RUNTIME_IMAGE_TWO_BOOT.load(Ordering::Relaxed)
-        || disk_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.contains("runtime-image-test"))
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureScenario {
+    BootSmoke,
+    Integration,
+    RuntimeImageReplay,
 }
 
-fn add_x86_firmware_args(cmd: &mut Command, firmware: &str, writable_flash: bool) {
-    if writable_flash {
+impl CaptureScenario {
+    fn for_test_app(app: &str) -> Self {
+        if app == "runtime-image-test" {
+            Self::RuntimeImageReplay
+        } else {
+            Self::Integration
+        }
+    }
+
+    /// Integration runs use snapshot pflash so variable persistence works
+    /// without changing the ROM. The replay test also permits a warm reset.
+    fn writable_flash(self) -> bool {
+        self != Self::BootSmoke
+    }
+
+    fn allows_reboot(self) -> bool {
+        self == Self::RuntimeImageReplay
+    }
+}
+
+fn add_x86_boot_args(cmd: &mut Command, firmware: &str, scenario: CaptureScenario) {
+    if scenario.writable_flash() {
         cmd.args([
             "-drive",
             &format!("if=pflash,format=raw,file={firmware},snapshot=on"),
         ]);
     } else {
         cmd.args(["-bios", firmware]);
+    }
+    if scenario.allows_reboot() {
+        cmd.args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]);
+    } else {
+        cmd.arg("-no-reboot");
     }
 }
 
@@ -282,14 +302,8 @@ fn build_qemu_command_x86_64(config: &QemuConfig, disk_path: &Path) -> Result<Co
 
     // Basic machine setup
     cmd.args(["-machine", "q35"]);
-    let two_boot = is_runtime_image_two_boot(disk_path);
-    add_x86_firmware_args(&mut cmd, &config.coreboot_rom, two_boot);
+    add_x86_boot_args(&mut cmd, &config.coreboot_rom, CaptureScenario::BootSmoke);
     cmd.args(["-m", "512M"]);
-    if two_boot {
-        cmd.args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]);
-    } else {
-        cmd.arg("-no-reboot");
-    }
 
     // Display and serial settings
     if config.headless {
@@ -791,11 +805,7 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
     if app_name == "fwui-test" {
         return fwui::run(config, disk_path);
     }
-    RUNTIME_IMAGE_TWO_BOOT.store(app_name == "runtime-image-test", Ordering::Relaxed);
-    // Every x86 integration run advertises SMMSTORE to the payload. Boot it
-    // from writable snapshot pflash so variable persistence can initialize
-    // without mutating the checked-in ROM.
-    WRITABLE_TEST_FLASH.store(true, Ordering::Relaxed);
+    let scenario = CaptureScenario::for_test_app(app_name);
     println!(
         "=== CrabEFI Integration Tests ({}, {:?}) ===\n",
         app_name, config.arch
@@ -803,7 +813,7 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
 
     // Run QEMU and capture output
     println!("Running tests in QEMU...\n");
-    let result = run_qemu_with_capture(config, disk_path)?;
+    let result = run_qemu_with_capture(config, disk_path, scenario)?;
 
     // Keep firmware memory metrics visible in successful CI runs.
     for line in result
@@ -1410,7 +1420,7 @@ pub fn run_uefi_sct_smoke_tests(
     println!("SCT reports: {}", report_dir.display());
     println!("Running SCT sequence in QEMU...\n");
 
-    let result = run_qemu_with_capture(config, disk_path)?;
+    let result = run_qemu_with_capture(config, disk_path, CaptureScenario::BootSmoke)?;
     fs::write(report_dir.join("serial.log"), &result.output)?;
     let image = crate::disk::mtools_esp_image(disk_path);
     for directory in ["::/Sct/Overall", "::/Sct/Log", "::/Sct/Report"] {
@@ -1512,7 +1522,7 @@ pub fn run_windows_boot_smoke_test(
         "CRABEFI: boot failed",
     ];
     validate_windows_markers(success_markers, &failure_markers)?;
-    let result = run_qemu_with_capture(config, disk_path)?;
+    let result = run_qemu_with_capture(config, disk_path, CaptureScenario::BootSmoke)?;
 
     println!("\n=== Windows Boot Smoke Results ===");
     println!("Serial output captured: {} bytes", result.output.len());
@@ -1634,11 +1644,15 @@ fn extract_sct_log(disk_path: &Path, src: &str) -> Result<Option<String>> {
 }
 
 /// Run QEMU and capture serial output
-fn run_qemu_with_capture(config: &QemuConfig, disk_path: &Path) -> Result<TestResult> {
+fn run_qemu_with_capture(
+    config: &QemuConfig,
+    disk_path: &Path,
+    scenario: CaptureScenario,
+) -> Result<TestResult> {
     let timeout = config.timeout_secs.unwrap_or(60);
 
     match (config.arch, config.machine) {
-        (Arch::X86_64, _) => run_qemu_with_capture_x86_64(config, disk_path, timeout),
+        (Arch::X86_64, _) => run_qemu_with_capture_x86_64(config, disk_path, timeout, scenario),
         (Arch::Aarch64, Machine::Sbsa) => {
             run_qemu_with_capture_aarch64_sbsa(config, disk_path, timeout)
         }
@@ -1654,6 +1668,7 @@ fn run_qemu_with_capture_x86_64(
     config: &QemuConfig,
     disk_path: &Path,
     timeout: u64,
+    scenario: CaptureScenario,
 ) -> Result<TestResult> {
     // Use the `timeout` command to enforce the timeout at the process level
     let mut cmd = Command::new("timeout");
@@ -1663,8 +1678,7 @@ fn run_qemu_with_capture_x86_64(
 
     // Build the rest of QEMU args
     cmd.args(["-machine", "q35"]);
-    let two_boot = is_runtime_image_two_boot(disk_path);
-    let writable_flash = WRITABLE_TEST_FLASH.load(Ordering::Relaxed);
+    let writable_flash = scenario.writable_flash();
     let runtime_flash = if writable_flash {
         Some(prepare_runtime_test_flash(Path::new(&config.coreboot_rom))?)
     } else {
@@ -1678,13 +1692,8 @@ fn run_qemu_with_capture_x86_64(
                 .to_str()
                 .expect("temporary flash path is not UTF-8")
         });
-    add_x86_firmware_args(&mut cmd, firmware, writable_flash);
+    add_x86_boot_args(&mut cmd, firmware, scenario);
     cmd.args(["-m", "2G"]);
-    if two_boot {
-        cmd.args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]);
-    } else {
-        cmd.arg("-no-reboot");
-    }
 
     // Serial settings for capture
     cmd.args(["-display", "none"]);
@@ -1979,6 +1988,39 @@ fn parse_qemu_output(output: &std::process::Output) -> Result<TestResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn x86_replay_is_selected_by_scenario_not_by_disk_name_or_prior_run() {
+        let args = |scenario| {
+            let mut command = Command::new("qemu-system-x86_64");
+            add_x86_boot_args(&mut command, "test.rom", scenario);
+            command
+                .get_args()
+                .map(|arg| arg.to_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        let replay = args(CaptureScenario::for_test_app("runtime-image-test"));
+        assert_eq!(
+            replay,
+            [
+                "-drive",
+                "if=pflash,format=raw,file=test.rom,snapshot=on",
+                "-device",
+                "isa-debug-exit,iobase=0xf4,iosize=0x04"
+            ]
+        );
+        let ordinary = args(CaptureScenario::for_test_app("hello"));
+        assert_eq!(
+            ordinary,
+            [
+                "-drive",
+                "if=pflash,format=raw,file=test.rom,snapshot=on",
+                "-no-reboot"
+            ]
+        );
+        let smoke = args(CaptureScenario::BootSmoke);
+        assert_eq!(smoke, ["-bios", "test.rom", "-no-reboot"]);
+    }
 
     #[test]
     fn storage_security_results_require_completion_and_no_failures() {
