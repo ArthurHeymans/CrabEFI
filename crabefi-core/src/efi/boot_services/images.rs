@@ -982,22 +982,11 @@ pub(super) extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: 
         // runtime memory.
         log::set_max_level(log::LevelFilter::Off);
 
-        // Switch from Secure EL1 to Non-Secure EL1 via a RAM trampoline.
-        //
-        // At Secure EL1, GICv3 routes Non-Secure Group 1 interrupts (LPIs /
-        // MSI-X) as FIQ. The Linux kernel only handles IRQ, so NVMe and other
-        // MSI-X devices hang forever waiting for completion interrupts.
-        //
-        // We can't issue the SMC directly from flash because the ERET returns
-        // to the instruction after the SMC — which is in Secure flash, not
-        // accessible from NS-EL1 on QEMU virt. Instead, we write a small
-        // trampoline to RAM that does SMC + RET. The RET returns to the EFI
-        // stub (also in RAM), now at NS-EL1 with proper interrupt routing.
-        //
-        // Uses vendor-specific SMCCC function ID 0xC2000000 handled by
-        // fstart's EL3 exception vector. No-op if no EL3 exists.
-        #[cfg(target_arch = "aarch64")]
-        crate::arch::aarch64::ns_switch::install_ns_trampoline();
+        // Security-state transitions are platform-owned. In particular,
+        // coreboot/TF-A already entered Non-Secure EL2. A PSCI version does
+        // not identify fstart or authorize its vendor-specific NS-switch SMC.
+        // Platforms needing that service must opt in through their own
+        // on_exit_boot_services hook, with the matching EL3 ABI.
     } else {
         #[cfg(feature = "tpm")]
         super::super::tcg::measured_boot::measure_action_all(
