@@ -94,7 +94,10 @@ impl fmt::Display for AbiError {
 /// | 28     | exports_offset `u32`    |
 /// | 32     | feature_bits `u64`      |
 /// | 40     | abi_version `u32`       |
-/// | 44     | reserved `u32` (zero)   |
+/// | 44     | reserved `u32` (zero on write) |
+///
+/// ABI v1 readers ignore reserved padding in the header, section, and
+/// relocation records. The relocation addend is not padding and must be zero.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RuntimeImageHeader {
     pub architecture: u16,
@@ -188,15 +191,17 @@ impl RuntimeRelocation {
         // Absolute64 has a zero addend. The trailing reserved field is zero too.
         bytes[16] = self.patch_section;
         bytes[17] = self.target_section;
-        bytes[18..20].copy_from_slice(&(self.kind as u16).to_le_bytes());
+        let wire_kind = match self.kind {
+            RelocationKind::Absolute64 => relocation_kind::ABSOLUTE64,
+        };
+        bytes[18..20].copy_from_slice(&wire_kind.to_le_bytes());
         bytes
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u16)]
 pub enum RelocationKind {
-    Absolute64 = relocation_kind::ABSOLUTE64,
+    Absolute64,
 }
 
 impl TryFrom<u16> for RelocationKind {

@@ -283,20 +283,26 @@ fn normalize(
             bail!("runtime ELF PT_LOAD segments overlap");
         }
     }
-    let linked_image_end = segments
-        .iter()
-        .map(|segment| segment.address + segment.memory_size)
-        .max()
-        .context("missing runtime image segments")?
-        .next_multiple_of(PAGE_SIZE);
+    // The non-overlap check establishes that the last segment ends last.
+    // Bound the rounded extent before allocating any leading zero padding.
+    let last = segments.last().context("missing runtime image segments")?;
+    let image_size = last
+        .address
+        .checked_add(last.memory_size)
+        .and_then(|end| end.checked_next_multiple_of(PAGE_SIZE))
+        .context("runtime image extent overflow")?;
+    let image_size_u32 = u32::try_from(image_size).context("runtime image exceeds 4 GiB")?;
     for index in 0..segments.len() {
         let original_address = segments[index].address;
         let normalized_start = if index == 0 { 0 } else { original_address };
         let normalized_end = segments
             .get(index + 1)
-            .map_or(linked_image_end, |next| next.address);
+            .map_or(image_size, |next| next.address);
         let prefix = usize::try_from(original_address - normalized_start)?;
-        let mut data = vec![0u8; prefix + segments[index].data.len()];
+        let padded_len = prefix
+            .checked_add(segments[index].data.len())
+            .context("runtime segment padding exceeds host address space")?;
+        let mut data = vec![0u8; padded_len];
         data[prefix..].copy_from_slice(&segments[index].data);
         segments[index].address = normalized_start;
         segments[index].memory_size = normalized_end - normalized_start;
@@ -305,9 +311,6 @@ fn normalize(
             segments[index].flags |= abi_section_flags::ZERO_FILL;
         }
     }
-    let image_size = linked_image_end;
-    let image_size_u32 = u32::try_from(image_size).context("runtime image exceeds 4 GiB")?;
-
     let relocations = collect_dynamic_relocations(&file, &segments, arch)?;
     if relocations.len() > crabefi_runtime_abi::MAX_RELOCATIONS {
         bail!(

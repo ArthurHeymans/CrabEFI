@@ -59,6 +59,8 @@ fn valid_image() -> Vec<u8> {
 
 #[test]
 fn section_and_relocation_encoders_match_wire_layout() {
+    // The public Rust discriminant predates the wire encoder.
+    assert_eq!(RelocationKind::Absolute64 as u16, 0);
     let section = RuntimeSection {
         file_offset: 0x1234,
         image_offset: 0x2000,
