@@ -783,10 +783,12 @@ fn append_instance_end(path: *mut device_path::Protocol) -> *mut device_path::Pr
 ///
 /// Returns a pointer suitable for `install_protocol`, or null on allocation failure.
 pub fn create_protocol() -> *mut c_void {
-    let proto =
-        allocate_protocol_with_log::<device_path_from_text::Protocol>("DevicePathFromText", |p| {
-            p.convert_text_to_device_node = convert_text_to_device_node;
-            p.convert_text_to_device_path = convert_text_to_device_path;
-        });
+    let proto = allocate_protocol_with_log(
+        "DevicePathFromText",
+        device_path_from_text::Protocol {
+            convert_text_to_device_node,
+            convert_text_to_device_path,
+        },
+    );
     proto as *mut c_void
 }

@@ -642,10 +642,13 @@ pub fn create_ata_pass_thru_protocol(
     }
 
     // Allocate mode structure
-    let mode_ptr = allocate_protocol_with_log::<AtaPassThruMode>("AtaPassThruMode", |m| {
-        m.attributes = ATTRIBUTES_PHYSICAL | ATTRIBUTES_LOGICAL;
-        m.io_align = 4; // 4-byte alignment
-    });
+    let mode_ptr = allocate_protocol_with_log(
+        "AtaPassThruMode",
+        AtaPassThruMode {
+            attributes: ATTRIBUTES_PHYSICAL | ATTRIBUTES_LOGICAL,
+            io_align: 4, // 4-byte alignment
+        },
+    );
 
     if mode_ptr.is_null() {
         return core::ptr::null_mut();
@@ -659,15 +662,15 @@ pub fn create_ata_pass_thru_protocol(
             pci_device,
             pci_function,
         },
-        |p| {
-            p.mode = mode_ptr;
-            p.pass_thru = ata_pass_thru;
-            p.get_next_port = ata_get_next_port;
-            p.get_next_device = ata_get_next_device;
-            p.build_device_path = ata_build_device_path;
-            p.get_device = ata_get_device;
-            p.reset_port = ata_reset_port;
-            p.reset_device = ata_reset_device;
+        AtaPassThruProtocol {
+            mode: mode_ptr,
+            pass_thru: ata_pass_thru,
+            get_next_port: ata_get_next_port,
+            get_next_device: ata_get_next_device,
+            build_device_path: ata_build_device_path,
+            get_device: ata_get_device,
+            reset_port: ata_reset_port,
+            reset_device: ata_reset_device,
         },
     );
     if protocol_ptr.is_null() {

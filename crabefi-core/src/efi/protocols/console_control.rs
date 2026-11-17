@@ -151,11 +151,14 @@ extern "efiapi" fn console_lock_std_in(
 
 /// Create a Console Control Protocol instance
 pub fn create_protocol() -> *mut c_void {
-    let ptr = allocate_protocol_with_log::<ConsoleControlProtocol>("ConsoleControlProtocol", |p| {
-        p.get_mode = console_get_mode;
-        p.set_mode = console_set_mode;
-        p.lock_std_in = console_lock_std_in;
-    });
+    let ptr = allocate_protocol_with_log(
+        "ConsoleControlProtocol",
+        ConsoleControlProtocol {
+            get_mode: console_get_mode,
+            set_mode: console_set_mode,
+            lock_std_in: console_lock_std_in,
+        },
+    );
     if ptr.is_null() {
         return core::ptr::null_mut();
     }

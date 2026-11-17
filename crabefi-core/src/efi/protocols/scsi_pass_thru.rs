@@ -640,11 +640,14 @@ pub fn create_scsi_pass_thru_protocol(
     usb_port: u8,
 ) -> *mut ExtScsiPassThruProtocol {
     // Allocate mode structure
-    let mode_ptr = allocate_protocol_with_log::<ExtScsiPassThruMode>("ExtScsiPassThruMode", |m| {
-        m.adapter_id = controller_index as u32;
-        m.attributes = ATTRIBUTES_PHYSICAL | ATTRIBUTES_LOGICAL;
-        m.io_align = 4; // 4-byte alignment
-    });
+    let mode_ptr = allocate_protocol_with_log(
+        "ExtScsiPassThruMode",
+        ExtScsiPassThruMode {
+            adapter_id: controller_index as u32,
+            attributes: ATTRIBUTES_PHYSICAL | ATTRIBUTES_LOGICAL,
+            io_align: 4, // 4-byte alignment
+        },
+    );
 
     if mode_ptr.is_null() {
         return core::ptr::null_mut();
@@ -673,15 +676,15 @@ pub fn create_scsi_pass_thru_protocol(
             usb_port,
             target_id,
         },
-        |p| {
-            p.mode = mode_ptr;
-            p.pass_thru = scsi_pass_thru;
-            p.get_next_target_lun = scsi_get_next_target_lun;
-            p.build_device_path = scsi_build_device_path;
-            p.get_target_lun = scsi_get_target_lun;
-            p.reset_channel = scsi_reset_channel;
-            p.reset_target_lun = scsi_reset_target_lun;
-            p.get_next_target = scsi_get_next_target;
+        ExtScsiPassThruProtocol {
+            mode: mode_ptr,
+            pass_thru: scsi_pass_thru,
+            get_next_target_lun: scsi_get_next_target_lun,
+            build_device_path: scsi_build_device_path,
+            get_target_lun: scsi_get_target_lun,
+            reset_channel: scsi_reset_channel,
+            reset_target_lun: scsi_reset_target_lun,
+            get_next_target: scsi_get_next_target,
         },
     );
     if protocol_ptr.is_null() {

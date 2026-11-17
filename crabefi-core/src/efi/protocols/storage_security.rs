@@ -424,9 +424,9 @@ pub fn create_storage_security_protocol(
             media_id,
             storage_type,
         },
-        |p| {
-            p.receive_data = storage_security_receive_data;
-            p.send_data = storage_security_send_data;
+        StorageSecurityCommandProtocol {
+            receive_data: storage_security_receive_data,
+            send_data: storage_security_send_data,
         },
     );
     if protocol_ptr.is_null() {

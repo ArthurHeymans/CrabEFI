@@ -175,11 +175,15 @@ pub fn install_disk_io_on_handle(handle: Handle) {
     }
 
     // Allocate the protocol structure and its handle context together.
-    let protocol_ptr = INSTANCES.allocate("DiskIoProtocol", DiskIoContext { handle }, |p| {
-        p.revision = DISK_IO_REVISION;
-        p.read_disk = disk_io_read_disk;
-        p.write_disk = disk_io_write_disk;
-    });
+    let protocol_ptr = INSTANCES.allocate(
+        "DiskIoProtocol",
+        DiskIoContext { handle },
+        DiskIoProtocol {
+            revision: DISK_IO_REVISION,
+            read_disk: disk_io_read_disk,
+            write_disk: disk_io_write_disk,
+        },
+    );
 
     if protocol_ptr.is_null() {
         return;

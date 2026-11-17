@@ -28,11 +28,15 @@ impl<Proto, Ctx: Copy> Registry<Proto, Ctx> {
         }
     }
 
-    pub fn allocate(&self, name: &str, ctx: Ctx, init: impl FnOnce(&mut Proto)) -> *mut Proto {
-        let ptr = allocate_protocol_with_log::<Instance<Proto, Ctx>>(name, |instance| {
-            init(&mut instance.protocol);
-            instance.ctx = ctx;
-        });
+    pub fn allocate(&self, name: &str, ctx: Ctx, protocol: Proto) -> *mut Proto {
+        let ptr = allocate_protocol_with_log(
+            name,
+            Instance {
+                protocol,
+                ctx,
+                next: core::ptr::null_mut(),
+            },
+        );
         if ptr.is_null() {
             return core::ptr::null_mut();
         }

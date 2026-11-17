@@ -33,24 +33,27 @@ pub fn create_loaded_image_protocol(
     // In a real implementation, this would be freed when the image is unloaded
     use crate::efi::utils::allocate_protocol_with_log;
 
-    let ptr = allocate_protocol_with_log::<loaded_image::Protocol>("LoadedImageProtocol", |p| {
-        p.revision = loaded_image::REVISION;
-        p.parent_handle = parent_handle;
-        p.system_table = system_table;
-        p.device_handle = device_handle;
-        p.file_path = core::ptr::null_mut(); // TODO: Create device path
-        p.reserved = core::ptr::null_mut();
-        p.load_options_size = 0;
-        p.load_options = core::ptr::null_mut();
-        p.image_base = image_base as *mut c_void;
-        p.image_size = image_size;
-        p.image_code_type = r_efi::efi::LOADER_CODE;
-        p.image_data_type = r_efi::efi::LOADER_DATA;
-        // Images are resident unless they explicitly install their own unload
-        // handler. A successful firmware-provided default would let callers
-        // free driver code that never opted into unloading.
-        p.unload = None;
-    });
+    let ptr = allocate_protocol_with_log(
+        "LoadedImageProtocol",
+        loaded_image::Protocol {
+            revision: loaded_image::REVISION,
+            parent_handle,
+            system_table,
+            device_handle,
+            file_path: core::ptr::null_mut(), // TODO: Create device path
+            reserved: core::ptr::null_mut(),
+            load_options_size: 0,
+            load_options: core::ptr::null_mut(),
+            image_base: image_base as *mut c_void,
+            image_size,
+            image_code_type: r_efi::efi::LOADER_CODE,
+            image_data_type: r_efi::efi::LOADER_DATA,
+            // Images are resident unless they explicitly install their own unload
+            // handler. A successful firmware-provided default would let callers
+            // free driver code that never opted into unloading.
+            unload: None,
+        },
+    );
     if ptr.is_null() {
         return ptr;
     }

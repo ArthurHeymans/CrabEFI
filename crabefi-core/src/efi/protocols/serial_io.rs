@@ -311,17 +311,20 @@ extern "efiapi" fn serial_read(
 /// A pointer to the protocol instance, or null on allocation failure
 pub fn create_protocol() -> *mut Protocol {
     // SAFETY: The helper already operates within an unsafe block for initialization
-    let ptr = allocate_protocol_with_log::<Protocol>("SerialIoProtocol", |p| {
-        p.revision = EFI_SERIAL_IO_PROTOCOL_REVISION1P1;
-        p.reset = serial_reset;
-        p.set_attributes = serial_set_attributes;
-        p.set_control = serial_set_control;
-        p.get_control = serial_get_control;
-        p.write = serial_write;
-        p.read = serial_read;
-        p.mode = IO_MODE.as_ptr();
-        p.device_type_guid = core::ptr::null();
-    });
+    let ptr = allocate_protocol_with_log(
+        "SerialIoProtocol",
+        Protocol {
+            revision: EFI_SERIAL_IO_PROTOCOL_REVISION1P1,
+            reset: serial_reset,
+            set_attributes: serial_set_attributes,
+            set_control: serial_set_control,
+            get_control: serial_get_control,
+            write: serial_write,
+            read: serial_read,
+            mode: IO_MODE.as_ptr(),
+            device_type_guid: core::ptr::null(),
+        },
+    );
     if ptr.is_null() {
         return ptr;
     }

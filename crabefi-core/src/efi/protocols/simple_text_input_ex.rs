@@ -303,15 +303,17 @@ fn dispatch_key_notifications(
 ///
 /// Returns a pointer to the allocated protocol, or null on failure.
 pub fn create_protocol() -> *mut c_void {
-    let ptr =
-        allocate_protocol_with_log::<SimpleTextInputExProtocol>("SimpleTextInputExProtocol", |p| {
-            p.reset = text_input_ex_reset;
-            p.read_key_stroke_ex = text_input_ex_read_key_stroke;
-            p.wait_for_key_ex = KEYBOARD_EVENT_ID as *mut c_void as Event;
-            p.set_state = text_input_ex_set_state;
-            p.register_key_notify = text_input_ex_register_key_notify;
-            p.unregister_key_notify = text_input_ex_unregister_key_notify;
-        });
+    let ptr = allocate_protocol_with_log(
+        "SimpleTextInputExProtocol",
+        SimpleTextInputExProtocol {
+            reset: text_input_ex_reset,
+            read_key_stroke_ex: text_input_ex_read_key_stroke,
+            wait_for_key_ex: KEYBOARD_EVENT_ID as *mut c_void as Event,
+            set_state: text_input_ex_set_state,
+            register_key_notify: text_input_ex_register_key_notify,
+            unregister_key_notify: text_input_ex_unregister_key_notify,
+        },
+    );
     if ptr.is_null() {
         return core::ptr::null_mut();
     }

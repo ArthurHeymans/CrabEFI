@@ -468,12 +468,14 @@ pub fn create_nvme_pass_thru_protocol(
         };
 
     // Allocate mode structure
-    let mode_ptr =
-        allocate_protocol_with_log::<NvmExpressPassThruMode>("NvmExpressPassThruMode", |m| {
-            m.attributes = ATTRIBUTES_PHYSICAL | ATTRIBUTES_LOGICAL | ATTRIBUTES_CMD_SET_NVM;
-            m.io_align = 4; // 4-byte alignment
-            m.nvme_version = nvme_version;
-        });
+    let mode_ptr = allocate_protocol_with_log(
+        "NvmExpressPassThruMode",
+        NvmExpressPassThruMode {
+            attributes: ATTRIBUTES_PHYSICAL | ATTRIBUTES_LOGICAL | ATTRIBUTES_CMD_SET_NVM,
+            io_align: 4, // 4-byte alignment
+            nvme_version,
+        },
+    );
 
     if mode_ptr.is_null() {
         return core::ptr::null_mut();
@@ -487,12 +489,12 @@ pub fn create_nvme_pass_thru_protocol(
             pci_device,
             pci_function,
         },
-        |p| {
-            p.mode = mode_ptr;
-            p.pass_thru = nvme_pass_thru;
-            p.get_next_namespace = nvme_get_next_namespace;
-            p.build_device_path = nvme_build_device_path;
-            p.get_namespace = nvme_get_namespace;
+        NvmExpressPassThruProtocol {
+            mode: mode_ptr,
+            pass_thru: nvme_pass_thru,
+            get_next_namespace: nvme_get_next_namespace,
+            build_device_path: nvme_build_device_path,
+            get_namespace: nvme_get_namespace,
         },
     );
     if protocol_ptr.is_null() {
