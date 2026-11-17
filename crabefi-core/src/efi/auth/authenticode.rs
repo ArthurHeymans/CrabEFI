@@ -36,7 +36,9 @@ use crabefi_pkcs7::cms::SignedData;
 #[cfg(feature = "secure-boot")]
 use crabefi_pkcs7::der::{DecodeError, Tlv, tag};
 use sha1::Sha1;
-use sha2::{Digest, Sha256, Sha384, Sha512};
+use sha2::{Digest, Sha384, Sha512};
+
+use crate::efi::digest::boot_sha256;
 
 /// WIN_CERTIFICATE header type for PKCS#7
 #[cfg(feature = "secure-boot")]
@@ -142,11 +144,7 @@ fn compute_authenticode_hash_inner(
     let mut result = [0u8; 64];
     match algorithm {
         TPM_ALG_SHA256 => {
-            let mut hasher = Sha256::new();
-            for (start, end) in &regions {
-                hasher.update(&pe_data[*start..*end]);
-            }
-            let hash = hasher.finalize();
+            let hash = boot_sha256(regions.iter().map(|&(start, end)| &pe_data[start..end]));
             result[..SHA256_DIGEST_SIZE].copy_from_slice(&hash);
         }
         TPM_ALG_SHA1 => {

@@ -103,6 +103,12 @@ Payload ELFs remain under `target/<triple>/release/crabefi`. Runtime ELF/image,
 map, symbols, disassembly, stack report, digest, and JSON audits are under
 `target/runtime/<arch>/`.
 
+On AArch64, boot-time image hashing and measured boot use SHA-256 instructions
+when the CPU advertises them and the firmware execution level permits SIMD.
+Otherwise they use software SHA-256. No build flag is needed. The isolated
+UEFI runtime image keeps software SHA-256 because it runs in an OS-owned CPU
+context after `ExitBootServices()`.
+
 ### Build Configuration
 
 | File | Purpose |
