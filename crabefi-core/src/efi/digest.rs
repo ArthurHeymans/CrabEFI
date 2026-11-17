@@ -1,5 +1,29 @@
 //! Algorithm-tagged digests shared by Authenticode hashing and measured boot.
 
+#[cfg(all(
+    target_arch = "aarch64",
+    target_endian = "little",
+    any(target_os = "none", all(test, target_os = "linux"))
+))]
+mod aarch64;
+
+/// Compute a boot-time SHA-256 digest over the ordered chunks.
+pub(crate) fn boot_sha256<'a>(chunks: impl IntoIterator<Item = &'a [u8]>) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+
+    #[cfg(all(target_arch = "aarch64", target_endian = "little", target_os = "none"))]
+    if aarch64::available() {
+        // SAFETY: SHA-256 and SIMD are usable on this CPU at the current EL.
+        return unsafe { aarch64::digest(chunks) };
+    }
+
+    let mut hasher = Sha256::new();
+    for chunk in chunks {
+        hasher.update(chunk);
+    }
+    hasher.finalize().into()
+}
+
 /// TPM_ALG_SHA1
 pub const TPM_ALG_SHA1: u16 = 0x0004;
 /// TPM_ALG_SHA256

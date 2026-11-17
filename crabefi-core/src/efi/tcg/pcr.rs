@@ -9,7 +9,9 @@
 //! boot evidence.
 
 use sha1::Sha1;
-use sha2::{Digest as _, Sha256, Sha384, Sha512};
+use sha2::{Digest as _, Sha384, Sha512};
+
+use crate::efi::digest::boot_sha256;
 
 use super::types::{
     PCR_COUNT, SHA1_DIGEST_SIZE, SHA256_DIGEST_SIZE, SHA384_DIGEST_SIZE, SHA512_DIGEST_SIZE,
@@ -32,9 +34,7 @@ fn hash_data_for_algorithm(algorithm: u16, data: &[u8]) -> Option<TaggedDigest> 
     let mut digest = TaggedDigest::zeroed(algorithm);
     match algorithm {
         TPM_ALG_SHA1 => digest.digest[..SHA1_DIGEST_SIZE].copy_from_slice(&Sha1::digest(data)),
-        TPM_ALG_SHA256 => {
-            digest.digest[..SHA256_DIGEST_SIZE].copy_from_slice(&Sha256::digest(data))
-        }
+        TPM_ALG_SHA256 => digest.digest[..SHA256_DIGEST_SIZE].copy_from_slice(&boot_sha256([data])),
         TPM_ALG_SHA384 => {
             digest.digest[..SHA384_DIGEST_SIZE].copy_from_slice(&Sha384::digest(data))
         }
@@ -89,10 +89,11 @@ impl PcrBank {
                 self.pcrs[index][..SHA1_DIGEST_SIZE].copy_from_slice(&hasher.finalize());
             }
             TPM_ALG_SHA256 => {
-                let mut hasher = Sha256::new();
-                hasher.update(&self.pcrs[index][..SHA256_DIGEST_SIZE]);
-                hasher.update(&digest[..SHA256_DIGEST_SIZE]);
-                self.pcrs[index][..SHA256_DIGEST_SIZE].copy_from_slice(&hasher.finalize());
+                let hash = boot_sha256([
+                    &self.pcrs[index][..SHA256_DIGEST_SIZE],
+                    &digest[..SHA256_DIGEST_SIZE],
+                ]);
+                self.pcrs[index][..SHA256_DIGEST_SIZE].copy_from_slice(&hash);
             }
             TPM_ALG_SHA384 => {
                 let mut hasher = Sha384::new();
