@@ -443,15 +443,14 @@ extern "efiapi" fn nvme_get_namespace(
 // Protocol Creation
 // ============================================================================
 
-/// Create an NVM Express Pass Thru Protocol instance
-///
-/// # Arguments
-/// * `controller_index` - Index of the NVMe controller
-/// * `pci_device` - PCI device number
-/// * `pci_function` - PCI function number
-///
-/// # Returns
-/// Pointer to the protocol instance, or null on failure
+pub(super) fn discard_unpublished(protocol: *mut NvmExpressPassThruProtocol) {
+    INSTANCES.remove_with(protocol, |protocol, _| {
+        let _ = crate::efi::allocator::free_pool(protocol.mode as *mut u8);
+    });
+}
+
+/// Create an NVM Express Pass Thru Protocol instance.
+/// Returns null on failure.
 pub fn create_nvme_pass_thru_protocol(
     controller_index: usize,
     pci_device: u8,

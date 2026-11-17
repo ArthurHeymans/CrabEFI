@@ -621,17 +621,15 @@ extern "efiapi" fn scsi_get_next_target(
 // Protocol Creation
 // ============================================================================
 
-/// Create an Extended SCSI Pass Thru Protocol instance
-///
-/// # Arguments
-/// * `controller_index` - Index of the USB controller
-/// * `device_addr` - USB device address (slot ID)
-/// * `pci_device` - PCI device number
-/// * `pci_function` - PCI function number
-/// * `usb_port` - USB port number
-///
-/// # Returns
-/// Pointer to the protocol instance, or null on failure
+pub(super) fn discard_unpublished(protocol: *mut ExtScsiPassThruProtocol) {
+    INSTANCES.remove_with(protocol, |protocol, ctx| {
+        let _ = crate::efi::allocator::free_pool(ctx.target_id);
+        let _ = crate::efi::allocator::free_pool(protocol.mode as *mut u8);
+    });
+}
+
+/// Create an Extended SCSI Pass Thru Protocol instance.
+/// Returns null on failure.
 pub fn create_scsi_pass_thru_protocol(
     controller_index: usize,
     device_addr: u8,

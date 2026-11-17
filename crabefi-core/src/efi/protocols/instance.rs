@@ -75,6 +75,12 @@ impl<Proto, Ctx: Copy> Registry<Proto, Ctx> {
     /// firmware's boot-time heap. Returns whether a registered instance
     /// was removed.
     pub fn remove(&self, protocol: *mut Proto) -> bool {
+        self.remove_with(protocol, |_, _| {})
+    }
+
+    /// Unlink an unpublished instance and release allocations it owns before
+    /// returning the instance itself to the pool.
+    pub fn remove_with(&self, protocol: *mut Proto, release: impl FnOnce(&Proto, Ctx)) -> bool {
         let mut head = self.head.borrow_mut();
         let mut prev: *mut Instance<Proto, Ctx> = core::ptr::null_mut();
         let mut cursor = *head;
@@ -92,6 +98,8 @@ impl<Proto, Ctx: Copy> Registry<Proto, Ctx> {
                     }
                 }
                 drop(head);
+                // SAFETY: this invocation now exclusively owns the unlinked instance.
+                release(unsafe { &(*cursor).protocol }, unsafe { (*cursor).ctx });
                 // SAFETY: `cursor` was allocated by `allocate` via
                 // `allocate_pool`, has just been unlinked, and is never
                 // touched again after this call.

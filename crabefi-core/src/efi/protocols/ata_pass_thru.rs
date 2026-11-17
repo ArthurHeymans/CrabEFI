@@ -621,15 +621,14 @@ extern "efiapi" fn ata_reset_device(
 // Protocol Creation
 // ============================================================================
 
-/// Create an ATA Pass Thru Protocol instance
-///
-/// # Arguments
-/// * `controller_index` - Index of the AHCI controller
-/// * `pci_device` - PCI device number
-/// * `pci_function` - PCI function number
-///
-/// # Returns
-/// Pointer to the protocol instance, or null on failure
+pub(super) fn discard_unpublished(protocol: *mut AtaPassThruProtocol) {
+    INSTANCES.remove_with(protocol, |protocol, _| {
+        let _ = crate::efi::allocator::free_pool(protocol.mode as *mut u8);
+    });
+}
+
+/// Create an ATA Pass Thru Protocol instance.
+/// Returns null on failure.
 pub fn create_ata_pass_thru_protocol(
     controller_index: usize,
     pci_device: u8,
