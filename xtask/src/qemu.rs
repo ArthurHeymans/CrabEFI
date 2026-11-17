@@ -276,7 +276,11 @@ pub struct TestResult {
 }
 
 /// Build QEMU command with the given configuration
-fn build_qemu_command(config: &QemuConfig, disk_path: &Path) -> Result<Command> {
+fn build_qemu_command(
+    config: &QemuConfig,
+    disk_path: &Path,
+    runtime_replay: bool,
+) -> Result<(Command, Option<tempfile::NamedTempFile>)> {
     // Check that coreboot ROM exists
     if !Path::new(&config.coreboot_rom).exists() {
         bail!(
@@ -288,21 +292,50 @@ fn build_qemu_command(config: &QemuConfig, disk_path: &Path) -> Result<Command> 
         );
     }
 
-    match (config.arch, config.machine) {
-        (Arch::X86_64, _) => build_qemu_command_x86_64(config, disk_path),
+    if runtime_replay {
+        anyhow::ensure!(
+            config.arch == Arch::X86_64,
+            "runtime replay requires x86-64"
+        );
+        let flash = prepare_runtime_test_flash(Path::new(&config.coreboot_rom))?;
+        let firmware = flash
+            .path()
+            .to_str()
+            .context("temporary flash path is not UTF-8")?;
+        let command = build_qemu_command_x86_64(
+            config,
+            disk_path,
+            firmware,
+            CaptureScenario::RuntimeImageReplay,
+        )?;
+        return Ok((command, Some(flash)));
+    }
+    let command = match (config.arch, config.machine) {
+        (Arch::X86_64, _) => build_qemu_command_x86_64(
+            config,
+            disk_path,
+            &config.coreboot_rom,
+            CaptureScenario::BootSmoke,
+        ),
         (Arch::Aarch64, Machine::Sbsa) => build_qemu_command_aarch64_sbsa(config, disk_path),
         (Arch::Aarch64, Machine::Virt) => build_qemu_command_aarch64_virt(config, disk_path),
         (Arch::Riscv64, _) => build_qemu_command_riscv64(config, disk_path),
-    }
+    }?;
+    Ok((command, None))
 }
 
 /// Build QEMU command for x86_64 (Q35)
-fn build_qemu_command_x86_64(config: &QemuConfig, disk_path: &Path) -> Result<Command> {
+fn build_qemu_command_x86_64(
+    config: &QemuConfig,
+    disk_path: &Path,
+    firmware: &str,
+    scenario: CaptureScenario,
+) -> Result<Command> {
     let mut cmd = Command::new("qemu-system-x86_64");
 
     // Basic machine setup
     cmd.args(["-machine", "q35"]);
-    add_x86_boot_args(&mut cmd, &config.coreboot_rom, CaptureScenario::BootSmoke);
+    add_x86_boot_args(&mut cmd, firmware, scenario);
     cmd.args(["-m", "512M"]);
 
     // Display and serial settings
@@ -550,7 +583,7 @@ fn is_kvm_available() -> bool {
 }
 
 /// Run QEMU interactively (for `xtask run`)
-pub fn run_qemu(config: &QemuConfig, disk_path: Option<&Path>) -> Result<()> {
+pub fn run_qemu(config: &QemuConfig, disk_path: Option<&Path>, runtime_replay: bool) -> Result<()> {
     // Create a temporary disk if none provided
     let temp_disk;
     let disk = if let Some(path) = disk_path {
@@ -566,7 +599,7 @@ pub fn run_qemu(config: &QemuConfig, disk_path: Option<&Path>) -> Result<()> {
         temp_disk.path().to_path_buf()
     };
 
-    let mut cmd = build_qemu_command(config, &disk)?;
+    let (mut cmd, _runtime_flash) = build_qemu_command(config, &disk, runtime_replay)?;
 
     // Start swtpm for TPM emulation if requested.
     let _swtpm = if config.enable_tpm {
@@ -606,7 +639,8 @@ pub fn run_qemu(config: &QemuConfig, disk_path: Option<&Path>) -> Result<()> {
     let status = cmd.status().context("failed to run QEMU")?;
     // _swtpm dropped here
 
-    if !status.success() {
+    // isa-debug-exit encodes the runtime test's success byte (0x10) as 33.
+    if !status.success() && !(runtime_replay && status.code() == Some(33)) {
         bail!("QEMU exited with status: {:?}", status.code());
     }
 
@@ -2020,6 +2054,44 @@ mod tests {
         );
         let smoke = args(CaptureScenario::BootSmoke);
         assert_eq!(smoke, ["-bios", "test.rom", "-no-reboot"]);
+    }
+
+    #[test]
+    fn interactive_replay_uses_explicit_option_and_owns_temporary_flash() {
+        let rom = fmap_flash(0, 256 * 1024);
+        let original = fs::read(rom.path()).unwrap();
+        let config = QemuConfig {
+            coreboot_rom: rom.path().to_str().unwrap().to_owned(),
+            tfa_flash: None,
+            storage: StorageType::Usb,
+            headless: true,
+            disable_kvm: true,
+            timeout_secs: None,
+            arch: Arch::X86_64,
+            machine: Machine::Sbsa,
+            extra_devices: Vec::new(),
+            enable_tpm: false,
+        };
+        let (default, flash) =
+            build_qemu_command(&config, Path::new("runtime-image-test.img"), false).unwrap();
+        assert!(flash.is_none());
+        assert!(default.get_args().any(|arg| arg == "-no-reboot"));
+        assert!(default.get_args().any(|arg| arg == "-bios"));
+
+        let (replay, flash) = build_qemu_command(&config, Path::new("test.img"), true).unwrap();
+        let flash = flash.unwrap();
+        let path = flash.path().to_owned();
+        let pflash = format!("if=pflash,format=raw,file={},snapshot=on", path.display());
+        assert!(replay.get_args().any(|arg| arg == pflash.as_str()));
+        assert!(
+            replay
+                .get_args()
+                .any(|arg| arg == "isa-debug-exit,iobase=0xf4,iosize=0x04")
+        );
+        assert!(!replay.get_args().any(|arg| arg == "-no-reboot"));
+        assert_eq!(fs::read(rom.path()).unwrap(), original);
+        drop(flash);
+        assert!(!path.exists());
     }
 
     #[test]

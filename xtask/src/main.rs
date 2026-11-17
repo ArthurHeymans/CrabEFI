@@ -159,6 +159,10 @@ enum Commands {
         #[arg(long)]
         disk: Option<String>,
 
+        /// Enable the x86-64 runtime test's two-boot replay on an existing disk
+        #[arg(long, requires = "disk")]
+        runtime_replay: bool,
+
         /// Enable graphical UI with mouse support
         #[arg(long)]
         ui: bool,
@@ -318,6 +322,7 @@ fn main() -> Result<()> {
             disable_kvm,
             app,
             disk,
+            runtime_replay,
             ui,
         } => cmd_run(
             coreboot_rom,
@@ -328,6 +333,7 @@ fn main() -> Result<()> {
             disable_kvm,
             app,
             disk,
+            runtime_replay,
             ui,
             arch,
             machine,
@@ -511,10 +517,14 @@ fn cmd_run(
     disable_kvm: bool,
     app: Option<String>,
     disk: Option<String>,
+    runtime_replay: bool,
     ui: bool,
     arch: Arch,
     machine: Machine,
 ) -> Result<()> {
+    if runtime_replay && arch != Arch::X86_64 {
+        bail!("--runtime-replay is only supported on x86-64");
+    }
     let storage = if ahci {
         qemu::StorageType::Ahci
     } else if nvme {
@@ -568,7 +578,7 @@ fn cmd_run(
 
     // If a disk is specified, use it directly
     if let Some(disk_path) = disk {
-        return qemu::run_qemu(&config, Some(Path::new(&disk_path)));
+        return qemu::run_qemu(&config, Some(Path::new(&disk_path)), runtime_replay);
     }
 
     // If an app is specified, build it and create a disk with it
@@ -584,11 +594,11 @@ fn cmd_run(
         let disk_path = temp_dir.path().join("test.img");
         disk::create_test_disk(disk_path.to_string_lossy().as_ref(), Some(&efi_path), arch)?;
 
-        return qemu::run_qemu(&config, Some(&disk_path));
+        return qemu::run_qemu(&config, Some(&disk_path), false);
     }
 
     // Otherwise just run with a minimal disk
-    qemu::run_qemu(&config, None)
+    qemu::run_qemu(&config, None, false)
 }
 
 fn cmd_screenshot(
@@ -1105,6 +1115,26 @@ fn find_test_app_efi(name: &str, arch: Arch) -> Result<String> {
 #[cfg(test)]
 mod entry_tests {
     use super::*;
+
+    #[test]
+    fn runtime_replay_requires_an_explicit_run_disk() {
+        assert!(Cli::try_parse_from(["crabefi", "run", "--runtime-replay"]).is_err());
+        assert!(Cli::try_parse_from(["crabefi", "test", "--runtime-replay"]).is_err());
+        for (disk, args, expected) in [
+            ("runtime-image-test.img", &[][..], false),
+            ("test.img", &["--runtime-replay"][..], true),
+        ] {
+            let cli = Cli::try_parse_from(
+                ["crabefi", "run", "--disk", disk]
+                    .into_iter()
+                    .chain(args.iter().copied()),
+            )
+            .unwrap();
+            assert!(
+                matches!(cli.command, Commands::Run { runtime_replay, .. } if runtime_replay == expected)
+            );
+        }
+    }
 
     #[test]
     fn entry64_is_opt_in() {
