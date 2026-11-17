@@ -31,6 +31,39 @@ struct DiskIoContext {
 
 static INSTANCES: Registry<DiskIoProtocol, DiskIoContext> = Registry::new();
 
+#[derive(Debug, PartialEq, Eq)]
+struct ReadSpan {
+    start_lba: u64,
+    start_offset: usize,
+    aligned_size: usize,
+}
+
+impl ReadSpan {
+    fn checked(offset: u64, len: usize, block_size: u64, last_block: u64) -> Option<Self> {
+        if block_size == 0 || len == 0 {
+            return None;
+        }
+        let end = offset.checked_add(u64::try_from(len).ok()?)?;
+        let start_lba = offset / block_size;
+        let end_lba = end.div_ceil(block_size);
+        if end_lba.checked_sub(1)? > last_block {
+            return None;
+        }
+        let blocks = end_lba.checked_sub(start_lba)?;
+        let aligned_size = usize::try_from(blocks.checked_mul(block_size)?).ok()?;
+        let start_offset = usize::try_from(offset % block_size).ok()?;
+        // Keep the BlockIO buffer and the copy within one representable span.
+        if aligned_size > isize::MAX as usize || start_offset.checked_add(len)? > aligned_size {
+            return None;
+        }
+        Some(Self {
+            start_lba,
+            start_offset,
+            aligned_size,
+        })
+    }
+}
+
 /// Read from the disk at a byte offset
 ///
 /// This reads `buffer_size` bytes starting at byte `offset` from the beginning
@@ -69,8 +102,10 @@ extern "efiapi" fn disk_io_read_disk(
     }
 
     let block_io = block_io_ptr as *mut BlockIoProtocol;
-    let media = unsafe { &*(*block_io).media };
-    let block_size = media.block_size as u64;
+    let Some(media) = (unsafe { (*block_io).media.as_ref() }) else {
+        return Status::DEVICE_ERROR;
+    };
+    let block_size = u64::from(media.block_size);
 
     if block_size == 0 {
         return Status::DEVICE_ERROR;
@@ -81,13 +116,14 @@ extern "efiapi" fn disk_io_read_disk(
         return Status::MEDIA_CHANGED;
     }
 
-    // Calculate block-aligned read parameters
-    let start_lba = offset / block_size;
-    let start_offset = (offset % block_size) as usize;
-    let end_byte = offset + buffer_size as u64;
-    let end_lba = end_byte.div_ceil(block_size);
-    let total_blocks = end_lba - start_lba;
-    let aligned_size = (total_blocks * block_size) as usize;
+    let Some(ReadSpan {
+        start_lba,
+        start_offset,
+        aligned_size,
+    }) = ReadSpan::checked(offset, buffer_size, block_size, media.last_block)
+    else {
+        return Status::INVALID_PARAMETER;
+    };
 
     // If already block-aligned, read directly into buffer
     if start_offset == 0 && buffer_size == aligned_size {
@@ -135,6 +171,41 @@ extern "efiapi" fn disk_io_read_disk(
 
     let _ = crate::efi::allocator::free_pool(temp_buf);
     status
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ReadSpan;
+
+    #[test]
+    fn rounds_unaligned_reads_up_to_full_blocks() {
+        assert_eq!(
+            ReadSpan::checked(4095, 2, 4096, 1),
+            Some(ReadSpan {
+                start_lba: 0,
+                start_offset: 4095,
+                aligned_size: 8192,
+            })
+        );
+        assert_eq!(
+            ReadSpan::checked(4096, 4096, 4096, 1),
+            Some(ReadSpan {
+                start_lba: 1,
+                start_offset: 0,
+                aligned_size: 4096,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_or_unrepresentable_spans() {
+        assert!(ReadSpan::checked(4095, 2, 4096, 0).is_none());
+        assert!(ReadSpan::checked(4096, 1, 4096, 0).is_none());
+        assert!(ReadSpan::checked(u64::MAX, 1, 512, u64::MAX).is_none());
+        assert!(ReadSpan::checked(0, isize::MAX as usize, 512, u64::MAX).is_none());
+        assert!(ReadSpan::checked(0, 1, 0, 0).is_none());
+        assert!(ReadSpan::checked(0, 0, 512, 0).is_none());
+    }
 }
 
 /// Write to the disk (not supported - read only for boot)
