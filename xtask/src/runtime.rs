@@ -420,7 +420,10 @@ fn normalize(
     // Sum executable sections, including architecture-specific text sections.
     let text_size = file
         .sections()
-        .filter(|section| section.kind() == object::SectionKind::Text)
+        .filter(|section| {
+            matches!(section.flags(), object::SectionFlags::Elf { sh_flags, .. }
+                if sh_flags.0 & object::elf::SHF_EXECINSTR.0 != 0)
+        })
         .map(|section| section.size())
         .sum::<u64>();
     write_json(
