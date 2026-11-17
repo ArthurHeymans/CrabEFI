@@ -24,6 +24,14 @@ pub fn get_variable_timestamp(_guid: &Guid, _name: &[u16]) -> Option<VariableTim
     None
 }
 
+/// There is no authoritative persistent replay floor in this profile.
+pub fn try_get_variable_timestamp(
+    _guid: &Guid,
+    _name: &[u16],
+) -> Result<Option<VariableTimestamp>, VarStoreError> {
+    Err(VarStoreError::NotInitialized)
+}
+
 pub(crate) fn persist_firmware_variable(
     _guid: &Guid,
     _name: &[u16],

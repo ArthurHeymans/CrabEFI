@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::{Arch, Machine};
 
 mod filesystem;
+mod fwui;
 pub(crate) mod sct;
 
 static RUNTIME_IMAGE_TWO_BOOT: AtomicBool = AtomicBool::new(false);
@@ -787,6 +788,9 @@ fn storage_security_test_passed(output: &str) -> bool {
 
 /// Run integration tests in QEMU
 pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Result<()> {
+    if app_name == "fwui-test" {
+        return fwui::run(config, disk_path);
+    }
     RUNTIME_IMAGE_TWO_BOOT.store(app_name == "runtime-image-test", Ordering::Relaxed);
     // Every x86 integration run advertises SMMSTORE to the payload. Boot it
     // from writable snapshot pflash so variable persistence can initialize
@@ -2013,12 +2017,6 @@ mod tests {
             validate_windows_markers(&["CRABEFI_WINDOWS_BOOT_SMOKE_SUCCESS".into()], &failures)
                 .is_ok()
         );
-    }
-
-    #[test]
-    fn test_kvm_check() {
-        // Just ensure it doesn't panic
-        let _ = is_kvm_available();
     }
 
     fn fmap_flash(count: u16, extra_bytes: usize) -> tempfile::NamedTempFile {

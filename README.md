@@ -6,16 +6,20 @@ CrabEFI implements enough UEFI to boot Linux via shim/GRUB2 or systemd-boot on r
 
 ![CrabEFI graphical boot menu](docs/screenshot.jpg)
 
-*Graphical boot menu (`--features ui`), captured headlessly with
-`./crabefi screenshot --app hello --out screenshot.png`. The command writes PPM
-directly or converts to PNG with ImageMagick; the referenced JPG was produced
-from that PNG with ImageMagick.*
+*Graphical boot menu (`--features ui`) running headlessly in QEMU at
+1024×768 with BLS test entries from an EFI System Partition, during the
+autoboot countdown. Captured with QEMU `screendump` and converted from PNG to
+JPEG using ImageMagick. See [docs/UI.md](docs/UI.md) for the design.*
+
+[Try the UI in your browser](https://arthurheymans.github.io/CrabEFI/) — the same
+Rust screens compiled to WebAssembly, with simulated boot devices and settings.
 
 ## Documentation
 
 See the [docs/](docs/README.md) directory:
 
 - [Building](docs/BUILDING.md) - How to build CrabEFI and run tests
+- [UI Testing](docs/UI_TESTING.md) - Test and screenshot the setup UI without firmware
 - [Architecture](docs/ARCHITECTURE.md) - Workspace layout and code organization
 - [Integration](docs/INTEGRATION.md) - Using CrabEFI as a library in external firmware
 - [Capabilities](docs/capabilities.md) - Minimal/full feature sets, runtime identity and bounded variable storage
@@ -66,6 +70,7 @@ Linux input-device identification, and CrabEFI's PS/2/USB initialization logs.
 |-------|-------------|
 | `crabefi-core` | Core library -- UEFI implementation and boot-time hardware drivers |
 | `crabefi-coreboot` | Coreboot payload binary (arch entry points, table parsing) |
+| `crabefi-ui` | Boot menu model, framebuffer, renderer and setup screens, shared by firmware and the UI test harness |
 | `crabefi-runtime-abi` | Pointer-free normalized image/handoff ABI |
 | `crabefi-runtime-image` | Separate EFI Runtime Services image with image-local bounded scratch allocation |
 

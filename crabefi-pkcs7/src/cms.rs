@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 use crate::der::{DecodeError, Reader, Result, Tlv, tag};
 use crate::oid;
 
-/// Structurally validated `SignedData` from a `ContentInfo`.
+/// Structurally validated `SignedData`, from a `ContentInfo` or bare.
 ///
 /// Algorithm identifiers are exposed undecoded; each caller applies its own
 /// algorithm policy.
@@ -19,18 +19,30 @@ pub struct SignedData<'a> {
 }
 
 impl<'a> SignedData<'a> {
-    /// Parse the `ContentInfo` at the start of `input`; bytes after it (such
-    /// as WIN_CERTIFICATE alignment padding) are ignored.
+    /// Parse the `SignedData` at the start of `input`, either wrapped in a
+    /// `ContentInfo` or bare: Microsoft's EFI authenticated-variable blobs
+    /// (including the shipping dbx updates) carry the raw `SignedData`
+    /// SEQUENCE as the certificate data. The two are told apart by the
+    /// first field inside the outer SEQUENCE — a version INTEGER for bare
+    /// `SignedData`, the content-type OID for `ContentInfo`. Bytes after
+    /// the outer SEQUENCE (such as WIN_CERTIFICATE alignment padding) are
+    /// ignored.
     pub fn parse(input: &'a [u8]) -> Result<Self> {
-        let (content_info, _padding) = Tlv::read(input)?;
-        let mut content_info = content_info.contents(tag::SEQUENCE)?;
-        if content_info.read()?.oid()? != oid::SIGNED_DATA {
-            return Err(DecodeError);
-        }
-        let signed_data = content_info
-            .read_tag(tag::context_constructed(0))?
-            .inner()?;
-        content_info.finish()?;
+        let (outer, _padding) = Tlv::read(input)?;
+        let mut probe = outer.contents(tag::SEQUENCE)?;
+        let signed_data = if probe.read()?.tag == tag::INTEGER {
+            outer
+        } else {
+            let mut content_info = outer.contents(tag::SEQUENCE)?;
+            if content_info.read()?.oid()? != oid::SIGNED_DATA {
+                return Err(DecodeError);
+            }
+            let signed_data = content_info
+                .read_tag(tag::context_constructed(0))?
+                .inner()?;
+            content_info.finish()?;
+            signed_data
+        };
 
         let mut fields = signed_data.contents(tag::SEQUENCE)?;
         fields.read_tag(tag::INTEGER)?;
@@ -266,6 +278,62 @@ mod tests {
             };
             assert!(key.verify_pkcs1v15_sha256::<64>(signer.signature, &signed_digest));
         }
+    }
+
+    /// Strip the ContentInfo wrapper the way Microsoft's EFI blobs omit
+    /// it: SEQUENCE { OID, [0] { SignedData } } -> SignedData alone.
+    fn bare_signed_data(cms: &[u8]) -> &[u8] {
+        let (outer, _) = Tlv::read(cms).unwrap();
+        let mut content_info = outer.contents(tag::SEQUENCE).unwrap();
+        content_info.read().unwrap();
+        content_info
+            .read_tag(tag::context_constructed(0))
+            .unwrap()
+            .inner()
+            .unwrap()
+            .encoded
+    }
+
+    #[test]
+    fn bare_signed_data_without_content_info_parses() {
+        for cms in [CMS_ATTRS, CMS_NOATTR, CMS_KEYID] {
+            let bare = bare_signed_data(cms);
+            let signed = SignedData::parse(bare).unwrap();
+            assert_eq!(signed.encapsulated_content.content_type, oid::DATA);
+            assert!(
+                signed
+                    .certificates()
+                    .any(|certificate| certificate.encoded == LEAF)
+            );
+            signer(bare);
+        }
+    }
+
+    #[test]
+    fn malformed_bare_and_wrapped_forms_are_rejected() {
+        let bare = bare_signed_data(CMS_ATTRS);
+        // Truncated bare SignedData.
+        assert!(SignedData::parse(&bare[..bare.len() - 1]).is_err());
+        // Extra field inside the bare SEQUENCE: grow its DER length by a
+        // trailing INTEGER 0; field validation must not stop early.
+        assert_eq!(bare[1], 0x82, "fixture uses two-byte DER length");
+        let mut trailed = bare.to_vec();
+        let len = u16::from_be_bytes([trailed[2], trailed[3]]) + 3;
+        trailed[2..4].copy_from_slice(&len.to_be_bytes());
+        trailed.extend_from_slice(&[0x02, 0x01, 0x00]);
+        assert!(SignedData::parse(&trailed).is_err());
+        // Wrong ContentInfo OID (id-signedData ...07 02 -> ...07 03) must
+        // not fall through to the bare path or be accepted as wrapped.
+        let oid_encoding = [
+            0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x02,
+        ];
+        let mut wrong_oid = CMS_ATTRS.to_vec();
+        let pos = wrong_oid
+            .windows(oid_encoding.len())
+            .position(|window| window == oid_encoding)
+            .expect("fixture carries the signedData OID");
+        wrong_oid[pos + oid_encoding.len() - 1] = 0x03;
+        assert!(SignedData::parse(&wrong_oid).is_err());
     }
 
     #[test]

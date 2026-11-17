@@ -16,6 +16,18 @@ heap: the old in-payload Runtime Services design could otherwise carry a boot
 heap pointer across EBS or SetVirtualAddressMap, after the backing pages became
 conventional memory or were no longer reachable at their physical address.
 
+The PCI inventory grows on this boot heap after allocator initialization;
+large systems are not limited to a fixed number of enumerated functions.
+Growth is fallible: on allocation failure enumeration stops with a warning
+and preserves the devices already found. Internal readers borrow the inventory
+instead of cloning it, and SPI matching uses mapped iterators. The final PCI
+bus-master disable pass runs without allocating, before EBS commits. It always
+scans every function in the selected PCI backend's bus ranges, independently of
+the inventory: missing function zero or an unreliable multifunction flag can
+hide devices even when enumeration succeeds. The sweep reads IDs and command
+registers without probing BARs. Runtime Services never retain the inventory or
+its backing allocation.
+
 The separate runtime image performs RSA verification on fixed stack
 buffers instead of an allocation arena. Operands are `[u64; 64]` arrays
 (4096-bit maximum) always processed at full width, combined by a
@@ -39,17 +51,17 @@ data. The loader then copies/zeros sections and applies only normalized
 relocation slots. The image-owned MAT publishes the exact code/data protection
 domains even where the EFI memory map merges adjacent data descriptors.
 
-The audited release images currently reserve about 244 KiB of runtime address
-space on both x86_64 and AArch64:
+The audited release images currently reserve about 296 KiB of runtime address
+space on x86_64, and one page less on AArch64:
 
 | Mapping | Size | Contents |
 | --- | ---: | --- |
-| RX | 60 KiB | runtime code plus leading page/alignment space |
+| RX | 64 KiB | runtime code plus leading page/alignment space |
 | RO/NX | 4 KiB | immutable data |
-| RW/NX | 180 KiB | variable store, runtime state, and padding |
+| RW/NX | 228 KiB | variable store, runtime state, and padding |
 
 Normalized on-disk images are currently about 64 KiB. The dominant resident
-allocation is roughly 170 KiB of variable-store state, plus under 5 KiB of
+allocation is roughly 186 KiB of variable-store state, plus under 5 KiB of
 runtime state. The remainder is code, immutable data,
 dynamic metadata, small synchronization globals, and page/alignment padding.
 

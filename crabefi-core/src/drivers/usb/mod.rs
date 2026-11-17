@@ -348,14 +348,14 @@ pub fn shutdown() {
 pub fn init() {
     log::info!("Initializing USB controllers...");
 
-    let devices = pci::get_all_devices();
-
-    for dev in devices.iter() {
-        if dev.class_code != 0x0C || dev.subclass != 0x03 {
-            continue;
+    pci::with_devices(|devices| {
+        for dev in devices {
+            if dev.class_code != 0x0C || dev.subclass != 0x03 {
+                continue;
+            }
+            let _ = init_device(dev);
         }
-        let _ = init_device(dev);
-    }
+    });
 
     let controllers = ALL_CONTROLLERS.lock();
     log::info!(

@@ -1,6 +1,6 @@
 use super::*;
 use crate::peripheral::InputLine;
-use alloc::collections::VecDeque;
+use alloc::{collections::VecDeque, vec::Vec};
 use core::convert::Infallible;
 use embedded_hal::{
     digital::{self, InputPin},
@@ -141,7 +141,10 @@ fn absolute_mouse_axes_are_not_treated_as_relative_motion() {
         .unwrap();
     descriptor[axes + 1] = 0x02; // Data, Variable, Absolute
     let descriptor = ReportDescriptor::try_from(descriptor.as_slice()).unwrap();
-    assert!(Mouse::find(&descriptor).is_none());
+    let mouse = Mouse::find(&descriptor).unwrap();
+    let report = mouse.read(&[1, 0, 0, 0, 0]).unwrap();
+    assert_eq!((report.dx, report.dy), (0, 0));
+    assert!(report.absolute.is_some());
     assert!(Keyboard::find(&descriptor).is_some());
 }
 
@@ -243,7 +246,8 @@ fn mouse_reports_accumulate_and_keyboard_reports_produce_keys() {
             dx: 7,
             dy: -3,
             dz: -1,
-            buttons: 1
+            buttons: 1,
+            absolute: None,
         })
     );
     assert_eq!(

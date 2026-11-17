@@ -99,7 +99,7 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 
     // Test 2: nothing installed yet, so the queue must be empty.
     print("  [2] Empty queue... ");
-    if locate_by_notify(bs, registration).is_none() {
+    if locate_by_notify(bs, registration) == Ok(None) {
         print_line("[PASS] empty_queue: NOT_FOUND before any install");
         passed += 1;
     } else {
@@ -136,10 +136,10 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
     print("  [4] Drain once... ");
     let first = locate_by_notify(bs, registration);
     let second = locate_by_notify(bs, registration);
-    if first == Some(handle) && second.is_none() {
+    if first == Ok(Some(handle)) && second == Ok(None) {
         print_line("[PASS] drain_once: handle delivered exactly once");
         passed += 1;
-    } else if first != Some(handle) {
+    } else if first != Ok(Some(handle)) {
         print_line("[FAIL] drain_once: wrong handle reported");
         failed += 1;
     } else {
@@ -206,7 +206,7 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
     if installed != Status::SUCCESS {
         print_line("[FAIL] guid_scoping: setup install failed");
         failed += 1;
-    } else if locate_by_notify(bs, registration).is_none() {
+    } else if locate_by_notify(bs, registration) == Ok(None) {
         print_line("[PASS] guid_scoping: unrelated GUID did not enqueue");
         passed += 1;
     } else {
@@ -257,7 +257,9 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
     }
 
     if transaction::run(bs, image_handle) {
-        print_line("[PASS] transaction: rollback, complete callback visibility, active users and multi-uninstall");
+        print_line(
+            "[PASS] transaction: rollback, complete callback visibility, active users and multi-uninstall",
+        );
         passed += 1;
     } else {
         print_line("[FAIL] transaction: rollback, callback visibility or multi-uninstall");
@@ -281,11 +283,11 @@ extern "efiapi" fn notify_callback(_event: r_efi::efi::Event, _context: *mut c_v
 /// * `registration` - Token from RegisterProtocolNotify.
 ///
 /// # Returns
-/// The next queued handle, or `None` when the queue is empty.
+/// The next queued handle, `Ok(None)` only for NOT_FOUND, or the actual error.
 fn locate_by_notify(
     bs: *mut r_efi::efi::BootServices,
     registration: *mut c_void,
-) -> Option<Handle> {
+) -> Result<Option<Handle>, Status> {
     let mut handle: Handle = core::ptr::null_mut();
     let mut size = core::mem::size_of::<Handle>();
     let status = unsafe {
@@ -297,7 +299,15 @@ fn locate_by_notify(
             &mut handle,
         )
     };
-    (status == Status::SUCCESS).then_some(handle)
+    if status == Status::NOT_FOUND {
+        Ok(None)
+    } else if status != Status::SUCCESS {
+        Err(status)
+    } else if handle.is_null() || size != core::mem::size_of::<Handle>() {
+        Err(Status::DEVICE_ERROR)
+    } else {
+        Ok(Some(handle))
+    }
 }
 
 fn print(s: &str) {

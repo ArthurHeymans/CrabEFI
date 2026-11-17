@@ -69,6 +69,49 @@ async fn debounce_hub_connection(
     }
 }
 
+/// Hub scan coordination, shared by real enumeration and fake-port tests.
+/// Keep port iteration and retry/progress decisions here so the tests do not
+/// implement a second enumeration loop with its own tried-port bitmap.
+struct HubPortScan {
+    num_ports: u8,
+    next_port: u8,
+    tried: u16,
+    tried_before: u16,
+}
+
+impl HubPortScan {
+    fn new(num_ports: u8) -> Self {
+        Self {
+            num_ports,
+            next_port: 1,
+            tried: 0,
+            tried_before: 0,
+        }
+    }
+
+    fn next_port(&mut self) -> Option<u8> {
+        while self.next_port <= self.num_ports {
+            let port = self.next_port;
+            self.next_port += 1;
+            if self.tried & (1u16 << port) == 0 {
+                return Some(port);
+            }
+        }
+        None
+    }
+
+    fn mark_tried(&mut self, port: u8) {
+        self.tried |= 1u16 << port;
+    }
+
+    fn complete_pass(&mut self, final_pass: bool) -> bool {
+        let complete = hub_scan_complete(final_pass, self.tried_before, self.tried, self.num_ports);
+        self.tried_before = self.tried;
+        self.next_port = 1;
+        complete
+    }
+}
+
 fn hub_scan_complete(final_pass: bool, tried_before: u16, tried: u16, num_ports: u8) -> bool {
     tried.count_ones() == u32::from(num_ports) || (final_pass && tried == tried_before)
 }
@@ -147,17 +190,15 @@ mod hub_protocol_tests {
 
     #[test]
     fn hub_final_pass_rescans_connections_during_nested_enumeration() {
-        let mut tried = 0u16;
+        let mut scan = HubPortScan::new(3);
         let mut connected = 1u16 << 3;
         let mut attached = Vec::new();
         for pass in 0..3 {
-            let tried_before = tried;
-            for port in 1..=3 {
-                let bit = 1u16 << port;
-                if tried & bit != 0 || connected & bit == 0 {
+            while let Some(port) = scan.next_port() {
+                if connected & (1u16 << port) == 0 {
                     continue;
                 }
-                tried |= bit;
+                scan.mark_tried(port);
                 attached.push(port);
                 // Nested enumeration on ports 3 and 2 lets an earlier port
                 // connect, after that port was already scanned this pass.
@@ -166,7 +207,7 @@ mod hub_protocol_tests {
                 }
             }
             // The first nested enumeration ran past the discovery deadline.
-            if hub_scan_complete(pass > 0, tried_before, tried, 3) {
+            if scan.complete_pass(pass > 0) {
                 assert_eq!(attached, [3, 2, 1]);
                 return;
             }
@@ -642,16 +683,11 @@ impl super::XhciController {
         // rescan after any progress until a pass is quiet. The tried bitmap
         // bounds these extra passes even after the deadline.
         let timeout = Timeout::from_ms(CONNECTION_TIMEOUT_MS);
-        let mut tried = 0u16;
+        let mut scan = HubPortScan::new(num_ports);
         let mut first_pass = true;
         loop {
             let final_pass = timeout.is_expired();
-            let tried_before = tried;
-            for p in 1..=num_ports {
-                let bit = 1u16 << p;
-                if tried & bit != 0 {
-                    continue;
-                }
+            while let Some(p) = scan.next_port() {
                 let mut status_buf = [0u8; 4];
                 if let Err(error) = self.control_transfer(
                     hub_slot_id,
@@ -661,7 +697,7 @@ impl super::XhciController {
                     p as u16,
                     Some(&mut status_buf),
                 ) {
-                    tried |= bit;
+                    scan.mark_tried(p);
                     log::warn!("Hub {} port {} status failed: {:?}", hub_slot_id, p, error);
                     continue;
                 }
@@ -708,7 +744,7 @@ impl super::XhciController {
                     Ok((connected, changed))
                 })
                 .await;
-                tried |= bit;
+                scan.mark_tried(p);
                 match debounced {
                     Ok(true) => {}
                     Ok(false) => continue,
@@ -826,7 +862,7 @@ impl super::XhciController {
                 }
             }
             first_pass = false;
-            if hub_scan_complete(final_pass, tried_before, tried, num_ports) {
+            if scan.complete_pass(final_pass) {
                 break;
             }
             exec::sleep_ms(10).await;

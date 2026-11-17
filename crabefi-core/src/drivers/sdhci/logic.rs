@@ -91,14 +91,14 @@ mod tests {
 
     #[test]
     fn normalizes_sdhci_r2_registers() {
-        let canonical = [0x0123_4567, 0x89ab_cdef, 0x1020_3040, 0x5060_7000];
-        let raw = [
-            (canonical[3] >> 8) | (canonical[2] << 24),
-            (canonical[2] >> 8) | (canonical[1] << 24),
-            (canonical[1] >> 8) | (canonical[0] << 24),
-            canonical[0] >> 8,
-        ];
-        assert_eq!(normalize_r2(raw), canonical);
+        // SDHCI response registers 0..3 omit the trailing CRC/end byte.
+        // Hand-authored register bytes, not the inverse of normalize_r2:
+        // RSP3 = 00 01 23 45, RSP2 = 67 89 ab cd,
+        // RSP1 = ef 10 20 30, RSP0 = 40 50 60 70.
+        assert_eq!(
+            normalize_r2([0x4050_6070, 0xef10_2030, 0x6789_abcd, 0x0001_2345]),
+            [0x0123_4567, 0x89ab_cdef, 0x1020_3040, 0x5060_7000]
+        );
     }
 
     #[test]

@@ -16,6 +16,19 @@ fn hid_interface(number: u8, alternate: u8, protocol: u8) -> [u8; 9] {
 const INTERRUPT_IN: [u8; 7] = [7, 5, 0x81, 3, 8, 0, 10];
 
 #[test]
+fn hid_report_lengths_belong_to_their_composite_interfaces() {
+    let mut descriptors = hid_interface(0, 0, 1).to_vec();
+    descriptors.extend_from_slice(&[9, 0x21, 0x11, 1, 0, 1, 0x22, 63, 0]);
+    descriptors.extend_from_slice(&INTERRUPT_IN);
+    descriptors.extend_from_slice(&hid_interface(1, 0, 2));
+    descriptors.extend_from_slice(&[9, 0x21, 0x11, 1, 0, 1, 0x22, 77, 0]);
+    descriptors.extend_from_slice(&[7, 5, 0x83, 3, 6, 0, 100]);
+    let parsed = parse_configuration_checked(&configuration(2, &descriptors)).unwrap();
+    assert_eq!(parsed.interfaces[0].hid_report_descriptor_length, 63);
+    assert_eq!(parsed.interfaces[1].hid_report_descriptor_length, 77);
+}
+
+#[test]
 fn reads_complete_configuration_with_hid_after_byte_256() {
     for protocol in [1, 2] {
         let mut descriptors = alloc::vec![0; 255];

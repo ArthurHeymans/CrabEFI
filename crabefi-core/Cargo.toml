@@ -15,7 +15,7 @@ xhci = ["dep:xhci"]
 # TPM devices, TCG protocols, event tables and measured boot.
 tpm = ["dep:sha1"]
 # UEFI image/key authentication, independent of a host firmware's signed FFS.
-secure-boot = ["pkcs7", "crabefi-runtime-bundle?/secure-boot"]
+secure-boot = ["pkcs7", "crabefi-runtime-bundle?/secure-boot", "crabefi-ui/secure-boot"]
 # Signed firmware capsule application requires durable result persistence.
 capsule-update = ["pkcs7", "variable-store"]
 # Shared verification implementation, not a runtime policy switch.
@@ -23,7 +23,10 @@ capsule-update = ["pkcs7", "variable-store"]
 # image.
 pkcs7 = ["dep:sha1", "dep:crabefi-pkcs7"]
 # Preserve the standalone payload's existing non-graphical capabilities explicitly.
-full = ["tpm", "xhci", "spi-flash", "secure-boot", "capsule-update"]
+full = ["tpm", "xhci", "spi-flash", "secure-boot", "capsule-update", "cfr"]
+# CFR (coreboot form representation) firmware settings: the parser and the
+# menu. Values are EFI variables under the CFR GUID, through the runtime image.
+cfr = ["crabefi-ui/cfr"]
 # Direct flash variable persistence; omitted when the host provides no flash store.
 variable-store = []
 spi-flash = ["variable-store", "dep:rflasher-core", "dep:rflasher-internal"]
@@ -40,15 +43,17 @@ global-allocator = []
 fb-log = []
 # Enable graphical UI with mouse support (PS/2 and USB HID mouse drivers,
 # cursor rendering, SimplePointerProtocol, and graphical setup utility)
-ui = ["dep:noto-sans-mono-bitmap"]
+ui = ["crabefi-ui/screens"]
 # Native ELAN I2C touchpads described by the platform as peripherals.
 elan-i2c = ["ui"]
 # HID-over-I2C touchpads, mice and keyboards described by the platform.
-hid-i2c = ["ui", "dep:hidreport"]
+hid-i2c = ["ui"]
 
 [dependencies]
+crabefi-ui = { path = "../crabefi-ui" }
 embedded-hal = "1"
-hidreport = { version = "0.6", default-features = false, optional = true }
+# Unsigned absolute ranges (e.g. 0..65535): https://github.com/hidutils/hidreport/pull/65
+hidreport = { git = "https://github.com/ArthurHeymans/hidreport", rev = "d25ffa58a92201c5387d564c933180cdd48f4398", default-features = false }
 crabefi-efi-types = { workspace = true }
 crabefi-pkcs7 = { workspace = true, optional = true }
 crabefi-runtime-bundle = { workspace = true, optional = true }
@@ -65,14 +70,6 @@ bitflags = "2"
 embassy-futures = "0.1"
 atomic_refcell = "0.1"
 spin = "0.12"
-noto-sans-mono-bitmap = { optional = true, version = "0.3", default-features = false, features = [
-  "regular",
-  "size_16",
-  "size_20",
-  "size_24",
-  "size_32",
-  "unicode-basic-latin",
-] }
 tock-registers = "0.10"
 zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
 rflasher-core = { optional = true, git = "https://github.com/ArthurHeymans/rflasher.git", rev = "4fb9d6270972d5ba04b5e22671b3416aaaaf6328", default-features = false }

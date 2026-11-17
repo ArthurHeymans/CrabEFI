@@ -71,9 +71,9 @@ checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 
 [[package]]
 name = "cc"
-version = "1.10.0"
+version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86e055fa6e3e40ad6187ba25b6855eeb635d5271f8e0f0e1e9a5826b8d75bea0"
+checksum = "375989decec1a0fa424442bed520fa12ede43a48475ce8c7417d2c69b32b5f6b"
 dependencies = [
  "find-msvc-tools",
  "shlex",
@@ -119,6 +119,7 @@ dependencies = [
  "crabefi-pkcs7",
  "crabefi-runtime-abi",
  "crabefi-runtime-bundle",
+ "crabefi-ui",
  "embassy-futures",
  "embedded-hal",
  "fdt",
@@ -127,7 +128,6 @@ dependencies = [
  "linked_list_allocator",
  "log",
  "mem-barrier",
- "noto-sans-mono-bitmap",
  "object",
  "pci_types",
  "r-efi",
@@ -194,6 +194,15 @@ version = "0.1.0"
 dependencies = [
  "crabefi-runtime-abi",
  "sha2 0.10.9",
+]
+
+[[package]]
+name = "crabefi-ui"
+version = "0.1.0"
+dependencies = [
+ "heapless 0.9.3",
+ "log",
+ "noto-sans-mono-bitmap",
 ]
 
 [[package]]
@@ -332,8 +341,7 @@ dependencies = [
 [[package]]
 name = "hidreport"
 version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6bba4f2ebef8032ef0125a72c7052481c9d63e50f1d48d35c0933ae11aa58c6d"
+source = "git+https://github.com/ArthurHeymans/hidreport?rev=d25ffa58a92201c5387d564c933180cdd48f4398#d25ffa58a92201c5387d564c933180cdd48f4398"
 dependencies = [
  "thiserror",
 ]
@@ -373,9 +381,9 @@ dependencies = [
 
 [[package]]
 name = "log"
-version = "0.4.34"
+version = "0.4.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
+checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
 name = "mem-barrier"

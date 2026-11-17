@@ -4,6 +4,10 @@
 //! configuration options to payloads. CFR allows displaying and modifying
 //! boot-time configurable options like "Hyper-Threading Enable", "SATA Mode", etc.
 //!
+//! coreboot hands CFR over in its tables; a host firmware that links CrabEFI
+//! as a library passes the same record to [`parse_cfr`] and [`store_cfr`],
+//! and shows [`crate::cfr_menu::show_cfr_menu`] from its platform hooks.
+//!
 //! # CFR Structure
 //!
 //! CFR records form a tree structure where:
@@ -143,104 +147,11 @@ pub struct CfrVarbinaryHeader {
     pub data_length: u32,
 }
 
-/// Enum choice (value and display name)
-#[derive(Debug, Clone)]
-pub struct CfrEnumChoice {
-    pub value: u32,
-    pub ui_name: String,
-}
-
-/// CFR option type with type-specific data
-#[derive(Debug, Clone)]
-pub enum CfrOptionType {
-    /// Boolean option (true/false)
-    Bool { default: bool },
-
-    /// Numeric option with range
-    Number {
-        default: u32,
-        min: u32,
-        max: u32,
-        step: u32,
-        hex_display: bool,
-    },
-
-    /// Enum option with discrete choices
-    Enum {
-        default: u32,
-        choices: Vec<CfrEnumChoice>,
-    },
-
-    /// Variable-length string option
-    Varchar { default: String },
-
-    /// Comment (informational, not editable)
-    Comment,
-}
-
-/// A single CFR option
-#[derive(Debug, Clone)]
-pub struct CfrOption {
-    /// Unique object ID
-    pub object_id: u64,
-    /// Dependency on another option's object_id (0 = none)
-    pub dependency_id: u64,
-    /// Variable name (for storage)
-    pub opt_name: String,
-    /// Display name
-    pub ui_name: String,
-    /// Help text
-    pub ui_helptext: String,
-    /// Option flags
-    pub flags: u32,
-    /// Option type and type-specific data
-    pub option_type: CfrOptionType,
-    /// Dependency values: option is visible when the dependency's current value
-    /// matches one of these. Empty means visible when dependency value != 0.
-    pub dep_values: Vec<u32>,
-}
-
-impl CfrOption {
-    /// Check if this option is editable (ignoring dependency state)
-    pub fn is_editable(&self) -> bool {
-        (self.flags & CFR_OPTFLAG_READONLY) == 0
-            && (self.flags & CFR_OPTFLAG_INACTIVE) == 0
-            && (self.flags & CFR_OPTFLAG_VOLATILE) == 0
-            && !matches!(self.option_type, CfrOptionType::Comment)
-    }
-
-    /// Check if this option is visible (ignoring dependency state)
-    pub fn is_visible(&self) -> bool {
-        (self.flags & CFR_OPTFLAG_SUPPRESS) == 0
-    }
-}
-
-/// A CFR form (category/group of options)
-///
-/// Nested subforms are flattened during parsing: the subform's ui_name is
-/// inserted as a Comment option, then its options are inlined into the parent.
-#[derive(Debug, Clone)]
-pub struct CfrForm {
-    /// Unique object ID
-    pub object_id: u64,
-    /// Dependency on another option's object_id (0 = none)
-    pub dependency_id: u64,
-    /// Display name
-    pub ui_name: String,
-    /// Form flags
-    pub flags: u32,
-    /// Options in this form (including flattened subform options)
-    pub options: Vec<CfrOption>,
-    /// Dependency values for this form
-    pub dep_values: Vec<u32>,
-}
-
-impl CfrForm {
-    /// Check if this form is visible (ignoring dependency state)
-    pub fn is_visible(&self) -> bool {
-        (self.flags & CFR_OPTFLAG_SUPPRESS) == 0
-    }
-}
+// Presentation types are shared with the settings UI in `crabefi-ui`. Parsing
+// and actual variable/CMOS storage remain firmware-owned below.
+pub use crabefi_ui::cfr::{
+    CfrEnumChoice, CfrForm, CfrOption, CfrOptionType, CfrValue, OptionStore,
+};
 
 /// Parsed CFR information
 #[derive(Debug, Clone)]
@@ -309,6 +220,27 @@ impl CfrInfo {
             }
             None => true, // If we can't find the dependency, show the option
         }
+    }
+}
+
+impl crabefi_ui::cfr::SettingsModel for CfrInfo {
+    fn forms(&self) -> &[CfrForm] {
+        &self.forms
+    }
+    fn read_option_value(&self, option: &CfrOption) -> CfrValue {
+        read_option_value(option)
+    }
+    fn write_option_value(&self, option: &CfrOption, value: &CfrValue) -> Result<(), &'static str> {
+        write_option_value(option, value)
+    }
+    fn configured_level(&self) -> log::LevelFilter {
+        crate::logger::configured_level()
+    }
+    fn set_configured_level(&self, level: log::LevelFilter) -> Result<(), &'static str> {
+        crate::logger::set_configured_level(level).map_err(|status| {
+            log::warn!("Failed to persist CrabEFI log level: {:?}", status);
+            "Failed to persist CrabEFI log level"
+        })
     }
 }
 
@@ -920,36 +852,8 @@ fn parse_enum_value(data: &[u8]) -> Option<CfrEnumChoice> {
 /// This is the GUID used by coreboot's `get_uint_option()` / `set_uint_option()`
 /// in `src/drivers/efi/option.c`. It must match exactly for coreboot to find
 /// the variables we write.
-pub const COREBOOT_CFR_GUID: r_efi::efi::Guid = r_efi::efi::Guid::from_fields(
-    0xceae4c1d,
-    0x335b,
-    0x4685,
-    0xa4,
-    0xa0,
-    &[0xfc, 0x4a, 0x94, 0xee, 0xa0, 0x85],
-);
-
-/// Value types for CFR options
-#[derive(Debug, Clone, PartialEq)]
-pub enum CfrValue {
-    Bool(bool),
-    Number(u32),
-    Varchar(String),
-}
-
-impl CfrValue {
-    /// Get default value from an option type
-    pub fn from_option_type(opt_type: &CfrOptionType) -> Self {
-        match opt_type {
-            CfrOptionType::Bool { default } => CfrValue::Bool(*default),
-            CfrOptionType::Number { default, .. } | CfrOptionType::Enum { default, .. } => {
-                CfrValue::Number(*default)
-            }
-            CfrOptionType::Varchar { default } => CfrValue::Varchar(default.clone()),
-            CfrOptionType::Comment => CfrValue::Bool(false),
-        }
-    }
-}
+pub const COREBOOT_CFR_GUID: r_efi::efi::Guid =
+    r_efi::efi::Guid::from_bytes(&crabefi_efi_types::varstore::COREBOOT_CFR_GUID);
 
 /// Convert ASCII string to UCS-2 (UTF-16LE) for UEFI variable names
 fn ascii_to_ucs2(s: &str) -> Vec<u16> {
@@ -961,12 +865,56 @@ fn ascii_to_ucs2(s: &str) -> Vec<u16> {
     result
 }
 
+static OPTION_STORE: AtomicPtr<&'static dyn OptionStore> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Keep the options `store` keeps there. Call once, before the menu runs.
+pub fn set_option_store(store: &'static dyn OptionStore) {
+    let ptr = Box::into_raw(Box::new(store));
+    if OPTION_STORE
+        .compare_exchange(
+            core::ptr::null_mut(),
+            ptr,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        )
+        .is_err()
+    {
+        // SAFETY: publication failed, so no reader can hold this allocation.
+        unsafe { drop(Box::from_raw(ptr)) };
+        panic!("set_option_store must only be called once");
+    }
+}
+
+/// The platform store keeping `option`, if any.
+fn store_of(option: &CfrOption) -> Option<&'static dyn OptionStore> {
+    let ptr = OPTION_STORE.load(Ordering::SeqCst);
+    // SAFETY: set once from a leaked box, never freed.
+    let store = unsafe { ptr.as_ref() }.copied()?;
+    store.keeps(option).then_some(store)
+}
+
 /// Read a CFR option value from storage
 ///
 /// Returns the stored value or falls back to the CFR default.
 pub fn read_option_value(option: &CfrOption) -> CfrValue {
+    if let Some(store) = store_of(option) {
+        return store
+            .read(option)
+            .filter(|value| {
+                matches!(
+                    (&option.option_type, value),
+                    (CfrOptionType::Bool { .. }, CfrValue::Bool(_))
+                        | (
+                            CfrOptionType::Number { .. } | CfrOptionType::Enum { .. },
+                            CfrValue::Number(_)
+                        )
+                        | (CfrOptionType::Varchar { .. }, CfrValue::Varchar(_))
+                )
+            })
+            .unwrap_or_else(|| CfrValue::from_option_type(&option.option_type));
+    }
     let name = ascii_to_ucs2(&option.opt_name);
-    let data = crabefi::efi::runtime_image::client::variables::get(&COREBOOT_CFR_GUID, &name)
+    let data = crate::efi::runtime_image::client::variables::get(&COREBOOT_CFR_GUID, &name)
         .map(|(_, data)| data);
     data.map_or_else(
         || CfrValue::from_option_type(&option.option_type),
@@ -1000,7 +948,10 @@ fn read_cfr_number(data: &[u8]) -> u32 {
 /// All numeric types (Bool, Number, Enum) are stored as 4-byte LE u32
 /// for compatibility with coreboot's get_uint_option() which returns unsigned int.
 pub fn write_option_value(option: &CfrOption, value: &CfrValue) -> Result<(), &'static str> {
-    use crabefi::efi::runtime_image::client::variables;
+    if let Some(store) = store_of(option) {
+        return store.write(option, value);
+    }
+    use crate::efi::runtime_image::client::variables;
     use r_efi::efi;
 
     let name = ascii_to_ucs2(&option.opt_name);
@@ -1040,11 +991,13 @@ pub fn write_option_value(option: &CfrOption, value: &CfrValue) -> Result<(), &'
 }
 
 /// Delete a CFR option from storage (revert to default)
-// Completes the write/delete facade checked structurally by
-// ci/run-coreboot-feature-tests.sh; no menu path calls it yet.
+// No menu path calls this yet; the runtime lifecycle test covers the facade.
 #[allow(dead_code)]
 pub fn delete_option_value(option: &CfrOption) -> Result<(), &'static str> {
-    use crabefi::efi::runtime_image::client::variables;
+    if store_of(option).is_some() {
+        return Err("Cannot delete option kept by platform store");
+    }
+    use crate::efi::runtime_image::client::variables;
     use r_efi::efi;
 
     let name = ascii_to_ucs2(&option.opt_name);

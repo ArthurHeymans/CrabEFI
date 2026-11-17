@@ -57,9 +57,10 @@ for target in x86_64-unknown-none aarch64-unknown-none riscv64gc-unknown-none-el
         --features full,ui,bundled-runtime-image
 done
 # Exercise independent capabilities, not just the endpoints of the feature set.
-for features in tpm secure-boot capsule-update ui; do
+for features in tpm secure-boot capsule-update ui cfr; do
     cargo check --locked -p crabefi-core --release --no-default-features --features "$features"
 done
+cargo test --locked -p crabefi-core --target "$HOST" --no-default-features --features cfr --test cfr_store
 cargo test --locked -p crabefi-core --target "$HOST" --no-default-features --doc platform::VariableStorage
 for features in '' variable-store full; do
     cargo test --locked -p crabefi-core --target "$HOST" --lib --no-default-features --features "$features"

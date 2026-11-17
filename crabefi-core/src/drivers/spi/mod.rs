@@ -416,39 +416,25 @@ fn map_core_error(error: rflasher_core::error::Error) -> SpiError {
     }
 }
 
-type RflasherPciDevices =
-    heapless::Vec<rflasher_internal::PciDevice, { crate::drivers::pci::MAX_PCI_DEVICES }>;
+impl From<&pci::PciDevice> for rflasher_internal::PciDevice {
+    /// Preserve the full PCI address when adapting a borrowed inventory entry.
+    fn from(dev: &pci::PciDevice) -> Self {
+        let class =
+            ((dev.class_code as u32) << 16) | ((dev.subclass as u32) << 8) | (dev.prog_if as u32);
 
-fn rflasher_pci_device(dev: &pci::PciDevice) -> rflasher_internal::PciDevice {
-    let class =
-        ((dev.class_code as u32) << 16) | ((dev.subclass as u32) << 8) | (dev.prog_if as u32);
-
-    rflasher_internal::PciDevice {
-        address: RflasherPciAddress::new(
-            0,
-            dev.address.bus(),
-            dev.address.device(),
-            dev.address.function(),
-        ),
-        vendor_id: dev.vendor_id,
-        device_id: dev.device_id,
-        revision_id: dev.revision,
-        class,
-    }
-}
-
-fn rflasher_pci_devices() -> RflasherPciDevices {
-    let devices = pci::get_all_devices();
-    let mut result = heapless::Vec::new();
-
-    for rdev in devices.iter().map(rflasher_pci_device) {
-        if result.push(rdev).is_err() {
-            log::warn!("rflasher PCI device list full");
-            break;
+        Self {
+            address: RflasherPciAddress::new(
+                dev.address.segment(),
+                dev.address.bus(),
+                dev.address.device(),
+                dev.address.function(),
+            ),
+            vendor_id: dev.vendor_id,
+            device_id: dev.device_id,
+            revision_id: dev.revision,
+            class,
         }
     }
-
-    result
 }
 
 /// Detect and initialize the SPI controller.
@@ -478,9 +464,14 @@ pub fn detect_and_init() -> Option<AnySpiController> {
         }
     }
 
-    let devices = rflasher_pci_devices();
-
-    match rflasher_internal::find_intel_chipset_in_devices(&devices) {
+    // Return only the detection result, releasing the PCI borrow before any
+    // controller initialization. Neither matcher needs an owned device list.
+    let intel = pci::with_devices(|devices| {
+        rflasher_internal::find_intel_chipset_in_iter(
+            devices.iter().map(rflasher_internal::PciDevice::from),
+        )
+    });
+    match intel {
         Ok(Some(chipset)) => {
             log::info!(
                 "Found Intel chipset: {} {}",
@@ -507,7 +498,12 @@ pub fn detect_and_init() -> Option<AnySpiController> {
         Err(e) => log::warn!("Intel SPI chipset detection failed: {}", e),
     }
 
-    match rflasher_internal::find_amd_chipset_in_devices(&devices) {
+    let amd = pci::with_devices(|devices| {
+        rflasher_internal::find_amd_chipset_in_iter(
+            devices.iter().map(rflasher_internal::PciDevice::from),
+        )
+    });
+    match amd {
         Ok(Some(chipset)) => {
             log::info!("Found AMD chipset: {} {}", chipset.vendor(), chipset.name());
             chipset.log_warnings();

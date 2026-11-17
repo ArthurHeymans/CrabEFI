@@ -1,5 +1,5 @@
 # Workspace: the core library and platform payloads are separate crates.
-# xtask and test-apps are NOT workspace members (different build targets).
+# xtask, ui-harness and test-apps are NOT workspace members (different build targets).
 
 [workspace]
 members = [
@@ -9,9 +9,11 @@ members = [
   "crabefi-hw",
   "crabefi-pkcs7",
   "crabefi-runtime-bundle",
+  "crabefi-ui",
 ]
 exclude = [
   "xtask",
+  "ui-harness",
   "crabefi-runtime-abi",
   "crabefi-runtime-image",
   "test-apps/hello",

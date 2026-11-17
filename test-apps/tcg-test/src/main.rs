@@ -18,8 +18,11 @@
 #![no_std]
 #![no_main]
 
+mod tpm;
+
 use core::panic::PanicInfo;
 use r_efi::efi::{self, Char16, Guid, Handle, Status, SystemTable};
+use sha2::{Digest, Sha256};
 
 // ============================================================================
 // Protocol GUIDs
@@ -107,7 +110,9 @@ unsafe fn print(con_out: *mut efi::protocols::simple_text_output::Protocol, s: &
         buf[i] = b as u16;
     }
     buf[len] = 0;
-    ((*con_out).output_string)(con_out, buf.as_ptr() as *mut Char16);
+    unsafe {
+        ((*con_out).output_string)(con_out, buf.as_ptr() as *mut Char16);
+    }
 }
 
 fn be_u32(bytes: &[u8], offset: usize) -> u32 {
@@ -119,12 +124,68 @@ fn be_u32(bytes: &[u8], offset: usize) -> u32 {
     ])
 }
 
+fn read_pcr4_sha256(protocol: *mut Tcg2Protocol) -> Option<[u8; 32]> {
+    let mut response = [0u8; 128];
+    let status = unsafe {
+        ((*protocol).submit_command)(
+            protocol,
+            tpm::READ_PCR4_SHA256.len() as u32,
+            tpm::READ_PCR4_SHA256.as_ptr(),
+            response.len() as u32,
+            response.as_mut_ptr(),
+        )
+    };
+    (status == Status::SUCCESS)
+        .then(|| tpm::pcr4_sha256(&response))
+        .flatten()
+}
+
+fn measurement_was_logged(protocol: *mut Tcg2Protocol, digest: &[u8; 32], event: &[u8]) -> bool {
+    let (mut first, mut last, mut truncated) = (0, 0, 0);
+    let status =
+        unsafe { ((*protocol).get_event_log)(protocol, 2, &mut first, &mut last, &mut truncated) };
+    if status != Status::SUCCESS || first == 0 || last < first || truncated != 0 {
+        return false;
+    }
+    tpm::measurement_event_matches(
+        |offset, output| {
+            // At most eight supported digests plus this test's 16-byte event.
+            if offset.checked_add(output.len()).is_none_or(|end| end > 560) {
+                return false;
+            }
+            let Some(address) = last.checked_add(offset as u64) else {
+                return false;
+            };
+            if address.checked_add(output.len() as u64).is_none() {
+                return false;
+            }
+            // SAFETY: GetEventLog supplies a readable TCG_PCR_EVENT2. The parser
+            // reads only its declared fields and never padding beyond this event.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    address as *const u8,
+                    output.as_mut_ptr(),
+                    output.len(),
+                );
+            }
+            true
+        },
+        digest,
+        event,
+    )
+}
+
 // ============================================================================
 // Entry point
 // ============================================================================
 
+/// # Safety
+/// The firmware loader must supply a live System Table and protocol services.
 #[no_mangle]
-pub extern "efiapi" fn efi_main(_image_handle: Handle, system_table: *mut SystemTable) -> Status {
+pub unsafe extern "efiapi" fn efi_main(
+    _image_handle: Handle,
+    system_table: *mut SystemTable,
+) -> Status {
     let con_out = unsafe { (*system_table).con_out };
     let boot_services = unsafe { (*system_table).boot_services };
     let mut _pass_count: u32 = 0;
@@ -246,6 +307,7 @@ pub extern "efiapi" fn efi_main(_image_handle: Handle, system_table: *mut System
             data: *EVENT_DATA,
         };
 
+        let before = read_pcr4_sha256(tcg2);
         let status = unsafe {
             ((*tcg2).hash_log_extend_event)(
                 tcg2,
@@ -255,11 +317,32 @@ pub extern "efiapi" fn efi_main(_image_handle: Handle, system_table: *mut System
                 &test_event as *const _ as *const core::ffi::c_void,
             )
         };
-        if status == Status::SUCCESS {
-            unsafe { print(con_out, b"[PASS] tcg2_hash_log_extend: PCR 4 extended\r\n") };
+        let after = read_pcr4_sha256(tcg2);
+        let measurement: [u8; 32] = Sha256::digest(test_data).into();
+        let extended = before.is_some_and(|before| {
+            let mut hash = Sha256::new();
+            hash.update(before);
+            hash.update(measurement);
+            after == Some(hash.finalize().into())
+        });
+        if status == Status::SUCCESS
+            && extended
+            && measurement_was_logged(tcg2, &measurement, EVENT_DATA)
+        {
+            unsafe {
+                print(
+                    con_out,
+                    b"[PASS] tcg2_hash_log_extend: PCR 4 digest and event log verified\r\n",
+                )
+            };
             _pass_count += 1;
         } else {
-            unsafe { print(con_out, b"[FAIL] tcg2_hash_log_extend: failed\r\n") };
+            unsafe {
+                print(
+                    con_out,
+                    b"[FAIL] tcg2_hash_log_extend: PCR or event log mismatch\r\n",
+                )
+            };
             fail_count += 1;
         }
 

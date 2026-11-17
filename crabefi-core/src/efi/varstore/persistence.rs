@@ -30,6 +30,7 @@
 
 use alloc::vec::Vec;
 
+use crabefi_efi_types::authentication::EfiTime;
 use crabefi_runtime_abi::VariableTimestamp;
 
 use crate::cell::{Local, LocalCell};
@@ -639,17 +640,49 @@ fn load_variables_from_storage() -> Result<(), VarStoreError> {
 
 /// Get the latest durable authenticated timestamp, including deletion floors.
 pub fn get_variable_timestamp(guid: &r_efi::efi::Guid, name: &[u16]) -> Option<VariableTimestamp> {
+    try_get_variable_timestamp(guid, name).ok().flatten()
+}
+
+/// Unlike the compatibility accessor, distinguish absent authentication
+/// history from an unreadable store. Consent preflight must fail closed.
+pub fn try_get_variable_timestamp(
+    guid: &r_efi::efi::Guid,
+    name: &[u16],
+) -> Result<Option<VariableTimestamp>, VarStoreError> {
     let variable_store = VARSTORE.get();
-    if !variable_store.initialized || !variable_store.auth_format {
-        return None;
+    if !variable_store.initialized {
+        return Err(VarStoreError::NotInitialized);
+    }
+    if !variable_store.auth_format {
+        return Ok(None);
     }
     let guid = edk2::guid_to_bytes(guid);
     with_storage_mut(|storage| {
         let mut read_fn = |offset: u32, buffer: &mut [u8]| storage.read(offset, buffer).is_ok();
-        let variables = edk2::walk_variables(&mut read_fn, true, variable_store.data_size);
-        latest_matching_timestamp(&variables, &guid, name)
+        // The checked walk covers read failures and malformed records alike:
+        // a truncated history is a storage failure, never "no history".
+        match edk2::walk_variables_checked(&mut read_fn, true, variable_store.data_size) {
+            Some(variables) => Ok(latest_matching_timestamp(&variables, &guid, name)),
+            None => Err(VarStoreError::StorageFailure),
+        }
     })
-    .flatten()
+    .unwrap_or(Err(VarStoreError::NotInitialized))
+}
+
+fn efi_time_from_timestamp(timestamp: VariableTimestamp) -> EfiTime {
+    EfiTime {
+        year: timestamp.year,
+        month: timestamp.month,
+        day: timestamp.day,
+        hour: timestamp.hour,
+        minute: timestamp.minute,
+        second: timestamp.second,
+        pad1: timestamp.pad1,
+        nanosecond: timestamp.nanosecond,
+        timezone: timestamp.timezone,
+        daylight: timestamp.daylight,
+        pad2: timestamp.pad2,
+    }
 }
 
 fn latest_matching_timestamp(
@@ -657,12 +690,21 @@ fn latest_matching_timestamp(
     guid: &[u8; 16],
     name: &[u16],
 ) -> Option<VariableTimestamp> {
+    // The floor is the maximum, not the last record: append order is only
+    // chronological while every writer behaved, and an out-of-order record
+    // must never lower the replay floor.
     variables
         .iter()
         .filter(|variable| edk2::is_var_added(variable.state))
         .filter(|variable| variable.guid == *guid && edk2::name_matches(&variable.name, name))
         .filter_map(|variable| variable.timestamp)
-        .next_back()
+        .reduce(|latest, candidate| {
+            if efi_time_from_timestamp(candidate).is_after(&efi_time_from_timestamp(latest)) {
+                candidate
+            } else {
+                latest
+            }
+        })
 }
 
 /// Write a variable to storage using EDK2 FV format
@@ -1105,6 +1147,20 @@ mod tests {
                 day: 1,
                 ..VariableTimestamp::default()
             })
+        );
+    }
+
+    #[test]
+    fn timestamp_floor_is_the_maximum_not_the_last_record() {
+        // An out-of-order append (e.g. a write issued while the floor was
+        // misread) must not lower the floor for later preflight checks.
+        let variables = vec![
+            variable(edk2::VAR_ADDED, 2030, vec![1]),
+            variable(edk2::VAR_ADDED, 2025, vec![]),
+        ];
+        assert_eq!(
+            latest_matching_timestamp(&variables, &[0x5a; 16], &[b'T' as u16]).map(|t| t.year),
+            Some(2030)
         );
     }
 

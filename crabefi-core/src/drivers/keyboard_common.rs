@@ -36,8 +36,21 @@ pub mod efi_toggle_state {
 
 /// A keyboard or equivalent key source.
 pub trait KeyboardDevice {
+    /// Whether initialization succeeded and this device can accept input.
+    /// Deferred drivers must override this; registration alone is not readiness.
+    fn is_available(&mut self) -> bool {
+        true
+    }
+
     /// Next key press, or `None` when none is waiting. Must not wait for input.
     fn read_key(&mut self) -> Option<Key>;
+
+    /// A key with the modifiers that accompanied it. Buffered devices should
+    /// override this instead of sampling state after processing releases.
+    fn read_key_with_state(&mut self) -> Option<(Key, KeyState)> {
+        let key = self.read_key()?;
+        Some((key, self.key_state()))
+    }
 
     /// Pressed modifiers and active toggles, without the VALID bits.
     fn key_state(&mut self) -> KeyState {
@@ -67,6 +80,11 @@ fn with_devices<R>(f: impl FnOnce(&mut Vec<Box<dyn KeyboardDevice>>) -> R) -> R 
     result
 }
 
+/// Whether any registered keyboard is ready, without consuming a key.
+pub fn is_available() -> bool {
+    with_devices(|devices| devices.iter_mut().any(|device| device.is_available()))
+}
+
 /// Initialize and register the PS/2 keyboard. USB keyboards register when
 /// USB is enumerated.
 pub fn init() {
@@ -93,6 +111,16 @@ pub fn try_read_key() -> Option<(u16, u16)> {
         .map(|key| (key.scancode, key.unicode_char))
 }
 
+/// Read a UI key and sample modifiers from that same device at dequeue time.
+/// Keep the legacy tuple API unchanged for EFI console consumers.
+pub fn try_read_key_with_state() -> Option<(Key, KeyState)> {
+    with_devices(|devices| {
+        devices
+            .iter_mut()
+            .find_map(|device| device.read_key_with_state())
+    })
+}
+
 /// Combined EFI shift and toggle state of every keyboard, with VALID bits.
 pub fn get_efi_key_state() -> (u32, u8) {
     let state = with_devices(|devices| {
@@ -117,6 +145,11 @@ impl KeyboardDevice for PlatformKeyboard {
     fn read_key(&mut self) -> Option<Key> {
         self.0.poll();
         self.0.read_key()
+    }
+
+    fn read_key_with_state(&mut self) -> Option<(Key, KeyState)> {
+        self.0.poll();
+        self.0.read_key_with_state()
     }
 
     fn key_state(&mut self) -> KeyState {

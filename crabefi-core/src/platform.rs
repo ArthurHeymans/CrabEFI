@@ -515,6 +515,12 @@ pub trait PlatformHooks {
     /// Any transition must preserve access to the caller and continuation.
     fn on_exit_boot_services(&self) {}
 
+    /// Stop DMA of platform-owned devices CrabEFI does not drive (for example
+    /// a storage controller behind a platform block device) before every OS
+    /// handoff: `ExitBootServices()` and direct Linux boot. Runs before
+    /// CrabEFI shuts its own drivers down and clears PCI bus mastering.
+    fn quiesce_dma(&self) {}
+
     /// Return whether the platform exposes a firmware settings UI.
     fn firmware_settings_available(&self) -> bool {
         false
@@ -526,6 +532,14 @@ pub trait PlatformHooks {
     /// platform has no firmware settings provider.
     fn show_firmware_settings(&self) -> bool {
         false
+    }
+
+    /// Graphical settings may navigate directly to another menu screen.
+    /// Existing providers retain their show-and-return behavior by default.
+    #[cfg(feature = "ui")]
+    fn show_graphical_firmware_settings(&self) -> crate::ui::ScreenNav {
+        self.show_firmware_settings();
+        crate::ui::ScreenNav::Back
     }
 }
 
@@ -714,6 +728,14 @@ pub trait ConsoleInput {
     /// Try to read a key press. Returns `None` if no key is available.
     fn read_key(&mut self) -> Option<Key>;
 
+    /// A key with its modifier snapshot. Buffered providers should override
+    /// this; providers using the default must implement `key_state` for
+    /// Shift+Tab navigation. Existing unmodified input remains supported.
+    fn read_key_with_state(&mut self) -> Option<(Key, KeyState)> {
+        let key = self.read_key()?;
+        Some((key, self.key_state()))
+    }
+
     /// Check if a key press is available without consuming it.
     fn has_key(&self) -> bool;
 
@@ -732,219 +754,7 @@ pub trait ConsoleInput {
 // Framebuffer
 // ============================================================================
 
-/// Framebuffer configuration for the Graphics Output Protocol.
-///
-/// The platform provides this when a framebuffer is available. CrabEFI uses
-/// it for the EFI GOP protocol and the text-mode boot menu.
-#[derive(Debug, Clone, Copy)]
-pub struct FramebufferConfig {
-    /// Physical address of the framebuffer memory.
-    pub physical_address: u64,
-    /// Horizontal resolution in pixels.
-    pub width: u32,
-    /// Vertical resolution in pixels.
-    pub height: u32,
-    /// Pixels per scanline (may be wider than `width` due to alignment).
-    ///
-    /// To get bytes per scanline, multiply by `bits_per_pixel / 8`.
-    pub stride: u32,
-    /// Bits per pixel (typically 32).
-    pub bits_per_pixel: u8,
-    /// Bit position of the red channel.
-    pub red_mask_pos: u8,
-    /// Number of bits in the red channel.
-    pub red_mask_size: u8,
-    /// Bit position of the green channel.
-    pub green_mask_pos: u8,
-    /// Number of bits in the green channel.
-    pub green_mask_size: u8,
-    /// Bit position of the blue channel.
-    pub blue_mask_pos: u8,
-    /// Number of bits in the blue channel.
-    pub blue_mask_size: u8,
-}
-
-impl FramebufferConfig {
-    /// Framebuffer size in bytes.
-    pub fn size(&self) -> u64 {
-        self.bytes_per_line() as u64 * self.height as u64
-    }
-
-    /// Bytes per scanline (`stride * bytes_per_pixel`).
-    pub fn bytes_per_line(&self) -> u32 {
-        self.stride * (self.bits_per_pixel as u32 / 8)
-    }
-
-    /// Raw pointer to the framebuffer.
-    pub fn as_ptr(&self) -> *mut u8 {
-        core::ptr::with_exposed_provenance_mut(self.physical_address as usize)
-    }
-
-    /// Byte offset for a pixel at coordinates (x, y).
-    ///
-    /// Uses `u64` intermediates to avoid overflow on large framebuffers.
-    pub fn pixel_offset(&self, x: u32, y: u32) -> usize {
-        let bpp = self.bits_per_pixel as u64 / 8;
-        (y as u64 * self.stride as u64 * bpp + x as u64 * bpp) as usize
-    }
-
-    /// Encode a pixel value for the framebuffer's native format.
-    ///
-    /// For 32bpp, returns the native pixel encoding.
-    /// For 16bpp, returns the 16-bit pixel zero-extended to u32.
-    /// For other bpp, returns 0.
-    pub fn encode_pixel(&self, r: u8, g: u8, b: u8) -> u32 {
-        match self.bits_per_pixel {
-            32 => self.encode_pixel_32(r, g, b),
-            16 => self.encode_pixel_16(r, g, b) as u32,
-            _ => 0,
-        }
-    }
-
-    /// Write a pixel at (x, y) with the given RGB color.
-    ///
-    /// # Safety
-    ///
-    /// The framebuffer must be accessible and (x, y) must be in bounds.
-    pub unsafe fn write_pixel(&self, x: u32, y: u32, r: u8, g: u8, b: u8) {
-        if x >= self.width || y >= self.height {
-            return;
-        }
-        let offset = self.pixel_offset(x, y);
-        let fb = self.as_ptr();
-        unsafe {
-            match self.bits_per_pixel {
-                32 => {
-                    let pixel = self.encode_pixel_32(r, g, b);
-                    (fb.add(offset) as *mut u32).write_volatile(pixel);
-                }
-                24 => {
-                    let ptr = fb.add(offset);
-                    if self.blue_mask_pos < self.red_mask_pos {
-                        ptr.write_volatile(b);
-                        ptr.add(1).write_volatile(g);
-                        ptr.add(2).write_volatile(r);
-                    } else {
-                        ptr.write_volatile(r);
-                        ptr.add(1).write_volatile(g);
-                        ptr.add(2).write_volatile(b);
-                    }
-                }
-                16 => {
-                    let pixel = self.encode_pixel_16(r, g, b);
-                    (fb.add(offset) as *mut u16).write_volatile(pixel);
-                }
-                _ => {}
-            }
-        }
-    }
-
-    /// Fill a framebuffer region with a solid color.
-    ///
-    /// # Safety
-    ///
-    /// `dst` must point to `pixel_count * (bits_per_pixel/8)` writable bytes
-    /// within the framebuffer.
-    pub unsafe fn fill_pixels(&self, dst: *mut u8, pixel_count: usize, r: u8, g: u8, b: u8) {
-        unsafe {
-            match self.bits_per_pixel {
-                32 => {
-                    let pixel = self.encode_pixel_32(r, g, b);
-                    let ptr = dst as *mut u32;
-                    for i in 0..pixel_count {
-                        ptr.add(i).write_volatile(pixel);
-                    }
-                }
-                16 => {
-                    let pixel = self.encode_pixel_16(r, g, b);
-                    let ptr = dst as *mut u16;
-                    for i in 0..pixel_count {
-                        ptr.add(i).write_volatile(pixel);
-                    }
-                }
-                _ => {
-                    core::slice::from_raw_parts_mut(
-                        dst,
-                        pixel_count * (self.bits_per_pixel as usize / 8),
-                    )
-                    .fill(0);
-                }
-            }
-        }
-    }
-
-    /// Fill the entire framebuffer with a solid color.
-    ///
-    /// # Safety
-    ///
-    /// The framebuffer must be accessible.
-    pub unsafe fn fill_solid(&self, r: u8, g: u8, b: u8) {
-        let bpl = self.bytes_per_line() as usize;
-        let row_pixels = self.width as usize;
-        let packed = bpl == row_pixels * (self.bits_per_pixel as usize / 8);
-        // SAFETY: caller guarantees the framebuffer is identity-mapped.
-        unsafe {
-            let fb = self.as_ptr();
-            if packed {
-                let total = row_pixels * self.height as usize;
-                self.fill_pixels(fb, total, r, g, b);
-            } else {
-                for y in 0..self.height {
-                    let offset = (y as usize) * bpl;
-                    self.fill_pixels(fb.add(offset), row_pixels, r, g, b);
-                }
-            }
-        }
-    }
-
-    /// Clear the entire framebuffer.
-    ///
-    /// # Safety
-    ///
-    /// The framebuffer must be accessible.
-    pub unsafe fn clear(&self, r: u8, g: u8, b: u8) {
-        let fb = self.as_ptr();
-        let bpl = self.bytes_per_line() as usize;
-        unsafe {
-            match self.bits_per_pixel {
-                32 => {
-                    let pixel = self.encode_pixel_32(r, g, b);
-                    for y in 0..self.height as usize {
-                        let row = fb.add(y * bpl);
-                        for x in 0..self.width as usize {
-                            (row.add(x * 4) as *mut u32).write_volatile(pixel);
-                        }
-                    }
-                }
-                _ => {
-                    for y in 0..self.height {
-                        for x in 0..self.width {
-                            self.write_pixel(x, y, r, g, b);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    fn encode_pixel_32(&self, r: u8, g: u8, b: u8) -> u32 {
-        let r = ((r as u32) >> 8u32.saturating_sub(self.red_mask_size as u32)) << self.red_mask_pos;
-        let g =
-            ((g as u32) >> 8u32.saturating_sub(self.green_mask_size as u32)) << self.green_mask_pos;
-        let b =
-            ((b as u32) >> 8u32.saturating_sub(self.blue_mask_size as u32)) << self.blue_mask_pos;
-        r | g | b
-    }
-
-    fn encode_pixel_16(&self, r: u8, g: u8, b: u8) -> u16 {
-        let r = ((r as u16) >> 8u16.saturating_sub(self.red_mask_size as u16)) << self.red_mask_pos;
-        let g =
-            ((g as u16) >> 8u16.saturating_sub(self.green_mask_size as u16)) << self.green_mask_pos;
-        let b =
-            ((b as u16) >> 8u16.saturating_sub(self.blue_mask_size as u16)) << self.blue_mask_pos;
-        r | g | b
-    }
-}
+pub use crabefi_ui::FramebufferConfig;
 
 // ============================================================================
 // TPM Event Log

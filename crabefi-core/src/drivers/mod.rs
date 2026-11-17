@@ -142,8 +142,10 @@ impl<T, const N: usize> ControllerRegistry<T, N> {
 pub mod block;
 #[cfg(feature = "elan-i2c")]
 pub(crate) mod elan;
+pub(crate) mod hid_descriptor;
 #[cfg(feature = "hid-i2c")]
 pub(crate) mod hid_i2c;
+pub(crate) mod hid_report;
 #[cfg(target_arch = "x86_64")]
 mod i8042;
 #[cfg(target_arch = "x86_64")]
@@ -169,10 +171,14 @@ pub mod usb;
 
 /// Stop firmware-owned DMA before transferring control to an operating system.
 ///
+/// The platform first stops the devices it owns ([`crate::PlatformHooks::quiesce_dma`]).
 /// Driver shutdown handles controller-specific teardown. Clearing bus mastering
 /// afterwards is the final safety net for devices without complete shutdown
 /// coverage or for controllers that failed to quiesce cleanly.
 pub fn quiesce_dma_for_os_handoff() {
+    if let Some(hooks) = crate::handoff::callbacks().hooks {
+        hooks.quiesce_dma();
+    }
     pci::shutdown_drivers();
     pci::disable_all_bus_mastering_for_handoff();
 }

@@ -2,6 +2,7 @@
 
 use super::PciAddress;
 use super::access_rules::{ecam_offset, valid_config_access};
+use crate::drivers::mmio::MmioRegion;
 use crate::fdt::MAX_ECAM_REGIONS;
 use crate::platform::PciEcamRegion;
 use pci_types::ConfigRegionAccess;
@@ -96,14 +97,10 @@ pub trait PciAccess: ConfigRegionAccess {
         if !valid_config_access(self.max_offset(), offset, 2) || !self.contains_address(addr) {
             return Err(ConfigAccessError::OutOfRange);
         }
-        let aligned = offset & !0x3;
-        let shift = (offset & 0x02) * 8;
-        let current = self.try_read32(addr, aligned)?;
-        self.try_write32(
-            addr,
-            aligned,
-            (current & !(0xffff_u32 << shift)) | ((value as u32) << shift),
-        )
+        // A 32-bit RMW would acknowledge neighboring W1C status bits. A
+        // backend must implement an actual halfword transaction instead.
+        let _ = value;
+        Err(ConfigAccessError::OutOfRange)
     }
 
     /// Read a 16-bit value, returning all ones on invalid access.
@@ -135,14 +132,9 @@ pub trait PciAccess: ConfigRegionAccess {
         if !valid_config_access(self.max_offset(), offset, 1) || !self.contains_address(addr) {
             return Err(ConfigAccessError::OutOfRange);
         }
-        let aligned = offset & !0x3;
-        let shift = (offset & 0x03) * 8;
-        let current = self.try_read32(addr, aligned)?;
-        self.try_write32(
-            addr,
-            aligned,
-            (current & !(0xff_u32 << shift)) | ((value as u32) << shift),
-        )
+        // Never synthesize byte enables with a neighboring-register RMW.
+        let _ = value;
+        Err(ConfigAccessError::OutOfRange)
     }
 
     /// Read an 8-bit value, returning all ones on invalid access.
@@ -164,25 +156,38 @@ const PCI_CONFIG_DATA: u16 = 0xcfc;
 /// Legacy x86 CF8/CFC configuration mechanism (segment 0, first 256 bytes).
 pub struct IoCamAccess;
 
-impl ConfigRegionAccess for IoCamAccess {
+impl IoCamAccess {
     #[cfg(target_arch = "x86_64")]
-    unsafe fn read(&self, addr: PciAddress, offset: u16) -> u32 {
-        use x86_64::instructions::port::{Port, PortWriteOnly};
-        if addr.segment() != 0 || !valid_config_access(255, offset, 4) {
-            return u32::MAX;
+    fn select(&self, addr: PciAddress, offset: u16, width: u16) -> Result<(), ConfigAccessError> {
+        use x86_64::instructions::port::PortWriteOnly;
+        if addr.segment() != 0 || !valid_config_access(255, offset, width) {
+            return Err(ConfigAccessError::OutOfRange);
         }
-        let mut address_port: PortWriteOnly<u32> = PortWriteOnly::new(PCI_CONFIG_ADDRESS);
-        let mut data_port: Port<u32> = Port::new(PCI_CONFIG_DATA);
+        let mut port: PortWriteOnly<u32> = PortWriteOnly::new(PCI_CONFIG_ADDRESS);
+        // The address selects a dword; data-port lane and transaction width
+        // supply byte enables. Local PCI ownership is still single-CPU only.
         unsafe {
-            address_port.write(
+            port.write(
                 1 << 31
                     | (addr.bus() as u32) << 16
                     | (addr.device() as u32) << 11
                     | (addr.function() as u32) << 8
-                    | offset as u32,
+                    | u32::from(offset & !3),
             );
-            data_port.read()
         }
+        Ok(())
+    }
+}
+
+impl ConfigRegionAccess for IoCamAccess {
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn read(&self, addr: PciAddress, offset: u16) -> u32 {
+        use x86_64::instructions::port::Port;
+        if self.select(addr, offset, 4).is_err() {
+            return u32::MAX;
+        }
+        let mut data_port: Port<u32> = Port::new(PCI_CONFIG_DATA);
+        unsafe { data_port.read() }
     }
 
     #[cfg(not(target_arch = "x86_64"))]
@@ -192,22 +197,12 @@ impl ConfigRegionAccess for IoCamAccess {
 
     #[cfg(target_arch = "x86_64")]
     unsafe fn write(&self, addr: PciAddress, offset: u16, value: u32) {
-        use x86_64::instructions::port::{Port, PortWriteOnly};
-        if addr.segment() != 0 || !valid_config_access(255, offset, 4) {
+        use x86_64::instructions::port::Port;
+        if self.select(addr, offset, 4).is_err() {
             return;
         }
-        let mut address_port: PortWriteOnly<u32> = PortWriteOnly::new(PCI_CONFIG_ADDRESS);
         let mut data_port: Port<u32> = Port::new(PCI_CONFIG_DATA);
-        unsafe {
-            address_port.write(
-                1 << 31
-                    | (addr.bus() as u32) << 16
-                    | (addr.device() as u32) << 11
-                    | (addr.function() as u32) << 8
-                    | offset as u32,
-            );
-            data_port.write(value);
-        }
+        unsafe { data_port.write(value) };
     }
 
     #[cfg(not(target_arch = "x86_64"))]
@@ -215,6 +210,78 @@ impl ConfigRegionAccess for IoCamAccess {
 }
 
 impl PciAccess for IoCamAccess {
+    fn try_read8(&self, addr: PciAddress, offset: u16) -> Result<u8, ConfigAccessError> {
+        #[cfg(target_arch = "x86_64")]
+        {
+            use x86_64::instructions::port::Port;
+            self.select(addr, offset, 1)?;
+            let mut port: Port<u8> = Port::new(PCI_CONFIG_DATA + (offset & 3));
+            Ok(unsafe { port.read() })
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = (addr, offset);
+            Err(ConfigAccessError::Unavailable)
+        }
+    }
+
+    fn try_read16(&self, addr: PciAddress, offset: u16) -> Result<u16, ConfigAccessError> {
+        #[cfg(target_arch = "x86_64")]
+        {
+            use x86_64::instructions::port::Port;
+            self.select(addr, offset, 2)?;
+            let mut port: Port<u16> = Port::new(PCI_CONFIG_DATA + (offset & 3));
+            Ok(unsafe { port.read() })
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = (addr, offset);
+            Err(ConfigAccessError::Unavailable)
+        }
+    }
+
+    fn try_write8(
+        &self,
+        addr: PciAddress,
+        offset: u16,
+        value: u8,
+    ) -> Result<(), ConfigAccessError> {
+        #[cfg(target_arch = "x86_64")]
+        {
+            use x86_64::instructions::port::Port;
+            self.select(addr, offset, 1)?;
+            let mut port: Port<u8> = Port::new(PCI_CONFIG_DATA + (offset & 3));
+            unsafe { port.write(value) };
+            Ok(())
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = (addr, offset, value);
+            Err(ConfigAccessError::Unavailable)
+        }
+    }
+
+    fn try_write16(
+        &self,
+        addr: PciAddress,
+        offset: u16,
+        value: u16,
+    ) -> Result<(), ConfigAccessError> {
+        #[cfg(target_arch = "x86_64")]
+        {
+            use x86_64::instructions::port::Port;
+            self.select(addr, offset, 2)?;
+            let mut port: Port<u16> = Port::new(PCI_CONFIG_DATA + (offset & 3));
+            unsafe { port.write(value) };
+            Ok(())
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = (addr, offset, value);
+            Err(ConfigAccessError::Unavailable)
+        }
+    }
+
     fn name(&self) -> &'static str {
         "Legacy I/O CAM"
     }
@@ -224,7 +291,7 @@ impl PciAccess for IoCamAccess {
     }
 
     fn contains_address(&self, addr: PciAddress) -> bool {
-        addr.segment() == 0
+        cfg!(target_arch = "x86_64") && addr.segment() == 0
     }
 }
 
@@ -257,7 +324,7 @@ impl EcamAccess {
         self.regions.as_slice()
     }
 
-    fn address(&self, addr: PciAddress, offset: u16) -> Option<u64> {
+    fn register(&self, addr: PciAddress, offset: u16, width: u16) -> Option<MmioRegion> {
         let region = self.regions.iter().find(|region| {
             region.segment == addr.segment()
                 && region.bus_start <= addr.bus()
@@ -272,31 +339,65 @@ impl EcamAccess {
             addr.device(),
             addr.function(),
             offset,
-            4,
+            width,
         )?;
-        region.base.checked_add(relative)
+        let address = region.base.checked_add(relative)?;
+        // SAFETY: the platform supplied mapped ECAM and the exact aligned
+        // transaction lies inside its validated function/region bounds.
+        unsafe { MmioRegion::try_new(address, usize::from(width)).ok() }
     }
 }
 
 impl ConfigRegionAccess for EcamAccess {
     unsafe fn read(&self, addr: PciAddress, offset: u16) -> u32 {
-        let Some(address) = self.address(addr, offset) else {
-            return u32::MAX;
-        };
-        // SAFETY: address is aligned and contained in a validated ECAM allocation.
-        unsafe { core::ptr::read_volatile(address as *const u32) }
+        self.register(addr, offset, 4)
+            .map_or(u32::MAX, |register| register.read32(0))
     }
 
     unsafe fn write(&self, addr: PciAddress, offset: u16, value: u32) {
-        let Some(address) = self.address(addr, offset) else {
-            return;
-        };
-        // SAFETY: address is aligned and contained in a validated ECAM allocation.
-        unsafe { core::ptr::write_volatile(address as *mut u32, value) };
+        if let Some(register) = self.register(addr, offset, 4) {
+            register.write32(0, value);
+        }
     }
 }
 
 impl PciAccess for EcamAccess {
+    fn try_read8(&self, addr: PciAddress, offset: u16) -> Result<u8, ConfigAccessError> {
+        self.register(addr, offset, 1)
+            .map(|register| register.read8(0))
+            .ok_or(ConfigAccessError::OutOfRange)
+    }
+
+    fn try_read16(&self, addr: PciAddress, offset: u16) -> Result<u16, ConfigAccessError> {
+        self.register(addr, offset, 2)
+            .map(|register| register.read16(0))
+            .ok_or(ConfigAccessError::OutOfRange)
+    }
+
+    fn try_write8(
+        &self,
+        addr: PciAddress,
+        offset: u16,
+        value: u8,
+    ) -> Result<(), ConfigAccessError> {
+        self.register(addr, offset, 1)
+            .ok_or(ConfigAccessError::OutOfRange)?
+            .write8(0, value);
+        Ok(())
+    }
+
+    fn try_write16(
+        &self,
+        addr: PciAddress,
+        offset: u16,
+        value: u16,
+    ) -> Result<(), ConfigAccessError> {
+        self.register(addr, offset, 2)
+            .ok_or(ConfigAccessError::OutOfRange)?
+            .write16(0, value);
+        Ok(())
+    }
+
     fn name(&self) -> &'static str {
         "PCIe ECAM"
     }
@@ -343,6 +444,48 @@ impl ConfigRegionAccess for AnyPciAccess {
 }
 
 impl PciAccess for AnyPciAccess {
+    fn try_read8(&self, addr: PciAddress, offset: u16) -> Result<u8, ConfigAccessError> {
+        match self {
+            Self::Unavailable => Err(ConfigAccessError::Unavailable),
+            Self::IoCam(access) => access.try_read8(addr, offset),
+            Self::Ecam(access) => access.try_read8(addr, offset),
+        }
+    }
+
+    fn try_read16(&self, addr: PciAddress, offset: u16) -> Result<u16, ConfigAccessError> {
+        match self {
+            Self::Unavailable => Err(ConfigAccessError::Unavailable),
+            Self::IoCam(access) => access.try_read16(addr, offset),
+            Self::Ecam(access) => access.try_read16(addr, offset),
+        }
+    }
+
+    fn try_write8(
+        &self,
+        addr: PciAddress,
+        offset: u16,
+        value: u8,
+    ) -> Result<(), ConfigAccessError> {
+        match self {
+            Self::Unavailable => Err(ConfigAccessError::Unavailable),
+            Self::IoCam(access) => access.try_write8(addr, offset, value),
+            Self::Ecam(access) => access.try_write8(addr, offset, value),
+        }
+    }
+
+    fn try_write16(
+        &self,
+        addr: PciAddress,
+        offset: u16,
+        value: u16,
+    ) -> Result<(), ConfigAccessError> {
+        match self {
+            Self::Unavailable => Err(ConfigAccessError::Unavailable),
+            Self::IoCam(access) => access.try_write16(addr, offset, value),
+            Self::Ecam(access) => access.try_write16(addr, offset, value),
+        }
+    }
+
     fn name(&self) -> &'static str {
         match self {
             Self::Unavailable => "unavailable",
@@ -404,3 +547,7 @@ pub fn create_access(regions: &[PciEcamRegion], allow_legacy_cam: bool) -> AnyPc
         AnyPciAccess::Unavailable
     }
 }
+
+#[cfg(test)]
+#[path = "access_tests.rs"]
+mod tests;

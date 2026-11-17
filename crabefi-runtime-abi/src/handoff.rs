@@ -5,7 +5,9 @@ use crate::format::{EFI_PAGE_SIZE, MAX_SECTIONS, architecture};
 pub const MAX_EXTERNAL_RANGES: usize = 8;
 pub const MAX_VARIABLES: usize = 64;
 pub const MAX_VARIABLE_NAME_LEN: usize = 64;
-pub const MAX_VARIABLE_DATA_SIZE: usize = 16 * 1024;
+/// Largest single variable. Microsoft's dbx alone is over 21 KiB, and it
+/// only grows as revocations are appended.
+pub const MAX_VARIABLE_DATA_SIZE: usize = 32 * 1024;
 pub const MAX_CONFIGURATION_TABLES: usize = 24;
 /// Maximum runtime memory descriptors passed to `runtime_image_prepare_ebs`.
 pub const MAX_RUNTIME_DESCRIPTORS: usize = 32;
@@ -513,21 +515,3 @@ const _: () = assert!(core::mem::size_of::<BridgeRequest>() == 72);
 const _: () = assert!(core::mem::size_of::<ConfigurationRegistration>() == 32);
 const _: () = assert!(core::mem::size_of::<ConsoleRegistration>() == 24);
 const _: () = assert!(core::mem::size_of::<EsrtRegistration>() == 40);
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn validate_rejects_foreign_abi_version() {
-        // An unstamped handoff (pre-versioning boot image) reads as 0.
-        assert_eq!(
-            RuntimeHandoff::empty().validate(),
-            Err(HandoffError::Version)
-        );
-        let mut handoff = RuntimeHandoff::empty();
-        handoff.abi_version = crate::format::ABI_VERSION;
-        // Passes the version gate, then fails on the empty contents.
-        assert_eq!(handoff.validate(), Err(HandoffError::Count));
-    }
-}

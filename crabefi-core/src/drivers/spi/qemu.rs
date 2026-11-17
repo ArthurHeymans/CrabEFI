@@ -344,42 +344,42 @@ impl QemuPflashController {
 
     /// Check if we're running in a QEMU environment
     fn is_qemu_environment() -> bool {
-        let devices = pci::get_all_devices();
+        pci::with_devices(|devices| {
+            log::debug!("QEMU detection: checking {} PCI devices", devices.len());
 
-        log::debug!("QEMU detection: checking {} PCI devices", devices.len());
+            // Look for QEMU-specific devices
+            for dev in devices.iter() {
+                // QEMU fw_cfg device (Red Hat vendor)
+                if dev.vendor_id == QEMU_RH_VID && dev.device_id == QEMU_FW_CFG_DID {
+                    log::info!("Found QEMU fw_cfg device - running in QEMU");
+                    return true;
+                }
 
-        // Look for QEMU-specific devices
-        for dev in devices.iter() {
-            // QEMU fw_cfg device (Red Hat vendor)
-            if dev.vendor_id == QEMU_RH_VID && dev.device_id == QEMU_FW_CFG_DID {
-                log::info!("Found QEMU fw_cfg device - running in QEMU");
-                return true;
+                // QEMU NVMe controller (Red Hat vendor)
+                if dev.vendor_id == QEMU_RH_VID && dev.device_id == QEMU_NVME_DID {
+                    log::info!("Found QEMU NVMe controller - running in QEMU");
+                    return true;
+                }
+
+                // QEMU XHCI controller (Red Hat vendor)
+                if dev.vendor_id == QEMU_RH_VID && dev.device_id == QEMU_XHCI_DID {
+                    log::info!("Found QEMU XHCI controller - running in QEMU");
+                    return true;
+                }
+
+                // QEMU VGA (bochs-display with vendor 1234:1111)
+                if dev.vendor_id == QEMU_VGA_VID && dev.device_id == QEMU_VGA_DID {
+                    log::info!("Found QEMU VGA (bochs-display) - running in QEMU");
+                    return true;
+                }
             }
 
-            // QEMU NVMe controller (Red Hat vendor)
-            if dev.vendor_id == QEMU_RH_VID && dev.device_id == QEMU_NVME_DID {
-                log::info!("Found QEMU NVMe controller - running in QEMU");
-                return true;
-            }
-
-            // QEMU XHCI controller (Red Hat vendor)
-            if dev.vendor_id == QEMU_RH_VID && dev.device_id == QEMU_XHCI_DID {
-                log::info!("Found QEMU XHCI controller - running in QEMU");
-                return true;
-            }
-
-            // QEMU VGA (bochs-display with vendor 1234:1111)
-            if dev.vendor_id == QEMU_VGA_VID && dev.device_id == QEMU_VGA_DID {
-                log::info!("Found QEMU VGA (bochs-display) - running in QEMU");
-                return true;
-            }
-        }
-
-        log::debug!(
-            "No QEMU-specific devices found in {} devices",
-            devices.len()
-        );
-        false
+            log::debug!(
+                "No QEMU-specific devices found in {} devices",
+                devices.len()
+            );
+            false
+        })
     }
 
     /// Convert flash offset to host memory address

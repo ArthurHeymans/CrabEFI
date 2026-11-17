@@ -525,13 +525,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn crl_reason_round_trips() {
-        assert_eq!(CrlReason::from_u32(1), Some(CrlReason::KeyCompromise));
-        assert_eq!(CrlReason::from_u32(7), None);
-        assert_eq!(CrlReason::from_u32(10), Some(CrlReason::AaCompromise));
-    }
-
-    #[test]
     fn crl_reason_skips_other_entry_extensions() {
         // invalidityDate (2.5.29.24) with a GeneralizedTime, then
         // cRLReasons (2.5.29.21) = keyCompromise.
@@ -542,11 +535,20 @@ mod tests {
             0x30, 0x0d, 0x06, 0x03, 0x55, 0x1d, 0x15, 0x01, 0x01, 0xff, 0x04, 0x03, 0x0a, 0x01,
             0x01,
         ];
-        let parse = |bytes| Extensions::parse(Tlv::parse(bytes).unwrap()).unwrap();
-        assert_eq!(
-            crl_reason(parse(&extensions)),
-            Ok(Some(CrlReason::KeyCompromise))
-        );
+        fn parse(bytes: &[u8]) -> Extensions<'_> {
+            Extensions::parse(Tlv::parse(bytes).unwrap()).unwrap()
+        }
+        for (code, expected) in [
+            (0, Some(CrlReason::Unspecified)),
+            (1, Some(CrlReason::KeyCompromise)),
+            (5, Some(CrlReason::CessationOfOperation)),
+            (7, None), // RFC 5280 leaves reason code 7 unassigned.
+            (10, Some(CrlReason::AaCompromise)),
+        ] {
+            let mut encoded = extensions;
+            *encoded.last_mut().unwrap() = code;
+            assert_eq!(crl_reason(parse(&encoded)), Ok(expected));
+        }
         let mut invalidity_only = extensions[..0x19].to_vec();
         invalidity_only[1] = 0x17;
         assert_eq!(crl_reason(parse(&invalidity_only)), Ok(None));
@@ -571,20 +573,5 @@ mod tests {
         let mut deep = alloc::vec![0x30, deep_dp.len() as u8];
         deep.extend_from_slice(&deep_dp);
         assert!(extract_crl_uris(&deep).is_err());
-    }
-
-    #[test]
-    fn test_crl_reason_values() {
-        // Discriminants are the RFC 5280 reason codes.
-        assert_eq!(CrlReason::Unspecified as u32, 0);
-        assert_eq!(CrlReason::KeyCompromise as u32, 1);
-        assert_eq!(CrlReason::CessationOfOperation as u32, 5);
-    }
-
-    #[test]
-    fn test_revocation_config_default() {
-        let config = RevocationConfig::default();
-        assert!(config.enable_crl);
-        assert!(config.allow_soft_fail);
     }
 }

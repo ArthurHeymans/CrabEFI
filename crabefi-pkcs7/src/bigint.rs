@@ -271,16 +271,6 @@ mod tests {
     }
 
     #[test]
-    fn widths_agree() {
-        let mut narrow = [0u8; 2];
-        mod_pow_vartime::<1>(C, D, N, &mut narrow).unwrap();
-        let mut wide = [0u8; 2];
-        mod_pow_vartime::<128>(C, D, N, &mut wide).unwrap();
-        assert_eq!(narrow, [0x00, M[0]]);
-        assert_eq!(wide, narrow);
-    }
-
-    #[test]
     fn rejects_invalid_inputs() {
         let mut out = [0u8; 2];
         assert_eq!(
@@ -318,11 +308,11 @@ mod tests {
     }
 
     #[test]
-    fn max_width_smoke() {
+    fn exponent_one_preserves_a_full_width_base() {
         let modulus = [0xffu8; MAX_BYTES];
         let mut out = vec![0u8; MAX_BYTES];
         mod_pow_vartime::<LIMBS>(&[0xa5; MAX_BYTES], &[1], &modulus, &mut out).unwrap();
-        assert_eq!(cmp_be(&out, &modulus), Ordering::Less);
+        assert_eq!(out, [0xa5; MAX_BYTES]);
         let mut base = [0xa5u8; MAX_BYTES];
         base[0] = 0x7f;
         assert_eq!(pow_to_vec(&base, &[1], &modulus), base);

@@ -25,9 +25,8 @@ use alloc::vec::Vec;
 use crabefi_efi_types::{
     authentication::EfiTime,
     secure_boot::{
-        DB_NAME, DBX_NAME, EFI_CERT_TYPE_PKCS7_GUID, EFI_GLOBAL_VARIABLE_GUID,
-        EFI_IMAGE_SECURITY_DATABASE_GUID, KEK_NAME, PK_NAME, SECURE_BOOT_ENABLE_NAME,
-        SecureBootVariable,
+        DBX_NAME, EFI_CERT_TYPE_PKCS7_GUID, EFI_GLOBAL_VARIABLE_GUID,
+        EFI_IMAGE_SECURITY_DATABASE_GUID, SECURE_BOOT_ENABLE_NAME, SecureBootVariable,
     },
 };
 use crabefi_pkcs7::time::DateTime;
@@ -47,6 +46,8 @@ const SECURE_BOOT_KEY_ATTRS: u32 = super::attributes::NON_VOLATILE
 
 struct DatabaseSnapshot {
     initialized: bool,
+    #[cfg(feature = "ui")]
+    complete: bool,
     data: Option<Vec<u8>>,
 }
 
@@ -54,6 +55,8 @@ impl DatabaseSnapshot {
     const fn new() -> Self {
         Self {
             initialized: false,
+            #[cfg(feature = "ui")]
+            complete: false,
             data: None,
         }
     }
@@ -213,10 +216,16 @@ fn refresh_key_database(
 
     let mut database = key_database(variable);
     database.clear();
+    #[cfg(feature = "ui")]
+    let mut complete = true;
     if let Some(value) = data.as_deref()
         && !value.is_empty()
     {
         if let Err(error) = database.load_from_signature_lists(value) {
+            #[cfg(feature = "ui")]
+            {
+                complete = false;
+            }
             log::warn!("Failed to parse {:?} variable: {:?}", variable, error);
         } else {
             log::debug!("Loaded {} {:?} entries", database.len(), variable);
@@ -239,6 +248,8 @@ fn refresh_key_database(
     let mut snapshots = KEY_DATABASE_SNAPSHOTS.lock();
     snapshots[variable.index()] = DatabaseSnapshot {
         initialized: true,
+        #[cfg(feature = "ui")]
+        complete,
         data,
     };
 }
@@ -250,7 +261,7 @@ pub(crate) fn refresh_key_databases() {
     refresh_key_databases_with_force(false);
 }
 
-fn force_refresh_key_databases() {
+pub(crate) fn force_refresh_key_databases() {
     refresh_key_databases_with_force(true);
 }
 
@@ -265,9 +276,43 @@ fn refresh_key_databases_with_force(force: bool) {
     }
 }
 
+/// Counts and identities must not imply a complete inventory after a
+/// malformed database or a cache-capacity error.
+#[cfg(feature = "ui")]
+pub(crate) fn key_inventory_complete() -> bool {
+    refresh_key_databases();
+    KEY_DATABASE_SNAPSHOTS
+        .lock()
+        .iter()
+        .all(|snapshot| snapshot.initialized && snapshot.complete)
+}
+
 /// Get variable data from the authoritative runtime image store.
-fn get_variable_data(guid: &Guid, name: &[u16]) -> Option<Vec<u8>> {
+pub(crate) fn get_variable_data(guid: &Guid, name: &[u16]) -> Option<Vec<u8>> {
     crate::efi::runtime_image::client::variables::get(guid, name).map(|(_, data)| data)
+}
+
+/// Authentication preflight must not use verification-cache timestamps: those
+/// intentionally are not refreshed on every write and are cleared with keys.
+/// The persistence facade includes active zero-length deletion-history records.
+pub(crate) fn dbx_replay_floor() -> Result<EfiTime, AuthError> {
+    let cached = *dbx_database().timestamp();
+    let persisted = crate::efi::varstore::persistence::try_get_variable_timestamp(
+        &Guid::from_bytes(&EFI_IMAGE_SECURITY_DATABASE_GUID),
+        DBX_NAME,
+    )
+    .map_err(|_| {
+        log::error!("Cannot determine the persisted dbx replay floor");
+        AuthError::AccessDenied
+    })?;
+    Ok(replay_floor(cached, persisted))
+}
+
+fn replay_floor(cached: EfiTime, persisted: Option<VariableTimestamp>) -> EfiTime {
+    match persisted.map(efi_time_from_timestamp) {
+        Some(timestamp) if timestamp.is_after(&cached) => timestamp,
+        _ => cached,
+    }
 }
 
 fn efi_time_from_timestamp(timestamp: VariableTimestamp) -> EfiTime {
@@ -396,16 +441,32 @@ static ISSUED_TIMESTAMPS: spin::Mutex<[i64; 4]> = spin::Mutex::new([i64::MIN; 4]
 /// than the date CrabEFI was built from. That keeps default-key enrollment,
 /// clearing and re-enrollment working without an RTC, and a wrong RTC can no
 /// longer push timestamps into the future.
-fn next_firmware_timestamp(variable: SecureBootVariable, guid: &Guid, name: &[u16]) -> EfiTime {
-    let persisted = get_variable_timestamp(guid, name)
-        .map(|timestamp| utc_seconds(&efi_time_from_timestamp(timestamp)));
+fn next_firmware_timestamp(
+    variable: SecureBootVariable,
+    guid: &Guid,
+    name: &[u16],
+) -> Result<EfiTime, AuthError> {
+    let persisted = match crate::efi::varstore::persistence::try_get_variable_timestamp(guid, name)
+    {
+        Ok(timestamp) => timestamp.map(|t| utc_seconds(&efi_time_from_timestamp(t))),
+        // No durable store exists in this profile, so there is no persisted
+        // floor a new record could undercut; session issuance stays monotonic.
+        Err(crate::efi::varstore::VarStoreError::NotInitialized) => None,
+        // A durable store exists but its history is unreadable or malformed.
+        // Issuing from the build-date floor could append an older record and
+        // lower the replay floor, so refuse the write instead.
+        Err(_) => {
+            log::error!("Cannot read persisted timestamp history; refusing authenticated write");
+            return Err(AuthError::AccessDenied);
+        }
+    };
     let mut issued = ISSUED_TIMESTAMPS.lock();
     let previous = persisted
         .into_iter()
         .fold(issued[variable.index()], i64::max);
     let next = next_timestamp_after(previous);
     issued[variable.index()] = next;
-    efi_time_from_unix(next)
+    Ok(efi_time_from_unix(next))
 }
 
 /// One second after `previous`, but at least the build date.
@@ -471,20 +532,21 @@ fn efi_time_from_unix(seconds: i64) -> EfiTime {
 ///
 /// The write carries [`next_firmware_timestamp`], so it passes the same
 /// monotonic timestamp check as any other authenticated update.
-fn persist_key_variable(var_type: SecureBootVariable, data: &[u8]) -> Result<(), AuthError> {
-    let (guid, name) = match var_type {
-        SecureBootVariable::PK => (Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID), PK_NAME),
-        SecureBootVariable::Kek => (Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID), KEK_NAME),
-        SecureBootVariable::Db => (Guid::from_bytes(&EFI_IMAGE_SECURITY_DATABASE_GUID), DB_NAME),
-        SecureBootVariable::Dbx => (
-            Guid::from_bytes(&EFI_IMAGE_SECURITY_DATABASE_GUID),
-            DBX_NAME,
-        ),
-    };
+pub(crate) fn persist_key_variable(
+    var_type: SecureBootVariable,
+    data: &[u8],
+) -> Result<(), AuthError> {
+    let envelope = prepare_key_variable(var_type, data)?;
+    submit_key_variable(var_type, &envelope, data.is_empty())
+}
 
+/// Read history and allocate before any destructive setup transition.
+fn prepare_key_variable(var_type: SecureBootVariable, data: &[u8]) -> Result<Vec<u8>, AuthError> {
+    let guid = Guid::from_bytes(var_type.guid());
+    let name = var_type.name();
     use zerocopy::IntoBytes;
 
-    let timestamp = next_firmware_timestamp(var_type, &guid, name);
+    let timestamp = next_firmware_timestamp(var_type, &guid, name)?;
     let mut envelope = Vec::new();
     envelope
         .try_reserve_exact(40usize.saturating_add(data.len()))
@@ -495,15 +557,22 @@ fn persist_key_variable(var_type: SecureBootVariable, data: &[u8]) -> Result<(),
     envelope.extend_from_slice(&super::WIN_CERT_TYPE_EFI_GUID.to_le_bytes());
     envelope.extend_from_slice(&EFI_CERT_TYPE_PKCS7_GUID);
     envelope.extend_from_slice(data);
+    Ok(envelope)
+}
 
+fn submit_key_variable(
+    var_type: SecureBootVariable,
+    envelope: &[u8],
+    deletion: bool,
+) -> Result<(), AuthError> {
     let status = crate::efi::runtime_image::client::variables::set(
-        &guid,
-        name,
+        &Guid::from_bytes(var_type.guid()),
+        var_type.name(),
         SECURE_BOOT_KEY_ATTRS,
-        &envelope,
+        envelope,
     );
     if status == r_efi::efi::Status::SUCCESS
-        || (data.is_empty() && status == r_efi::efi::Status::NOT_FOUND)
+        || (deletion && status == r_efi::efi::Status::NOT_FOUND)
     {
         // Clear-all is idempotent in Setup Mode; preserve ordinary public
         // SetVariable semantics while accepting an already-absent key here.
@@ -550,6 +619,22 @@ pub fn get_enrollment_summary() -> (usize, usize, usize, usize) {
     (pk_count, kek_count, db_count, dbx_count)
 }
 
+/// Recovery must remain available even when a stored database cannot be parsed.
+#[cfg(feature = "ui")]
+pub(crate) fn has_stored_keys() -> bool {
+    [
+        SecureBootVariable::PK,
+        SecureBootVariable::Kek,
+        SecureBootVariable::Db,
+        SecureBootVariable::Dbx,
+    ]
+    .iter()
+    .any(|variable| {
+        get_variable_data(&Guid::from_bytes(variable.guid()), variable.name())
+            .is_some_and(|data| !data.is_empty())
+    })
+}
+
 /// Clear all Secure Boot keys and return to Setup Mode
 ///
 /// This is a dangerous operation that clears all enrolled keys.
@@ -557,6 +642,18 @@ pub fn get_enrollment_summary() -> (usize, usize, usize, usize) {
 /// is disabled.
 pub fn clear_all_keys() -> Result<(), AuthError> {
     log::warn!("Clearing all Secure Boot keys by physical-presence setup action!");
+
+    // Validate every remaining replay history and prepare every envelope
+    // before disabling enforcement or deleting PK. Reuse these envelopes so
+    // a later history read cannot strand a half-cleared key set in Setup Mode.
+    let deletions = [
+        SecureBootVariable::Dbx,
+        SecureBootVariable::Db,
+        SecureBootVariable::Kek,
+    ]
+    .into_iter()
+    .map(|variable| prepare_key_variable(variable, &[]).map(|envelope| (variable, envelope)))
+    .collect::<Result<Vec<_>, _>>()?;
 
     // Record the user's clear intent durably before deleting any keys. If
     // clearing is interrupted after PK deletion, initialization must not
@@ -581,16 +678,13 @@ pub fn clear_all_keys() -> Result<(), AuthError> {
         }
     }
 
-    for variable in [
-        SecureBootVariable::Dbx,
-        SecureBootVariable::Db,
-        SecureBootVariable::Kek,
-    ] {
-        if let Err(error) = persist_key_variable(variable, &[]) {
+    for (variable, envelope) in deletions {
+        if let Err(error) = submit_key_variable(variable, &envelope, true) {
             // A preceding delete may already have changed live image policy.
             // Always reconcile disposable boot caches before reporting failure.
             force_refresh_key_databases();
-            return Err(error);
+            log::error!("Key clearing interrupted: {error:?}; repair storage and retry clear-all");
+            return Err(AuthError::PartialKeyClear);
         }
     }
 
@@ -606,20 +700,45 @@ pub fn clear_all_keys() -> Result<(), AuthError> {
 mod tests {
     use super::{
         DatabaseSnapshot, EFI_UNSPECIFIED_TIMEZONE, FIRMWARE_TIMESTAMP_FLOOR, SOURCE_DATE_EPOCH,
-        efi_time_from_unix, next_timestamp_after, utc_seconds,
+        efi_time_from_timestamp, efi_time_from_unix, next_timestamp_after, replay_floor,
+        utc_seconds,
     };
-    use crate::efi::utils::ucs2_eq;
     use alloc::vec;
     use crabefi_efi_types::authentication::EfiTime;
 
     #[test]
-    fn test_ucs2_eq() {
-        let name1 = [0x50, 0x4B, 0x00]; // "PK\0"
-        let name2 = [0x50, 0x4B, 0x00, 0x00, 0x00]; // "PK\0" with padding
-
-        assert!(ucs2_eq(&name1, &name1));
-        assert!(ucs2_eq(&name2, &name1));
-        assert!(ucs2_eq(&name1, &name2));
+    fn replay_floor_survives_same_session_refresh_and_authenticated_deletion() {
+        let accepted = crabefi_runtime_abi::VariableTimestamp {
+            year: 2028,
+            month: 1,
+            day: 1,
+            ..Default::default()
+        };
+        let older = efi_time_from_timestamp(crabefi_runtime_abi::VariableTimestamp {
+            year: 2027,
+            month: 1,
+            day: 1,
+            ..Default::default()
+        });
+        let cleared_cache = EfiTime {
+            year: 0,
+            month: 0,
+            day: 0,
+            ..older
+        };
+        let same_update = efi_time_from_timestamp(accepted);
+        // An unchanged verification cache must not make an accepted update newer.
+        assert!(!same_update.is_after(&replay_floor(older, Some(accepted))));
+        // Deleting dbx clears its cache but leaves the active persistent tombstone.
+        assert!(!same_update.is_after(&replay_floor(cleared_cache, Some(accepted))));
+        assert!(replay_floor(cleared_cache, Some(accepted)).is_after(&older));
+        let newer = EfiTime {
+            year: 2029,
+            ..same_update
+        };
+        assert!(newer.is_after(&replay_floor(cleared_cache, Some(accepted))));
+        // Keep the in-memory floor on platforms without readable persistence metadata.
+        assert!(!older.is_after(&replay_floor(older, None)));
     }
 
     #[test]

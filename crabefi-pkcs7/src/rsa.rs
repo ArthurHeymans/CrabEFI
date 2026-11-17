@@ -143,22 +143,19 @@ mod tests {
     }
 
     #[test]
-    fn oversize_modulus_fails_soft() {
-        let key = RsaPublicKey {
-            modulus: &[0xff; 4096 / 8 + 1],
-            public_exponent: &[3],
-        };
-        assert!(!key.verify_pkcs1v15_sha256::<64>(&[1], &[0; 32]));
-    }
-
-    #[test]
     fn encoding_requires_full_padding_and_sha256_digest_info() {
         let digest = [0x5a; 32];
         let encode = |padding: usize| {
             let mut encoded = vec![0x00, 0x01];
             encoded.extend(core::iter::repeat_n(0xff, padding));
             encoded.push(0x00);
-            encoded.extend_from_slice(SHA256_DIGEST_INFO_PREFIX);
+            // RFC 8017 Appendix B.1: DER DigestInfo for SHA-256, including
+            // the NULL AlgorithmIdentifier parameters and 32-byte OCTET STRING.
+            // Do not reuse the verifier's prefix: that would bless its typos.
+            encoded.extend_from_slice(&[
+                0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02,
+                0x01, 0x05, 0x00, 0x04, 0x20,
+            ]);
             encoded.extend_from_slice(&digest);
             encoded
         };

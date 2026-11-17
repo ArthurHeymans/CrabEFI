@@ -416,8 +416,33 @@ mod tests {
         let slot = input.device_mut().slot_mut();
         slot.set_speed(4);
         slot.set_root_hub_port_number(2);
-        assert!(input.control().add_context_flag(1));
-        assert_eq!(input.device().slot().speed(), 4);
-        assert_eq!(input.device().slot().root_hub_port_number(), 2);
+        // xHCI Input Control Context DW1 bit 1, Slot Context DW0 bits
+        // 23:20 (speed) and DW1 bits 23:16 (root port). Check device-visible
+        // words, not the dependency's getters paired with its setters.
+        assert_eq!(
+            input.control().as_ref(),
+            &[0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,]
+        );
+        assert_eq!(
+            input.device().slot().as_ref(),
+            &[
+                0x0040_0000,
+                0x0002_0000,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ]
+        );
     }
 }

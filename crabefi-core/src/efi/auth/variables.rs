@@ -87,6 +87,9 @@ impl KeyDatabase {
 
     /// Parse and load entries from a signature list blob
     pub fn load_from_signature_lists(&mut self, data: &[u8]) -> Result<(), AuthError> {
+        if !crabefi_efi_types::authentication::validate_signature_database(data) {
+            return Err(AuthError::InvalidSignatureList);
+        }
         for (list, list_data) in SignatureListIterator::new(data) {
             for (owner, sig_data) in SignatureIterator::new(list, list_data) {
                 let entry = KeyDatabaseEntry {
@@ -199,6 +202,15 @@ impl KeyDatabase {
         })
     }
 
+    /// Get all SHA-256 hash entries in the database
+    pub fn sha256_hashes(&self) -> impl Iterator<Item = &[u8]> {
+        let sha256_guid = EFI_CERT_SHA256_GUID;
+        self.entries
+            .iter()
+            .filter(move |e| e.cert_type == sha256_guid)
+            .map(|e| e.data.as_slice())
+    }
+
     /// Get all X.509 certificates in the database
     pub fn x509_certificates(&self) -> impl Iterator<Item = &[u8]> {
         let x509_guid = EFI_CERT_X509_GUID;
@@ -251,4 +263,19 @@ pub fn db_database() -> spin::MutexGuard<'static, KeyDatabase> {
 /// Get a reference to the dbx database
 pub fn dbx_database() -> spin::MutexGuard<'static, KeyDatabase> {
     DBX_DATABASE.lock()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn malformed_inventory_is_not_silently_accepted_as_empty() {
+        let mut db = KeyDatabase::new();
+        assert_eq!(
+            db.load_from_signature_lists(&[1, 2, 3]),
+            Err(AuthError::InvalidSignatureList)
+        );
+        assert!(db.is_empty());
+    }
 }

@@ -41,6 +41,12 @@ struct SlotPatch {
     value: u64,
 }
 
+struct RelocationPlan {
+    tail: Vec<SlotPatch, MAX_TAIL_RELOCATIONS>,
+    runtime_table_start: u64,
+    runtime_table_end: u64,
+}
+
 pub fn set_virtual_address_map(
     memory_map_size: usize,
     descriptor_size: usize,
@@ -337,79 +343,11 @@ fn validate_and_commit(
         .map(|(retained, mapping)| virtual_base(retained.physical_base, &mapping))
         .transpose()?;
 
-    let runtime_table_start = core::ptr::addr_of!(runtime.tables.runtime) as u64;
-    let runtime_table_end = runtime_table_start
-        .checked_add(runtime.tables.runtime.hdr.header_size.into())
-        .ok_or(efi::Status::INVALID_PARAMETER)?;
-    let state_address = runtime as *mut state::RuntimeState as u64;
-    let transition_tail_addresses = state::transition_tail_addresses();
-    let store_address = core::ptr::addr_of!(state::RUNTIME_VARIABLE_STORE) as u64;
-    let mut tail: Vec<SlotPatch, MAX_TAIL_RELOCATIONS> = Vec::new();
-
-    // Validation pass: no writes.
-    for relocation in &runtime.relocations {
-        let patch_section = runtime
-            .sections
-            .get(usize::from(relocation.patch_section))
-            .ok_or(efi::Status::INVALID_PARAMETER)?;
-        let target_section = runtime
-            .sections
-            .get(usize::from(relocation.target_section))
-            .ok_or(efi::Status::INVALID_PARAMETER)?;
-        let patch_relative = relocation
-            .patch_offset
-            .checked_sub(patch_section.image_offset)
-            .ok_or(efi::Status::INVALID_PARAMETER)?;
-        if patch_relative
-            .checked_add(8)
-            .is_none_or(|end| end > patch_section.byte_len)
-            || !patch_relative.is_multiple_of(8)
-        {
-            return Err(efi::Status::INVALID_PARAMETER);
-        }
-        let target_relative = relocation
-            .target_offset
-            .checked_sub(target_section.image_offset)
-            .ok_or(efi::Status::INVALID_PARAMETER)?;
-        if target_relative >= target_section.byte_len
-            || relocation.kind != relocation_kind::ABSOLUTE64
-        {
-            return Err(efi::Status::INVALID_PARAMETER);
-        }
-        let patch_address = patch_section
-            .physical_base
-            .checked_add(u64::from(patch_relative))
-            .ok_or(efi::Status::INVALID_PARAMETER)?;
-        let virtual_target = section_virtual_bases
-            .get(usize::from(relocation.target_section))
-            .and_then(|base| base.checked_add(u64::from(target_relative)))
-            .ok_or(efi::Status::INVALID_PARAMETER)?;
-        let physical_target = target_section
-            .physical_base
-            .checked_add(u64::from(target_relative))
-            .ok_or(efi::Status::INVALID_PARAMETER)?;
-        let tail_required = target_section.flags & section_flags::EXECUTE != 0
-            || physical_target == state_address
-            || physical_target == store_address
-            || transition_tail_addresses.contains(&physical_target);
-        // `commit_matching` skips every patch address inside the Runtime
-        // Services table, so a table-resident slot that is not classified for
-        // the tail would never be patched and would silently keep its stale
-        // physical value after the virtual transition. Reject it instead.
-        if patch_address >= runtime_table_start
-            && patch_address < runtime_table_end
-            && !tail_required
-        {
-            return Err(efi::Status::INVALID_PARAMETER);
-        }
-        if tail_required {
-            tail.push(SlotPatch {
-                address: patch_address,
-                value: virtual_target,
-            })
-            .map_err(|_| efi::Status::OUT_OF_RESOURCES)?;
-        }
-    }
+    let RelocationPlan {
+        tail,
+        runtime_table_start,
+        runtime_table_end,
+    } = plan_relocations(runtime, &section_virtual_bases)?;
 
     // Infallible commit begins. First publish resolved bases in image state.
     for (section, virtual_base) in runtime.sections.iter_mut().zip(&section_virtual_bases) {
@@ -456,6 +394,89 @@ fn validate_and_commit(
     state::publish_virtual_and_unlock();
     runtime_image_commit_tail_and_return(state_pointer, tail.as_ptr(), tail.len());
     Ok(())
+}
+
+/// Validate all relocation destinations and collect transition-sensitive writes
+/// without mutating image state or publishing a lifecycle phase.
+fn plan_relocations(
+    runtime: &state::RuntimeState,
+    section_virtual_bases: &[u64],
+) -> Result<RelocationPlan, efi::Status> {
+    let runtime_table_start = core::ptr::addr_of!(runtime.tables.runtime) as u64;
+    let runtime_table_end = runtime_table_start
+        .checked_add(runtime.tables.runtime.hdr.header_size.into())
+        .ok_or(efi::Status::INVALID_PARAMETER)?;
+    let state_address = runtime as *const state::RuntimeState as u64;
+    let transition_tail_addresses = state::transition_tail_addresses();
+    let store_address = core::ptr::addr_of!(state::RUNTIME_VARIABLE_STORE) as u64;
+    let mut tail: Vec<SlotPatch, MAX_TAIL_RELOCATIONS> = Vec::new();
+
+    for relocation in &runtime.relocations {
+        let patch_section = runtime
+            .sections
+            .get(usize::from(relocation.patch_section))
+            .ok_or(efi::Status::INVALID_PARAMETER)?;
+        let target_section = runtime
+            .sections
+            .get(usize::from(relocation.target_section))
+            .ok_or(efi::Status::INVALID_PARAMETER)?;
+        let patch_relative = relocation
+            .patch_offset
+            .checked_sub(patch_section.image_offset)
+            .ok_or(efi::Status::INVALID_PARAMETER)?;
+        if patch_relative
+            .checked_add(8)
+            .is_none_or(|end| end > patch_section.byte_len)
+            || !patch_relative.is_multiple_of(8)
+        {
+            return Err(efi::Status::INVALID_PARAMETER);
+        }
+        let target_relative = relocation
+            .target_offset
+            .checked_sub(target_section.image_offset)
+            .ok_or(efi::Status::INVALID_PARAMETER)?;
+        if target_relative >= target_section.byte_len
+            || relocation.kind != relocation_kind::ABSOLUTE64
+        {
+            return Err(efi::Status::INVALID_PARAMETER);
+        }
+        let patch_address = patch_section
+            .physical_base
+            .checked_add(u64::from(patch_relative))
+            .ok_or(efi::Status::INVALID_PARAMETER)?;
+        let virtual_target = section_virtual_bases
+            .get(usize::from(relocation.target_section))
+            .and_then(|base| base.checked_add(u64::from(target_relative)))
+            .ok_or(efi::Status::INVALID_PARAMETER)?;
+        let physical_target = target_section
+            .physical_base
+            .checked_add(u64::from(target_relative))
+            .ok_or(efi::Status::INVALID_PARAMETER)?;
+        let tail_required = target_section.flags & section_flags::EXECUTE != 0
+            || physical_target == state_address
+            || physical_target == store_address
+            || transition_tail_addresses.contains(&physical_target);
+        // `commit_matching` skips Runtime Services table slots; a slot there
+        // not assigned to the tail would otherwise retain its physical value.
+        if patch_address >= runtime_table_start
+            && patch_address < runtime_table_end
+            && !tail_required
+        {
+            return Err(efi::Status::INVALID_PARAMETER);
+        }
+        if tail_required {
+            tail.push(SlotPatch {
+                address: patch_address,
+                value: virtual_target,
+            })
+            .map_err(|_| efi::Status::OUT_OF_RESOURCES)?;
+        }
+    }
+    Ok(RelocationPlan {
+        tail,
+        runtime_table_start,
+        runtime_table_end,
+    })
 }
 
 fn commit_matching(
@@ -694,17 +715,70 @@ mod tests {
     }
 
     #[test]
-    fn transition_tail_covers_the_format_relocation_limit() {
-        assert_eq!(MAX_TAIL_RELOCATIONS, MAX_RELOCATIONS);
-    }
-
-    #[test]
-    fn exposed_provenance_slot_write_reaches_validated_destination() {
-        let mut value = 0u64;
-        let address = (&mut value as *mut u64) as usize as u64;
-        // SAFETY: casting the local pointer exposed its provenance and the
-        // destination is one complete writable u64.
-        unsafe { write_slot_at_address(address, 0xfeed_face_dead_beef) };
-        assert_eq!(value, 0xfeed_face_dead_beef);
+    fn transition_tail_applies_every_relocation_at_the_format_limit() {
+        use crabefi_runtime_abi::RelocationImport;
+        let mut slots = std::vec![0xdead_beefu64; MAX_RELOCATIONS];
+        let mut runtime = state::RuntimeState::new();
+        let byte_len = (slots.len() * 8) as u32;
+        runtime.sections = Vec::from_array([
+            state::SectionRecord {
+                physical_base: slots.as_mut_ptr() as u64,
+                virtual_base: 0,
+                image_offset: 0,
+                byte_len,
+                flags: section_flags::WRITE | section_flags::RELOCATION_SLOTS,
+            },
+            state::SectionRecord {
+                physical_base: 0x40_0000,
+                virtual_base: 0,
+                image_offset: byte_len,
+                byte_len,
+                flags: section_flags::EXECUTE,
+            },
+        ]);
+        for index in 0..MAX_RELOCATIONS {
+            assert_eq!(
+                runtime.import_relocation(&RelocationImport {
+                    patch_offset: (index * 8) as u32,
+                    target_offset: byte_len + (index * 8) as u32,
+                    patch_section: 0,
+                    target_section: 1,
+                    kind: relocation_kind::ABSOLUTE64,
+                    ..RelocationImport::default()
+                }),
+                Ok(())
+            );
+        }
+        assert_eq!(
+            runtime.import_relocation(&RelocationImport {
+                patch_offset: 0,
+                target_offset: byte_len,
+                patch_section: 0,
+                target_section: 1,
+                kind: relocation_kind::ABSOLUTE64,
+                ..RelocationImport::default()
+            }),
+            Err(efi::Status::OUT_OF_RESOURCES)
+        );
+        let bases = [slots.as_ptr() as u64, 0xffff_8000_0040_0000];
+        let last = runtime.relocations.last_mut().unwrap();
+        let valid_target = last.target_offset;
+        last.target_offset = byte_len * 2;
+        assert_eq!(
+            plan_relocations(&runtime, &bases).err(),
+            Some(efi::Status::INVALID_PARAMETER)
+        );
+        assert!(slots.iter().all(|value| *value == 0xdead_beef));
+        runtime.relocations.last_mut().unwrap().target_offset = valid_target;
+        let plan = plan_relocations(&runtime, &bases).unwrap();
+        assert_eq!(plan.tail.len(), MAX_RELOCATIONS);
+        runtime_image_commit_tail_and_return(
+            core::ptr::null_mut(),
+            plan.tail.as_ptr(),
+            plan.tail.len(),
+        );
+        for (index, value) in slots.iter().enumerate() {
+            assert_eq!(*value, 0xffff_8000_0040_0000 + index as u64 * 8);
+        }
     }
 }

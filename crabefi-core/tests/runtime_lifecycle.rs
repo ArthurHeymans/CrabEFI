@@ -120,11 +120,11 @@ impl StorageBackend for Region {
         let target = media
             .get_mut(offset as usize..offset as usize + bytes.len())
             .ok_or(StorageError::InvalidArgument)?;
+        // NOR programming only clears bits. In particular EDK2's 0xfd
+        // deletion mask must turn a 0x3f state into 0x3d, not fail because
+        // the mask contains ones at already-cleared bit positions.
         for (old, new) in target.iter_mut().zip(bytes) {
-            if *old & *new != *new {
-                return Err(StorageError::IoError);
-            }
-            *old = *new;
+            *old &= *new;
         }
         self.writes.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -317,6 +317,207 @@ fn interrupted_key_clear_survives_reset(config: RuntimePlatformConfig) {
     auth::boot::clear_all_keys().unwrap();
 }
 
+/// Microsoft's shipping dbx update, through the public SetVariable path
+/// against the default keys: a 21 KiB payload, signed as an append and
+/// stamped 2010.
+#[cfg(feature = "secure-boot")]
+fn microsoft_dbx_update_appends(config: RuntimePlatformConfig) {
+    use crabefi::efi::auth;
+    use crabefi_efi_types::{
+        authentication::EfiVariableAuthentication2, secure_boot::SecureBootVariable,
+    };
+    const UPDATE: &[u8] = include_bytes!("../src/efi/auth/testdata/microsoft_dbxupdate_x64.bin");
+    let revocations = EfiVariableAuthentication2::from_bytes(UPDATE)
+        .and_then(|header| header.variable_data(UPDATE))
+        .unwrap();
+
+    let media = Arc::new(Mutex::new(vec![0xff; 256 * 1024]));
+    let writes = Arc::new(AtomicUsize::new(0));
+    let boot = || {
+        let client = runtime_image::load(crabefi::BUNDLED_RUNTIME_IMAGE, config).unwrap();
+        runtime_image::install(client);
+        varstore::init_persistence(VariableStorage::Platform(Box::leak(Box::new(Region {
+            bytes: media.clone(),
+            writes: writes.clone(),
+            failure: Arc::new(AtomicUsize::new(0)),
+        }))))
+        .unwrap();
+        client.complete_import().unwrap();
+        client
+    };
+    let guid = efi::Guid::from_bytes(SecureBootVariable::Dbx.guid());
+    let import = |client: &runtime_image::RuntimeImageClient, append: u32| {
+        let mut name = SecureBootVariable::Dbx.name().to_vec();
+        name.push(0);
+        let attributes = efi::VARIABLE_NON_VOLATILE
+            | efi::VARIABLE_BOOTSERVICE_ACCESS
+            | efi::VARIABLE_RUNTIME_ACCESS
+            | efi::VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS
+            | append;
+        unsafe {
+            ((*client.runtime_services()).set_variable)(
+                name.as_mut_ptr(),
+                &guid as *const _ as *mut _,
+                attributes,
+                UPDATE.len(),
+                UPDATE.as_ptr().cast_mut().cast(),
+            )
+        }
+    };
+    let dbx = || {
+        runtime_image::client::variables::get(&guid, SecureBootVariable::Dbx.name())
+            .map(|(_, data)| data)
+    };
+
+    let client = boot();
+    auth::boot::enroll_and_persist_default_keys().unwrap();
+    // The signature covers an append; the same bytes must not replace dbx.
+    assert_eq!(import(&client, 0), efi::Status::SECURITY_VIOLATION);
+    assert_eq!(
+        import(&client, efi::VARIABLE_APPEND_WRITE),
+        efi::Status::SUCCESS
+    );
+    assert_eq!(dbx().as_deref(), Some(revocations));
+
+    // Importing it again adds nothing and writes nothing.
+    let writes_before = writes.load(Ordering::Relaxed);
+    assert_eq!(
+        import(&client, efi::VARIABLE_APPEND_WRITE),
+        efi::Status::SUCCESS
+    );
+    assert_eq!(dbx().as_deref(), Some(revocations));
+    assert_eq!(writes.load(Ordering::Relaxed), writes_before);
+
+    // Clearing leaves dbx history from this firmware's own, far newer clock.
+    // The 2010 update must still be accepted, and survive a reboot.
+    auth::boot::clear_all_keys().unwrap();
+    auth::boot::enroll_and_persist_default_keys().unwrap();
+    assert_eq!(dbx(), None);
+    assert_eq!(
+        import(&client, efi::VARIABLE_APPEND_WRITE),
+        efi::Status::SUCCESS
+    );
+    boot();
+    assert_eq!(dbx().as_deref(), Some(revocations));
+    auth::boot::clear_all_keys().unwrap();
+}
+
+/// Exercise the public CFR facade against the loaded runtime and real media,
+/// rather than checking that particular Rust source strings exist.
+#[cfg(feature = "cfr")]
+fn cfr_writes_and_deletes_reach_persistent_runtime_storage(
+    failure: &AtomicUsize,
+    media: &Mutex<Vec<u8>>,
+) {
+    use crabefi::cfr::{self, CfrOption, CfrOptionType, CfrValue};
+    let guid = efi::Guid::from_fields(
+        0xceae4c1d,
+        0x335b,
+        0x4685,
+        0xa4,
+        0xa0,
+        &[0xfc, 0x4a, 0x94, 0xee, 0xa0, 0x85],
+    );
+    let name: Vec<u16> = "oracle_option".encode_utf16().chain([0]).collect();
+    let cases = [
+        (
+            CfrOptionType::Bool { default: false },
+            CfrValue::Bool(true),
+            vec![1, 0, 0, 0],
+            CfrValue::Bool(false),
+        ),
+        (
+            CfrOptionType::Number {
+                default: 0,
+                min: 0,
+                max: u32::MAX,
+                step: 1,
+                hex_display: false,
+            },
+            CfrValue::Number(0x1234_5678),
+            vec![0x78, 0x56, 0x34, 0x12],
+            CfrValue::Number(0),
+        ),
+        (
+            CfrOptionType::Varchar {
+                default: String::new(),
+            },
+            CfrValue::Varchar("aé".into()),
+            vec![0x61, 0xc3, 0xa9, 0],
+            CfrValue::Varchar(String::new()),
+        ),
+    ];
+    for (option_type, value, expected, default) in cases {
+        let option = CfrOption {
+            object_id: 1,
+            dependency_id: 0,
+            opt_name: "oracle_option".into(),
+            ui_name: "Oracle".into(),
+            ui_helptext: String::new(),
+            flags: 0,
+            option_type,
+            dep_values: Vec::new(),
+        };
+        assert_eq!(cfr::write_option_value(&option, &value), Ok(()));
+        assert_eq!(
+            runtime_image::client::variables::get(&guid, &name),
+            Some((0x07, expected.clone()))
+        );
+        let mut persisted = vec![0; 128];
+        let size = varstore::edk2::read_variable_data_from_region(
+            &media.lock().unwrap(),
+            guid.as_bytes(),
+            &name,
+            &mut persisted,
+        )
+        .unwrap();
+        assert_eq!(&persisted[..size], expected);
+        assert_eq!(cfr::read_option_value(&option), value);
+
+        let rejected = match &value {
+            CfrValue::Bool(value) => CfrValue::Bool(!value),
+            CfrValue::Number(value) => CfrValue::Number(!value),
+            CfrValue::Varchar(_) => CfrValue::Varchar("rejected".into()),
+        };
+        let before = media.lock().unwrap().clone();
+        for mode in [1, 2, 3] {
+            failure.store(mode, Ordering::Relaxed);
+            assert_eq!(
+                cfr::write_option_value(&option, &rejected),
+                Err("Failed to set CFR variable")
+            );
+            assert_eq!(
+                cfr::delete_option_value(&option),
+                Err("Failed to delete CFR variable")
+            );
+            assert_eq!(
+                runtime_image::client::variables::get(&guid, &name),
+                Some((0x07, expected.clone()))
+            );
+            assert_eq!(*media.lock().unwrap(), before);
+        }
+        failure.store(0, Ordering::Relaxed);
+        assert_eq!(cfr::delete_option_value(&option), Ok(()));
+        assert!(runtime_image::client::variables::get(&guid, &name).is_none());
+        assert!(
+            varstore::edk2::read_variable_data_from_region(
+                &media.lock().unwrap(),
+                guid.as_bytes(),
+                &name,
+                &mut persisted,
+            )
+            .is_none(),
+            "deletion must reach persistent media too"
+        );
+        assert_eq!(
+            cfr::delete_option_value(&option),
+            Ok(()),
+            "already absent is success"
+        );
+        assert_eq!(cfr::read_option_value(&option), default);
+    }
+}
+
 #[test]
 fn actual_loader_seal_svam_and_runtime_services_with_and_without_retained_staging() {
     let ram = Ram::new();
@@ -351,6 +552,7 @@ fn actual_loader_seal_svam_and_runtime_services_with_and_without_retained_stagin
         #[cfg(feature = "secure-boot")]
         if !retained {
             interrupted_key_clear_survives_reset(config);
+            microsoft_dbx_update_appends(config);
         }
         let client = runtime_image::load(crabefi::BUNDLED_RUNTIME_IMAGE, config)
             .expect("actual core image loader");
@@ -417,6 +619,8 @@ fn actual_loader_seal_svam_and_runtime_services_with_and_without_retained_stagin
             client.prepare_retained_staging().unwrap();
         }
         client.complete_import().unwrap();
+        #[cfg(feature = "cfr")]
+        cfr_writes_and_deletes_reach_persistent_runtime_storage(&failure, &media);
         // SAFETY: loader validated and initialized this image-owned EFI table.
         let mut runtime = client.runtime_services();
         let guid = efi::Guid::from_bytes(&[0x42; 16]);
@@ -487,6 +691,18 @@ fn actual_loader_seal_svam_and_runtime_services_with_and_without_retained_stagin
                 efi::Status::SECURITY_VIOLATION
             );
             let media_before = media.lock().unwrap().clone();
+            // History must be readable before the clear intent or PK deletion
+            // commits. A read failure must leave enforcement and every key intact.
+            let writes_before = writes.load(Ordering::Relaxed);
+            failure.store(5, Ordering::Relaxed);
+            assert_eq!(
+                auth::boot::clear_all_keys(),
+                Err(auth::AuthError::AccessDenied)
+            );
+            assert!(!auth::is_setup_mode());
+            assert!(auth::is_secure_boot_enabled());
+            assert_eq!(writes.load(Ordering::Relaxed), writes_before);
+            assert_eq!(*media.lock().unwrap(), media_before);
             failure.store(1, Ordering::Relaxed);
             assert!(auth::boot::clear_all_keys().is_err());
             assert!(!auth::is_setup_mode());

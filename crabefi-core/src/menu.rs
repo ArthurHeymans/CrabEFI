@@ -25,7 +25,7 @@ use crate::framebuffer_console::{
 use crate::fs::{fat::FatFilesystem, gpt, iso9660};
 use crate::time::{Timeout, delay_ms};
 use core::fmt::Write;
-use heapless::{String, Vec};
+use heapless::String;
 
 /// Update the mouse cursor on the framebuffer.
 ///
@@ -42,10 +42,6 @@ fn update_cursor(
         cursor_renderer.update(fb, x, y);
     }
 }
-
-/// Maximum number of boot entries
-/// Increased to accommodate BLS, GRUB, and payload entries
-const MAX_BOOT_ENTRIES: usize = 16;
 
 /// Default timeout in seconds for auto-boot
 const DEFAULT_TIMEOUT_SECONDS: u32 = 5;
@@ -68,89 +64,73 @@ const HELP_TEXT: &str = "Enter: Boot | F: Firmware | C: Cmdline | S: Secure Boot
 #[cfg(not(feature = "secure-boot"))]
 const HELP_TEXT: &str = "Enter: Boot | F: Firmware | C: Cmdline | R: Reset";
 
-/// Boot entry kind - how this entry should be booted
-#[derive(Debug, Clone, Default)]
-pub enum BootEntryKind {
-    /// UEFI executable (EFI\BOOT\BOOTxx.EFI)
-    #[default]
-    Uefi,
-
-    /// BLS Type #1 - direct Linux boot
-    BlsLinux {
-        /// Path to Linux kernel
-        linux_path: String<128>,
-        /// The initrds, in order
-        initrd_paths: crate::bls::Initrds,
-        /// Kernel command line
-        cmdline: String<512>,
-    },
-
-    /// BLS Type #2 - Unified Kernel Image (still EFI)
-    BlsUki,
-
-    /// GRUB menu entry - direct Linux boot
-    GrubLinux {
-        /// Path to Linux kernel
-        linux_path: String<128>,
-        /// The initrds, in order
-        initrd_paths: crate::bls::Initrds,
-        /// Kernel command line
-        cmdline: String<512>,
-    },
-
-    /// Coreboot payload (ELF or flat binary)
-    Payload {
-        /// Path to payload file
-        path: String<128>,
-        /// Payload format
-        format: crate::payload::PayloadFormat,
-    },
-}
-
-/// Category for menu grouping
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BootCategory {
-    /// UEFI boot entries
-    Uefi,
-    /// Boot Loader Specification entries
-    Bls,
-    /// GRUB configuration entries
-    Grub,
-    /// Coreboot payload entries
-    Payload,
-}
-
-impl BootCategory {
-    /// Get a display name for this category
-    pub fn display_name(&self) -> &'static str {
-        match self {
-            BootCategory::Uefi => "UEFI Boot",
-            BootCategory::Bls => "Boot Loader Spec",
-            BootCategory::Grub => "GRUB Entries",
-            BootCategory::Payload => "Coreboot Payloads",
-        }
-    }
-}
+pub use crabefi_ui::{BootCategory, BootEntryKind};
 
 /// A boot entry discovered on storage media
 #[derive(Debug, Clone)]
 pub struct BootEntry {
-    /// Display name for the menu
-    pub name: String<64>,
-    /// Path to the EFI application (for UEFI entries)
-    pub path: String<128>,
+    /// What the menu shows: name, path, kind and partition number
+    pub entry: crabefi_ui::BootEntry,
     /// Storage device holding the entry
     pub storage: StorageId,
     /// PCI address of the storage controller, if any
     pub pci: Option<PciAddress>,
-    /// Partition number (1-based)
-    pub partition_num: u32,
     /// Partition information
     pub partition: gpt::Partition,
-    /// Boot entry kind (how to boot this entry)
-    pub kind: BootEntryKind,
-    /// Boot category (for menu grouping)
-    pub category: BootCategory,
+}
+
+impl core::ops::Deref for BootEntry {
+    type Target = crabefi_ui::BootEntry;
+    fn deref(&self) -> &Self::Target {
+        &self.entry
+    }
+}
+
+impl core::ops::DerefMut for BootEntry {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.entry
+    }
+}
+
+impl crabefi_ui::MenuEntry for BootEntry {
+    fn disk_name(&self) -> alloc::string::String {
+        let n = match self.storage {
+            StorageId::Nvme { controller_id, .. } | StorageId::Sdhci { controller_id } => {
+                controller_id
+            }
+            StorageId::Ahci { port, .. } => port,
+            StorageId::Usb { device_addr, .. } => device_addr as usize,
+            StorageId::Platform { index } => index,
+        };
+        alloc::format!("{} {n}", self.storage.description())
+    }
+    fn disk_detail(&self) -> alloc::string::String {
+        storage_identity(self.storage)
+    }
+    fn same_disk(&self, other: &Self) -> bool {
+        self.storage == other.storage
+    }
+}
+
+fn storage_identity(id: StorageId) -> alloc::string::String {
+    match id {
+        StorageId::Nvme {
+            controller_id,
+            nsid,
+        } => alloc::format!("NVMe controller {controller_id}, namespace {nsid}"),
+        StorageId::Ahci {
+            controller_id,
+            port,
+        } => alloc::format!("SATA controller {controller_id}, port {port}"),
+        StorageId::Usb {
+            controller_id,
+            device_addr,
+        } => alloc::format!("USB controller {controller_id}, device {device_addr}"),
+        StorageId::Sdhci { controller_id } => {
+            alloc::format!("{} {controller_id}", id.description())
+        }
+        StorageId::Platform { index } => alloc::format!("{} {index}", id.description()),
+    }
 }
 
 impl BootEntry {
@@ -183,19 +163,12 @@ impl BootEntry {
         kind: BootEntryKind,
         category: BootCategory,
     ) -> Self {
-        let mut entry = BootEntry {
-            name: String::new(),
-            path: String::new(),
+        BootEntry {
+            entry: crabefi_ui::BootEntry::new(name, path, partition_num, kind, category),
             storage: device.id,
             pci: device.pci,
-            partition_num,
             partition,
-            kind,
-            category,
-        };
-        let _ = entry.name.push_str(name);
-        let _ = entry.path.push_str(path);
-        entry
+        }
     }
 
     /// Format a description for display
@@ -209,64 +182,27 @@ impl BootEntry {
             self.partition_num
         );
     }
-
-    /// Check if this is a direct Linux boot entry
-    pub fn is_linux_boot(&self) -> bool {
-        matches!(
-            self.kind,
-            BootEntryKind::BlsLinux { .. } | BootEntryKind::GrubLinux { .. }
-        )
-    }
-
-    /// Check if this is a UEFI entry
-    pub fn is_uefi(&self) -> bool {
-        matches!(self.kind, BootEntryKind::Uefi | BootEntryKind::BlsUki)
-    }
-
-    /// Check if this is a payload entry
-    pub fn is_payload(&self) -> bool {
-        matches!(self.kind, BootEntryKind::Payload { .. })
-    }
-
-    /// Check if this entry has an editable command line
-    pub fn has_cmdline(&self) -> bool {
-        matches!(
-            self.kind,
-            BootEntryKind::BlsLinux { .. } | BootEntryKind::GrubLinux { .. }
-        )
-    }
-
-    /// Get a reference to the command line, if any
-    pub fn get_cmdline(&self) -> Option<&String<512>> {
-        match &self.kind {
-            BootEntryKind::BlsLinux { cmdline, .. } | BootEntryKind::GrubLinux { cmdline, .. } => {
-                Some(cmdline)
-            }
-            _ => None,
-        }
-    }
-
-    /// Get a mutable reference to the command line, if any
-    pub fn get_cmdline_mut(&mut self) -> Option<&mut String<512>> {
-        match &mut self.kind {
-            BootEntryKind::BlsLinux { cmdline, .. } | BootEntryKind::GrubLinux { cmdline, .. } => {
-                Some(cmdline)
-            }
-            _ => None,
-        }
-    }
 }
 
 /// Boot menu state
 pub struct BootMenu {
-    /// Discovered boot entries
-    pub(crate) entries: Vec<BootEntry, MAX_BOOT_ENTRIES>,
-    /// Currently selected entry index
-    pub(crate) selected: usize,
-    /// Timeout in seconds (0 = no timeout)
-    pub(crate) timeout_seconds: u32,
+    /// Entries, selection and timeout, as the menus show them
+    pub(crate) menu: crabefi_ui::BootMenu<BootEntry>,
     /// `selected` is a `loader.conf` default, which the first one sets
     default_chosen: bool,
+}
+
+impl core::ops::Deref for BootMenu {
+    type Target = crabefi_ui::BootMenu<BootEntry>;
+    fn deref(&self) -> &Self::Target {
+        &self.menu
+    }
+}
+
+impl core::ops::DerefMut for BootMenu {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.menu
+    }
 }
 
 impl Default for BootMenu {
@@ -278,51 +214,12 @@ impl Default for BootMenu {
 impl BootMenu {
     /// Create a new boot menu
     pub fn new() -> Self {
+        let mut menu = crabefi_ui::BootMenu::new();
+        menu.timeout_seconds = DEFAULT_TIMEOUT_SECONDS;
         BootMenu {
-            entries: Vec::new(),
-            selected: 0,
-            timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+            menu,
             default_chosen: false,
         }
-    }
-
-    /// Add a boot entry
-    pub fn add_entry(&mut self, entry: BootEntry) -> bool {
-        self.entries.push(entry).is_ok()
-    }
-
-    /// Get the number of entries
-    pub fn entry_count(&self) -> usize {
-        self.entries.len()
-    }
-
-    /// Get a reference to an entry
-    pub fn get_entry(&self, index: usize) -> Option<&BootEntry> {
-        self.entries.get(index)
-    }
-
-    /// Get the selected entry
-    pub fn selected_entry(&self) -> Option<&BootEntry> {
-        self.entries.get(self.selected)
-    }
-
-    /// Move selection up
-    pub fn select_previous(&mut self) {
-        if self.selected > 0 {
-            self.selected -= 1;
-        }
-    }
-
-    /// Move selection down
-    pub fn select_next(&mut self) {
-        if self.selected + 1 < self.entries.len() {
-            self.selected += 1;
-        }
-    }
-
-    /// Set the timeout
-    pub fn set_timeout(&mut self, seconds: u32) {
-        self.timeout_seconds = seconds;
     }
 }
 
@@ -691,10 +588,14 @@ fn scan_partition_for_entries(
 /// # Returns
 ///
 /// The index of the selected boot entry, or `None` if no selection was made.
+/// Boot [`BootMenu::entry_for_boot`] for that index so a one-shot
+/// command-line edit made in the menu applies to this boot attempt.
 pub fn show_menu(menu: &mut BootMenu) -> Option<usize> {
+    menu.clear_edited_cmdline();
+    // An empty, indefinite menu still provides firmware/security settings.
+    // The boot manager uses this for explicit setup requests without media.
     if menu.entry_count() == 0 {
-        log::error!("No boot entries to display");
-        return None;
+        menu.set_timeout(0);
     }
 
     // Get framebuffer for console and cursor rendering.
@@ -717,8 +618,10 @@ pub fn show_menu(menu: &mut BootMenu) -> Option<usize> {
     let mut remaining_seconds = menu.timeout_seconds;
     let mut last_second_check = Timeout::from_ms(1000);
 
-    // Show initial countdown
-    draw_countdown(remaining_seconds, &mut fb_console);
+    // Zero disables autoboot; do not announce "Booting now..." in setup.
+    if remaining_seconds > 0 {
+        draw_countdown(remaining_seconds, &mut fb_console);
+    }
 
     // Initialize cursor renderer for mouse support
     #[cfg(feature = "ui")]
@@ -756,7 +659,7 @@ pub fn show_menu(menu: &mut BootMenu) -> Option<usize> {
                     menu.select_next();
                     draw_menu(menu, &mut fb_console);
                 }
-                KeyPress::Enter => {
+                KeyPress::Enter if menu.entry_count() > 0 => {
                     // Show booting message before returning
                     if let Some(entry) = menu.entries.get(menu.selected) {
                         log::info!(
@@ -809,30 +712,40 @@ pub fn show_menu(menu: &mut BootMenu) -> Option<usize> {
                     crate::reset_system();
                 }
                 KeyPress::Char('c') | KeyPress::Char('C') => {
-                    // Edit kernel command line
-                    if let Some(entry) = menu.entries.get_mut(menu.selected) {
-                        if entry.has_cmdline() {
-                            match edit_cmdline(entry, &mut fb_console) {
-                                EditResult::Boot => {
-                                    // Boot immediately with the edited command line
-                                    let mut msg: String<64> = String::new();
-                                    let _ = msg.push_str("Booting ");
-                                    let _ = msg.push_str(&entry.name);
-                                    let _ = msg.push_str("...");
-                                    menu_common::clear_screen(&mut fb_console);
-                                    draw_status(&msg, &mut fb_console);
-                                    return Some(menu.selected);
-                                }
-                                EditResult::Confirmed => {
-                                    draw_status("Command line updated", &mut fb_console);
-                                }
-                                EditResult::Cancelled => {
-                                    draw_status("Edit cancelled", &mut fb_console);
-                                }
+                    // Edit kernel command line (one-shot: recorded on the
+                    // menu, never written into the entry itself)
+                    let selected = menu.selected;
+                    let editing = menu
+                        .entries
+                        .get(selected)
+                        .filter(|entry| entry.has_cmdline())
+                        .and_then(|entry| {
+                            menu.effective_cmdline(selected)
+                                .map(|initial| (entry.name.clone(), initial))
+                        });
+                    if let Some((name, initial)) = editing {
+                        match edit_cmdline(&name, initial, &mut fb_console) {
+                            (EditResult::Boot, edited) => {
+                                menu.set_edited_cmdline(selected, edited);
+                                // Boot immediately with the edited command line
+                                let mut msg: String<64> = String::new();
+                                let _ = msg.push_str("Booting ");
+                                let _ = msg.push_str(&name);
+                                let _ = msg.push_str("...");
+                                menu_common::clear_screen(&mut fb_console);
+                                draw_status(&msg, &mut fb_console);
+                                return Some(selected);
                             }
-                        } else {
-                            draw_status("This entry has no editable command line", &mut fb_console);
+                            (EditResult::Confirmed, edited) => {
+                                menu.set_edited_cmdline(selected, edited);
+                                draw_status("Command line updated", &mut fb_console);
+                            }
+                            (EditResult::Cancelled, _) => {
+                                draw_status("Edit cancelled", &mut fb_console);
+                            }
                         }
+                    } else {
+                        draw_status("This entry has no editable command line", &mut fb_console);
                     }
                     // Redraw menu after editing (unless we're booting)
                     delay_ms(500);
@@ -1020,6 +933,13 @@ fn draw_menu(menu: &BootMenu, fb_console: &mut Option<FramebufferConsole>) {
     }
     if scroll_offset + visible_rows < total_rows {
         draw_scroll_indicator(start_row + visible_rows, "v", fb_console);
+    }
+
+    if menu.entry_count() == 0 {
+        draw_status(
+            "No bootable media - firmware settings are still available",
+            fb_console,
+        );
     }
 
     // Draw help text
@@ -1212,11 +1132,11 @@ fn draw_status(message: &str, fb_console: &mut Option<FramebufferConsole>) {
 /// Result of command line editing
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EditResult {
-    /// Edit cancelled (Escape) - don't modify cmdline
+    /// Edit cancelled (Escape) - drop the edited buffer
     Cancelled,
-    /// Edit confirmed (Enter) - update cmdline and return to menu
+    /// Edit confirmed (Enter) - keep the edited buffer, return to menu
     Confirmed,
-    /// Boot now (Ctrl+X) - update cmdline and boot immediately
+    /// Boot now (Ctrl+X) - keep the edited buffer and boot immediately
     Boot,
 }
 
@@ -1226,30 +1146,27 @@ enum EditResult {
 ///
 /// # Arguments
 ///
-/// * `entry` - The boot entry to edit
+/// * `entry_name` - Display name of the entry being edited
+/// * `initial` - Command line to start editing from
 /// * `fb_console` - Optional framebuffer console for display
 ///
 /// # Returns
 ///
-/// `EditResult::Cancelled` if the user pressed Escape (cmdline unchanged)
-/// `EditResult::Confirmed` if the user pressed Enter (cmdline updated, return to menu)
-/// `EditResult::Boot` if the user pressed Ctrl+X (cmdline updated, boot immediately)
-fn edit_cmdline(entry: &mut BootEntry, fb_console: &mut Option<FramebufferConsole>) -> EditResult {
-    // Check if entry has cmdline and extract initial value
-    let initial_cmdline = match entry.get_cmdline() {
-        Some(c) => c.clone(),
-        None => {
-            draw_status("This entry has no command line to edit", fb_console);
-            delay_ms(1500);
-            return EditResult::Cancelled;
-        }
-    };
-
-    // Copy entry name for display (to avoid borrow issues)
-    let entry_name: String<64> = entry.name.clone();
-
+/// The returned buffer is the edited text; the caller records it as the
+/// menu's one-shot override for `Confirmed`/`Boot` and drops it otherwise.
+/// Nothing is written into the entry here.
+///
+/// `EditResult::Cancelled` if the user pressed Escape
+/// `EditResult::Confirmed` if the user pressed Enter (return to menu)
+/// `EditResult::Boot` if the user pressed Ctrl+X (boot immediately)
+fn edit_cmdline(
+    entry_name: &str,
+    initial: &str,
+    fb_console: &mut Option<FramebufferConsole>,
+) -> (EditResult, String<512>) {
     // Create a working buffer for editing
-    let mut buffer: String<512> = initial_cmdline;
+    let mut buffer: String<512> = String::new();
+    let _ = buffer.push_str(initial);
     let mut cursor_pos = buffer.len();
 
     // Calculate scroll offset for long command lines
@@ -1257,7 +1174,7 @@ fn edit_cmdline(entry: &mut BootEntry, fb_console: &mut Option<FramebufferConsol
     let edit_width = cols.saturating_sub(4); // Leave margin for decoration
 
     // Draw static parts once
-    draw_cmdline_editor_static(&entry_name, fb_console, cols);
+    draw_cmdline_editor_static(entry_name, fb_console, cols);
 
     // Track if display needs updating
     let mut needs_redraw = true;
@@ -1273,27 +1190,18 @@ fn edit_cmdline(entry: &mut BootEntry, fb_console: &mut Option<FramebufferConsol
         if let Some(key) = menu_common::read_key() {
             match key {
                 KeyPress::Enter => {
-                    // Confirm - update the cmdline
-                    if let Some(cmdline) = entry.get_cmdline_mut() {
-                        cmdline.clear();
-                        let _ = cmdline.push_str(&buffer);
-                    }
-                    return EditResult::Confirmed;
+                    return (EditResult::Confirmed, buffer);
                 }
                 KeyPress::Escape => {
-                    // Cancel - don't modify
-                    return EditResult::Cancelled;
+                    // Cancel - caller drops the buffer
+                    return (EditResult::Cancelled, buffer);
                 }
                 KeyPress::Char(c) => {
                     // Handle special characters
                     match c {
                         '\x18' => {
                             // Ctrl+X - boot immediately
-                            if let Some(cmdline) = entry.get_cmdline_mut() {
-                                cmdline.clear();
-                                let _ = cmdline.push_str(&buffer);
-                            }
-                            return EditResult::Boot;
+                            return (EditResult::Boot, buffer);
                         }
                         '\x08' | '\x7f' if cursor_pos > 0 => {
                             // Backspace - remove character before cursor
@@ -1373,10 +1281,25 @@ fn edit_cmdline(entry: &mut BootEntry, fb_console: &mut Option<FramebufferConsol
                         needs_redraw = true;
                     }
                 }
-                // Ignore Up/Down in editor
-                KeyPress::Up | KeyPress::Down => {}
+                KeyPress::Home => {
+                    cursor_pos = 0;
+                    needs_redraw = true;
+                }
+                KeyPress::End => {
+                    cursor_pos = buffer.len();
+                    needs_redraw = true;
+                }
+                // These have no meaning in the legacy single-line editor.
+                KeyPress::Up
+                | KeyPress::Down
+                | KeyPress::PageUp
+                | KeyPress::PageDown
+                | KeyPress::Tab
+                | KeyPress::BackTab
+                | KeyPress::Delete
+                | KeyPress::F8
+                | KeyPress::F10 => {}
                 // Mouse events are ignored in the command line editor
-                #[cfg(feature = "ui")]
                 KeyPress::MouseClick { .. } | KeyPress::MouseScroll(_) => {}
             }
         }
@@ -1607,5 +1530,38 @@ fn draw_cmdline_editor_line(
         let _ = write!(len_str, "Length: {}/512    ", buffer_len); // Extra spaces to clear old longer values
         let _ = console.write_str(&len_str);
         console.reset_colors();
+    }
+}
+
+#[cfg(test)]
+mod disk_detail_tests {
+    use super::*;
+
+    #[test]
+    fn disk_details_distinguish_controllers_and_namespaces() {
+        assert_ne!(
+            storage_identity(StorageId::Ahci {
+                controller_id: 0,
+                port: 1
+            }),
+            storage_identity(StorageId::Ahci {
+                controller_id: 1,
+                port: 1
+            })
+        );
+        assert!(
+            storage_identity(StorageId::Nvme {
+                controller_id: 2,
+                nsid: 3
+            })
+            .contains("namespace 3")
+        );
+        assert!(
+            storage_identity(StorageId::Usb {
+                controller_id: 4,
+                device_addr: 5
+            })
+            .contains("controller 4")
+        );
     }
 }

@@ -1,0 +1,11 @@
+{
+  "name": "crabefi-ui-browser-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node tests/browser.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.65.0"
+  }
+}

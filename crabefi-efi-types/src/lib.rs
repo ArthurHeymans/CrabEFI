@@ -5,6 +5,7 @@
 pub mod authentication;
 pub mod crc32;
 pub mod secure_boot;
+pub mod varstore;
 
 /// Compare byte strings without data-dependent early returns.
 #[inline(never)]

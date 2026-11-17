@@ -36,6 +36,17 @@ may remain readable in the basic profile; it does not enable enforcement or
 change the reported `SecureBoot=0`/`SetupMode=1`. Protected key/auth-history writes
 remain denied. This is not an authenticated-variable implementation.
 
+Authenticated `dbx` imports additionally require a durable replay floor: the
+anti-downgrade check compares the update timestamp against the persisted
+authenticated-variable history (including deletion records; appending updates
+only need that history to be readable), so builds without
+`variable-store` (or with an unreadable or malformed store) reject `dbx`
+updates instead of falling back to an in-memory timestamp that a key deletion
+could reset. This
+is deliberate: without persisted auth history there is nothing trustworthy to
+compare against. Enable `variable-store` (directly, or via `spi-flash` or
+`capsule-update`) on platforms that must import `dbx` updates.
+
 Storage drivers are currently retained: AHCI, NVMe, SDHCI and USB 1/2 storage;
 PS/2 and serial console also remain. There is **no IDE/ATA driver** in CrabEFI.
 A platform that exposes an IDE-class controller needs a host `BlockDevice` or a
@@ -154,6 +165,34 @@ its explicit nonzero retained-buffer configuration. A host must explicitly decid
 whether retained staging is acceptable or implement a genuinely runtime-safe
 bounded persistent service. Selecting final fstart post-EBS persistence policy is
 not implied by selecting Secure Boot or a basic feature profile.
+
+## Reboot to firmware UI
+
+`OsIndicationsSupported` advertises `EFI_OS_INDICATIONS_BOOT_TO_FW_UI` (`0x1`)
+only with writable variable persistence, a successfully prepared/replayed
+retained runtime NV journal, and either a live native bidirectional serial
+console or a framebuffer with a ready keyboard (or a ready pointer with the
+`ui` feature). USB input is enumerated before the capability check. A framebuffer
+alone and a failed or still-initializing PS/2 device are not usable input paths.
+The text setup menu is always built; `ui` is not required. An arbitrary platform
+`DebugOutput` alone is not assumed to accept input. Capsule capability bits are
+independent and retain their existing gates.
+
+After import/replay, a valid NV/BS/RT eight-byte `OsIndications` request is
+consumed through the runtime variable facade. Only bit zero is cleared; all
+other bits and the variable's attributes remain unchanged. Setup is entered
+only after the persistent clear succeeds; malformed requests and clear failures
+fall back to normal boot rather than creating reset loops. Setup bypasses both
+BootNext and BootOrder without deleting BootNext and disables autoboot regardless
+of `Timeout`. Firmware/security settings remain reachable without boot media.
+A later reset follows the ordinary boot sequence.
+
+Pre-ExitBootServices tools (GRUB `fwsetup`, systemd-boot) write through the
+boot-time persistent backend. OS runtime requests use the existing retained RAM
+journal and warm-reset replay; this does **not** add power-loss-safe runtime
+flash persistence. Embedders without retained staging intentionally do not
+advertise this feature, even if pre-ExitBootServices NV writes would work.
+The dedicated QEMU regression is documented in [Building](BUILDING.md).
 
 ## Toolchain and validation scope
 

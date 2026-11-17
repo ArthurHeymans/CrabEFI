@@ -4,7 +4,7 @@
 //! progress bars, pill badges, toggle switches, and multi-size anti-aliased
 //! text rendering using the Noto Sans Mono bitmap font.
 
-use crate::FramebufferConfig as FramebufferInfo;
+use crate::Surface as FramebufferInfo;
 use noto_sans_mono_bitmap::{FontWeight, RasterHeight, get_raster, get_raster_width};
 
 /// RGB color triple.
@@ -92,7 +92,27 @@ pub fn font_width(size: FontSize) -> u32 {
 
 /// Pixel width of a string at the given size.
 pub fn text_width(s: &str, size: FontSize) -> u32 {
-    s.len() as u32 * font_width(size)
+    s.chars().count() as u32 * font_width(size)
+}
+
+/// Width-bounded labels, preserving UTF-8 boundaries and reserving an ellipsis.
+pub fn ellipsize(s: &str, width: u32, size: FontSize) -> heapless::String<256> {
+    let columns = (width / font_width(size)) as usize;
+    let mut out = heapless::String::new();
+    let truncated = s.chars().count() > columns || s.len() > out.capacity();
+    // ASCII-only marker: the bitmap font has no ellipsis glyph.
+    let marker = if columns >= 6 { 3 } else { 1 };
+    let reserve = if truncated { marker } else { 0 };
+    for ch in s.chars().take(columns.saturating_sub(reserve)) {
+        if out.len() + ch.len_utf8() + reserve > out.capacity() {
+            break;
+        }
+        let _ = out.push(ch);
+    }
+    if truncated && columns > 0 {
+        let _ = out.push_str(if marker == 3 { "..." } else { "~" });
+    }
+    out
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -101,6 +121,7 @@ pub fn text_width(s: &str, size: FontSize) -> u32 {
 
 /// Fill a rectangle with a solid color (bounds-clipped).
 pub fn fill_rect(fb: &FramebufferInfo, x: i32, y: i32, w: u32, h: u32, c: Rgb) {
+    let c = super::theme::tone(fb, c);
     let x0 = x.max(0) as u32;
     let y0 = y.max(0) as u32;
     let x1 = ((x as i64 + w as i64) as u32).min(fb.width);
@@ -332,6 +353,7 @@ pub fn draw_dot(fb: &FramebufferInfo, cx: i32, cy: i32, r: u32, c: Rgb) {
                 let py = cy + dy;
                 if px >= 0 && py >= 0 && px < fb.width as i32 && py < fb.height as i32 {
                     // SAFETY: bounds checked
+                    let c = super::theme::tone(fb, c);
                     unsafe { fb.write_pixel(px as u32, py as u32, c.r, c.g, c.b) };
                 }
             }
@@ -353,39 +375,9 @@ pub fn draw_separator(fb: &FramebufferInfo, x: i32, y: i32, w: u32, c: Rgb, bg: 
 
 /// Read a framebuffer pixel as RGB (for alpha blending on unknown backgrounds).
 fn read_fb_pixel(fb: &FramebufferInfo, x: u32, y: u32) -> Rgb {
-    let off = fb.pixel_offset(x, y);
     // SAFETY: caller ensures x,y are within bounds.
-    unsafe {
-        let ptr = fb.as_ptr().add(off);
-        match fb.bits_per_pixel {
-            32 => {
-                let b = ptr.read_volatile();
-                let g = ptr.add(1).read_volatile();
-                let r = ptr.add(2).read_volatile();
-                Rgb::new(r, g, b)
-            }
-            24 => {
-                let b = ptr.read_volatile();
-                let g = ptr.add(1).read_volatile();
-                let r = ptr.add(2).read_volatile();
-                Rgb::new(r, g, b)
-            }
-            16 => {
-                let lo = ptr.read_volatile() as u16;
-                let hi = ptr.add(1).read_volatile() as u16;
-                let v = lo | (hi << 8);
-                let r = ((v >> 11) & 0x1F) as u8;
-                let g = ((v >> 5) & 0x3F) as u8;
-                let b = (v & 0x1F) as u8;
-                Rgb::new(
-                    (r << 3) | (r >> 2),
-                    (g << 2) | (g >> 4),
-                    (b << 3) | (b >> 2),
-                )
-            }
-            _ => Rgb::new(0, 0, 0),
-        }
-    }
+    let (r, g, b) = fb.decode_pixel(unsafe { fb.read_raw(x, y) });
+    Rgb::new(r, g, b)
 }
 
 /// Draw a single character with anti-aliased alpha blending.
@@ -401,9 +393,31 @@ pub fn draw_char(
     fg: Rgb,
     bg: Option<Rgb>,
 ) {
-    let raster = match get_raster(ch, FontWeight::Regular, size.raster_height()) {
+    draw_char_weight(fb, px, py, ch, size, false, fg, bg);
+}
+
+/// Bold is reserved for focus, titles and values that must survive dim KVMs.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_char_weight(
+    fb: &FramebufferInfo,
+    px: i32,
+    py: i32,
+    ch: char,
+    size: FontSize,
+    bold: bool,
+    fg: Rgb,
+    bg: Option<Rgb>,
+) {
+    let fg = super::theme::tone(fb, fg);
+    let bg = bg.map(|c| super::theme::tone(fb, c));
+    let weight = if bold {
+        FontWeight::Bold
+    } else {
+        FontWeight::Regular
+    };
+    let raster = match get_raster(ch, weight, size.raster_height()) {
         Some(r) => r,
-        None => match get_raster('?', FontWeight::Regular, size.raster_height()) {
+        None => match get_raster('?', weight, size.raster_height()) {
             Some(r) => r,
             None => return,
         },
@@ -458,13 +472,40 @@ pub fn draw_text(
     fg: Rgb,
     bg: Option<Rgb>,
 ) -> u32 {
+    draw_text_weight(fb, px, py, s, size, false, fg, bg)
+}
+
+/// Draw a bold string. Returns pixel width.
+pub fn draw_text_bold(
+    fb: &FramebufferInfo,
+    px: i32,
+    py: i32,
+    s: &str,
+    size: FontSize,
+    fg: Rgb,
+    bg: Option<Rgb>,
+) -> u32 {
+    draw_text_weight(fb, px, py, s, size, true, fg, bg)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn draw_text_weight(
+    fb: &FramebufferInfo,
+    px: i32,
+    py: i32,
+    s: &str,
+    size: FontSize,
+    bold: bool,
+    fg: Rgb,
+    bg: Option<Rgb>,
+) -> u32 {
     let gw = font_width(size) as i32;
     let mut x = px;
     for ch in s.chars() {
-        draw_char(fb, x, py, ch, size, fg, bg);
+        draw_char_weight(fb, x, py, ch, size, bold, fg, bg);
         x += gw;
     }
-    s.len() as u32 * gw as u32
+    s.chars().count() as u32 * gw as u32
 }
 
 /// Draw text with extra letter-spacing (for "tracking-widest" labels).

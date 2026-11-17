@@ -71,8 +71,13 @@ impl BlockDevice for RamDisk {
     fn read_blocks(&mut self, lba: u64, count: u32, buffer: &mut [u8]) -> Result<(), BlockError> {
         self.validate_io(lba, count, buffer)?;
         for index in 0..count as usize {
-            let block = self.block(lba + index as u64);
-            buffer[index * self.block_size..][..self.block_size].copy_from_slice(&block);
+            // Reads need no host allocation, so EFI allocation-failure tests
+            // can inspect existing files without failing inside the fixture.
+            let output = &mut buffer[index * self.block_size..][..self.block_size];
+            match self.blocks.get(&(lba + index as u64)) {
+                Some(block) => output.copy_from_slice(block),
+                None => output.fill(0),
+            }
         }
         Ok(())
     }

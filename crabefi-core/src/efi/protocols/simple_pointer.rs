@@ -14,8 +14,8 @@
 //!
 //! - UEFI Specification 2.10, Section 12.5
 
-use crate::cell::StaticMut;
-use crate::drivers::pointer;
+use crate::cell::{LocalCell, StaticMut};
+use crate::drivers::{mouse_cursor, pointer};
 use crate::efi::boot_services::POINTER_EVENT_ID;
 use core::ffi::c_void;
 use r_efi::efi::{Boolean, Event, Status};
@@ -108,6 +108,10 @@ unsafe impl Sync for SimplePointerProtocol {}
 // Protocol Implementation
 // ============================================================================
 
+// Absolute devices also serve relative-only EFI clients. Anchor their first
+// sample after Reset rather than fabricating an initial relative jump.
+static LAST_ABSOLUTE: LocalCell<Option<(i32, i32)>> = LocalCell::new(None);
+
 /// Reset the pointer device
 unsafe extern "efiapi" fn pointer_reset(
     _this: *mut SimplePointerProtocol,
@@ -116,6 +120,7 @@ unsafe extern "efiapi" fn pointer_reset(
     // Drain stale motion and acknowledge the current button level.
     pointer::poll();
     let _ = pointer::take();
+    LAST_ABSOLUTE.set(None);
     Status::SUCCESS
 }
 
@@ -134,11 +139,24 @@ unsafe extern "efiapi" fn pointer_get_state(
         return Status::NOT_READY;
     }
     let pointer::PointerReport {
-        dx,
-        dy,
+        mut dx,
+        mut dy,
         dz,
         buttons,
+        absolute,
     } = pointer::take();
+    if let Some((x, y)) = absolute {
+        let (width, height) = mouse_cursor::screen_size();
+        let position = (
+            mouse_cursor::absolute_pixel(x, width),
+            mouse_cursor::absolute_pixel(y, height),
+        );
+        if let Some(previous) = LAST_ABSOLUTE.get() {
+            dx = dx.saturating_add(position.0 - previous.0);
+            dy = dy.saturating_add(position.1 - previous.1);
+        }
+        LAST_ABSOLUTE.set(Some(position));
+    }
 
     unsafe {
         (*state).relative_movement_x = dx;

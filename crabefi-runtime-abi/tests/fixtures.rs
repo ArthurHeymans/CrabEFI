@@ -59,9 +59,20 @@ fn valid_image() -> Vec<u8> {
 #[test]
 fn parses_checked_fixture() {
     let bytes = valid_image();
+    // Wire ABI v1 at its defined byte offset, independent of the serializer's
+    // version constant. Mutate only that field of an otherwise valid image.
+    assert_eq!(&bytes[40..44], &[1, 0, 0, 0]);
     let image = ValidatedImage::parse(&bytes, architecture::X86_64).unwrap();
     assert_eq!(image.header().image_size, 4096);
     assert_eq!(image.section(0).unwrap().memory_size, 4096);
+    for version in [0, 2] {
+        let mut incompatible = bytes.clone();
+        write_u32(&mut incompatible, 40, version);
+        assert_eq!(
+            ValidatedImage::parse(&incompatible, architecture::X86_64).err(),
+            Some(AbiError::UnsupportedVersion)
+        );
+    }
 }
 
 #[test]
@@ -243,6 +254,11 @@ fn handoff_validates_architecture_mechanism_pairs() {
     x86.time.mechanism = time_mechanism::X86_CMOS;
     x86.reset.io_or_mmio_base = 0xcf9;
     assert_eq!(x86.validate(), Ok(()));
+    for version in [0, 2] {
+        let mut incompatible = valid_handoff(architecture::X86_64);
+        incompatible.abi_version = version;
+        assert_eq!(incompatible.validate(), Err(HandoffError::Version));
+    }
 
     x86.time.mechanism = time_mechanism::PL031;
     assert_eq!(x86.validate(), Err(HandoffError::Mechanism));

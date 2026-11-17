@@ -735,6 +735,36 @@ pub trait UsbController {
             .ok_or(UsbError::DeviceNotFound)
     }
 
+    /// Read the report descriptor for one active HID interface.
+    fn hid_report_descriptor(
+        &mut self,
+        device: u8,
+        interface: u8,
+    ) -> Result<alloc::vec::Vec<u8>, UsbError> {
+        let config = self.read_configuration(device)?;
+        let length = config.interfaces[..config.num_interfaces]
+            .iter()
+            .find(|iface| iface.interface_number == interface)
+            .map(|iface| usize::from(iface.hid_report_descriptor_length))
+            .ok_or(UsbError::DeviceNotFound)?;
+        if !(1..=4096).contains(&length) {
+            return Err(UsbError::NotSupported);
+        }
+        let mut descriptor = alloc::vec![0u8; length];
+        let actual = self.control_transfer(
+            device,
+            req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_INTERFACE,
+            request::GET_DESCRIPTOR,
+            u16::from(desc_type::HID_REPORT) << 8,
+            u16::from(interface),
+            Some(&mut descriptor),
+        )?;
+        if actual != length {
+            return Err(UsbError::InvalidParameter);
+        }
+        Ok(descriptor)
+    }
+
     /// Create an interrupt transfer queue
     ///
     /// # Arguments
@@ -1320,9 +1350,28 @@ fn parse_configuration_inner(config_data: &[u8]) -> ConfigurationInfo {
                         interface_class: iface.interface_class,
                         interface_subclass: iface.interface_subclass,
                         interface_protocol: iface.interface_protocol,
+                        hid_report_descriptor_length: 0,
                         endpoints: [EndpointInfo::control_ep0(8); 4],
                         num_endpoints: 0,
                     });
+                }
+            }
+            desc_type::HID => {
+                if let Some(ref mut iface) = current_interface
+                    && iface.interface_class == class::HID
+                    && desc_data.len() >= 6
+                {
+                    for descriptor in desc_data[6..]
+                        .as_chunks::<3>()
+                        .0
+                        .iter()
+                        .take(usize::from(desc_data[5]))
+                    {
+                        if descriptor[0] == desc_type::HID_REPORT {
+                            iface.hid_report_descriptor_length =
+                                u16::from_le_bytes([descriptor[1], descriptor[2]]);
+                        }
+                    }
                 }
             }
             desc_type::ENDPOINT => {
@@ -1367,6 +1416,8 @@ pub struct InterfaceInfo {
     pub interface_class: u8,
     pub interface_subclass: u8,
     pub interface_protocol: u8,
+    /// HID report descriptor length from this interface's HID descriptor.
+    pub hid_report_descriptor_length: u16,
     pub endpoints: [EndpointInfo; 4],
     pub num_endpoints: usize,
 }
@@ -1379,6 +1430,7 @@ impl Default for InterfaceInfo {
             interface_class: 0,
             interface_subclass: 0,
             interface_protocol: 0,
+            hid_report_descriptor_length: 0,
             endpoints: [EndpointInfo::control_ep0(8); 4],
             num_endpoints: 0,
         }

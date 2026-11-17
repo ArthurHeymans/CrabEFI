@@ -13,18 +13,7 @@ use crate::time::read_counter;
 use log::{Level, LevelFilter, Metadata, Record};
 use r_efi::efi::Guid;
 
-/// Default log level when no persistent CrabEFI log-level variable exists.
-pub const DEFAULT_LEVEL: LevelFilter = LevelFilter::Debug;
-
-/// Log levels shown in the CrabEFI settings menu.
-pub const LEVEL_CHOICES: [LevelFilter; 6] = [
-    LevelFilter::Off,
-    LevelFilter::Error,
-    LevelFilter::Warn,
-    LevelFilter::Info,
-    LevelFilter::Debug,
-    LevelFilter::Trace,
-];
+pub use crabefi_ui::log_level::{DEFAULT_LEVEL, LEVEL_CHOICES, level_index, level_name};
 
 /// CrabEFI settings variable GUID.
 ///
@@ -70,6 +59,32 @@ pub fn get_us_since_boot() -> u64 {
     ((delta as u128 * 1_000_000) / freq as u128) as u64
 }
 
+// DebugOutput may itself use drivers which log (e.g. an SPI flash console).
+// Never re-enter the serial/framebuffer callbacks while formatting a record.
+static LOG_ACTIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+struct LogEntry<'a>(&'a core::sync::atomic::AtomicBool);
+
+impl<'a> LogEntry<'a> {
+    fn try_enter(active: &'a core::sync::atomic::AtomicBool) -> Option<Self> {
+        active
+            .compare_exchange(
+                false,
+                true,
+                core::sync::atomic::Ordering::Acquire,
+                core::sync::atomic::Ordering::Relaxed,
+            )
+            .ok()
+            .map(|_| Self(active))
+    }
+}
+
+impl Drop for LogEntry<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, core::sync::atomic::Ordering::Release);
+    }
+}
+
 /// Combined serial + framebuffer logger
 struct CombinedLogger;
 
@@ -80,6 +95,9 @@ impl log::Log for CombinedLogger {
 
     fn log(&self, record: &Record) {
         if self.enabled(record.metadata()) {
+            let Some(_entry) = LogEntry::try_enter(&LOG_ACTIVE) else {
+                return;
+            };
             // Level strings for serial (with ANSI colors)
             let level_str_serial = match record.level() {
                 Level::Error => "\x1b[31mERROR\x1b[0m",
@@ -142,23 +160,6 @@ pub fn set_framebuffer(_fb: crate::platform::FramebufferConfig) {
 /// Set the maximum log level
 pub fn set_level(level: LevelFilter) {
     log::set_max_level(level);
-}
-
-/// Return the display name for a log level.
-pub fn level_name(level: LevelFilter) -> &'static str {
-    match level {
-        LevelFilter::Off => "Off",
-        LevelFilter::Error => "Error",
-        LevelFilter::Warn => "Warn",
-        LevelFilter::Info => "Info",
-        LevelFilter::Debug => "Debug",
-        LevelFilter::Trace => "Trace",
-    }
-}
-
-/// Return the menu index for a log level.
-pub fn level_index(level: LevelFilter) -> usize {
-    LEVEL_CHOICES.iter().position(|&l| l == level).unwrap_or(4)
 }
 
 /// Parse a persisted log-level variable payload.
@@ -246,4 +247,66 @@ fn read_persisted_level() -> Option<LevelFilter> {
         LOG_LEVEL_VARIABLE_NAME,
     )
     .and_then(|(_, data)| level_from_data(&data))
+}
+
+#[cfg(test)]
+mod reentry_tests {
+    use core::{cell::Cell, fmt};
+    use log::Log;
+
+    struct CountFormats<'a>(&'a Cell<usize>);
+
+    impl fmt::Display for CountFormats<'_> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            self.0.set(self.0.get() + 1);
+            f.write_str("nested record")
+        }
+    }
+
+    struct LogOnFormat<'a> {
+        outer_formats: &'a Cell<usize>,
+        nested_formats: &'a Cell<usize>,
+    }
+
+    impl fmt::Display for LogOnFormat<'_> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            self.outer_formats.set(self.outer_formats.get() + 1);
+            super::LOGGER.log(
+                &log::Record::builder()
+                    .level(log::Level::Info)
+                    .args(format_args!("{}", CountFormats(self.nested_formats)))
+                    .build(),
+            );
+            f.write_str("outer record")
+        }
+    }
+
+    #[test]
+    fn output_formatting_cannot_reenter_logger_and_next_record_still_works() {
+        let outer_formats = Cell::new(0);
+        let nested_formats = Cell::new(0);
+        let callback = LogOnFormat {
+            outer_formats: &outer_formats,
+            nested_formats: &nested_formats,
+        };
+        let emit = || {
+            super::LOGGER.log(
+                &log::Record::builder()
+                    .level(log::Level::Info)
+                    .args(format_args!("{callback}"))
+                    .build(),
+            );
+        };
+
+        // Exercise CombinedLogger::log and its real output formatting callback.
+        // Counting formatting, not serial writes, catches recursion even when
+        // the serial subsystem's borrow guard would suppress nested writes.
+        emit();
+        let first_formats = outer_formats.get();
+        assert!(first_formats > 0);
+        assert_eq!(nested_formats.get(), 0);
+        emit();
+        assert!(outer_formats.get() > first_formats);
+        assert_eq!(nested_formats.get(), 0);
+    }
 }

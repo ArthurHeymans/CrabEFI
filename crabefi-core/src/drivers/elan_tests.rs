@@ -159,7 +159,8 @@ fn reports_motion_click_release_and_resets_origin_after_lift_or_slot_change() {
                 dx: 10,
                 dy: 20,
                 dz: 0,
-                buttons: 1
+                buttons: 1,
+                absolute: None,
             })
         );
         for _ in 0..3 {

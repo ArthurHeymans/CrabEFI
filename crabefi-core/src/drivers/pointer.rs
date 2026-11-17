@@ -8,7 +8,7 @@
 use crate::cell::Local;
 use alloc::{boxed::Box, vec::Vec};
 
-/// Relative motion since the previous report and the current button level.
+/// Relative motion or a normalized absolute position and current button level.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct PointerReport {
     pub dx: i32,
@@ -17,10 +17,18 @@ pub struct PointerReport {
     /// Bit 0: left, bit 1: right, bit 2: middle. A level, not an edge:
     /// releases are reported as cleared bits.
     pub buttons: u32,
+    /// Absolute coordinates normalized to 0..=65535, without acceleration.
+    pub absolute: Option<(u16, u16)>,
 }
 
-/// A relative pointing device.
+/// A relative or absolute pointing device.
 pub trait PointerDevice {
+    /// Whether initialization succeeded and this device can accept input.
+    /// Deferred drivers must override this; registration alone is not readiness.
+    fn is_available(&self) -> bool {
+        true
+    }
+
     /// Return motion since the previous call and the current button level,
     /// or `None` when idle. Must not wait for user input.
     fn poll(&mut self) -> Option<PointerReport>;
@@ -40,6 +48,7 @@ struct Pending {
     dy: i32,
     dz: i32,
     buttons: u32,
+    absolute: Option<(u16, u16)>,
     /// Button level at the last [`take`].
     reported: u32,
 }
@@ -52,6 +61,7 @@ impl Pending {
             dz: 0,
             buttons: 0,
             reported: 0,
+            absolute: None,
         }
     }
 
@@ -60,7 +70,11 @@ impl Pending {
     }
 
     fn is_ready(&self) -> bool {
-        self.dx != 0 || self.dy != 0 || self.dz != 0 || self.has_transition()
+        self.dx != 0
+            || self.dy != 0
+            || self.dz != 0
+            || self.absolute.is_some()
+            || self.has_transition()
     }
 
     fn add(&mut self, motion: PointerReport, buttons: u32) {
@@ -68,6 +82,7 @@ impl Pending {
         self.dy = self.dy.saturating_add(motion.dy);
         self.dz = self.dz.saturating_add(motion.dz);
         self.buttons = buttons;
+        self.absolute = motion.absolute.or(self.absolute);
     }
 
     fn take(&mut self) -> PointerReport {
@@ -76,6 +91,7 @@ impl Pending {
             dy: core::mem::take(&mut self.dy),
             dz: core::mem::take(&mut self.dz),
             buttons: self.buttons,
+            absolute: self.absolute.take(),
         };
         self.reported = self.buttons;
         report
@@ -88,6 +104,14 @@ static PENDING: Local<Pending> = Local::new(Pending::new());
 /// Register a pointing device for the rest of boot services.
 pub fn register(device: Box<dyn PointerDevice>) {
     DEVICES.borrow_mut().push(Entry { device, buttons: 0 });
+}
+
+/// Whether any registered pointing device is ready, without consuming input.
+pub fn is_available() -> bool {
+    DEVICES
+        .borrow()
+        .iter()
+        .any(|entry| entry.device.is_available())
 }
 
 /// Register the PS/2 mouse. USB mice register when USB is enumerated.
@@ -117,6 +141,7 @@ pub fn poll() {
             dy: sum.dy.saturating_add(report.dy),
             dz: sum.dz.saturating_add(report.dz),
             buttons: 0,
+            absolute: report.absolute.or(sum.absolute),
         });
     let buttons = devices.iter().fold(0, |level, entry| level | entry.buttons);
     let mut registered = DEVICES.borrow_mut();
@@ -149,6 +174,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn absolute_motion_keeps_the_latest_position_and_is_consumed_once() {
+        let mut pending = Pending::new();
+        for position in [(10, 20), (30, 40)] {
+            pending.add(
+                PointerReport {
+                    absolute: Some(position),
+                    ..Default::default()
+                },
+                0,
+            );
+        }
+        assert!(pending.is_ready());
+        assert_eq!(pending.take().absolute, Some((30, 40)));
+        assert!(!pending.is_ready());
+        assert_eq!(pending.take().absolute, None);
+    }
+
+    #[test]
     fn button_transitions_are_reported_once_and_motion_accumulates() {
         let mut pending = Pending::new();
         pending.add(
@@ -173,7 +216,8 @@ mod tests {
                 dx: 7,
                 dy: -2,
                 dz: 0,
-                buttons: 1
+                buttons: 1,
+                absolute: None,
             }
         );
         assert!(!pending.is_ready());

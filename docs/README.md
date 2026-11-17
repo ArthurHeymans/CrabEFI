@@ -8,7 +8,9 @@ scratch allocation used on every architecture.
 ## Contents
 
 - [Building](BUILDING.md) — build and test commands
+- [UI Testing](UI_TESTING.md) — test and screenshot the setup UI without firmware
 - [Architecture](ARCHITECTURE.md) — workspace and component organization
+- [Native Setup UI](UI.md) — keyboard interaction, text sizing, trust review and accessibility boundaries
 - [Integration](INTEGRATION.md) — embedding the boot library and mandatory runtime image
 - [x86 Entry ABIs](X86_ENTRY_ABI.md) — default coreboot entry and opt-in entry64 for u-root
 - [Memory Management](MEMORY.md) — boot/runtime ownership and EFI memory map

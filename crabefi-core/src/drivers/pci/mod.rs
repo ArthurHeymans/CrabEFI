@@ -35,13 +35,11 @@ use crate::cell::Local;
 use crate::efi::dma::DmaDomain;
 use crate::platform::PciEcamRegion;
 
-/// Maximum number of PCI devices
-pub const MAX_PCI_DEVICES: usize = 64;
-
 /// PCI bus subsystem state
 struct PciState {
-    /// Enumerated PCI device list
-    devices: heapless::Vec<PciDevice, MAX_PCI_DEVICES>,
+    /// Enumerated PCI device list, on the heap: one server socket alone
+    /// exposes well over a hundred functions across its root complexes.
+    devices: alloc::vec::Vec<PciDevice>,
     /// Validated PCIe ECAM allocations (from platform, ACPI MCFG, or FDT).
     ecam_regions: heapless::Vec<PciEcamRegion, { crate::fdt::MAX_ECAM_REGIONS }>,
     /// Whether firmware explicitly supplied ECAM configuration.
@@ -53,7 +51,7 @@ struct PciState {
 impl PciState {
     const fn new() -> Self {
         Self {
-            devices: heapless::Vec::new(),
+            devices: alloc::vec::Vec::new(),
             ecam_regions: heapless::Vec::new(),
             ecam_configured: false,
             #[cfg(target_arch = "x86_64")]
@@ -334,20 +332,36 @@ fn enabled_command(dev: &PciDevice, original: CommandRegister) -> CommandRegiste
     ))
 }
 
+/// Read the device's typed PCI command register without changing decode state.
+pub fn command_register(address: PciAddress) -> CommandRegister {
+    with_access(|access| PciHeader::new(address).command(access))
+}
+
 /// Enable only assigned decode types and bus mastering for a DMA driver.
 pub fn enable_device(dev: &PciDevice) {
     with_access(|access| {
-        let mut header = PciHeader::new(dev.address);
-        let original = header.command(access);
-        let enabled = enabled_command(dev, original);
-        header.update_command(access, |_| enabled);
-        log::debug!(
-            "Enabled device {}: cmd {:#06x} -> {:#06x}",
-            dev.address,
-            original.bits(),
-            enabled.bits()
-        );
+        if let Err(error) = enable_device_with_access(access, dev) {
+            log::warn!("PCI {}: enable failed: {:?}", dev.address, error);
+        }
     });
+}
+
+fn enable_device_with_access(
+    access: &impl PciAccess,
+    dev: &PciDevice,
+) -> Result<(), ConfigAccessError> {
+    let original = CommandRegister::from_bits_retain(access.try_read16(dev.address, 0x04)?);
+    let enabled = enabled_command(dev, original);
+    // pci_types::update_command performs a dword RMW, acknowledging W1C
+    // status in the upper half. Only write the command register itself.
+    access.try_write16(dev.address, 0x04, enabled.bits())?;
+    log::debug!(
+        "Enabled device {}: cmd {:#06x} -> {:#06x}",
+        dev.address,
+        original.bits(),
+        enabled.bits()
+    );
+    Ok(())
 }
 
 /// Read a 16-bit PCI configuration-space register.
@@ -402,14 +416,17 @@ pub fn init() {
     PCI.with_mut(|pci| {
         pci.access = new_access;
         pci.devices.clear();
-        match &pci.access {
-            AnyPciAccess::Unavailable => log::info!("PCI enumeration skipped: unavailable"),
+        let result = match &pci.access {
+            AnyPciAccess::Unavailable => {
+                log::info!("PCI enumeration skipped: unavailable");
+                Ok(())
+            }
             AnyPciAccess::IoCam(_) => {
                 enumerate_region(&pci.access, &mut pci.devices, 0, 0, u8::MAX)
             }
             AnyPciAccess::Ecam(ecam) => {
                 let regions = ecam.regions();
-                for region in regions {
+                regions.iter().try_for_each(|region| {
                     log::debug!(
                         "PCI: enumerating segment {} buses {:02x}-{:02x}",
                         region.segment,
@@ -422,15 +439,27 @@ pub fn init() {
                         region.segment,
                         region.bus_start,
                         region.bus_end,
-                    );
-                    if pci.devices.is_full() {
-                        break;
-                    }
-                }
+                    )
+                })
             }
+        };
+        let enumeration_complete = result.is_ok();
+        if let Err(error) = result {
+            // Keep the inventory collected so far usable, as with the old
+            // fixed-capacity list, but never abort firmware on heap exhaustion.
+            log::warn!(
+                "PCI enumeration truncated at {} devices: {}; remaining devices unavailable",
+                pci.devices.len(),
+                error,
+            );
         }
         log::info!(
-            "PCI enumeration complete: {} devices found",
+            "PCI enumeration {}: {} devices found",
+            if enumeration_complete {
+                "complete"
+            } else {
+                "incomplete"
+            },
             pci.devices.len()
         );
     });
@@ -439,11 +468,11 @@ pub fn init() {
 /// Enumerate one declared PCI segment/bus range.
 fn enumerate_region(
     access: &AnyPciAccess,
-    devices: &mut heapless::Vec<PciDevice, MAX_PCI_DEVICES>,
+    devices: &mut alloc::vec::Vec<PciDevice>,
     segment: u16,
     bus_start: u8,
     bus_end: u8,
-) {
+) -> Result<(), alloc::collections::TryReserveError> {
     for bus in bus_start..=bus_end {
         for device in 0..32u8 {
             // First check function 0
@@ -459,10 +488,8 @@ fn enumerate_region(
                     dev.subclass
                 );
 
-                if devices.push(dev).is_err() {
-                    log::warn!("PCI device list full!");
-                    return;
-                }
+                devices.try_reserve(1)?;
+                devices.push(dev);
 
                 // Check other functions if multi-function
                 if is_multi_function {
@@ -477,16 +504,15 @@ fn enumerate_region(
                                 dev.subclass
                             );
 
-                            if devices.push(dev).is_err() {
-                                log::warn!("PCI device list full!");
-                                return;
-                            }
+                            devices.try_reserve(1)?;
+                            devices.push(dev);
                         }
                     }
                 }
             }
         }
     }
+    Ok(())
 }
 
 /// Bind drivers to all enumerated PCI devices
@@ -499,9 +525,7 @@ fn enumerate_region(
 pub fn bind_drivers() {
     log::info!("Binding PCI drivers to devices...");
 
-    let devices = PCI.borrow().devices.clone();
-
-    let bound_count = driver::bind_all(&devices);
+    let bound_count = with_devices(driver::bind_all);
 
     log::info!("PCI driver binding complete: {} devices bound", bound_count);
 }
@@ -513,42 +537,88 @@ pub fn shutdown_drivers() {
     driver::shutdown_all();
 }
 
-/// Clear PCI Bus Master Enable on all enumerated devices.
+/// Clear PCI Bus Master Enable on every present function in the selected backend.
 ///
 /// This is a conservative OS-handoff safety net: once ExitBootServices has
 /// succeeded, firmware-owned DMA rings and bounce buffers are no longer owned
 /// by firmware.  Any device left bus-mastering can scribble over pages Linux
 /// has already repurposed for early stacks or metadata.
 pub fn disable_all_bus_mastering_for_handoff() {
-    let devices = PCI.borrow().devices.clone();
-    if devices.is_empty() {
-        return;
-    }
-
-    let mut changed = 0usize;
-    with_access(|access| {
-        for dev in devices.iter() {
-            let mut header = PciHeader::new(dev.address);
-            let command = header.command(access);
-            if !command.contains(CommandRegister::BUS_MASTER_ENABLE) {
-                continue;
-            }
-            let new_command = command - CommandRegister::BUS_MASTER_ENABLE;
-            header.update_command(access, |_| new_command);
-            changed += 1;
-            log::debug!(
-                "PCI {}: bus master disabled for OS handoff ({:#06x} -> {:#06x})",
-                dev.address,
-                command.bits(),
-                new_command.bits()
-            );
-        }
-    });
+    // Handoff must not allocate: the boot heap may already be exhausted.
+    let pci = PCI.borrow();
+    // Even successful enumeration can omit a function if function zero is
+    // absent or its multifunction flag is wrong. Earlier firmware may have
+    // left DMA active there, so never limit this safety sweep to the inventory.
+    // Read only IDs and command registers: do not probe or resize BARs.
+    let changed = match &pci.access {
+        AnyPciAccess::Unavailable => 0,
+        AnyPciAccess::IoCam(_) => disable_region_bus_mastering(&pci.access, 0, 0, u8::MAX),
+        AnyPciAccess::Ecam(ecam) => ecam
+            .regions()
+            .iter()
+            .map(|region| {
+                disable_region_bus_mastering(
+                    &pci.access,
+                    region.segment,
+                    region.bus_start,
+                    region.bus_end,
+                )
+            })
+            .sum(),
+    };
 
     log::info!(
         "PCI: disabled bus mastering on {} device(s) for OS handoff",
         changed
     );
+}
+
+/// Clear BME without changing decode enables or probing BARs.
+fn disable_bus_mastering(access: &impl PciAccess, address: PciAddress) -> bool {
+    let Ok(bits) = access.try_read16(address, 0x04) else {
+        return false;
+    };
+    let command = CommandRegister::from_bits_retain(bits);
+    if !command.contains(CommandRegister::BUS_MASTER_ENABLE) {
+        return false;
+    }
+    let new_command = command - CommandRegister::BUS_MASTER_ENABLE;
+    if let Err(error) = access.try_write16(address, 0x04, new_command.bits()) {
+        log::warn!("PCI {}: bus master disable failed: {:?}", address, error);
+        return false;
+    }
+    log::debug!(
+        "PCI {}: bus master disabled for OS handoff ({:#06x} -> {:#06x})",
+        address,
+        command.bits(),
+        new_command.bits()
+    );
+    true
+}
+
+/// Quiesce every present function in a backend range without allocating.
+fn disable_region_bus_mastering(
+    access: &AnyPciAccess,
+    segment: u16,
+    bus_start: u8,
+    bus_end: u8,
+) -> usize {
+    let mut changed = 0;
+    for bus in bus_start..=bus_end {
+        for device in 0..32 {
+            // Include all functions even when function zero is absent or its
+            // multifunction flag is unreliable. This is a safety-only sweep.
+            for function in 0..8 {
+                let address = PciAddress::new(segment, bus, device, function);
+                let (vendor, device_id) = PciHeader::new(address).id(access);
+                let id = u32::from(vendor) | (u32::from(device_id) << 16);
+                if access_rules::valid_device_id(id) && disable_bus_mastering(access, address) {
+                    changed += 1;
+                }
+            }
+        }
+    }
+    changed
 }
 
 // ============================================================================
@@ -613,8 +683,18 @@ pub fn find_sdhci_controllers() -> heapless::Vec<PciDevice, 8> {
     result
 }
 
-/// Get all enumerated PCI devices
-pub fn get_all_devices() -> heapless::Vec<PciDevice, MAX_PCI_DEVICES> {
+/// Borrow all enumerated PCI devices without allocating a snapshot.
+///
+/// PCI configuration access may be nested inside `f`, but the callback must
+/// not reinitialize PCI or mutate its ECAM configuration while borrowed.
+pub fn with_devices<R>(f: impl FnOnce(&[PciDevice]) -> R) -> R {
+    f(&PCI.borrow().devices)
+}
+
+/// Get an owned snapshot of all enumerated PCI devices.
+///
+/// Prefer [`with_devices`] when the caller does not need ownership.
+pub fn get_all_devices() -> alloc::vec::Vec<PciDevice> {
     PCI.borrow().devices.clone()
 }
 
@@ -848,6 +928,82 @@ mod tests {
                 .command(TestConfig)
                 .contains(CommandRegister::BUS_MASTER_ENABLE)
         );
+    }
+
+    struct CommandConfig {
+        command_status: core::cell::Cell<u32>,
+        dword_writes: core::cell::Cell<usize>,
+        word_writes: core::cell::Cell<usize>,
+    }
+
+    impl ConfigRegionAccess for CommandConfig {
+        unsafe fn read(&self, _address: PciAddress, offset: u16) -> u32 {
+            assert_eq!(offset, 0x04);
+            self.command_status.get()
+        }
+
+        unsafe fn write(&self, _address: PciAddress, offset: u16, value: u32) {
+            assert_eq!(offset, 0x04);
+            let prior = self.command_status.get();
+            // Low half RW, upper half W1C, unlike the RAM ECAM fixture.
+            self.command_status
+                .set((prior & 0xffff_0000 & !value) | (value & 0xffff));
+            self.dword_writes.set(self.dword_writes.get() + 1);
+        }
+    }
+
+    impl PciAccess for CommandConfig {
+        fn name(&self) -> &'static str {
+            "native command/W1C fixture"
+        }
+
+        fn max_offset(&self) -> u16 {
+            255
+        }
+
+        fn contains_address(&self, _address: PciAddress) -> bool {
+            true
+        }
+
+        fn try_write16(
+            &self,
+            _address: PciAddress,
+            offset: u16,
+            value: u16,
+        ) -> Result<(), ConfigAccessError> {
+            assert_eq!(offset, 0x04);
+            self.command_status
+                .set((self.command_status.get() & 0xffff_0000) | u32::from(value));
+            self.word_writes.set(self.word_writes.get() + 1);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn enable_and_handoff_preserve_w1c_status_with_native_command_writes() {
+        let access = CommandConfig {
+            command_status: core::cell::Cell::new(0xa900_0140),
+            dword_writes: core::cell::Cell::new(0),
+            word_writes: core::cell::Cell::new(0),
+        };
+        let mut dev = PciDevice::new(PciAddress::new(7, 0x40, 1, 2));
+        dev.bars[0] = PciBar {
+            bar_type: BarType::Memory32,
+            address: 0x1000,
+            ..PciBar::default()
+        };
+
+        enable_device_with_access(&access, &dev).unwrap();
+        assert_eq!(access.command_status.get(), 0xa900_0146);
+        assert_eq!(access.word_writes.get(), 1);
+        assert_eq!(access.dword_writes.get(), 0);
+
+        assert!(disable_bus_mastering(&access, dev.address));
+        assert_eq!(access.command_status.get(), 0xa900_0142);
+        assert_eq!(access.word_writes.get(), 2);
+        assert_eq!(access.dword_writes.get(), 0);
+        assert!(!disable_bus_mastering(&access, dev.address));
+        assert_eq!(access.word_writes.get(), 2);
     }
 
     #[test]
