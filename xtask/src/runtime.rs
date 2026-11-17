@@ -16,8 +16,8 @@ use sha2::{Digest, Sha256};
 use crabefi_runtime_abi::exports::{EXPORT_COUNT, ExportOffsets};
 use crabefi_runtime_abi::format::{
     ABI_VERSION, EFI_PAGE_SIZE, EXPORTS_SIZE, HEADER_SIZE, MAX_SECTIONS, RELOCATION_SIZE,
-    RuntimeImageHeader, SECTION_SIZE, ValidatedImage, architecture,
-    relocation_kind as abi_relocation_kind, section_flags as abi_section_flags,
+    RelocationKind as AbiRelocationKind, RuntimeImageHeader, RuntimeRelocation, RuntimeSection,
+    SECTION_SIZE, ValidatedImage, architecture, section_flags as abi_section_flags,
 };
 
 use crate::{Arch, project_root};
@@ -32,14 +32,6 @@ struct Segment {
     data: Vec<u8>,
     flags: u32,
     normalized_offset: u32,
-}
-
-#[derive(Clone, Copy)]
-struct Relocation {
-    patch_offset: u32,
-    target_offset: u32,
-    patch_section: u8,
-    target_section: u8,
 }
 
 pub struct RuntimeArtifact {
@@ -357,27 +349,21 @@ fn normalize(
 
     for (index, segment) in segments.iter().enumerate() {
         let offset = section_offset + index * SECTION_SIZE;
-        write_u32(&mut normalized, offset, segment.normalized_offset);
-        write_u32(&mut normalized, offset + 4, segment.address as u32);
-        write_u32(&mut normalized, offset + 8, segment.data.len() as u32);
-        write_u32(&mut normalized, offset + 12, segment.memory_size as u32);
-        write_u32(&mut normalized, offset + 16, segment.alignment as u32);
-        write_u32(&mut normalized, offset + 20, segment.flags);
+        let section = RuntimeSection {
+            file_offset: segment.normalized_offset,
+            image_offset: u32::try_from(segment.address)?,
+            file_size: u32::try_from(segment.data.len())?,
+            memory_size: u32::try_from(segment.memory_size)?,
+            alignment: u32::try_from(segment.alignment)?,
+            flags: segment.flags,
+        };
+        normalized[offset..offset + SECTION_SIZE].copy_from_slice(&section.to_bytes());
         let destination = usize::try_from(segment.normalized_offset)?;
         normalized[destination..destination + segment.data.len()].copy_from_slice(&segment.data);
     }
     for (index, relocation) in relocations.iter().enumerate() {
         let offset = relocation_offset + index * RELOCATION_SIZE;
-        write_u32(&mut normalized, offset, relocation.patch_offset);
-        write_u32(&mut normalized, offset + 4, relocation.target_offset);
-        write_u64(&mut normalized, offset + 8, 0);
-        normalized[offset + 16] = relocation.patch_section;
-        normalized[offset + 17] = relocation.target_section;
-        write_u16(
-            &mut normalized,
-            offset + 18,
-            abi_relocation_kind::ABSOLUTE64,
-        );
+        normalized[offset..offset + RELOCATION_SIZE].copy_from_slice(&relocation.to_bytes());
     }
     for (index, value) in exports.iter().enumerate() {
         write_u32(&mut normalized, exports_offset + index * 4, *value);
@@ -456,7 +442,7 @@ fn collect_dynamic_relocations(
     file: &object::File<'_>,
     segments: &[Segment],
     arch: Arch,
-) -> Result<Vec<Relocation>> {
+) -> Result<Vec<RuntimeRelocation>> {
     let expected = dynamic_relocation_count(file)?;
     let mut output = Vec::with_capacity(expected);
     let relocations = file
@@ -481,11 +467,12 @@ fn collect_dynamic_relocations(
             .with_context(|| format!("relocation patch {patch:#x} is outside PT_LOAD"))?;
         let target_section = containing_segment(segments, target, 1)
             .with_context(|| format!("relocation target {target:#x} is outside PT_LOAD"))?;
-        output.push(Relocation {
+        output.push(RuntimeRelocation {
             patch_offset: u32::try_from(patch)?,
             target_offset: u32::try_from(target)?,
             patch_section: u8::try_from(patch_section)?,
             target_section: u8::try_from(target_section)?,
+            kind: AbiRelocationKind::Absolute64,
         });
     }
     if output.is_empty() || output.len() != expected {
@@ -1045,16 +1032,8 @@ fn write_json(path: PathBuf, value: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
-fn write_u16(bytes: &mut [u8], offset: usize, value: u16) {
-    bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
-}
-
 fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
     bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-}
-
-fn write_u64(bytes: &mut [u8], offset: usize, value: u64) {
-    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
 fn hex(bytes: &[u8]) -> String {
