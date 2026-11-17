@@ -276,8 +276,12 @@ pub fn can_edit_item(cfr: &CfrInfo<'_>, items: &[MenuItem], index: usize) -> boo
         },
     ) = items.get(index)
     {
-        is_item_visible(cfr, items, item)
-            && get_option(cfr, *form_idx, *option_idx).is_some_and(|o| o.is_editable())
+        cfr.forms()
+            .get(*form_idx)
+            .is_some_and(|form| form.is_visible())
+            && get_option(cfr, *form_idx, *option_idx)
+                .is_some_and(|o| o.is_visible() && o.is_editable())
+            && is_item_visible(cfr, items, item)
     } else {
         false
     }
@@ -432,8 +436,9 @@ pub(crate) fn validate_number(
 
 fn accepts_value(kind: &CfrOptionType, value: &CfrValue) -> bool {
     match (kind, value) {
-        (CfrOptionType::Bool { .. }, CfrValue::Bool(_))
-        | (CfrOptionType::Varchar { .. }, CfrValue::Varchar(_)) => true,
+        (CfrOptionType::Bool { .. }, CfrValue::Bool(_)) => true,
+        // The firmware store treats the first NUL as the end of the value.
+        (CfrOptionType::Varchar { .. }, CfrValue::Varchar(text)) => !text.contains('\0'),
         (CfrOptionType::Enum { choices, .. }, CfrValue::Number(value)) => {
             choices.iter().any(|choice| choice.value == *value)
         }
@@ -607,6 +612,88 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn embedded_nul_is_rejected_without_changing_the_draft() {
+        let cfr = CfrInfo {
+            version: 0,
+            forms: alloc::vec![form(
+                "Test",
+                0,
+                alloc::vec![CfrOption {
+                    object_id: 1,
+                    dependency_id: 0,
+                    opt_name: String::from("text"),
+                    ui_name: String::from("Text"),
+                    ui_helptext: String::new(),
+                    flags: 0,
+                    option_type: CfrOptionType::Varchar {
+                        default: String::new()
+                    },
+                    dep_values: Vec::new(),
+                }]
+            )],
+        };
+        let mut items = [MenuItem::Option {
+            form_idx: 0,
+            option_idx: 0,
+            current_value: CfrValue::Varchar(String::from("draft")),
+            original_value: CfrValue::Varchar(String::new()),
+        }];
+        assert_eq!(
+            apply_edit(
+                &cfr,
+                &mut items,
+                0,
+                SettingEdit::Set(CfrValue::Varchar(String::from("a\0b")))
+            ),
+            None
+        );
+        assert!(
+            matches!(&items[0], MenuItem::Option { current_value: CfrValue::Varchar(text), .. } if text == "draft")
+        );
+        assert_eq!(
+            apply_edit(
+                &cfr,
+                &mut items,
+                0,
+                SettingEdit::Set(CfrValue::Varchar(String::from("é")))
+            ),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn manually_supplied_suppressed_rows_cannot_be_edited() {
+        let mut cfr = CfrInfo {
+            version: 0,
+            forms: alloc::vec![form(
+                "Test",
+                0,
+                alloc::vec![CfrOption {
+                    object_id: 1,
+                    dependency_id: 0,
+                    opt_name: String::from("switch"),
+                    ui_name: String::from("Switch"),
+                    ui_helptext: String::new(),
+                    flags: crate::cfr::CFR_OPTFLAG_SUPPRESS,
+                    option_type: CfrOptionType::Bool { default: false },
+                    dep_values: Vec::new(),
+                }]
+            )],
+        };
+        let mut items = [MenuItem::Option {
+            form_idx: 0,
+            option_idx: 0,
+            current_value: CfrValue::Bool(false),
+            original_value: CfrValue::Bool(false),
+        }];
+        assert_eq!(apply_edit(&cfr, &mut items, 0, SettingEdit::Cycle), None);
+        cfr.forms[0].options[0].flags = 0;
+        cfr.forms[0].flags = crate::cfr::CFR_OPTFLAG_SUPPRESS;
+        assert_eq!(apply_edit(&cfr, &mut items, 0, SettingEdit::Cycle), None);
+        assert!(!has_changes(&items));
     }
 
     #[test]

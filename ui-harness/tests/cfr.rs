@@ -232,6 +232,14 @@ fn failed_save_cannot_leave_and_repair_retries_the_existing_draft() {
         state(&host)["savedSettings"]["hyper_threading"],
         Value::Null
     );
+    key(&mut host, "ArrowDown");
+    for close in ["Escape", "Enter"] {
+        key(&mut host, "Enter");
+        assert_eq!(state(&host)["dialog"], "Power profile");
+        key(&mut host, close);
+        assert_eq!(firmware(&host)["saveResult"], json!([0, 1]));
+        assert_eq!(firmware(&host)["dirtyCount"], 1);
+    }
     key(&mut host, "b");
     choose(&mut host, 2);
     assert_eq!(state(&host)["screen"], "firmware");

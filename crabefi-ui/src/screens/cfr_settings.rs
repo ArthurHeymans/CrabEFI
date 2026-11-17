@@ -1255,20 +1255,18 @@ pub async fn show_cfr_menu_graphical(
             if !graphical_key_allowed(state.focus.group, key) {
                 continue;
             }
-            // Opening a section (Enter/Space in Sections) edits nothing, so it
-            // must not dismiss a failed-save notice or its Try again action.
+            // Opening an editor is not an edit. Only clear its saved feedback
+            // after a changed value is applied, not when the dialog opens.
             if action.is_none()
                 && matches!(state.focus.group, Group::Content | Group::Actions)
-                && (matches!(
-                    key,
-                    KeyPress::Enter | KeyPress::Char(' ' | 'w' | 'W') | KeyPress::F10
-                ) || (state.focus.group == Group::Content
-                    && matches!(
-                        key,
-                        KeyPress::Left
-                            | KeyPress::Right
-                            | KeyPress::Char('+' | '=' | '-' | 'd' | 'D')
-                    )))
+                && (matches!(key, KeyPress::Char('w' | 'W') | KeyPress::F10)
+                    || (state.focus.group == Group::Content
+                        && matches!(
+                            key,
+                            KeyPress::Left
+                                | KeyPress::Right
+                                | KeyPress::Char('+' | '=' | '-' | 'd' | 'D')
+                        )))
             {
                 state.status_message = None;
                 if !matches!(key, KeyPress::F10 | KeyPress::Char('w' | 'W')) {
@@ -1442,9 +1440,11 @@ pub async fn show_cfr_menu_graphical(
                             state.focus.group = Group::Actions;
                             state.focus.action = i;
                         }
-                        state.status_message = None;
-                        if action != FwAction::Save {
-                            state.save_result = None;
+                        if action != FwAction::Edit {
+                            state.status_message = None;
+                            if action != FwAction::Save {
+                                state.save_result = None;
+                            }
                         }
                         match action {
                             FwAction::Edit => {
