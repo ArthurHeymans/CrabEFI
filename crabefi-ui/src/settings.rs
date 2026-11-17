@@ -303,124 +303,159 @@ pub fn stepped_number(current: u32, min: u32, max: u32, step: u32, forward: bool
     }
 }
 
-pub fn increment_option(cfr: &CfrInfo<'_>, items: &mut [MenuItem], index: usize) -> bool {
-    // Check editability with live dependencies before taking a mutable borrow
+#[derive(Clone, Copy)]
+pub enum StepDirection {
+    Forward,
+    Backward,
+}
+
+impl StepDirection {
+    fn cycle_index(self, index: usize, len: usize) -> usize {
+        match self {
+            Self::Forward => (index + 1) % len,
+            Self::Backward => index.checked_sub(1).unwrap_or(len - 1),
+        }
+    }
+}
+
+pub enum SettingEdit {
+    /// Step a number without wrapping, or cycle a discrete choice.
+    Step(StepDirection),
+    /// Like a forward step, but wrap a number back to its minimum.
+    Cycle,
+    Set(CfrValue),
+    SetLogLevel(LevelFilter),
+    RestoreDefault,
+}
+
+/// Apply an edit to the current value without writing it to the store.
+/// `None` means no edit was possible; `Some` says whether the value changed.
+pub fn apply_edit(
+    cfr: &CfrInfo<'_>,
+    items: &mut [MenuItem],
+    index: usize,
+    edit: SettingEdit,
+) -> Option<bool> {
     if !can_edit_item(cfr, items, index) {
-        return false;
+        return None;
     }
-
-    if let Some(MenuItem::CrabLogLevel { current_level, .. }) = items.get_mut(index) {
-        let current_idx = crate::cfr::level_index(*current_level);
-        let next_idx = (current_idx + 1) % crate::cfr::LEVEL_CHOICES.len();
-        *current_level = crate::cfr::LEVEL_CHOICES[next_idx];
-        return true;
+    fn replace<T: PartialEq>(current: &mut T, next: T) -> bool {
+        let changed = *current != next;
+        *current = next;
+        changed
     }
+    match items.get_mut(index)? {
+        MenuItem::CrabLogLevel { current_level, .. } => {
+            use crate::cfr::{DEFAULT_LEVEL, LEVEL_CHOICES, level_index};
+            let next = match edit {
+                SettingEdit::RestoreDefault => DEFAULT_LEVEL,
+                SettingEdit::SetLogLevel(level) if LEVEL_CHOICES.contains(&level) => level,
+                SettingEdit::Step(_) | SettingEdit::Cycle => {
+                    let direction = match edit {
+                        SettingEdit::Step(direction) => direction,
+                        _ => StepDirection::Forward,
+                    };
+                    LEVEL_CHOICES
+                        [direction.cycle_index(level_index(*current_level), LEVEL_CHOICES.len())]
+                }
+                _ => return None,
+            };
+            Some(replace(current_level, next))
+        }
+        MenuItem::Option {
+            form_idx,
+            option_idx,
+            current_value,
+            ..
+        } => {
+            let kind = &get_option(cfr, *form_idx, *option_idx)?.option_type;
+            let next = match edit {
+                SettingEdit::RestoreDefault => CfrValue::from_option_type(kind),
+                SettingEdit::Set(value) if accepts_value(kind, &value) => value,
+                SettingEdit::Step(_) | SettingEdit::Cycle => {
+                    stepped_value(kind, current_value, edit)?
+                }
+                _ => return None,
+            };
+            Some(replace(current_value, next))
+        }
+        _ => None,
+    }
+}
 
-    let Some(MenuItem::Option {
-        form_idx,
-        option_idx,
-        current_value,
-        ..
-    }) = items.get_mut(index)
-    else {
-        return false;
+fn stepped_value(kind: &CfrOptionType, value: &CfrValue, edit: SettingEdit) -> Option<CfrValue> {
+    let direction = match edit {
+        SettingEdit::Cycle => StepDirection::Forward,
+        SettingEdit::Step(direction) => direction,
+        _ => return None,
     };
-    let (fi, oi) = (*form_idx, *option_idx);
-    let Some(option) = get_option(cfr, fi, oi) else {
-        return false;
-    };
-    match (&option.option_type, current_value) {
-        (CfrOptionType::Bool { .. }, CfrValue::Bool(b)) => {
-            *b = !*b;
-            true
+    match (kind, value) {
+        (CfrOptionType::Bool { .. }, CfrValue::Bool(value)) => Some(CfrValue::Bool(!value)),
+        (CfrOptionType::Enum { choices, .. }, CfrValue::Number(value)) if !choices.is_empty() => {
+            let current = choices
+                .iter()
+                .position(|choice| choice.value == *value)
+                .unwrap_or(0);
+            Some(CfrValue::Number(
+                choices[direction.cycle_index(current, choices.len())].value,
+            ))
         }
-        (CfrOptionType::Enum { choices, .. }, CfrValue::Number(n)) => {
-            if choices.is_empty() {
-                return false;
-            }
-            let current_idx = choices.iter().position(|c| c.value == *n).unwrap_or(0);
-            let next_idx = (current_idx + 1) % choices.len();
-            if let Some(choice) = choices.get(next_idx) {
-                *n = choice.value;
-                true
-            } else {
-                false
-            }
+        (CfrOptionType::Number { min, max, step, .. }, CfrValue::Number(value)) if min <= max => {
+            stepped_number(
+                *value,
+                *min,
+                *max,
+                *step,
+                matches!(direction, StepDirection::Forward),
+            )
+            .or_else(|| matches!(edit, SettingEdit::Cycle).then_some(*min))
+            .map(CfrValue::Number)
         }
-        (CfrOptionType::Number { min, max, step, .. }, CfrValue::Number(n)) => {
-            if let Some(next) = stepped_number(*n, *min, *max, *step, true) {
-                *n = next;
-                true
-            } else {
-                false
-            }
+        _ => None,
+    }
+}
+
+pub(crate) fn validate_number(
+    value: u32,
+    min: u32,
+    max: u32,
+    step: u32,
+) -> Result<(), &'static str> {
+    if !(min..=max).contains(&value) {
+        return Err("Value is outside the allowed range.");
+    }
+    if !(value - min).is_multiple_of(step.max(1)) {
+        return Err("Value must match the step from the minimum.");
+    }
+    Ok(())
+}
+
+fn accepts_value(kind: &CfrOptionType, value: &CfrValue) -> bool {
+    match (kind, value) {
+        (CfrOptionType::Bool { .. }, CfrValue::Bool(_))
+        | (CfrOptionType::Varchar { .. }, CfrValue::Varchar(_)) => true,
+        (CfrOptionType::Enum { choices, .. }, CfrValue::Number(value)) => {
+            choices.iter().any(|choice| choice.value == *value)
+        }
+        (CfrOptionType::Number { min, max, step, .. }, CfrValue::Number(value)) => {
+            validate_number(*value, *min, *max, *step).is_ok()
         }
         _ => false,
     }
 }
 
+pub fn increment_option(cfr: &CfrInfo<'_>, items: &mut [MenuItem], index: usize) -> bool {
+    apply_edit(cfr, items, index, SettingEdit::Step(StepDirection::Forward)).is_some()
+}
+
 pub fn decrement_option(cfr: &CfrInfo<'_>, items: &mut [MenuItem], index: usize) -> bool {
-    // Check editability with live dependencies before taking a mutable borrow
-    if !can_edit_item(cfr, items, index) {
-        return false;
-    }
-
-    if let Some(MenuItem::CrabLogLevel { current_level, .. }) = items.get_mut(index) {
-        let current_idx = crate::cfr::level_index(*current_level);
-        let prev_idx = if current_idx == 0 {
-            crate::cfr::LEVEL_CHOICES.len().saturating_sub(1)
-        } else {
-            current_idx - 1
-        };
-        *current_level = crate::cfr::LEVEL_CHOICES[prev_idx];
-        return true;
-    }
-
-    let Some(MenuItem::Option {
-        form_idx,
-        option_idx,
-        current_value,
-        ..
-    }) = items.get_mut(index)
-    else {
-        return false;
-    };
-    let (fi, oi) = (*form_idx, *option_idx);
-    let Some(option) = get_option(cfr, fi, oi) else {
-        return false;
-    };
-    match (&option.option_type, current_value) {
-        (CfrOptionType::Bool { .. }, CfrValue::Bool(b)) => {
-            *b = !*b;
-            true
-        }
-        (CfrOptionType::Enum { choices, .. }, CfrValue::Number(n)) => {
-            if choices.is_empty() {
-                return false;
-            }
-            let current_idx = choices.iter().position(|c| c.value == *n).unwrap_or(0);
-            let prev_idx = if current_idx == 0 {
-                choices.len().saturating_sub(1)
-            } else {
-                current_idx - 1
-            };
-            if let Some(choice) = choices.get(prev_idx) {
-                *n = choice.value;
-                true
-            } else {
-                false
-            }
-        }
-        (CfrOptionType::Number { min, max, step, .. }, CfrValue::Number(n)) => {
-            if let Some(next) = stepped_number(*n, *min, *max, *step, false) {
-                *n = next;
-                true
-            } else {
-                false
-            }
-        }
-        _ => false,
-    }
+    apply_edit(
+        cfr,
+        items,
+        index,
+        SettingEdit::Step(StepDirection::Backward),
+    )
+    .is_some()
 }
 
 pub fn save_all_changes(cfr: &CfrInfo<'_>, items: &mut [MenuItem]) -> (usize, usize) {
@@ -513,6 +548,65 @@ mod tests {
             options,
             dep_values: Vec::new(),
         }
+    }
+
+    #[test]
+    fn numeric_steps_stop_at_the_bound_but_cycle_wraps() {
+        let cfr = CfrInfo {
+            version: 0,
+            forms: alloc::vec![form(
+                "Test",
+                0,
+                alloc::vec![CfrOption {
+                    object_id: 1,
+                    dependency_id: 0,
+                    opt_name: String::from("number"),
+                    ui_name: String::from("Number"),
+                    ui_helptext: String::new(),
+                    flags: 0,
+                    option_type: CfrOptionType::Number {
+                        default: 5,
+                        min: 0,
+                        max: 12,
+                        step: 5,
+                        hex_display: false,
+                    },
+                    dep_values: Vec::new(),
+                }]
+            )],
+        };
+        let mut items = [MenuItem::Option {
+            form_idx: 0,
+            option_idx: 0,
+            current_value: CfrValue::Number(10),
+            original_value: CfrValue::Number(10),
+        }];
+        assert!(!increment_option(&cfr, &mut items, 0));
+        assert_eq!(
+            apply_edit(&cfr, &mut items, 0, SettingEdit::Cycle),
+            Some(true)
+        );
+        assert_eq!(
+            apply_edit(&cfr, &mut items, 0, SettingEdit::Set(CfrValue::Number(0))),
+            Some(false)
+        );
+        assert_eq!(
+            apply_edit(&cfr, &mut items, 0, SettingEdit::Set(CfrValue::Number(12))),
+            None
+        );
+        assert!(!decrement_option(&cfr, &mut items, 0));
+        assert_eq!(
+            apply_edit(&cfr, &mut items, 0, SettingEdit::RestoreDefault),
+            Some(true)
+        );
+        assert!(matches!(
+            items[0],
+            MenuItem::Option {
+                current_value: CfrValue::Number(5),
+                original_value: CfrValue::Number(10),
+                ..
+            }
+        ));
     }
 
     #[test]

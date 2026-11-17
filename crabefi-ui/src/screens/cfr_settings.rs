@@ -1802,31 +1802,16 @@ fn restore_graphical_default(
     state: &mut GraphicalState,
 ) {
     state.save_result = None;
-    if !can_edit_item(cfr, items, state.selected) {
-        state.status_message = Some((
-            "Read-only or unavailable; the default cannot be applied.",
-            false,
-        ));
-        return;
-    }
-    match items.get_mut(state.selected) {
-        Some(MenuItem::CrabLogLevel { current_level, .. }) => {
-            *current_level = crate::cfr::DEFAULT_LEVEL;
-        }
-        Some(MenuItem::Option {
-            form_idx,
-            option_idx,
-            current_value,
-            ..
-        }) => {
-            let Some(option) = get_option(cfr, *form_idx, *option_idx) else {
-                return;
-            };
-            *current_value = CfrValue::from_option_type(&option.option_type);
-        }
-        _ => return,
-    }
-    state.status_message = Some(("Default value set; save to keep it.", true));
+    state.status_message = Some(
+        if apply_edit(cfr, items, state.selected, SettingEdit::RestoreDefault).is_some() {
+            ("Default value set; save to keep it.", true)
+        } else {
+            (
+                "Read-only or unavailable; the default cannot be applied.",
+                false,
+            )
+        },
+    );
 }
 
 /// Numeric editors accept an explicit decimal or 0x-prefixed hexadecimal value.
@@ -1838,12 +1823,7 @@ fn parse_graphical_number(text: &str, min: u32, max: u32, step: u32) -> Result<u
         text.parse::<u32>()
     }
     .map_err(|_| "Enter a decimal number or 0x-prefixed hexadecimal.")?;
-    if n < min || n > max {
-        return Err("Value is outside the allowed range.");
-    }
-    if step > 1 && !(n - min).is_multiple_of(step) {
-        return Err("Value must match the step from the minimum.");
-    }
+    validate_number(n, min, max, step)?;
     Ok(n)
 }
 
@@ -1898,7 +1878,7 @@ async fn edit_graphical_item(
     }
     let anchor = selected_anchor(cfr, items, state, fb);
     // Painting the backdrop needs an immutable view; edit afterwards.
-    let result: Option<EditResult> = {
+    let result: Option<SettingEdit> = {
         let snapshot: &[MenuItem] = items;
         let st: &GraphicalState = state;
         let backdrop = || {
@@ -1929,7 +1909,8 @@ async fn edit_graphical_item(
                     &tags,
                 )
                 .await
-                .map(EditResult::Level)
+                .and_then(|index| cfr::LEVEL_CHOICES.get(index).copied())
+                .map(SettingEdit::SetLogLevel)
             }
             Some(MenuItem::Option {
                 form_idx,
@@ -1942,7 +1923,7 @@ async fn edit_graphical_item(
                 };
                 match (&option.option_type, current_value) {
                     (CfrOptionType::Bool { .. }, CfrValue::Bool(value)) => {
-                        Some(EditResult::Bool(!*value))
+                        Some(SettingEdit::Set(CfrValue::Bool(!*value)))
                     }
                     (CfrOptionType::Enum { choices, .. }, CfrValue::Number(value)) => {
                         let current = choices.iter().position(|c| c.value == *value);
@@ -1980,7 +1961,7 @@ async fn edit_graphical_item(
                         .await
                         .and_then(|i| i.checked_sub(extra))
                         .and_then(|i| choices.get(i))
-                        .map(|c| EditResult::Number(c.value))
+                        .map(|c| SettingEdit::Set(CfrValue::Number(c.value)))
                     }
                     (CfrOptionType::Number { min, max, step, .. }, CfrValue::Number(value)) => {
                         let hint =
@@ -1997,7 +1978,7 @@ async fn edit_graphical_item(
                         )
                         .await
                         .and_then(|text| parse_graphical_number(&text, *min, *max, *step).ok())
-                        .map(EditResult::Number)
+                        .map(|n| SettingEdit::Set(CfrValue::Number(n)))
                     }
                     (CfrOptionType::Varchar { .. }, CfrValue::Varchar(value)) => dialog::input(
                         fb,
@@ -2010,7 +1991,7 @@ async fn edit_graphical_item(
                         |_| Ok(()),
                     )
                     .await
-                    .map(EditResult::Text),
+                    .map(|text| SettingEdit::Set(CfrValue::Varchar(text))),
                     _ => {
                         return;
                     }
@@ -2022,38 +2003,19 @@ async fn edit_graphical_item(
     let Some(result) = result else {
         return;
     };
-    apply_graphical_edit(items, state, result);
+    apply_graphical_edit(cfr, items, state, result);
 }
 
-fn apply_graphical_edit(items: &mut [MenuItem], state: &mut GraphicalState, result: EditResult) {
-    fn replace<T: PartialEq>(old: &mut T, new: T) -> bool {
-        let changed = *old != new;
-        *old = new;
-        changed
-    }
-    let changed = match (items.get_mut(state.selected), result) {
-        (Some(MenuItem::CrabLogLevel { current_level, .. }), EditResult::Level(i)) => {
-            replace(current_level, crate::cfr::LEVEL_CHOICES[i])
-        }
-        (Some(MenuItem::Option { current_value, .. }), result) => match (current_value, result) {
-            (CfrValue::Bool(v), EditResult::Bool(n)) => replace(v, n),
-            (CfrValue::Number(v), EditResult::Number(n)) => replace(v, n),
-            (CfrValue::Varchar(v), EditResult::Text(t)) => replace(v, t),
-            _ => false,
-        },
-        _ => false,
-    };
-    if changed {
+fn apply_graphical_edit(
+    cfr: &CfrInfo<'_>,
+    items: &mut [MenuItem],
+    state: &mut GraphicalState,
+    edit: SettingEdit,
+) {
+    if apply_edit(cfr, items, state.selected, edit) == Some(true) {
         state.save_result = None;
         state.status_message = None;
     }
-}
-
-enum EditResult {
-    Level(usize),
-    Bool(bool),
-    Number(u32),
-    Text(String),
 }
 
 async fn show_no_options_graphical(fb: &FramebufferInfo) -> ui::ScreenNav {
@@ -2174,17 +2136,26 @@ mod graphical_tests {
             assert!(graphical_key_allowed(Group::Sections, key));
             assert!(!graphical_key_allowed(Group::Navigation, key));
         }
-        let mut items = [MenuItem::Option {
-            form_idx: 0,
-            option_idx: 0,
-            current_value: CfrValue::Bool(false),
-            original_value: CfrValue::Bool(false),
+        let cfr = CfrInfo::new();
+        let mut items = [MenuItem::CrabLogLevel {
+            current_level: log::LevelFilter::Info,
+            original_level: log::LevelFilter::Info,
         }];
         let mut state = GraphicalState::new(0);
         state.save_result = Some((1, 0));
-        apply_graphical_edit(&mut items, &mut state, EditResult::Bool(false));
+        apply_graphical_edit(
+            &cfr,
+            &mut items,
+            &mut state,
+            SettingEdit::SetLogLevel(log::LevelFilter::Info),
+        );
         assert_eq!(state.save_result, Some((1, 0)));
-        apply_graphical_edit(&mut items, &mut state, EditResult::Bool(true));
+        apply_graphical_edit(
+            &cfr,
+            &mut items,
+            &mut state,
+            SettingEdit::SetLogLevel(log::LevelFilter::Trace),
+        );
         assert_eq!(state.save_result, None);
     }
 

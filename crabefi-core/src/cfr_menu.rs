@@ -23,9 +23,9 @@ use core::fmt::Write;
 
 use crabefi_ui::cfr::SettingsModel;
 use crabefi_ui::settings::{
-    MenuItem, Session, build_menu_items, can_edit_item, decrement_option, find_first_selectable,
-    get_option, has_changes, increment_option, is_item_visible, is_selectable, push_truncated,
-    save_all_changes, stepped_number,
+    MenuItem, Session, SettingEdit, apply_edit, build_menu_items, can_edit_item, decrement_option,
+    find_first_selectable, get_option, has_changes, increment_option, is_item_visible,
+    is_selectable, push_truncated, save_all_changes,
 };
 use heapless::String as StackString;
 
@@ -121,22 +121,10 @@ pub fn show_cfr_menu() {
                         break;
                     }
                     KeyPress::Enter | KeyPress::Char(' ') => {
-                        if can_edit_item(cfr_info, &items, selected) {
-                            if let Some(MenuItem::Option {
-                                form_idx,
-                                option_idx,
-                                current_value,
-                                ..
-                            }) = items.get_mut(selected)
-                            {
-                                let (fi, oi) = (*form_idx, *option_idx);
-                                if let Some(option) = get_option(cfr_info, fi, oi) {
-                                    toggle_value(option, current_value);
-                                }
-                            } else {
-                                increment_option(cfr_info, &mut items, selected);
-                            }
-                        } else if is_selectable_item(items.get(selected)) {
+                        if apply_edit(cfr_info, &mut items, selected, SettingEdit::Cycle).is_none()
+                            && is_selectable_item(items.get(selected))
+                            && !can_edit_item(cfr_info, &items, selected)
+                        {
                             status_message = Some(("Option is read-only", false));
                         }
                         break;
@@ -210,36 +198,6 @@ fn get_visible_rows(fb_console: &Option<FramebufferConsole>) -> usize {
         .map(|c| c.rows() as usize)
         .unwrap_or(20)
         .saturating_sub(10)
-}
-
-/// Toggle/cycle a value (Enter/Space)
-fn toggle_value(option: &CfrOption, value: &mut CfrValue) -> bool {
-    match (&option.option_type, value) {
-        (CfrOptionType::Bool { .. }, CfrValue::Bool(b)) => {
-            *b = !*b;
-            true
-        }
-        (CfrOptionType::Enum { choices, .. }, CfrValue::Number(n)) => {
-            if choices.is_empty() {
-                return false;
-            }
-            let current_idx = choices.iter().position(|c| c.value == *n).unwrap_or(0);
-            let next_idx = (current_idx + 1) % choices.len();
-            if let Some(choice) = choices.get(next_idx) {
-                *n = choice.value;
-                return true;
-            }
-            false
-        }
-        (CfrOptionType::Number { min, max, step, .. }, CfrValue::Number(n)) => {
-            if min > max {
-                return false;
-            }
-            *n = stepped_number(*n, *min, *max, *step, true).unwrap_or(*min);
-            true
-        }
-        _ => false,
-    }
 }
 
 /// Show confirmation dialog for saving on exit
