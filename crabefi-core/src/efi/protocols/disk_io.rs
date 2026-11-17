@@ -9,7 +9,7 @@ use core::ffi::c_void;
 use r_efi::efi::{Handle, Status};
 use r_efi::protocols::disk_io;
 
-use super::block_io::{BLOCK_IO_PROTOCOL_GUID, BlockIoProtocol};
+use super::block_io::{BLOCK_IO_PROTOCOL_GUID, BlockIoMedia, BlockIoProtocol};
 use super::instance::Registry;
 use crate::efi::boot_services;
 
@@ -31,6 +31,28 @@ struct DiskIoContext {
 
 static INSTANCES: Registry<DiskIoProtocol, DiskIoContext> = Registry::new();
 
+/// The fields present even in revision 1 of EFI_BLOCK_IO_MEDIA.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MediaPrefix {
+    media_id: u32,
+    removable_media: u8,
+    media_present: u8,
+    logical_partition: u8,
+    read_only: u8,
+    write_caching: u8,
+    block_size: u32,
+    io_align: u32,
+    last_block: u64,
+}
+
+const _: () = {
+    use core::mem::{offset_of, size_of};
+    assert!(offset_of!(MediaPrefix, block_size) == offset_of!(BlockIoMedia, block_size));
+    assert!(offset_of!(MediaPrefix, last_block) == offset_of!(BlockIoMedia, last_block));
+    assert!(size_of::<MediaPrefix>() == offset_of!(BlockIoMedia, lowest_aligned_lba));
+};
+
 #[derive(Debug, PartialEq, Eq)]
 struct ReadSpan {
     start_lba: u64,
@@ -39,14 +61,14 @@ struct ReadSpan {
 }
 
 impl ReadSpan {
-    fn checked(offset: u64, len: usize, block_size: u64, last_block: u64) -> Option<Self> {
+    fn checked(offset: u64, len: usize, block_size: u64, last_block: Option<u64>) -> Option<Self> {
         if block_size == 0 || len == 0 {
             return None;
         }
         let end = offset.checked_add(u64::try_from(len).ok()?)?;
         let start_lba = offset / block_size;
         let end_lba = end.div_ceil(block_size);
-        if end_lba.checked_sub(1)? > last_block {
+        if last_block.is_some_and(|last| end_lba - 1 > last) {
             return None;
         }
         let blocks = end_lba.checked_sub(start_lba)?;
@@ -102,9 +124,12 @@ extern "efiapi" fn disk_io_read_disk(
     }
 
     let block_io = block_io_ptr as *mut BlockIoProtocol;
-    let Some(media) = (unsafe { (*block_io).media.as_ref() }) else {
+    let media = unsafe { (*block_io).media.cast::<MediaPrefix>() };
+    if media.is_null() {
         return Status::DEVICE_ERROR;
-    };
+    }
+    // Copy the revision-1 prefix; the provider may update it during ReadBlocks.
+    let media = unsafe { media.read() };
     let block_size = u64::from(media.block_size);
 
     if block_size == 0 {
@@ -116,27 +141,41 @@ extern "efiapi" fn disk_io_read_disk(
         return Status::MEDIA_CHANGED;
     }
 
+    // Removable devices can discover removal or replacement in ReadBlocks.
+    // Let them report media status before checking their current LBA bounds.
+    let last_block =
+        (media.removable_media == 0 && media.media_present != 0).then_some(media.last_block);
     let Some(ReadSpan {
         start_lba,
         start_offset,
         aligned_size,
-    }) = ReadSpan::checked(offset, buffer_size, block_size, media.last_block)
+    }) = ReadSpan::checked(offset, buffer_size, block_size, last_block)
     else {
         return Status::INVALID_PARAMETER;
     };
 
-    // If already block-aligned, read directly into buffer
-    if start_offset == 0 && buffer_size == aligned_size {
+    // IoAlign is zero or one for unrestricted buffers, otherwise a power of two.
+    let io_align = media.io_align.max(1) as usize;
+    if !io_align.is_power_of_two() {
+        return Status::DEVICE_ERROR;
+    }
+    if start_offset == 0 && buffer_size == aligned_size && buffer.addr().is_multiple_of(io_align) {
         let status = boot_services::with_image_callback(|| unsafe {
             ((*block_io).read_blocks)(block_io, media_id, start_lba, buffer_size, buffer)
         });
         return status;
     }
 
-    // Unaligned: allocate a temporary buffer for block-aligned read
-    let temp_buf = match crate::efi::allocator::allocate_pool(
+    // Leave room to align the temporary buffer without losing the pool pointer.
+    let Some(pool_size) = aligned_size
+        .checked_add(io_align - 1)
+        .filter(|size| *size <= isize::MAX as usize)
+    else {
+        return Status::OUT_OF_RESOURCES;
+    };
+    let pool = match crate::efi::allocator::allocate_pool(
         crate::efi::allocator::MemoryType::BootServicesData,
-        aligned_size,
+        pool_size,
     ) {
         Ok(ptr) => ptr,
         Err(_) => {
@@ -148,14 +187,10 @@ extern "efiapi" fn disk_io_read_disk(
         }
     };
 
+    // SAFETY: a byte pointer needs at most io_align - 1 bytes of padding.
+    let temp_buf = unsafe { pool.add(pool.align_offset(io_align)) };
     let status = boot_services::with_image_callback(|| unsafe {
-        ((*block_io).read_blocks)(
-            block_io,
-            media_id,
-            start_lba,
-            aligned_size,
-            temp_buf as *mut c_void,
-        )
+        ((*block_io).read_blocks)(block_io, media_id, start_lba, aligned_size, temp_buf.cast())
     });
 
     if status == Status::SUCCESS {
@@ -169,7 +204,7 @@ extern "efiapi" fn disk_io_read_disk(
         }
     }
 
-    let _ = crate::efi::allocator::free_pool(temp_buf);
+    let _ = crate::efi::allocator::free_pool(pool);
     status
 }
 
@@ -180,7 +215,7 @@ mod tests {
     #[test]
     fn rounds_unaligned_reads_up_to_full_blocks() {
         assert_eq!(
-            ReadSpan::checked(4095, 2, 4096, 1),
+            ReadSpan::checked(4095, 2, 4096, Some(1)),
             Some(ReadSpan {
                 start_lba: 0,
                 start_offset: 4095,
@@ -188,7 +223,7 @@ mod tests {
             })
         );
         assert_eq!(
-            ReadSpan::checked(4096, 4096, 4096, 1),
+            ReadSpan::checked(4096, 4096, 4096, Some(1)),
             Some(ReadSpan {
                 start_lba: 1,
                 start_offset: 0,
@@ -199,12 +234,12 @@ mod tests {
 
     #[test]
     fn rejects_invalid_or_unrepresentable_spans() {
-        assert!(ReadSpan::checked(4095, 2, 4096, 0).is_none());
-        assert!(ReadSpan::checked(4096, 1, 4096, 0).is_none());
-        assert!(ReadSpan::checked(u64::MAX, 1, 512, u64::MAX).is_none());
-        assert!(ReadSpan::checked(0, isize::MAX as usize, 512, u64::MAX).is_none());
-        assert!(ReadSpan::checked(0, 1, 0, 0).is_none());
-        assert!(ReadSpan::checked(0, 0, 512, 0).is_none());
+        assert!(ReadSpan::checked(4095, 2, 4096, Some(0)).is_none());
+        assert!(ReadSpan::checked(4096, 1, 4096, Some(0)).is_none());
+        assert!(ReadSpan::checked(u64::MAX, 1, 512, None).is_none());
+        assert!(ReadSpan::checked(0, isize::MAX as usize, 512, None).is_none());
+        assert!(ReadSpan::checked(0, 1, 0, None).is_none());
+        assert!(ReadSpan::checked(0, 0, 512, None).is_none());
     }
 }
 
