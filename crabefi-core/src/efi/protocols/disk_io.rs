@@ -53,36 +53,112 @@ const _: () = {
     assert!(size_of::<MediaPrefix>() == offset_of!(BlockIoMedia, lowest_aligned_lba));
 };
 
+/// Largest bounce buffer used for whole blocks that cannot go straight into
+/// the caller's buffer. Larger misaligned reads are bounced in chunks.
+const MAX_BOUNCE_BYTES: usize = 64 * 1024;
+
+/// How a byte-granular read maps onto BlockIO transfers.
+///
+/// Like EDK2's DiskIo, a read is split into an optional partial head block,
+/// whole middle blocks, and an optional partial tail block. Middle blocks
+/// are read straight into the caller's buffer when it satisfies `IoAlign`.
+/// Partial blocks, and middle blocks the caller's buffer cannot receive,
+/// pass through a bounce buffer of at most `MAX_BOUNCE_BYTES` (or one block,
+/// if that is larger), so temporary memory does not grow with the request.
 #[derive(Debug, PartialEq, Eq)]
-struct ReadSpan {
-    start_lba: u64,
-    start_offset: usize,
-    aligned_size: usize,
+struct ReadPlan {
+    /// First LBA the read touches.
+    lba: u64,
+    /// Offset of the first requested byte within the head block.
+    head_offset: usize,
+    /// Bytes copied out of the partially requested first block.
+    head_len: usize,
+    /// Whole blocks between the head and the tail.
+    middle_blocks: usize,
+    /// Whether the middle blocks must pass through the bounce buffer.
+    bounce_middle: bool,
+    /// Bytes copied out of the partially requested last block.
+    tail_len: usize,
+    /// Blocks in the bounce buffer; zero when every transfer is direct.
+    bounce_blocks: usize,
 }
 
-impl ReadSpan {
-    fn checked(offset: u64, len: usize, block_size: u64, last_block: Option<u64>) -> Option<Self> {
-        if block_size == 0 || len == 0 {
+impl ReadPlan {
+    /// Plan a read of `len` bytes at byte `offset` into the buffer at address
+    /// `buffer`. `last_block` bounds the request when the media size is
+    /// known; otherwise BlockIO validates each transfer.
+    fn new(
+        offset: u64,
+        len: usize,
+        block_size: u32,
+        buffer: usize,
+        io_align: usize,
+        last_block: Option<u64>,
+    ) -> Option<Self> {
+        let block = usize::try_from(block_size).ok().filter(|&size| size != 0)?;
+        let block_size = u64::from(block_size);
+        if len == 0 || io_align == 0 {
             return None;
         }
         let end = offset.checked_add(u64::try_from(len).ok()?)?;
-        let start_lba = offset / block_size;
-        let end_lba = end.div_ceil(block_size);
-        if last_block.is_some_and(|last| end_lba - 1 > last) {
+        if last_block.is_some_and(|last| (end - 1) / block_size > last) {
             return None;
         }
-        let blocks = end_lba.checked_sub(start_lba)?;
-        let aligned_size = usize::try_from(blocks.checked_mul(block_size)?).ok()?;
-        let start_offset = usize::try_from(offset % block_size).ok()?;
-        // Keep the BlockIO buffer and the copy within one representable span.
-        if aligned_size > isize::MAX as usize || start_offset.checked_add(len)? > aligned_size {
-            return None;
-        }
+        buffer.checked_add(len)?;
+
+        let head_offset = usize::try_from(offset % block_size).ok()?;
+        let head_len = if head_offset == 0 {
+            0
+        } else {
+            (block - head_offset).min(len)
+        };
+        let middle_blocks = (len - head_len) / block;
+        let tail_len = (len - head_len) % block;
+        let bounce_middle = middle_blocks != 0 && !(buffer + head_len).is_multiple_of(io_align);
+        let bounce_blocks = if bounce_middle {
+            middle_blocks.min((MAX_BOUNCE_BYTES / block).max(1))
+        } else {
+            usize::from(head_len != 0 || tail_len != 0)
+        };
         Some(Self {
-            start_lba,
-            start_offset,
-            aligned_size,
+            lba: offset / block_size,
+            head_offset,
+            head_len,
+            middle_blocks,
+            bounce_middle,
+            tail_len,
+            bounce_blocks,
         })
+    }
+}
+
+/// A pool allocation with an `IoAlign`-aligned window, freed on drop.
+struct Bounce {
+    pool: *mut u8,
+    data: *mut u8,
+}
+
+impl Bounce {
+    fn new(size: usize, io_align: usize) -> Option<Self> {
+        let pool_size = size
+            .checked_add(io_align - 1)
+            .filter(|size| *size <= isize::MAX as usize)?;
+        let pool = crate::efi::allocator::allocate_pool(
+            crate::efi::allocator::MemoryType::BootServicesData,
+            pool_size,
+        )
+        .ok()?;
+        let padding = pool.addr().next_multiple_of(io_align) - pool.addr();
+        // SAFETY: padding < io_align, so the aligned window of `size` bytes
+        // stays inside the `size + io_align - 1` byte allocation.
+        let data = unsafe { pool.add(padding) };
+        Some(Self { pool, data })
+    }
+}
+
+impl Drop for Bounce {
+    fn drop(&mut self) {
+        let _ = crate::efi::allocator::free_pool(self.pool);
     }
 }
 
@@ -97,7 +173,7 @@ extern "efiapi" fn disk_io_read_disk(
     buffer_size: usize,
     buffer: *mut c_void,
 ) -> Status {
-    if this.is_null() || buffer.is_null() || buffer_size == 0 {
+    if this.is_null() || (buffer.is_null() && buffer_size != 0) {
         return Status::INVALID_PARAMETER;
     }
 
@@ -130,9 +206,7 @@ extern "efiapi" fn disk_io_read_disk(
     }
     // Copy the revision-1 prefix; the provider may update it during ReadBlocks.
     let media = unsafe { media.read() };
-    let block_size = u64::from(media.block_size);
-
-    if block_size == 0 {
+    if media.block_size == 0 {
         return Status::DEVICE_ERROR;
     }
 
@@ -141,106 +215,107 @@ extern "efiapi" fn disk_io_read_disk(
         return Status::MEDIA_CHANGED;
     }
 
-    // Removable devices can discover removal or replacement in ReadBlocks.
-    // Let them report media status before checking their current LBA bounds.
-    let last_block =
-        (media.removable_media == 0 && media.media_present != 0).then_some(media.last_block);
-    let Some(ReadSpan {
-        start_lba,
-        start_offset,
-        aligned_size,
-    }) = ReadSpan::checked(offset, buffer_size, block_size, last_block)
-    else {
-        return Status::INVALID_PARAMETER;
-    };
+    // An empty read transfers nothing; the UEFI interface does not reject it.
+    if buffer_size == 0 {
+        return Status::SUCCESS;
+    }
 
     // IoAlign is zero or one for unrestricted buffers, otherwise a power of two.
     let io_align = media.io_align.max(1) as usize;
     if !io_align.is_power_of_two() {
         return Status::DEVICE_ERROR;
     }
-    if start_offset == 0 && buffer_size == aligned_size && buffer.addr().is_multiple_of(io_align) {
-        let status = boot_services::with_image_callback(|| unsafe {
-            ((*block_io).read_blocks)(block_io, media_id, start_lba, buffer_size, buffer)
-        });
-        return status;
-    }
 
-    // Leave room to align the temporary buffer without losing the pool pointer.
-    let Some(pool_size) = aligned_size
-        .checked_add(io_align - 1)
-        .filter(|size| *size <= isize::MAX as usize)
-    else {
-        return Status::OUT_OF_RESOURCES;
+    // Removable devices can discover removal or replacement in ReadBlocks.
+    // Let them report media status before checking their current LBA bounds.
+    let last_block =
+        (media.removable_media == 0 && media.media_present != 0).then_some(media.last_block);
+    let Some(plan) = ReadPlan::new(
+        offset,
+        buffer_size,
+        media.block_size,
+        buffer.addr(),
+        io_align,
+        last_block,
+    ) else {
+        return Status::INVALID_PARAMETER;
     };
-    let pool = match crate::efi::allocator::allocate_pool(
-        crate::efi::allocator::MemoryType::BootServicesData,
-        pool_size,
-    ) {
-        Ok(ptr) => ptr,
-        Err(_) => {
+
+    let block = media.block_size as usize;
+    let bounce = if plan.bounce_blocks == 0 {
+        None
+    } else {
+        // bounce_blocks * block cannot overflow: it is at most one block or
+        // MAX_BOUNCE_BYTES.
+        let size = plan.bounce_blocks * block;
+        let Some(bounce) = Bounce::new(size, io_align) else {
             log::error!(
-                "DiskIO.ReadDisk: failed to allocate {} bytes for temp buffer",
-                aligned_size
+                "DiskIO.ReadDisk: failed to allocate {} bytes for bounce buffer",
+                size
             );
             return Status::OUT_OF_RESOURCES;
-        }
+        };
+        Some(bounce)
+    };
+    let scratch = bounce.as_ref().map_or(core::ptr::null_mut(), |b| b.data);
+    let read = |lba: u64, size: usize, dest: *mut u8| {
+        boot_services::with_image_callback(|| unsafe {
+            ((*block_io).read_blocks)(block_io, media_id, lba, size, dest.cast())
+        })
     };
 
-    // SAFETY: a byte pointer needs at most io_align - 1 bytes of padding.
-    let temp_buf = unsafe { pool.add(pool.align_offset(io_align)) };
-    let status = boot_services::with_image_callback(|| unsafe {
-        ((*block_io).read_blocks)(block_io, media_id, start_lba, aligned_size, temp_buf.cast())
-    });
+    let dest = buffer.cast::<u8>();
+    let mut lba = plan.lba;
+    let mut done = 0usize;
 
-    if status == Status::SUCCESS {
-        // Copy the requested portion from the aligned buffer
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                temp_buf.add(start_offset),
-                buffer as *mut u8,
-                buffer_size,
-            );
+    if plan.head_len != 0 {
+        let status = read(lba, block, scratch);
+        if status != Status::SUCCESS {
+            return status;
         }
+        // SAFETY: the bounce buffer holds a whole block and the caller's
+        // buffer holds buffer_size >= head_len bytes.
+        unsafe {
+            core::ptr::copy_nonoverlapping(scratch.add(plan.head_offset), dest, plan.head_len);
+        }
+        done = plan.head_len;
+        lba += 1;
     }
 
-    let _ = crate::efi::allocator::free_pool(pool);
-    status
-}
-
-#[cfg(test)]
-mod tests {
-    use super::ReadSpan;
-
-    #[test]
-    fn rounds_unaligned_reads_up_to_full_blocks() {
-        assert_eq!(
-            ReadSpan::checked(4095, 2, 4096, Some(1)),
-            Some(ReadSpan {
-                start_lba: 0,
-                start_offset: 4095,
-                aligned_size: 8192,
-            })
-        );
-        assert_eq!(
-            ReadSpan::checked(4096, 4096, 4096, Some(1)),
-            Some(ReadSpan {
-                start_lba: 1,
-                start_offset: 0,
-                aligned_size: 4096,
-            })
-        );
+    let mut remaining = plan.middle_blocks;
+    while remaining != 0 {
+        let blocks = if plan.bounce_middle {
+            remaining.min(plan.bounce_blocks)
+        } else {
+            remaining
+        };
+        let size = blocks * block;
+        // SAFETY: done + size <= buffer_size.
+        let target = unsafe { dest.add(done) };
+        let status = read(lba, size, if plan.bounce_middle { scratch } else { target });
+        if status != Status::SUCCESS {
+            return status;
+        }
+        if plan.bounce_middle {
+            // SAFETY: the bounce buffer holds bounce_blocks >= blocks blocks.
+            unsafe { core::ptr::copy_nonoverlapping(scratch, target, size) };
+        }
+        done += size;
+        lba += blocks as u64;
+        remaining -= blocks;
     }
 
-    #[test]
-    fn rejects_invalid_or_unrepresentable_spans() {
-        assert!(ReadSpan::checked(4095, 2, 4096, Some(0)).is_none());
-        assert!(ReadSpan::checked(4096, 1, 4096, Some(0)).is_none());
-        assert!(ReadSpan::checked(u64::MAX, 1, 512, None).is_none());
-        assert!(ReadSpan::checked(0, isize::MAX as usize, 512, None).is_none());
-        assert!(ReadSpan::checked(0, 1, 0, None).is_none());
-        assert!(ReadSpan::checked(0, 0, 512, None).is_none());
+    if plan.tail_len != 0 {
+        let status = read(lba, block, scratch);
+        if status != Status::SUCCESS {
+            return status;
+        }
+        // SAFETY: done + tail_len == buffer_size, and the bounce buffer holds
+        // a whole block.
+        unsafe { core::ptr::copy_nonoverlapping(scratch, dest.add(done), plan.tail_len) };
     }
+
+    Status::SUCCESS
 }
 
 /// Write to the disk (not supported - read only for boot)
@@ -309,5 +384,77 @@ pub fn install_disk_io_on_handle(handle: Handle) {
             handle,
             status
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_BOUNCE_BYTES, ReadPlan};
+
+    #[test]
+    fn direct_reads_need_no_bounce_buffer() {
+        assert_eq!(
+            ReadPlan::new(512, 1024, 512, 0x1000, 512, Some(2)),
+            Some(ReadPlan {
+                lba: 1,
+                head_offset: 0,
+                head_len: 0,
+                middle_blocks: 2,
+                bounce_middle: false,
+                tail_len: 0,
+                bounce_blocks: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn partial_blocks_bounce_one_block_and_middles_stay_direct() {
+        // The middle starts at 0x1200, which satisfies IoAlign.
+        assert_eq!(
+            ReadPlan::new(100, 2000, 512, 0x1064, 512, Some(4)),
+            Some(ReadPlan {
+                lba: 0,
+                head_offset: 100,
+                head_len: 412,
+                middle_blocks: 3,
+                bounce_middle: false,
+                tail_len: 52,
+                bounce_blocks: 1,
+            })
+        );
+        // A read inside one block is all head.
+        assert_eq!(
+            ReadPlan::new(4095, 1, 4096, 0x1000, 1, Some(0)),
+            Some(ReadPlan {
+                lba: 0,
+                head_offset: 4095,
+                head_len: 1,
+                middle_blocks: 0,
+                bounce_middle: false,
+                tail_len: 0,
+                bounce_blocks: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn misaligned_middles_bounce_in_bounded_chunks() {
+        let plan = ReadPlan::new(0, 512 * 1000, 512, 0x1001, 512, None).unwrap();
+        assert!(plan.bounce_middle);
+        assert_eq!(plan.middle_blocks, 1000);
+        assert_eq!(plan.bounce_blocks, MAX_BOUNCE_BYTES / 512);
+        // A block larger than the cap still bounces one block at a time.
+        let plan = ReadPlan::new(0, 1 << 20, 1 << 18, 0x1001, 16, None).unwrap();
+        assert_eq!(plan.bounce_blocks, 1);
+    }
+
+    #[test]
+    fn rejects_invalid_or_unrepresentable_spans() {
+        assert!(ReadPlan::new(4095, 2, 4096, 0x1000, 1, Some(0)).is_none());
+        assert!(ReadPlan::new(4096, 1, 4096, 0x1000, 1, Some(0)).is_none());
+        assert!(ReadPlan::new(u64::MAX, 1, 512, 0x1000, 1, None).is_none());
+        assert!(ReadPlan::new(0, 2, 512, usize::MAX, 1, None).is_none());
+        assert!(ReadPlan::new(0, 1, 0, 0x1000, 1, None).is_none());
+        assert!(ReadPlan::new(0, 0, 512, 0x1000, 1, None).is_none());
     }
 }
