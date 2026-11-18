@@ -150,9 +150,57 @@ pub unsafe extern "C" fn dispatch(request: *const BridgeRequest) -> usize {
     let result = unsafe { request.as_ref() }
         .ok_or(Status::INVALID_PARAMETER)
         .and_then(|request| unsafe { persist(request) });
+    #[cfg(all(feature = "replay-test-reset-after-persist", target_arch = "x86_64"))]
+    if result.is_ok()
+        && let Some(request) = unsafe { request.as_ref() }
+    {
+        replay_fault::after_persist(request);
+    }
     match result {
         Ok(()) => Status::SUCCESS.as_usize(),
         Err(status) => status.as_usize(),
+    }
+}
+
+/// Test only (runtime-replay-interrupt-test): reset right after the first
+/// persisted write of runtime-image-test's private variable, before replay
+/// can acknowledge its journal record, as a power cut or watchdog would.
+/// Armed once through CMOS byte 0x7e, which survives the reset.
+#[cfg(all(feature = "replay-test-reset-after-persist", target_arch = "x86_64"))]
+mod replay_fault {
+    const CMOS_INDEX: u8 = 0x7e;
+    const ARMED: u8 = 0xa5;
+    /// GUID of runtime-image-test's private authenticated variable.
+    const GUID: [u8; 16] = [
+        0x5e, 0x7c, 0x7c, 0x2b, 0x0a, 0x0d, 0x8e, 0x4b, 0x9a, 0x59, 0x5c, 0xe0, 0xc3, 0xa0, 0xe7,
+        0xd1,
+    ];
+
+    fn cmos(value: Option<u8>) -> u8 {
+        // SAFETY: the RTC/CMOS index and data ports.
+        unsafe {
+            core::arch::asm!("out 0x70, al", in("al") CMOS_INDEX, options(nomem, nostack));
+            match value {
+                Some(value) => {
+                    core::arch::asm!("out 0x71, al", in("al") value, options(nomem, nostack));
+                    value
+                }
+                None => {
+                    let read: u8;
+                    core::arch::asm!("in al, 0x71", out("al") read, options(nomem, nostack));
+                    read
+                }
+            }
+        }
+    }
+
+    pub(super) fn after_persist(request: &crabefi_runtime_abi::BridgeRequest) {
+        if request.guid != GUID || cmos(None) != ARMED {
+            return;
+        }
+        cmos(Some(0));
+        log::warn!("replay fault injection: reset before the journal acknowledgement");
+        crate::reset_system();
     }
 }
 

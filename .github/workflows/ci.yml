@@ -217,6 +217,8 @@ jobs:
           sudo apt-get install -y qemu-system-x86 mtools dosfstools zstd coreboot-utils
       - name: Validate runtime image boundary and variable services
         run: ./crabefi test --app runtime-image-test --disable-kvm --timeout 120
+      - name: Replay applies an interrupted authenticated append once
+        run: ./crabefi test --app runtime-replay-interrupt-test --disable-kvm --timeout 180
       - name: Test on-demand USB and the external boot policy
         run: ./crabefi test --app boot-policy-test --disable-kvm --timeout 120
   test-payload-mm:

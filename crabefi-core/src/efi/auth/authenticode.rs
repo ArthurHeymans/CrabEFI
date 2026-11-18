@@ -653,7 +653,7 @@ mod tests {
             let tbs = crabefi_pkcs7::x509::Certificate::parse(certificate)
                 .unwrap()
                 .tbs;
-            let mut entry = Sha256::digest(tbs).to_vec();
+            let mut entry = crate::efi::digest::boot_sha256([tbs]).to_vec();
             entry.extend_from_slice(&[0; 16]);
             entry
         }

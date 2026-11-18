@@ -108,16 +108,24 @@ pub extern "efiapi" fn efi_main(image: Handle, system: *mut SystemTable) -> Stat
 
     #[cfg(target_arch = "x86_64")]
     if replay_marker_present(runtime) {
-        if replayed_runtime_writes(runtime) {
-            cleanup_replayed_runtime_writes(runtime);
+        let variables = replayed_runtime_writes(runtime);
+        let capsule = capsule_result_recorded(runtime);
+        cleanup_replayed_runtime_writes(runtime);
+        if variables {
             serial("RUNTIME DEFERRED VARIABLE REPLAY PASSED\r\n");
+        }
+        if capsule {
             serial("RUNTIME CAPSULE CONSUMPTION PASSED\r\n");
+        }
+        if variables && capsule {
             qemu_debug_exit(0x10);
         }
-        cleanup_replayed_runtime_writes(runtime);
         serial("RUNTIME TWO BOOT REPLAY FAILED\r\n");
         qemu_debug_exit(0x11);
-    } else if !set_replay_marker(runtime) || !set_boot_only_variable(runtime) {
+    } else if !set_replay_marker(runtime)
+        || !set_boot_only_variable(runtime)
+        || !create_private_variable(runtime)
+    {
         return Status::DEVICE_ERROR;
     }
 
@@ -292,6 +300,41 @@ const DEFERRED_NAME: [u16; 11] = [
     b'd' as u16,
     0,
 ];
+/// A private authenticated variable (fixtures from crabefi-runtime-image):
+/// created at boot, appended to at runtime, so replay re-verifies an append.
+#[cfg(target_arch = "x86_64")]
+const PRIVATE_GUID: efi::Guid = efi::Guid::from_fields(
+    0x2b7c7c5e,
+    0x0d0a,
+    0x4b8e,
+    0x9a,
+    0x59,
+    &[0x5c, 0xe0, 0xc3, 0xa0, 0xe7, 0xd1],
+);
+#[cfg(target_arch = "x86_64")]
+const PRIVATE_NAME: [u16; 15] = [
+    b'C' as u16,
+    b'r' as u16,
+    b'a' as u16,
+    b'b' as u16,
+    b'E' as u16,
+    b'f' as u16,
+    b'i' as u16,
+    b'P' as u16,
+    b'r' as u16,
+    b'i' as u16,
+    b'v' as u16,
+    b'a' as u16,
+    b't' as u16,
+    b'e' as u16,
+    0,
+];
+#[cfg(target_arch = "x86_64")]
+const PRIVATE_ATTRIBUTES: u32 = efi::VARIABLE_NON_VOLATILE
+    | efi::VARIABLE_BOOTSERVICE_ACCESS
+    | efi::VARIABLE_RUNTIME_ACCESS
+    | efi::VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS;
+
 /// A boot-services-only variable that runtime writes must not change.
 #[cfg(target_arch = "x86_64")]
 const BOOT_ONLY_NAME: [u16; 11] = [
@@ -374,6 +417,79 @@ fn set_replay_marker(runtime: *mut efi::RuntimeServices) -> bool {
             marker.as_mut_ptr().cast(),
         ) == Status::SUCCESS
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn set_private_variable(
+    runtime: *mut efi::RuntimeServices,
+    attributes: u32,
+    envelope: &[u8],
+) -> Status {
+    let mut name = PRIVATE_NAME;
+    let mut guid = PRIVATE_GUID;
+    let mut data = [0u8; 4096];
+    data[..envelope.len()].copy_from_slice(envelope);
+    unsafe {
+        ((*runtime).set_variable)(
+            name.as_mut_ptr(),
+            &mut guid,
+            attributes,
+            envelope.len(),
+            data.as_mut_ptr().cast(),
+        )
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn create_private_variable(runtime: *mut efi::RuntimeServices) -> bool {
+    let status = set_private_variable(
+        runtime,
+        PRIVATE_ATTRIBUTES,
+        include_bytes!("../../../crabefi-runtime-image/tests/fixtures/private-create.bin"),
+    );
+    if status != Status::SUCCESS {
+        serial("RUNTIME PRIVATE CREATE FAILED\r\n");
+    }
+    status == Status::SUCCESS
+}
+
+/// Append to the private variable after ExitBootServices: replay applies the
+/// journalled envelope on the next boot. CMOS byte 0x7e arms the
+/// replay-test-reset-after-persist payload to reset between persisting it
+/// and acknowledging it; the append must still be applied exactly once.
+#[cfg(target_arch = "x86_64")]
+fn append_private_variable(runtime: *mut efi::RuntimeServices) -> bool {
+    let status = set_private_variable(
+        runtime,
+        PRIVATE_ATTRIBUTES | efi::VARIABLE_APPEND_WRITE,
+        include_bytes!("../../../crabefi-runtime-image/tests/fixtures/private-append-older.bin"),
+    );
+    if status != Status::SUCCESS {
+        serial("RUNTIME PRIVATE APPEND FAILED\r\n");
+        return false;
+    }
+    cmos_replay_fault(0xa5);
+    true
+}
+
+#[cfg(target_arch = "x86_64")]
+fn cmos_replay_fault(value: u8) {
+    unsafe {
+        core::arch::asm!("out 0x70, al", in("al") 0x7eu8, options(nomem, nostack));
+        core::arch::asm!("out 0x71, al", in("al") value, options(nomem, nostack));
+    }
+}
+
+/// The append replayed once: create wrote "A", the append "C".
+#[cfg(target_arch = "x86_64")]
+fn private_variable_appended_once(runtime: *mut efi::RuntimeServices) -> bool {
+    let mut value = [0u8; 2];
+    let appended =
+        get_exact_variable(runtime, PRIVATE_NAME, PRIVATE_GUID, &mut value) && value == *b"AC";
+    if !appended {
+        serial("RUNTIME PRIVATE APPEND NOT REPLAYED EXACTLY ONCE\r\n");
+    }
+    appended
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -466,7 +582,7 @@ fn boot_only_variable_unchanged(runtime: *mut efi::RuntimeServices) -> bool {
 
 #[cfg(target_arch = "x86_64")]
 fn queue_runtime_writes(runtime: *mut efi::RuntimeServices) -> bool {
-    if !boot_only_variable_rejects_runtime_writes(runtime) {
+    if !boot_only_variable_rejects_runtime_writes(runtime) || !append_private_variable(runtime) {
         return false;
     }
     let mut name = DEFERRED_NAME;
@@ -546,6 +662,12 @@ fn replayed_runtime_writes(runtime: *mut efi::RuntimeServices) -> bool {
         }
         return false;
     }
+    boot_only_variable_unchanged(runtime) && private_variable_appended_once(runtime)
+}
+
+/// The capsule staged at runtime was applied on the next boot.
+#[cfg(target_arch = "x86_64")]
+fn capsule_result_recorded(runtime: *mut efi::RuntimeServices) -> bool {
     let mut capsule_result = [0u8; 44];
     let present = get_exact_variable(
         runtime,
@@ -553,9 +675,6 @@ fn replayed_runtime_writes(runtime: *mut efi::RuntimeServices) -> bool {
         CAPSULE_REPORT_GUID,
         &mut capsule_result,
     );
-    if !boot_only_variable_unchanged(runtime) {
-        return false;
-    }
     if !present {
         serial("RUNTIME CAPSULE RESULT MISSING\r\n");
     } else if capsule_result[40..44] != 0u32.to_le_bytes() {
@@ -589,6 +708,12 @@ fn cleanup_replayed_runtime_writes(runtime: *mut efi::RuntimeServices) {
     delete_variable(runtime, REPLAY_MARKER_NAME, DEFERRED_TEST_GUID);
     delete_variable(runtime, DEFERRED_NAME, DEFERRED_TEST_GUID);
     delete_variable(runtime, BOOT_ONLY_NAME, DEFERRED_TEST_GUID);
+    let _ = set_private_variable(
+        runtime,
+        PRIVATE_ATTRIBUTES,
+        include_bytes!("../../../crabefi-runtime-image/tests/fixtures/private-delete.bin"),
+    );
+    cmos_replay_fault(0);
     delete_variable(runtime, CAPSULE_RESULT_NAME, CAPSULE_REPORT_GUID);
 }
 

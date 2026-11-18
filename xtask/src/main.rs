@@ -409,6 +409,7 @@ fn test_payload_features(app: &str) -> &'static [&'static str] {
         "boot-policy-test" => &["usb-on-demand"],
         "fwui-test" => &["external-boot-setting"],
         "mm-seal-test" => &["payload-mm-test-lose-ready-to-boot"],
+        "runtime-replay-interrupt-test" => &["replay-test-reset-after-persist"],
         _ => &[],
     }
 }
@@ -933,7 +934,13 @@ fn cmd_test(
         // ── Normal UEFI test app ─────────────────────────────────────
         // mm-seal-test boots hello on a payload whose MM never closes the
         // firmware phase: hello must never run.
-        let efi_app = if app == "mm-seal-test" { "hello" } else { app };
+        let efi_app = match app {
+            "mm-seal-test" => "hello",
+            // runtime-image-test on a payload that resets in the middle of
+            // replaying its journal.
+            "runtime-replay-interrupt-test" => "runtime-image-test",
+            app => app,
+        };
         println!("Building test app: {}", efi_app);
         cmd_build_test_app(efi_app, arch)?;
 

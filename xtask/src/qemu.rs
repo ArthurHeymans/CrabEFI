@@ -26,7 +26,7 @@ enum CaptureScenario {
 
 impl CaptureScenario {
     fn for_test_app(app: &str) -> Self {
-        if app == "runtime-image-test" {
+        if app == "runtime-image-test" || app == "runtime-replay-interrupt-test" {
             Self::RuntimeImageReplay
         } else {
             Self::Integration
@@ -1492,7 +1492,19 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
                 failed += 1;
             }
         }
-        "runtime-image-test" => {
+        "runtime-image-test" | "runtime-replay-interrupt-test" => {
+            if app_name == "runtime-replay-interrupt-test" {
+                if result
+                    .output
+                    .contains("replay fault injection: reset before the journal acknowledgement")
+                {
+                    println!("[PASS] replay_interrupted: replay reset after persisting a record");
+                    passed += 1;
+                } else {
+                    println!("[FAIL] replay_interrupted: the fault was not injected");
+                    failed += 1;
+                }
+            }
             if result.output.contains("RUNTIME IMAGE TEST PASSED") {
                 println!(
                     "[PASS] runtime_image_boundary: all Runtime Services entries are image code"
@@ -1513,11 +1525,14 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
                 println!("[FAIL] runtime_post_svam: post-SVAM marker missing");
                 failed += 1;
             }
+            // A reset in the middle of the boot loses the capsule staged at
+            // runtime, so the interrupted run only checks the variables.
             if !matches!(config.arch, Arch::X86_64)
                 || (result
                     .output
                     .contains("RUNTIME DEFERRED VARIABLE REPLAY PASSED")
-                    && result.output.contains("RUNTIME CAPSULE CONSUMPTION PASSED"))
+                    && (app_name == "runtime-replay-interrupt-test"
+                        || result.output.contains("RUNTIME CAPSULE CONSUMPTION PASSED")))
             {
                 println!(
                     "[PASS] runtime_two_boot_replay: deferred variable replayed and capsule consumed"

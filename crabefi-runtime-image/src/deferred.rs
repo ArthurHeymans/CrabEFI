@@ -243,7 +243,9 @@ struct VariableRecordHeader {
     name_len: U16,
     reserved2: U16,
     data_len: U32,
-    monotonic_count: U64,
+    /// Was an unused, always-zero monotonic count; see
+    /// [`VariableRecord::result_digest`].
+    result_digest: U64,
     timestamp: VariableTimestampWire,
     crc: U32,
 }
@@ -257,6 +259,12 @@ pub struct VariableRecord<'a> {
     pub name: [u16; MAX_NAME_LEN + 1],
     pub data: &'a [u8],
     pub timestamp: VariableTimestamp,
+    /// Authenticated appends carry a digest of the data they leave behind.
+    /// Replay persists a record before acknowledging it, so after a reset in
+    /// between, a variable that already holds this digest has the append and
+    /// must not get it twice. 0 when the record has none (other writes, or
+    /// records from older images).
+    pub result_digest: u64,
     pub crc: u32,
 }
 
@@ -292,6 +300,10 @@ pub struct DeferredWrite<'a> {
     pub timestamp: VariableTimestamp,
     pub authenticated: bool,
     pub deletion: bool,
+    /// For an authenticated append: a nonzero digest of the variable's data
+    /// once the append is applied (see [`VariableRecord::result_digest`]);
+    /// 0 for every other write.
+    pub result_digest: u64,
 }
 
 /// The retained buffer shared with the next boot.
@@ -675,7 +687,7 @@ fn serialize_record<'t>(
         name_len: U16::new(name_len as u16),
         reserved2: U16::new(0),
         data_len: U32::new(write.data.len() as u32),
-        monotonic_count: U64::new(0),
+        result_digest: U64::new(write.result_digest),
         timestamp: write.timestamp.into(),
         crc: U32::new(0),
     };
@@ -737,6 +749,7 @@ fn decode_record(bytes: &[u8]) -> Result<VariableRecord<'_>, efi::Status> {
         name,
         data,
         timestamp: header.timestamp.into(),
+        result_digest: header.result_digest.get(),
         crc: header.crc.get(),
     })
 }
@@ -772,6 +785,7 @@ mod tests {
             timestamp: VariableTimestamp::default(),
             authenticated: false,
             deletion: false,
+            result_digest: 0,
         }
     }
 
@@ -798,6 +812,7 @@ mod tests {
                     timestamp: VariableTimestamp::default(),
                     authenticated: false,
                     deletion: false,
+                    result_digest: 0,
                 },
             )
             .unwrap();

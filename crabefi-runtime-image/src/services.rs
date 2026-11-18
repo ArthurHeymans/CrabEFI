@@ -598,6 +598,7 @@ fn apply_variable(
     if verified.payload.len() > MAX_VARIABLE_DATA_SIZE {
         return Err(efi::Status::OUT_OF_RESOURCES);
     }
+    #[cfg(feature = "secure-boot")]
     let delete = verified.payload.is_empty() && !request.append();
     if phase.runtime() {
         check_runtime_access(store, &request, verified.payload.is_empty())?;
@@ -629,84 +630,92 @@ fn apply_variable(
                     &request,
                     Some(&signer),
                 )?;
-                None
+                Some((nonvolatile, true))
             }
-            Some(nonvolatile) if delete => Some(nonvolatile),
+            Some(nonvolatile) if delete => Some((nonvolatile, false)),
             _ => None,
         },
         None => None,
     };
 
-    // As in EDK2, appending nothing to a variable that does not exist
-    // succeeds without creating it.
-    if request.append()
-        && verified.payload.is_empty()
-        && store.find(&request.guid, request.name, false).is_none()
-    {
-        return Ok(());
-    }
-    let mut prepared = store.prepare(
-        request.guid,
-        request.name,
-        request.attributes,
-        verified.payload.len(),
-    )?;
-    // Authenticated commits (including deletions) record their timestamp so
-    // later envelopes must be strictly newer.
-    let recorded = verified
-        .timestamp
-        .map(|timestamp| recorded_timestamp(store, &request, verified.secure_variable, timestamp));
-    prepared.timestamp = recorded.unwrap_or_default();
-    let staged_len = store
-        .stage(
-            transaction,
-            &mut prepared,
-            verified.payload,
-            request.append(),
-        )?
-        .len();
-    let staged = transaction
-        .data(staged_len)
-        .ok_or(efi::Status::DEVICE_ERROR)?;
-    if secure_variable.is_some() && !prepared.delete && !validate_signature_database(staged) {
-        return Err(efi::Status::INVALID_PARAMETER);
-    }
-    // An append that adds nothing and does not advance the timestamp leaves
-    // the variable as it is. Do not rewrite flash for it.
-    if request.append()
-        && store
-            .find(&request.guid, request.name, false)
-            .is_some_and(|slot| {
-                usize::from(slot.data_len) == staged_len && slot.timestamp == prepared.timestamp
-            })
-    {
-        return Ok(());
-    }
-
-    if prepared
-        .attributes
-        .contains(VariableAttributes::NON_VOLATILE)
-    {
-        if phase.boot_services() {
-            persist_through_bridge(bridge, &request, &prepared, staged, recorded)?;
-        } else {
-            let sink = deferred.as_mut().ok_or(efi::Status::DEVICE_ERROR)?;
-            queue_deferred(sink, &request, &prepared, staged, verified.timestamp)?;
+    // A creation that fails after its signer was bound drops the binding
+    // again, so failed writes leave nothing behind in the signer database.
+    let result = (|| -> Result<(), efi::Status> {
+        // As in EDK2, appending nothing to a variable that does not exist
+        // succeeds without creating it.
+        if request.append()
+            && verified.payload.is_empty()
+            && store.find(&request.guid, request.name, false).is_none()
+        {
+            return Ok(());
         }
-    }
+        let mut prepared = store.prepare(
+            request.guid,
+            request.name,
+            request.attributes,
+            verified.payload.len(),
+        )?;
+        // Authenticated commits (including deletions) record their timestamp so
+        // later envelopes must be strictly newer.
+        let recorded = verified.timestamp.map(|timestamp| {
+            recorded_timestamp(store, &request, verified.secure_variable, timestamp)
+        });
+        prepared.timestamp = recorded.unwrap_or_default();
+        let staged_len = store
+            .stage(
+                transaction,
+                &mut prepared,
+                verified.payload,
+                request.append(),
+            )?
+            .len();
+        let staged = transaction
+            .data(staged_len)
+            .ok_or(efi::Status::DEVICE_ERROR)?;
+        if secure_variable.is_some() && !prepared.delete && !validate_signature_database(staged) {
+            return Err(efi::Status::INVALID_PARAMETER);
+        }
+        // An append that adds nothing and does not advance the timestamp leaves
+        // the variable as it is. Do not rewrite flash for it.
+        if request.append()
+            && store
+                .find(&request.guid, request.name, false)
+                .is_some_and(|slot| {
+                    usize::from(slot.data_len) == staged_len && slot.timestamp == prepared.timestamp
+                })
+        {
+            return Ok(());
+        }
 
-    store.commit(transaction, prepared, request.name)?;
-    if let (Some(variable), Some(timestamp)) = (verified.secure_variable, recorded) {
-        store.commit_auth_timestamp(variable, timestamp);
-    }
-    store.refresh_policy();
+        if prepared
+            .attributes
+            .contains(VariableAttributes::NON_VOLATILE)
+        {
+            if phase.boot_services() {
+                persist_through_bridge(bridge, &request, &prepared, staged, recorded)?;
+            } else {
+                let sink = deferred.as_mut().ok_or(efi::Status::DEVICE_ERROR)?;
+                queue_deferred(sink, &request, &prepared, staged, verified.timestamp)?;
+            }
+        }
+
+        store.commit(transaction, prepared, request.name)?;
+        if let (Some(variable), Some(timestamp)) = (verified.secure_variable, recorded) {
+            store.commit_auth_timestamp(variable, timestamp);
+        }
+        store.refresh_policy();
+        Ok(())
+    })();
     #[cfg(feature = "secure-boot")]
-    if let Some(nonvolatile) = unbind {
-        // The variable is gone either way. A binding that stays behind is
-        // harmless: creating the variable again replaces it.
+    if let Some((nonvolatile, created)) = unbind
+        && (created != result.is_ok())
+    {
+        // Deleted, or a creation that failed: drop the binding. One that
+        // stays behind after a failure here is harmless, as creating the
+        // variable again replaces it.
         let _ = bind_signer(store, transaction, persist, nonvolatile, &request, None);
     }
-    Ok(())
+    result
 }
 
 /// Bind the private authenticated variable of `owner` to `signer`, or drop
@@ -1049,6 +1058,14 @@ fn queue_deferred(
     } else {
         (prepared.attributes, staged)
     };
+    // Raw writes journal the final value, so replaying one twice is harmless.
+    // An authenticated append journals its envelope instead, to be verified
+    // again; record what it leaves behind so replay can tell it is applied.
+    let result_digest = if request.authenticated() && request.append() && !prepared.delete {
+        append_result_digest(staged)
+    } else {
+        0
+    };
     sink.region.queue_write(
         sink.transaction,
         deferred::DeferredWrite {
@@ -1059,8 +1076,25 @@ fn queue_deferred(
             timestamp: timestamp.unwrap_or_default(),
             authenticated: request.authenticated(),
             deletion: prepared.delete,
+            result_digest,
         },
     )
+}
+
+/// Nonzero 64-bit digest of a variable's data, for [`deferred::VariableRecord::result_digest`].
+#[cfg(feature = "secure-boot")]
+fn append_result_digest(data: &[u8]) -> u64 {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(data);
+    let mut prefix = [0u8; 8];
+    prefix.copy_from_slice(&digest[..8]);
+    u64::from_le_bytes(prefix).max(1)
+}
+
+/// Authenticated writes need the secure-boot build.
+#[cfg(not(feature = "secure-boot"))]
+fn append_result_digest(_data: &[u8]) -> u64 {
+    0
 }
 
 pub fn prepare_retained_staging(lease: &mut state::Lease) -> Result<(), efi::Status> {
@@ -1143,6 +1177,18 @@ fn replay_record(
     // acknowledging it; skipping instead would lose appends whose timestamp
     // equals the floor.
     let replayable = record.attributes & efi::VARIABLE_APPEND_WRITE != 0;
+    if authenticated
+        && replayable
+        && record.result_digest != 0
+        && store
+            .find(&record.guid.bytes, name, false)
+            .and_then(|slot| store.data(slot))
+            .is_some_and(|data| append_result_digest(data) == record.result_digest)
+    {
+        // Persisted before a reset lost its acknowledgement: applying the
+        // append again would duplicate its data.
+        return Ok(());
+    }
     if authenticated && !replayable {
         let secure_floor = secure_variable.map(|variable| store.auth_timestamp(variable));
         let already_applied = secure_floor == Some(record.timestamp)
@@ -2284,6 +2330,116 @@ mod tests {
         );
     }
 
+    /// Persists the signer database but fails every other write.
+    extern "C" fn binding_only_bridge(request: *const BridgeRequest) -> usize {
+        // SAFETY: same immediate-call contract as successful_bridge.
+        let Some(request) = (unsafe { request.as_ref() }) else {
+            return efi::Status::INVALID_PARAMETER.as_usize();
+        };
+        // SAFETY: the runtime image passes its live name buffer.
+        let name = unsafe {
+            core::slice::from_raw_parts(
+                request.name_address as *const u16,
+                request.name_len as usize,
+            )
+        };
+        if request.guid == auth::cert_db::GUID && name == auth::cert_db::name(true) {
+            efi::Status::SUCCESS.as_usize()
+        } else {
+            efi::Status::DEVICE_ERROR.as_usize()
+        }
+    }
+
+    /// The signer is bound before the variable is written; a creation that
+    /// then fails leaves no binding behind.
+    #[test]
+    fn a_failed_creation_drops_its_signer_binding() {
+        let mut fixture = Fixture::retained();
+        let name = utf16("CrabEfiPrivate");
+        assert_eq!(
+            fixture.write_using_bridge(
+                Phase::BootActive,
+                PRIVATE_GUID,
+                &name,
+                AUTH_ATTRIBUTES,
+                include_bytes!("../tests/fixtures/private-create.bin"),
+                binding_only_bridge as *const () as u64,
+            ),
+            efi::Status::DEVICE_ERROR
+        );
+        assert_eq!(value(&fixture.store, &name), None);
+        assert_eq!(binding(&fixture.store, true, &name), None);
+        // Any signer may still create it.
+        assert_eq!(
+            fixture.write(
+                Phase::BootActive,
+                PRIVATE_GUID,
+                &name,
+                AUTH_ATTRIBUTES,
+                include_bytes!("../tests/fixtures/private-recreate-rogue.bin"),
+            ),
+            efi::Status::SUCCESS
+        );
+    }
+
+    /// A reset after replay persisted an append but before it acknowledged
+    /// the record replays it again on the next boot. The append must not
+    /// apply twice, even with a timestamp that leaves the floor unchanged.
+    #[test]
+    fn an_unacknowledged_authenticated_append_applies_once() {
+        let mut fixture = Fixture::retained();
+        let name = utf16("CrabEfiPrivate");
+        assert_eq!(
+            fixture.write(
+                Phase::BootActive,
+                PRIVATE_GUID,
+                &name,
+                AUTH_ATTRIBUTES,
+                include_bytes!("../tests/fixtures/private-create.bin"),
+            ),
+            efi::Status::SUCCESS
+        );
+        assert_eq!(
+            fixture.write(
+                Phase::SealedPhysical,
+                PRIVATE_GUID,
+                &name,
+                AUTH_ATTRIBUTES | VariableAttributes::APPEND_WRITE,
+                include_bytes!("../tests/fixtures/private-append-older.bin"),
+            ),
+            efi::Status::SUCCESS
+        );
+        let appended = value(&fixture.store, &name).unwrap();
+        // The retained buffer as it was before replay acknowledged anything.
+        let mut unacknowledged = Fixture::new();
+        unacknowledged.buffer = fixture.buffer.clone();
+
+        let mut reboot = Fixture::new();
+        assert_eq!(
+            reboot.write(
+                Phase::BootActive,
+                PRIVATE_GUID,
+                &name,
+                AUTH_ATTRIBUTES,
+                include_bytes!("../tests/fixtures/private-create.bin"),
+            ),
+            efi::Status::SUCCESS
+        );
+        assert_eq!(
+            replay_into(&mut fixture, &mut reboot, |record, authenticated, _| {
+                assert!(authenticated);
+                assert_ne!(record.result_digest, 0);
+            }),
+            1
+        );
+        assert_eq!(value(&reboot.store, &name).as_ref(), Some(&appended));
+        assert_eq!(
+            replay_into(&mut unacknowledged, &mut reboot, |_, _, _| {}),
+            1
+        );
+        assert_eq!(value(&reboot.store, &name), Some(appended));
+    }
+
     #[test]
     fn signer_databases_are_read_only() {
         let mut fixture = Fixture::retained();
@@ -2834,6 +2990,7 @@ mod tests {
                     timestamp: VariableTimestamp::default(),
                     authenticated: false,
                     deletion: false,
+                    result_digest: 0,
                 },
             )
             .unwrap();
@@ -2934,6 +3091,7 @@ mod tests {
                         timestamp: VariableTimestamp::default(),
                         authenticated: false,
                         deletion,
+                        result_digest: 0,
                     },
                 )
                 .unwrap();
@@ -3074,6 +3232,7 @@ mod tests {
                     timestamp: VariableTimestamp::default(),
                     authenticated: false,
                     deletion: false,
+                    result_digest: 0,
                 },
             )
             .unwrap();
@@ -3295,6 +3454,7 @@ mod tests {
                         timestamp: VariableTimestamp::default(),
                         authenticated: false,
                         deletion,
+                        result_digest: 0,
                     },
                 )
                 .unwrap();
