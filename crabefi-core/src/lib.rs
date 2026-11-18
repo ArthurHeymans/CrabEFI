@@ -288,6 +288,13 @@ fn init_persistence_and_boot(
     #[cfg(feature = "capsule-update")]
     if persistence_writable {
         if let Some(backend) = capsule_backend {
+            // A capsule file may sit on a USB ESP; scanning without USB would
+            // consume the request without finding it.
+            if !boot_manager::usb_ready()
+                && efi::capsule::disk::is_file_capsule_delivery_requested()
+            {
+                boot_manager::ensure_usb("capsule-on-disk request pending");
+            }
             let applied = efi::capsule::process_pending_capsules(backend);
             if applied != 0 {
                 log::info!("Applied {} pending firmware capsule(s)", applied);

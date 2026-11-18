@@ -92,7 +92,7 @@ pub(crate) fn ensure_usb(reason: &str) {
 }
 
 /// Variables that make shim start MokManager, which needs a keyboard.
-const SHIM_MOK_REQUESTS: [&str; 9] = [
+const SHIM_MOK_REQUESTS: [&str; 10] = [
     "MokNew",
     "MokDel",
     "MokSB",
@@ -101,6 +101,7 @@ const SHIM_MOK_REQUESTS: [&str; 9] = [
     "MokDB",
     "MokXNew",
     "MokXDel",
+    "MokXAuth",
     "MokListTrustedNew",
 ];
 
@@ -312,6 +313,22 @@ fn try_boot_order(boot_var_state: &boot_vars::BootVarState, scope: Scope) -> boo
 
 /// Discover boot entries and show setup indefinitely only on an explicit request.
 fn show_boot_menu(timeout_seconds: u32, firmware_ui_requested: bool) {
+    let mut timeout_seconds = timeout_seconds;
+    // A choice the boot policy refuses (the setup menu may have tightened it
+    // since the entries were listed) shows the menu again, rebuilt under the
+    // current policy and without the original countdown.
+    while show_boot_menu_once(timeout_seconds, firmware_ui_requested) == MenuOutcome::Refused {
+        timeout_seconds = 0;
+    }
+}
+
+#[derive(PartialEq, Eq)]
+enum MenuOutcome {
+    Done,
+    Refused,
+}
+
+fn show_boot_menu_once(timeout_seconds: u32, firmware_ui_requested: bool) -> MenuOutcome {
     // ---- Phase 3: Fallback to device discovery and interactive menu ----
     log::info!("=== Fallback: discovering boot entries from storage ===");
 
@@ -323,7 +340,7 @@ fn show_boot_menu(timeout_seconds: u32, firmware_ui_requested: bool) {
         #[cfg(feature = "ui")]
         crate::ui::show_no_media_screen();
 
-        return;
+        return MenuOutcome::Done;
     }
 
     let (graphical, timeout_seconds) = menu_configuration(
@@ -333,15 +350,28 @@ fn show_boot_menu(timeout_seconds: u32, firmware_ui_requested: bool) {
         firmware_ui_requested,
     );
     boot_menu.set_timeout(timeout_seconds);
-    // A timeout is an automatic boot; make the user pick external media.
+    // A timeout is an automatic boot: default to an entry it may start (a
+    // BLS default can point at external media), or make the user pick.
     if timeout_seconds != 0
         && !boot_policy::automatic_external_allowed()
         && boot_menu
             .get_entry(boot_menu.selected)
             .is_some_and(|entry| boot_policy::storage_is_external(entry.storage))
     {
-        log::info!("Boot policy: default entry is external; disabling the menu timeout");
-        boot_menu.set_timeout(0);
+        match boot_menu
+            .entries
+            .iter()
+            .position(|entry| !boot_policy::storage_is_external(entry.storage))
+        {
+            Some(internal) => {
+                log::info!("Boot policy: default entry is external; defaulting to an internal one");
+                boot_menu.selected = internal;
+            }
+            None => {
+                log::info!("Boot policy: every entry is external; disabling the menu timeout");
+                boot_menu.set_timeout(0);
+            }
+        }
     }
 
     log::info!(
@@ -357,7 +387,7 @@ fn show_boot_menu(timeout_seconds: u32, firmware_ui_requested: bool) {
         #[cfg(feature = "ui")]
         if graphical {
             crate::ui::show_no_media_screen();
-            return;
+            return MenuOutcome::Done;
         }
         // The text menu also exposes firmware/security settings without media.
     }
@@ -384,6 +414,18 @@ fn show_boot_menu(timeout_seconds: u32, firmware_ui_requested: bool) {
         // Boot a clone so a one-shot command-line edit applies to this
         // attempt only and never sticks to the menu's entry.
         if let Some(entry) = boot_menu.entry_for_boot(selected_index) {
+            // Both menus clear the timeout on any input, so one still set
+            // means the countdown chose this entry. Check the live policy:
+            // setup may have tightened it while the menu was open.
+            let automatic = boot_menu.timeout_seconds != 0;
+            if !boot_policy::dispatch_allowed(entry.storage, automatic) {
+                log::warn!(
+                    "Boot policy: refusing external entry '{}'{}",
+                    entry.name,
+                    if automatic { " on timeout" } else { "" }
+                );
+                return MenuOutcome::Refused;
+            }
             log::info!("Booting: {} from {}", entry.name, entry.path);
             log::info!("Entry kind: {:?}", entry.kind);
             log::info!("Storage: {:?}", entry.storage);
@@ -397,6 +439,7 @@ fn show_boot_menu(timeout_seconds: u32, firmware_ui_requested: bool) {
     }
 
     log::info!("Boot manager finished");
+    MenuOutcome::Done
 }
 
 #[cfg(test)]
@@ -438,9 +481,10 @@ mod menu_configuration_tests {
 /// attempts to find and boot the referenced EFI application from discovered
 /// storage devices. Sets BootCurrent before booting and clears it after.
 ///
-/// Currently this matches the file path against ESPs found on storage devices.
-/// Full device path matching (resolving the exact disk/partition from the
-/// device path) is a future enhancement.
+/// This matches the file path against ESPs found on storage devices. An
+/// option that names a GPT partition (a hard-drive media node) only matches
+/// that partition, so a copy of the same file on other media, such as a USB
+/// stick tried after the internal disk failed, cannot stand in for it.
 fn try_boot_load_option(
     load_option: &boot_vars::LoadOption,
     file_path: &str,
@@ -449,8 +493,12 @@ fn try_boot_load_option(
     // Set BootCurrent before attempting boot
     boot_vars::set_boot_current(load_option.option_number);
 
-    // Try to find this file on any discovered ESP
-    let result = try_boot_file_from_esps(file_path, scope);
+    // Try to find this file on the named partition, or on any discovered ESP
+    let result = try_boot_file_from_esps(
+        file_path,
+        boot_vars::gpt_partition(load_option).as_ref(),
+        scope,
+    );
 
     // Clear BootCurrent after boot returns
     boot_vars::clear_boot_current();
@@ -463,7 +511,11 @@ fn try_boot_load_option(
 /// Scans the storage devices, looks for ESPs, and tries to find and boot
 /// the specified file. This is the fallback path when we don't have full
 /// device path resolution yet.
-fn try_boot_file_from_esps(file_path: &str, scope: Scope) -> boot_vars::BootAttemptResult {
+fn try_boot_file_from_esps(
+    file_path: &str,
+    partition_guid: Option<&[u8; 16]>,
+    scope: Scope,
+) -> boot_vars::BootAttemptResult {
     // Convert forward slashes to backslashes for FAT
     let fat_path = if file_path.contains('/') {
         match crate::fs::linux_path_to_fat(file_path) {
@@ -487,7 +539,7 @@ fn try_boot_file_from_esps(file_path: &str, scope: Scope) -> boot_vars::BootAtte
     if crate::drivers::storage::devices()
         .iter()
         .filter(|device| scope.includes(device))
-        .any(|device| try_boot_file_on_device(device, &fat_path))
+        .any(|device| try_boot_file_on_device(device, &fat_path, partition_guid))
     {
         return boot_vars::BootAttemptResult::Success;
     }
@@ -502,6 +554,7 @@ fn try_boot_file_from_esps(file_path: &str, scope: Scope) -> boot_vars::BootAtte
 fn try_boot_file_on_device(
     device: &crate::drivers::storage::StorageDevice,
     file_path: &str,
+    partition_guid: Option<&[u8; 16]>,
 ) -> bool {
     use crate::drivers::storage;
     use crate::fs::{fat::FatFilesystem, gpt};
@@ -517,7 +570,8 @@ fn try_boot_file_on_device(
 
     // Look for ESPs containing the target file
     for (i, partition) in partitions.iter().enumerate() {
-        if !partition.is_esp {
+        if !partition.is_esp || partition_guid.is_some_and(|guid| *guid != partition.partition_guid)
+        {
             continue;
         }
 

@@ -503,6 +503,30 @@ pub fn set_timeout(seconds: u16) {
 // Device Path Extraction
 // ============================================================================
 
+/// The GPT partition a LoadOption's FilePathList names, from its first
+/// Media/HardDrive node (type 4, subtype 1) with a GUID signature.
+pub fn gpt_partition(load_option: &LoadOption) -> Option<[u8; 16]> {
+    const HARD_DRIVE_LENGTH: usize = 42;
+    const SIGNATURE_TYPE_GUID: u8 = 0x02;
+    let mut rest: &[u8] = &load_option.file_path;
+    while let Some((header, _)) = rest.split_first_chunk::<4>() {
+        let (node_type, subtype) = (header[0], header[1]);
+        let length = usize::from(u16::from_le_bytes([header[2], header[3]]));
+        if length < 4 || length > rest.len() || (node_type == 0x7F && subtype == 0xFF) {
+            return None;
+        }
+        if node_type == 4 && subtype == 1 && length == HARD_DRIVE_LENGTH {
+            // Partition number, start and size precede the signature.
+            let node = rest.get(..HARD_DRIVE_LENGTH)?;
+            if node[41] == SIGNATURE_TYPE_GUID {
+                return node.get(24..40)?.try_into().ok();
+            }
+        }
+        rest = &rest[length..];
+    }
+    None
+}
+
 /// Extract a file path string from the FilePathList in a LoadOption.
 ///
 /// Walks the EFI_DEVICE_PATH_PROTOCOL nodes looking for a Media/FilePath
@@ -634,5 +658,44 @@ pub fn read_boot_var_state() -> BootVarState {
         boot_next,
         boot_order,
         timeout,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gpt_partition_comes_from_the_hard_drive_node() {
+        let guid = [0x5a; 16];
+        let mut path = alloc::vec::Vec::new();
+        // ACPI node, then HD(1,GPT,guid), file path, end.
+        path.extend_from_slice(&[2, 1, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        path.extend_from_slice(&[4, 1, 42, 0]);
+        path.extend_from_slice(&1u32.to_le_bytes());
+        path.extend_from_slice(&2048u64.to_le_bytes());
+        path.extend_from_slice(&4096u64.to_le_bytes());
+        path.extend_from_slice(&guid);
+        path.extend_from_slice(&[2, 2]);
+        path.extend_from_slice(&[4, 4, 8, 0, b'A', 0, 0, 0]);
+        path.extend_from_slice(&[0x7F, 0xFF, 4, 0]);
+        let mut option = LoadOption {
+            option_number: 1,
+            attributes: 1,
+            description: heapless::String::new(),
+            file_path: HeaplessVec::new(),
+            optional_data: HeaplessVec::new(),
+        };
+        option.file_path.extend_from_slice(&path).unwrap();
+        assert_eq!(gpt_partition(&option), Some(guid));
+        // An MBR signature, or a file-only short form, names no GPT partition.
+        option.file_path[12 + 41] = 1;
+        assert_eq!(gpt_partition(&option), None);
+        option.file_path.clear();
+        option
+            .file_path
+            .extend_from_slice(&path[12 + 42..])
+            .unwrap();
+        assert_eq!(gpt_partition(&option), None);
     }
 }
