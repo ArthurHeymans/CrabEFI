@@ -400,8 +400,9 @@ impl VariableStore {
         let attributes = attributes.difference(VariableAttributes::APPEND_WRITE);
         let slot = match (existing, delete) {
             (Some(index), _) => {
+                // An append keeps the stored attributes, so it must name them
+                // too (EDK2 rejects any attribute change but a deletion).
                 if !delete
-                    && !append
                     && self.slots[index].attributes != attributes
                     && identify_key_database(&guid, name).is_none()
                 {

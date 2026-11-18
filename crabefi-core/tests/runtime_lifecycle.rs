@@ -626,6 +626,8 @@ fn actual_loader_seal_svam_and_runtime_services_with_and_without_retained_stagin
         let guid = efi::Guid::from_bytes(&[0x42; 16]);
         let mut nv_name = [b'N' as u16, 0];
         let mut volatile_name = [b'V' as u16, 0];
+        // Volatile and created before ExitBootServices: read-only after it.
+        let mut boot_volatile_name = [b'W' as u16, 0];
         let attributes = efi::VARIABLE_BOOTSERVICE_ACCESS | efi::VARIABLE_RUNTIME_ACCESS;
         let data = [1u8];
         let boot_writes_before = writes.load(Ordering::Relaxed);
@@ -822,6 +824,18 @@ fn actual_loader_seal_svam_and_runtime_services_with_and_without_retained_stagin
                 Err(efi::Status::UNSUPPORTED)
             );
         }
+        assert_eq!(
+            unsafe {
+                ((*runtime).set_variable)(
+                    boot_volatile_name.as_mut_ptr(),
+                    &guid as *const _ as *mut _,
+                    attributes,
+                    1,
+                    [1u8].as_ptr().cast_mut().cast(),
+                )
+            },
+            efi::Status::SUCCESS
+        );
         let before = writes.load(Ordering::Relaxed);
         let mut descriptors = [allocator::MemoryDescriptor::new(0, 0, 0, 0); 32];
         let count = allocator::copy_runtime_descriptors(&mut descriptors).unwrap();
@@ -862,6 +876,8 @@ fn actual_loader_seal_svam_and_runtime_services_with_and_without_retained_stagin
         runtime = (ram.2 as usize + (client.runtime_services() as usize - ram.0 as usize))
             as *mut efi::RuntimeServices;
         let new_data = [2u8];
+        // UEFI 2.10 8.2: after ExitBootServices volatile variables cannot be
+        // created, and existing ones are read-only.
         assert_eq!(
             unsafe {
                 ((*runtime).set_variable)(
@@ -872,7 +888,19 @@ fn actual_loader_seal_svam_and_runtime_services_with_and_without_retained_stagin
                     new_data.as_ptr().cast_mut().cast(),
                 )
             },
-            efi::Status::SUCCESS
+            efi::Status::INVALID_PARAMETER
+        );
+        assert_eq!(
+            unsafe {
+                ((*runtime).set_variable)(
+                    boot_volatile_name.as_mut_ptr(),
+                    &guid as *const _ as *mut _,
+                    attributes,
+                    1,
+                    new_data.as_ptr().cast_mut().cast(),
+                )
+            },
+            efi::Status::WRITE_PROTECTED
         );
         assert_eq!(
             unsafe {

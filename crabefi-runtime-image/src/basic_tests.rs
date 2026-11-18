@@ -25,16 +25,32 @@ fn apply(
     efi::status(apply_variable(context, request))
 }
 
+/// Volatile variables work during boot and are read-only after
+/// ExitBootServices (UEFI 2.10, 8.2 SetVariable).
 #[test]
-fn ordinary_variables_work_at_boot_and_runtime_without_authentication() {
+fn volatile_variables_work_at_boot_and_are_read_only_at_runtime() {
     let mut store = VariableStore::new();
     let mut transaction = VariableTransaction::new();
     let guid = [0x42; 16];
     let name = [b'T' as u16];
-    for (phase, data) in [
-        (Phase::BootActive, b"boot".as_slice()),
-        (Phase::SealedPhysical, b"runtime".as_slice()),
+    for (phase, data, status) in [
+        (Phase::BootActive, b"boot".as_slice(), efi::Status::SUCCESS),
+        (
+            Phase::SealedPhysical,
+            b"runtime".as_slice(),
+            efi::Status::WRITE_PROTECTED,
+        ),
+        (
+            Phase::SealedPhysical,
+            b"".as_slice(),
+            efi::Status::WRITE_PROTECTED,
+        ),
     ] {
+        let attributes = if data.is_empty() {
+            VariableAttributes::empty()
+        } else {
+            ATTRIBUTES
+        };
         assert_eq!(
             apply(
                 &mut store,
@@ -43,14 +59,14 @@ fn ordinary_variables_work_at_boot_and_runtime_without_authentication() {
                 VariableRequest {
                     guid,
                     name: &name,
-                    attributes: ATTRIBUTES,
+                    attributes,
                     data,
                 },
             ),
-            efi::Status::SUCCESS
+            status
         );
         let slot = store.find(&guid, &name, true).unwrap();
-        assert_eq!(store.data(slot), Some(data));
+        assert_eq!(store.data(slot), Some(b"boot".as_slice()));
     }
 }
 

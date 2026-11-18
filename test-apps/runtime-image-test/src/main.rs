@@ -117,11 +117,11 @@ pub extern "efiapi" fn efi_main(image: Handle, system: *mut SystemTable) -> Stat
         cleanup_replayed_runtime_writes(runtime);
         serial("RUNTIME TWO BOOT REPLAY FAILED\r\n");
         qemu_debug_exit(0x11);
-    } else if !set_replay_marker(runtime) {
+    } else if !set_replay_marker(runtime) || !set_boot_only_variable(runtime) {
         return Status::DEVICE_ERROR;
     }
 
-    if !exercise_variables(runtime) {
+    if !exercise_variables(runtime, false) {
         return Status::DEVICE_ERROR;
     }
     let mut pointer = runtime.cast::<core::ffi::c_void>();
@@ -190,7 +190,7 @@ pub extern "efiapi" fn efi_main(image: Handle, system: *mut SystemTable) -> Stat
             || convert != Status::SUCCESS
             || converted != runtime.cast()
             || !sealed_tables
-            || !exercise_variables(runtime)
+            || !exercise_variables(runtime, true)
         {
             loop {
                 core::hint::spin_loop();
@@ -292,6 +292,23 @@ const DEFERRED_NAME: [u16; 11] = [
     b'd' as u16,
     0,
 ];
+/// A boot-services-only variable that runtime writes must not change.
+#[cfg(target_arch = "x86_64")]
+const BOOT_ONLY_NAME: [u16; 11] = [
+    b'R' as u16,
+    b't' as u16,
+    b'B' as u16,
+    b'o' as u16,
+    b'o' as u16,
+    b't' as u16,
+    b'O' as u16,
+    b'n' as u16,
+    b'l' as u16,
+    b'y' as u16,
+    0,
+];
+#[cfg(target_arch = "x86_64")]
+const BOOT_ONLY_ATTRIBUTES: u32 = efi::VARIABLE_NON_VOLATILE | efi::VARIABLE_BOOTSERVICE_ACCESS;
 #[cfg(target_arch = "x86_64")]
 const CAPSULE_RESULT_NAME: [u16; 12] = [
     b'C' as u16,
@@ -360,7 +377,98 @@ fn set_replay_marker(runtime: *mut efi::RuntimeServices) -> bool {
 }
 
 #[cfg(target_arch = "x86_64")]
+fn set_boot_only_variable(runtime: *mut efi::RuntimeServices) -> bool {
+    let mut name = BOOT_ONLY_NAME;
+    let mut guid = DEFERRED_TEST_GUID;
+    let mut value = [1u8];
+    unsafe {
+        ((*runtime).set_variable)(
+            name.as_mut_ptr(),
+            &mut guid,
+            BOOT_ONLY_ATTRIBUTES,
+            value.len(),
+            value.as_mut_ptr().cast(),
+        ) == Status::SUCCESS
+    }
+}
+
+/// After ExitBootServices, an append, an overwrite or a deletion of a
+/// boot-services-only variable must fail, whatever attributes the OS passes.
+#[cfg(target_arch = "x86_64")]
+fn boot_only_variable_rejects_runtime_writes(runtime: *mut efi::RuntimeServices) -> bool {
+    let attempts = [
+        (
+            DEFERRED_ATTRIBUTES | efi::VARIABLE_APPEND_WRITE,
+            1usize,
+            Status::WRITE_PROTECTED,
+        ),
+        (
+            BOOT_ONLY_ATTRIBUTES | efi::VARIABLE_APPEND_WRITE,
+            1,
+            Status::WRITE_PROTECTED,
+        ),
+        (DEFERRED_ATTRIBUTES, 1, Status::WRITE_PROTECTED),
+        (DEFERRED_ATTRIBUTES, 0, Status::WRITE_PROTECTED),
+        (0, 0, Status::WRITE_PROTECTED),
+    ];
+    for (attributes, size, expected) in attempts {
+        let mut name = BOOT_ONLY_NAME;
+        let mut guid = DEFERRED_TEST_GUID;
+        let mut value = [2u8];
+        let status = unsafe {
+            ((*runtime).set_variable)(
+                name.as_mut_ptr(),
+                &mut guid,
+                attributes,
+                size,
+                value.as_mut_ptr().cast(),
+            )
+        };
+        if status != expected {
+            serial("RUNTIME BOOT-ONLY WRITE NOT REJECTED: ");
+            serial_hex(&attributes.to_le_bytes());
+            serial("\r\n");
+            return false;
+        }
+    }
+    true
+}
+
+/// The boot-services-only variable kept its value and attributes across the
+/// runtime write attempts and the deferred replay.
+#[cfg(target_arch = "x86_64")]
+fn boot_only_variable_unchanged(runtime: *mut efi::RuntimeServices) -> bool {
+    let mut name = BOOT_ONLY_NAME;
+    let mut guid = DEFERRED_TEST_GUID;
+    let mut attributes = 0u32;
+    let mut value = [0u8; 4];
+    let mut size = value.len();
+    let status = unsafe {
+        ((*runtime).get_variable)(
+            name.as_mut_ptr(),
+            &mut guid,
+            &mut attributes,
+            &mut size,
+            value.as_mut_ptr().cast(),
+        )
+    };
+    let unchanged = status == Status::SUCCESS
+        && attributes == BOOT_ONLY_ATTRIBUTES
+        && size == 1
+        && value[0] == 1;
+    if !unchanged {
+        serial("RUNTIME BOOT-ONLY VARIABLE CHANGED: ");
+        serial_hex(&value[..size.min(value.len())]);
+        serial("\r\n");
+    }
+    unchanged
+}
+
+#[cfg(target_arch = "x86_64")]
 fn queue_runtime_writes(runtime: *mut efi::RuntimeServices) -> bool {
+    if !boot_only_variable_rejects_runtime_writes(runtime) {
+        return false;
+    }
     let mut name = DEFERRED_NAME;
     let mut guid = DEFERRED_TEST_GUID;
     let mut value = *b"CrabRT";
@@ -445,6 +553,9 @@ fn replayed_runtime_writes(runtime: *mut efi::RuntimeServices) -> bool {
         CAPSULE_REPORT_GUID,
         &mut capsule_result,
     );
+    if !boot_only_variable_unchanged(runtime) {
+        return false;
+    }
     if !present {
         serial("RUNTIME CAPSULE RESULT MISSING\r\n");
     } else if capsule_result[40..44] != 0u32.to_le_bytes() {
@@ -477,6 +588,7 @@ fn get_exact_variable<const N: usize>(
 fn cleanup_replayed_runtime_writes(runtime: *mut efi::RuntimeServices) {
     delete_variable(runtime, REPLAY_MARKER_NAME, DEFERRED_TEST_GUID);
     delete_variable(runtime, DEFERRED_NAME, DEFERRED_TEST_GUID);
+    delete_variable(runtime, BOOT_ONLY_NAME, DEFERRED_TEST_GUID);
     delete_variable(runtime, CAPSULE_RESULT_NAME, CAPSULE_REPORT_GUID);
 }
 
@@ -617,7 +729,15 @@ fn in_runtime_descriptor(
     })
 }
 
-fn exercise_variables(runtime: *mut efi::RuntimeServices) -> bool {
+/// Set, append to, read and delete a variable. Volatile variables are
+/// read-only after ExitBootServices, so `after_exit` uses a non-volatile one
+/// and checks that a volatile one cannot be created.
+fn exercise_variables(runtime: *mut efi::RuntimeServices, after_exit: bool) -> bool {
+    let attributes = if after_exit {
+        efi::VARIABLE_NON_VOLATILE | efi::VARIABLE_BOOTSERVICE_ACCESS | efi::VARIABLE_RUNTIME_ACCESS
+    } else {
+        efi::VARIABLE_BOOTSERVICE_ACCESS | efi::VARIABLE_RUNTIME_ACCESS
+    };
     let mut name = [
         b'R' as u16,
         b't' as u16,
@@ -636,12 +756,29 @@ fn exercise_variables(runtime: *mut efi::RuntimeServices) -> bool {
     );
     let mut first = [1u8, 2, 3];
     let mut second = [4u8, 5];
+    if after_exit {
+        // SAFETY: runtime is the validated table and all buffers live for each call.
+        let volatile = unsafe {
+            ((*runtime).set_variable)(
+                name.as_mut_ptr(),
+                &mut guid,
+                efi::VARIABLE_BOOTSERVICE_ACCESS | efi::VARIABLE_RUNTIME_ACCESS,
+                first.len(),
+                first.as_mut_ptr().cast(),
+            )
+        };
+        if volatile != Status::INVALID_PARAMETER {
+            #[cfg(target_arch = "x86_64")]
+            serial("RUNTIME VOLATILE VARIABLE CREATED AFTER EXIT\r\n");
+            return false;
+        }
+    }
     // SAFETY: runtime is the validated table and all buffers live for each call.
     let set = unsafe {
         ((*runtime).set_variable)(
             name.as_mut_ptr(),
             &mut guid,
-            efi::VARIABLE_BOOTSERVICE_ACCESS | efi::VARIABLE_RUNTIME_ACCESS,
+            attributes,
             first.len(),
             first.as_mut_ptr().cast(),
         )
@@ -653,9 +790,7 @@ fn exercise_variables(runtime: *mut efi::RuntimeServices) -> bool {
         ((*runtime).set_variable)(
             name.as_mut_ptr(),
             &mut guid,
-            efi::VARIABLE_BOOTSERVICE_ACCESS
-                | efi::VARIABLE_RUNTIME_ACCESS
-                | efi::VARIABLE_APPEND_WRITE,
+            attributes | efi::VARIABLE_APPEND_WRITE,
             second.len(),
             second.as_mut_ptr().cast(),
         )
