@@ -67,8 +67,6 @@ const MAX_BOUNCE_BYTES: usize = 64 * 1024;
 /// if that is larger), so temporary memory does not grow with the request.
 #[derive(Debug, PartialEq, Eq)]
 struct ReadPlan {
-    /// First LBA the read touches.
-    lba: u64,
     /// Offset of the first requested byte within the head block.
     head_offset: usize,
     /// Bytes copied out of the partially requested first block.
@@ -100,8 +98,9 @@ impl ReadPlan {
         if len == 0 || io_align == 0 {
             return None;
         }
-        let end = offset.checked_add(u64::try_from(len).ok()?)?;
-        if last_block.is_some_and(|last| (end - 1) / block_size > last) {
+        // The last requested byte; the exclusive end may not be representable.
+        let last_byte = offset.checked_add(u64::try_from(len - 1).ok()?)?;
+        if last_block.is_some_and(|last| last_byte / block_size > last) {
             return None;
         }
         buffer.checked_add(len)?;
@@ -121,7 +120,6 @@ impl ReadPlan {
             usize::from(head_len != 0 || tail_len != 0)
         };
         Some(Self {
-            lba: offset / block_size,
             head_offset,
             head_len,
             middle_blocks,
@@ -216,8 +214,13 @@ extern "efiapi" fn disk_io_read_disk(
     }
 
     // An empty read transfers nothing; the UEFI interface does not reject it.
+    // A replaced medium is reported by the next read that reaches the device.
     if buffer_size == 0 {
-        return Status::SUCCESS;
+        return if media.media_present == 0 {
+            Status::NO_MEDIA
+        } else {
+            Status::SUCCESS
+        };
     }
 
     // IoAlign is zero or one for unrestricted buffers, otherwise a power of two.
@@ -265,11 +268,13 @@ extern "efiapi" fn disk_io_read_disk(
     };
 
     let dest = buffer.cast::<u8>();
-    let mut lba = plan.lba;
+    // LBA holding the next unread byte. Only called while done < buffer_size,
+    // so offset + done never passes the last requested byte.
+    let lba_at = |done: usize| (offset + done as u64) / u64::from(media.block_size);
     let mut done = 0usize;
 
     if plan.head_len != 0 {
-        let status = read(lba, block, scratch);
+        let status = read(lba_at(0), block, scratch);
         if status != Status::SUCCESS {
             return status;
         }
@@ -279,7 +284,6 @@ extern "efiapi" fn disk_io_read_disk(
             core::ptr::copy_nonoverlapping(scratch.add(plan.head_offset), dest, plan.head_len);
         }
         done = plan.head_len;
-        lba += 1;
     }
 
     let mut remaining = plan.middle_blocks;
@@ -292,7 +296,11 @@ extern "efiapi" fn disk_io_read_disk(
         let size = blocks * block;
         // SAFETY: done + size <= buffer_size.
         let target = unsafe { dest.add(done) };
-        let status = read(lba, size, if plan.bounce_middle { scratch } else { target });
+        let status = read(
+            lba_at(done),
+            size,
+            if plan.bounce_middle { scratch } else { target },
+        );
         if status != Status::SUCCESS {
             return status;
         }
@@ -301,12 +309,11 @@ extern "efiapi" fn disk_io_read_disk(
             unsafe { core::ptr::copy_nonoverlapping(scratch, target, size) };
         }
         done += size;
-        lba += blocks as u64;
         remaining -= blocks;
     }
 
     if plan.tail_len != 0 {
-        let status = read(lba, block, scratch);
+        let status = read(lba_at(done), block, scratch);
         if status != Status::SUCCESS {
             return status;
         }
@@ -396,7 +403,6 @@ mod tests {
         assert_eq!(
             ReadPlan::new(512, 1024, 512, 0x1000, 512, Some(2)),
             Some(ReadPlan {
-                lba: 1,
                 head_offset: 0,
                 head_len: 0,
                 middle_blocks: 2,
@@ -413,7 +419,6 @@ mod tests {
         assert_eq!(
             ReadPlan::new(100, 2000, 512, 0x1064, 512, Some(4)),
             Some(ReadPlan {
-                lba: 0,
                 head_offset: 100,
                 head_len: 412,
                 middle_blocks: 3,
@@ -426,7 +431,6 @@ mod tests {
         assert_eq!(
             ReadPlan::new(4095, 1, 4096, 0x1000, 1, Some(0)),
             Some(ReadPlan {
-                lba: 0,
                 head_offset: 4095,
                 head_len: 1,
                 middle_blocks: 0,
@@ -435,6 +439,15 @@ mod tests {
                 bounce_blocks: 1,
             })
         );
+    }
+
+    #[test]
+    fn the_last_byte_of_the_address_space_is_addressable() {
+        let plan = ReadPlan::new(u64::MAX, 1, 512, 0x1000, 1, None).unwrap();
+        assert_eq!((plan.head_offset, plan.head_len), (511, 1));
+        let last = u64::MAX / 512;
+        assert!(ReadPlan::new(u64::MAX, 1, 512, 0x1000, 1, Some(last)).is_some());
+        assert!(ReadPlan::new(u64::MAX, 1, 512, 0x1000, 1, Some(last - 1)).is_none());
     }
 
     #[test]
@@ -452,7 +465,7 @@ mod tests {
     fn rejects_invalid_or_unrepresentable_spans() {
         assert!(ReadPlan::new(4095, 2, 4096, 0x1000, 1, Some(0)).is_none());
         assert!(ReadPlan::new(4096, 1, 4096, 0x1000, 1, Some(0)).is_none());
-        assert!(ReadPlan::new(u64::MAX, 1, 512, 0x1000, 1, None).is_none());
+        assert!(ReadPlan::new(u64::MAX, 2, 512, 0x1000, 1, None).is_none());
         assert!(ReadPlan::new(0, 2, 512, usize::MAX, 1, None).is_none());
         assert!(ReadPlan::new(0, 1, 0, 0x1000, 1, None).is_none());
         assert!(ReadPlan::new(0, 0, 512, 0x1000, 1, None).is_none());
