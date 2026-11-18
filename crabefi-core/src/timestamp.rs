@@ -30,6 +30,9 @@ pub const TS_CRABEFI_EXIT_BOOT_SERVICES: u32 = 1508;
 pub const TS_CRABEFI_OS_LOADER_LOAD: u32 = 1509;
 /// `ExitBootServices` was called.
 pub const TS_CRABEFI_EXIT_BOOT_SERVICES_ENTRY: u32 = 1510;
+/// The boot option's image (the OS loader) is started. coreboot gives 1100,
+/// which U-Boot uses for this point, to vboot (TS_VB_VBOOT_DONE).
+pub const TS_CRABEFI_OS_LOADER_START: u32 = 1511;
 
 /// Record a boot milestone with the current platform timestamp.
 ///

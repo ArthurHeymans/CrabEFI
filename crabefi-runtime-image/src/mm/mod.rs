@@ -494,11 +494,13 @@ fn firmware_flash(
 }
 
 /// Variables the boot firmware writes through SET_FIRMWARE_VARIABLE: status
-/// it owns that SetVariable refuses, and its capsule staging reservation.
+/// it owns that SetVariable refuses (the ESRT last attempt, the boot event
+/// log), and its capsule staging reservation.
 /// Everything else, Secure Boot keys and signer bindings included, only
 /// changes through the verified variable services.
 fn firmware_owned(guid: &[u8; 16], name: &[u16]) -> bool {
     crabefi_runtime_abi::capsule::is_esrt_last_attempt_variable(guid, name)
+        || crabefi_runtime_abi::event_log::is_event_log_variable(guid, name)
         || services::is_capsule_staging_variable(guid, name)
 }
 

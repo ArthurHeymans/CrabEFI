@@ -41,12 +41,12 @@ pub(crate) struct CorebootTimestampRecorder {
 }
 
 /// FBPT field (byte offset) for a CrabEFI milestone: OS loader LoadImage
-/// (1509), StartImage (1100), ExitBootServices entry (1510) and exit (1508).
+/// (1509), StartImage (1511), ExitBootServices entry (1510) and exit (1508).
 /// Literal IDs: ci/run-coreboot-feature-tests.sh compiles this file alone.
 fn fbpt_field(id: u32) -> Option<usize> {
     match id {
         1509 => Some(24),
-        1100 => Some(32),
+        1511 => Some(32),
         1510 => Some(40),
         1508 => Some(48),
         _ => None,
