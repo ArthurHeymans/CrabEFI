@@ -145,15 +145,21 @@ pub fn is_setup_mode() -> bool {
         != Some(0)
 }
 
-/// Read the image-owned standard SecureBoot variable.
+/// Read the image-owned standard SecureBoot variable. A read that fails (for
+/// example because payload MM did not answer) counts as enforcing: callers
+/// must not boot unverified code because the policy could not be read.
 #[cfg(feature = "secure-boot")]
 pub fn is_secure_boot_enabled() -> bool {
-    crate::efi::runtime_image::client::variables::get(
+    match crate::efi::runtime_image::client::variables::try_get(
         &Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID),
         SECURE_BOOT_NAME,
-    )
-    .and_then(|(_, data)| data.first().copied())
-        == Some(1)
+    ) {
+        Ok(value) => value.and_then(|(_, data)| data.first().copied()) == Some(1),
+        Err(status) => {
+            log::error!("Cannot read SecureBoot ({:?}); enforcing", status);
+            true
+        }
+    }
 }
 
 /// Saved user preference, independent of whether a PK is enrolled.
@@ -201,7 +207,11 @@ pub fn toggle_secure_boot() -> Result<SecureBootState, r_efi::efi::Status> {
 /// the standard Runtime Services GetVariable entry point.
 #[cfg(feature = "secure-boot")]
 pub fn verify_pe_image_secure_boot(pe_data: &[u8]) -> Result<bool, AuthError> {
-    boot::refresh_key_databases();
+    // db and dbx that could not be read must not pass for empty ones: an
+    // empty dbx revokes nothing.
+    if !boot::refresh_key_databases() {
+        return Err(AuthError::AccessDenied);
+    }
     authenticode::verify_pe_image_secure_boot(pe_data)
 }
 

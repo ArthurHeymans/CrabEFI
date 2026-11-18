@@ -46,8 +46,9 @@ payload MM interface is still under review, so the image is built from:
 - `coreboot-payload-mm/0003-*.patch`: the defconfig. It differs from the
   plain Q35 fixture in using TSEG SMM (the payload MM area does not fit in
   ASEG), 64-bit coreboot (CrabEFI's MM image needs 64-bit SMM) and a 256 KiB
-  SMMSTORE (each half of the MM store holds at least one maximum-size
-  variable).
+  SMMSTORE region (each half of the MM store holds at least one maximum-size
+  variable). coreboot's own SMMSTORE handler is off: it would write the region
+  around payload MM, and CrabEFI refuses payload MM when coreboot offers it.
 
 ```sh
 git checkout 85915142b1a96564145160d28766c3bd3e2ca5a0

@@ -201,7 +201,10 @@ impl Flash {
 
     /// Erase whole blocks.
     pub fn erase(&self, offset: u64, len: u64) -> bool {
-        if !self.in_range(offset, len) || offset % ERASE_BLOCK != 0 || len % ERASE_BLOCK != 0 {
+        if !self.in_range(offset, len)
+            || !offset.is_multiple_of(ERASE_BLOCK)
+            || !len.is_multiple_of(ERASE_BLOCK)
+        {
             return false;
         }
         if self.services.is_some() {
@@ -253,11 +256,13 @@ impl Flash {
     /// Read back through the same path that wrote and compare byte by byte.
     fn verify(&self, offset: u64, data: &[u8], ok: fn(u8, u8) -> bool) -> bool {
         let mut buffer = [0u8; 64];
-        data.chunks(buffer.len()).enumerate().all(|(index, expected)| {
-            let now = &mut buffer[..expected.len().min(64)];
-            self.read(offset + (index * 64) as u64, now)
-                && now.iter().zip(expected).all(|(&now, &byte)| ok(now, byte))
-        })
+        data.chunks(buffer.len())
+            .enumerate()
+            .all(|(index, expected)| {
+                let now = &mut buffer[..expected.len().min(64)];
+                self.read(offset + (index * 64) as u64, now)
+                    && now.iter().zip(expected).all(|(&now, &byte)| ok(now, byte))
+            })
     }
 
     /// Clear bits in one already programmed byte (EDK2 record state). NOR

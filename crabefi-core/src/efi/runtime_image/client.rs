@@ -187,12 +187,19 @@ pub mod variables {
     use super::*;
 
     pub fn get(guid: &Guid, name: &[u16]) -> Option<(u32, Vec<u8>)> {
-        let client = client()?;
+        try_get(guid, name).ok().flatten()
+    }
+
+    /// Like [`get`], but tells an absent variable (`Ok(None)`) from a read
+    /// that failed, for example because payload MM did not answer. Security
+    /// decisions must not take a failed read for an absent variable.
+    pub fn try_get(guid: &Guid, name: &[u16]) -> Result<Option<(u32, Vec<u8>)>, Status> {
+        let client = client().ok_or(Status::NOT_READY)?;
         let runtime = client.runtime_services();
         if runtime.is_null() {
-            return None;
+            return Err(Status::NOT_READY);
         }
-        let mut name = nul_terminated(name)?;
+        let mut name = nul_terminated(name).ok_or(Status::INVALID_PARAMETER)?;
         let mut guid = *guid;
         let mut attributes = 0u32;
         let mut size = 0usize;
@@ -208,15 +215,17 @@ pub mod variables {
             )
         });
         if first == Status::NOT_FOUND {
-            return None;
+            return Ok(None);
         }
-        if first != Status::BUFFER_TOO_SMALL || size > crabefi_runtime_abi::MAX_VARIABLE_DATA_SIZE {
-            return None;
+        if first != Status::BUFFER_TOO_SMALL {
+            return Err(first);
+        }
+        if size > crabefi_runtime_abi::MAX_VARIABLE_DATA_SIZE {
+            return Err(Status::BAD_BUFFER_SIZE);
         }
         let mut data = Vec::new();
-        if data.try_reserve_exact(size).is_err() {
-            return None;
-        }
+        data.try_reserve_exact(size)
+            .map_err(|_| Status::OUT_OF_RESOURCES)?;
         data.resize(size, 0);
         let status = crate::efi::boot_services::with_image_callback(|| unsafe {
             ((*runtime).get_variable)(
@@ -227,7 +236,10 @@ pub mod variables {
                 data.as_mut_ptr().cast::<c_void>(),
             )
         });
-        (status == Status::SUCCESS).then_some((attributes, data))
+        if status != Status::SUCCESS {
+            return Err(status);
+        }
+        Ok(Some((attributes, data)))
     }
 
     pub fn set(guid: &Guid, name: &[u16], attributes: u32, data: &[u8]) -> Status {

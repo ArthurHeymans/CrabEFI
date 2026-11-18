@@ -76,6 +76,9 @@ pub const MIN_STORE_SIZE: u64 = {
 
 /// `status` of a request that is filled in or given up: MM skips it.
 pub const STATUS_IDLE: u64 = u64::MAX - 1;
+/// `status` once MM claimed a pending request (atomically, before it reads
+/// anything else): ring 0 must not touch the buffer until MM answers.
+pub const STATUS_BUSY: u64 = u64::MAX - 2;
 /// Byte offset of [`Request::status`] in the buffer.
 pub const STATUS_OFFSET: u64 = core::mem::offset_of!(Request, status) as u64;
 /// Encoded size of [`Request`].
@@ -142,10 +145,13 @@ pub trait Transport {
     fn write(&mut self, offset: u64, bytes: &[u8]);
     /// Copy from `offset` in the buffer.
     fn read(&mut self, offset: u64, bytes: &mut [u8]);
-    /// Atomically, with respect to SMIs, replace a `current` status with
-    /// `new`; return the status found.
+    /// Atomically replace a `current` status with `new`; return the status
+    /// found.
     fn compare_exchange_status(&mut self, current: u64, new: u64) -> u64;
-    /// Store `status`.
+    /// Load the status (acquire: MM's reply fields are visible after it).
+    fn read_status(&mut self) -> u64;
+    /// Store `status` (release: everything written before is visible to MM
+    /// once it sees the status).
     fn write_status(&mut self, status: u64);
     /// Raise the software SMI that makes MM look at the buffer.
     fn raise_smi(&mut self);
@@ -172,22 +178,33 @@ pub enum Outcome {
 /// One request/reply round trip.
 ///
 /// The request is only marked [`STATUS_PENDING`] once its name, data and
-/// header are in place, and a request MM did not answer is withdrawn before
-/// returning. MM therefore only ever runs a complete request that a caller is
-/// still waiting for. Callers check the name and data sizes against the
-/// buffer.
+/// header are in place. MM claims it atomically ([`STATUS_BUSY`]) before it
+/// reads anything else, and stores its answer status last. A request MM did
+/// not claim is withdrawn before returning, so a late SMI cannot run it with
+/// the next request's name or data; one MM claimed is waited for, and while
+/// it stays claimed the buffer is not reused. Callers check the name and data
+/// sizes against the buffer.
 pub fn exchange(
     transport: &mut dyn Transport,
     request: Request,
     name: &[u16],
     data: &[u8],
 ) -> Outcome {
+    // MM still owns the buffer for an earlier request.
+    if transport.read_status() == STATUS_BUSY {
+        return Outcome::Lost;
+    }
     // A request left pending by an earlier caller must not run with what
-    // follows.
+    // follows. MM may claim it right now; then wait for it.
+    if transport.compare_exchange_status(STATUS_PENDING, STATUS_IDLE) == STATUS_BUSY
+        && !wait_while_busy(transport)
+    {
+        return Outcome::Lost;
+    }
     transport.write_status(STATUS_IDLE);
     let mut name_bytes = [0u8; NAME_CAPACITY];
     for (bytes, unit) in name_bytes.as_chunks_mut::<2>().0.iter_mut().zip(name) {
-        bytes.copy_from_slice(&unit.to_le_bytes());
+        *bytes = unit.to_le_bytes();
     }
     transport.write(
         NAME_OFFSET,
@@ -205,32 +222,41 @@ pub fn exchange(
     for smis in 1..=SMI_ATTEMPTS {
         transport.raise_smi();
         for polls in 0..=POLLS_PER_SMI {
-            let mut status = [0u8; 8];
-            transport.read(STATUS_OFFSET, &mut status);
-            if u64::from_le_bytes(status) != STATUS_PENDING {
-                let mut reply = [0u8; REQUEST_SIZE];
-                transport.read(0, &mut reply);
-                return Outcome::Answered {
-                    reply: Request::from_bytes(&reply),
-                    smis,
-                    polls,
-                };
+            let status = transport.read_status();
+            if status != STATUS_PENDING && status != STATUS_BUSY {
+                return answered(transport, smis, polls);
             }
             transport.pause();
         }
     }
-    // An SMI may still arrive between the last poll and here: withdraw the
-    // request only if MM has not answered it meanwhile.
-    if transport.compare_exchange_status(STATUS_PENDING, STATUS_IDLE) != STATUS_PENDING {
-        let mut reply = [0u8; REQUEST_SIZE];
-        transport.read(0, &mut reply);
-        return Outcome::Answered {
-            reply: Request::from_bytes(&reply),
-            smis: SMI_ATTEMPTS,
-            polls: POLLS_PER_SMI,
-        };
+    // Withdraw the request unless MM took it meanwhile; if it did, its
+    // answer is still coming.
+    match transport.compare_exchange_status(STATUS_PENDING, STATUS_IDLE) {
+        STATUS_PENDING => Outcome::Lost,
+        STATUS_BUSY if !wait_while_busy(transport) => Outcome::Lost,
+        _ => answered(transport, SMI_ATTEMPTS, POLLS_PER_SMI),
     }
-    Outcome::Lost
+}
+
+/// Wait for MM to answer a request it claimed; `false` if it never does.
+fn wait_while_busy(transport: &mut dyn Transport) -> bool {
+    for _ in 0..SMI_ATTEMPTS * POLLS_PER_SMI {
+        if transport.read_status() != STATUS_BUSY {
+            return true;
+        }
+        transport.pause();
+    }
+    false
+}
+
+fn answered(transport: &mut dyn Transport, smis: u32, polls: u32) -> Outcome {
+    let mut reply = [0u8; REQUEST_SIZE];
+    transport.read(0, &mut reply);
+    Outcome::Answered {
+        reply: Request::from_bytes(&reply),
+        smis,
+        polls,
+    }
 }
 
 /// The communication buffer in RAM, accessed with volatile operations,
@@ -297,8 +323,9 @@ impl Transport for SharedBuffer<'_> {
     }
 
     fn compare_exchange_status(&mut self, current: u64, new: u64) -> u64 {
-        // SAFETY: the status word is 8-byte aligned inside the buffer, and a
-        // locked compare-exchange is one instruction, so no SMI splits it.
+        // SAFETY: the status word is 8-byte aligned inside the buffer. A
+        // locked compare-exchange is atomic against MM on another CPU, and no
+        // SMI splits it on this one.
         let status = unsafe { core::sync::atomic::AtomicU64::from_ptr(self.status()) };
         match status.compare_exchange(
             current,
@@ -310,11 +337,16 @@ impl Transport for SharedBuffer<'_> {
         }
     }
 
+    fn read_status(&mut self) -> u64 {
+        // SAFETY: the 8-byte aligned status word inside the buffer.
+        unsafe { core::sync::atomic::AtomicU64::from_ptr(self.status()) }
+            .load(core::sync::atomic::Ordering::Acquire)
+    }
+
     fn write_status(&mut self, status: u64) {
-        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
-        // SAFETY: the aligned status word inside the buffer.
-        unsafe { core::ptr::write_volatile(self.status(), status) };
-        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        // SAFETY: the 8-byte aligned status word inside the buffer.
+        unsafe { core::sync::atomic::AtomicU64::from_ptr(self.status()) }
+            .store(status, core::sync::atomic::Ordering::Release);
     }
 
     fn raise_smi(&mut self) {

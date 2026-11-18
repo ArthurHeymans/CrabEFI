@@ -57,6 +57,7 @@ const CAPSULE_UPDATE_NAME: &[u16] = &[
 ];
 
 /// The retained capsule staging reservation (`CapsuleUpdateData`).
+#[cfg(feature = "mm")]
 pub fn is_capsule_staging_variable(guid: &[u8; 16], name: &[u16]) -> bool {
     guid == CAPSULE_UPDATE_GUID.as_bytes() && name == CAPSULE_UPDATE_NAME
 }

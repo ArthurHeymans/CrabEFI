@@ -132,6 +132,27 @@ pub fn ready_to_boot() {
     }
 }
 
+/// Before a kernel starts without ExitBootServices (direct Linux boot): end
+/// the firmware phase and give later callers MM's runtime view only, as the
+/// runtime image's seal does for EFI boots. Stops the boot if MM does not
+/// confirm.
+pub fn enter_runtime() {
+    if !active() {
+        return;
+    }
+    ready_to_boot();
+    let status = call(request(command::EXIT_BOOT_SERVICES), &[], &[]);
+    if status != Status::SUCCESS {
+        log::error!(
+            "payload MM did not switch to the runtime view ({:?}); not starting the kernel",
+            status
+        );
+        loop {
+            crate::arch::halt();
+        }
+    }
+}
+
 /// Open (`true`) or close a physical-presence setup authorization
 /// (`bridge_operation::AUTHORIZE_SETUP_*`).
 pub fn setup_authorize(operation: u32, open: bool) -> Status {

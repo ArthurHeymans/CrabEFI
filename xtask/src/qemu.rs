@@ -899,7 +899,33 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
             for line in result.output.lines().filter(|l| l.contains("MMGATE ")) {
                 println!("  {}", line.trim());
             }
-            if result.output.contains("MMGATE DONE") && fails == 0 {
+            // Every gate must have been checked; a skipped run proves nothing.
+            const GATES: [&str; 7] = [
+                "ping",
+                "ring0-flash-write-blocked",
+                "firmware-write-denied",
+                "firmware-variable-denied",
+                "setup-authorize-denied",
+                "second-load-refused",
+                "mm-still-answers",
+            ];
+            let missing: Vec<_> = GATES
+                .iter()
+                .filter(|gate| {
+                    !result
+                        .output
+                        .lines()
+                        .any(|line| line.trim_end().ends_with(&format!("MMGATE PASS {gate}")))
+                })
+                .collect();
+            for gate in &missing {
+                println!("  missing MMGATE PASS {gate}");
+            }
+            if result.output.contains("MMGATE DONE")
+                && fails == 0
+                && missing.is_empty()
+                && !result.output.contains("MMGATE SKIP")
+            {
                 println!("[PASS] mm_gate: {passes} checks passed");
                 passed += 1;
             } else {

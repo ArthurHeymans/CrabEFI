@@ -125,10 +125,9 @@ pub fn reserve_buffer() {
     )
     .is_err()
     {
-        log::error!(
-            "payload MM: cannot reserve the request buffer at {:#x}",
-            base
-        );
+        // MM writes its replies there: memory the OS could get would be
+        // corrupted, and requests could not be kept apart from it.
+        panic!("payload MM: cannot reserve the request buffer at {base:#x}");
     }
 }
 
@@ -214,21 +213,27 @@ pub fn for_each_fmap_area(
         0 => flash_mapping(boot_media, None)?.0,
         base => base,
     };
-    walk_fmap((base + boot_media.fmap_offset) as *const u8, |name, offset, size| {
-        if let Ok(name) = core::str::from_utf8(name) {
-            f(name, offset, size);
-        }
-    })
+    walk_fmap(
+        (base + boot_media.fmap_offset) as *const u8,
+        |name, offset, size| {
+            if let Ok(name) = core::str::from_utf8(name) {
+                f(name, offset, size);
+            }
+        },
+    )
 }
 
 /// Find an FMAP area (offset, size) in the memory-mapped flash.
 fn fmap_area(flash_base: u64, fmap_offset: u64, name: &[u8]) -> Option<(u64, u64)> {
     let mut found = None;
-    walk_fmap((flash_base + fmap_offset) as *const u8, |area, offset, size| {
-        if found.is_none() && area == name {
-            found = Some((u64::from(offset), u64::from(size)));
-        }
-    })?;
+    walk_fmap(
+        (flash_base + fmap_offset) as *const u8,
+        |area, offset, size| {
+            if found.is_none() && area == name {
+                found = Some((u64::from(offset), u64::from(size)));
+            }
+        },
+    )?;
     found
 }
 

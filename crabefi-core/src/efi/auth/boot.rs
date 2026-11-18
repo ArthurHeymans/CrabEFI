@@ -203,15 +203,25 @@ fn key_database(variable: SecureBootVariable) -> spin::MutexGuard<'static, KeyDa
     }
 }
 
+/// Returns `false` when the variable could not be read; the cache is then
+/// emptied and marked uninitialized rather than taken for an absent database.
 fn refresh_key_database(
     variable: SecureBootVariable,
     restore_persistent_timestamp: bool,
     force: bool,
-) {
+) -> bool {
     let guid = Guid::from_bytes(variable.guid());
-    let data = get_variable_data(&guid, variable.name());
+    let data = match crate::efi::runtime_image::client::variables::try_get(&guid, variable.name()) {
+        Ok(value) => value.map(|(_, data)| data),
+        Err(status) => {
+            log::error!("Cannot read {:?} ({:?})", variable, status);
+            key_database(variable).clear();
+            KEY_DATABASE_SNAPSHOTS.lock()[variable.index()] = DatabaseSnapshot::new();
+            return false;
+        }
+    };
     if !force && KEY_DATABASE_SNAPSHOTS.lock()[variable.index()].matches(data.as_deref()) {
-        return;
+        return true;
     }
 
     let mut database = key_database(variable);
@@ -252,28 +262,33 @@ fn refresh_key_database(
         complete,
         data,
     };
+    true
 }
 
 /// Refresh boot-only Authenticode key caches from authoritative runtime-store
 /// snapshots. Unchanged values are not reparsed, and this verification-only
-/// path deliberately avoids persistent-store timestamp walks.
-pub(crate) fn refresh_key_databases() {
-    refresh_key_databases_with_force(false);
+/// path deliberately avoids persistent-store timestamp walks. Returns `false`
+/// when a database could not be read.
+pub(crate) fn refresh_key_databases() -> bool {
+    refresh_key_databases_with_force(false)
 }
 
-pub(crate) fn force_refresh_key_databases() {
-    refresh_key_databases_with_force(true);
+pub(crate) fn force_refresh_key_databases() -> bool {
+    refresh_key_databases_with_force(true)
 }
 
-fn refresh_key_databases_with_force(force: bool) {
+fn refresh_key_databases_with_force(force: bool) -> bool {
+    // Refresh every database even after a failed read.
+    let mut read = true;
     for variable in [
         SecureBootVariable::PK,
         SecureBootVariable::Kek,
         SecureBootVariable::Db,
         SecureBootVariable::Dbx,
     ] {
-        refresh_key_database(variable, false, force);
+        read &= refresh_key_database(variable, false, force);
     }
+    read
 }
 
 /// Counts and identities must not imply a complete inventory after a

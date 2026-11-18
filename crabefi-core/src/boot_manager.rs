@@ -795,9 +795,6 @@ fn boot_linux_entry(
     initrd_paths: &crate::bls::Initrds,
     cmdline: &heapless::String<512>,
 ) {
-    // From here on third-party code runs: end payload MM's firmware phase.
-    #[cfg(target_arch = "x86_64")]
-    crate::efi::payload_mm::ready_to_boot();
     use crate::fs;
 
     // Defense in depth: Direct Linux boot entries should not appear in the menu
@@ -876,6 +873,12 @@ fn boot_linux_entry(
             // The disk/controller borrow must be released before shutdown:
             // direct boot quiesces every firmware-owned DMA engine.
             log::info!("Linux loaded successfully, booting...");
+            // The kernel gets no EFI runtime services and never calls
+            // ExitBootServices, but it can still reach payload MM through
+            // the request buffer: end the firmware phase and switch MM to
+            // the runtime view first.
+            #[cfg(target_arch = "x86_64")]
+            crate::efi::payload_mm::enter_runtime();
             unsafe {
                 loaded.boot_direct();
             }
@@ -898,9 +901,6 @@ fn boot_payload_entry(
     path: &heapless::String<128>,
     format: crate::payload::PayloadFormat,
 ) {
-    // From here on third-party code runs: end payload MM's firmware phase.
-    #[cfg(target_arch = "x86_64")]
-    crate::efi::payload_mm::ready_to_boot();
     log::info!("Chainloading payload: {}", entry.name);
     log::info!("  Path: {}", path);
     log::info!("  Format: {:?}", format);

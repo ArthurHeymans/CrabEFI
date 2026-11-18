@@ -2,7 +2,7 @@
 
 use crabefi_runtime_abi::mm::{
     DATA_OFFSET, NAME_OFFSET, Outcome, POLLS_PER_SMI, REQUEST_SIZE, Request, SMI_ATTEMPTS,
-    STATUS_IDLE, STATUS_OFFSET, STATUS_PENDING, Transport, command, exchange,
+    STATUS_BUSY, STATUS_IDLE, STATUS_OFFSET, STATUS_PENDING, Transport, command, exchange,
 };
 
 /// A buffer with an MM that answers at a chosen SMI and poll.
@@ -14,6 +14,10 @@ struct FakeMm {
     answer_at: Option<(u32, u32)>,
     /// Answer when the caller withdraws the request.
     answer_on_withdraw: bool,
+    /// Claim the request when the caller withdraws it; answer on the next poll.
+    claim_on_withdraw: bool,
+    /// A claimed request never completes.
+    never_finish: bool,
     /// Bytes written while the request was pending (must stay empty).
     written_while_pending: usize,
     /// Requests MM ran.
@@ -28,6 +32,8 @@ impl FakeMm {
             polls: 0,
             answer_at,
             answer_on_withdraw: false,
+            claim_on_withdraw: false,
+            never_finish: false,
             written_while_pending: 0,
             ran: Vec::new(),
         }
@@ -56,7 +62,7 @@ impl FakeMm {
 
 impl Transport for FakeMm {
     fn write(&mut self, offset: u64, bytes: &[u8]) {
-        if self.status() == STATUS_PENDING {
+        if self.status() == STATUS_PENDING || self.status() == STATUS_BUSY {
             self.written_while_pending += bytes.len();
         }
         let at = offset as usize;
@@ -72,11 +78,18 @@ impl Transport for FakeMm {
         if self.answer_on_withdraw {
             self.run();
         }
+        if self.claim_on_withdraw && self.status() == STATUS_PENDING {
+            self.set_status(STATUS_BUSY);
+        }
         let found = self.status();
         if found == current {
             self.set_status(new);
         }
         found
+    }
+
+    fn read_status(&mut self) -> u64 {
+        self.status()
     }
 
     fn write_status(&mut self, status: u64) {
@@ -89,6 +102,12 @@ impl Transport for FakeMm {
     }
 
     fn pause(&mut self) {
+        if self.status() == STATUS_BUSY && !self.never_finish {
+            let request = Request::from_bytes(self.buffer[..REQUEST_SIZE].try_into().unwrap());
+            self.ran.push(request);
+            self.set_status(0);
+            return;
+        }
         self.polls += 1;
         if self.answer_at == Some((self.smis, self.polls)) {
             self.run();
@@ -180,4 +199,32 @@ fn a_stale_pending_request_never_runs_with_new_data() {
     let _ = exchange(&mut mm, request(), &[0], b"new");
     assert_eq!(mm.written_while_pending, 0);
     assert_eq!(mm.ran.len(), 1);
+}
+
+#[test]
+fn a_claimed_request_is_waited_for_not_withdrawn() {
+    let mut mm = FakeMm::new(None);
+    // MM claims the request as the caller gives up, and answers later.
+    mm.claim_on_withdraw = true;
+    assert!(matches!(
+        exchange(&mut mm, request(), &[0], &[]),
+        Outcome::Answered { .. }
+    ));
+    assert_eq!(mm.ran.len(), 1);
+}
+
+#[test]
+fn a_buffer_mm_still_holds_is_not_reused() {
+    let mut mm = FakeMm::new(Some((1, 1)));
+    mm.set_status(STATUS_BUSY);
+    mm.never_finish = true;
+    assert!(matches!(
+        exchange(&mut mm, request(), &[0], b"new"),
+        Outcome::Lost
+    ));
+    assert_eq!(mm.written_while_pending, 0);
+    assert_eq!(
+        &mm.buffer[DATA_OFFSET as usize..DATA_OFFSET as usize + 3],
+        &[0, 0, 0]
+    );
 }

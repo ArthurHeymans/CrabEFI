@@ -54,6 +54,9 @@ pub struct Record {
     pub next: u32,
 }
 
+/// Called with each live record, its name (with terminator) and its data.
+type LiveRecordVisitor<'a> = dyn FnMut(&Record, &[u16], &[u8]) -> Result<(), Error> + 'a;
+
 /// Region-relative reader over flash or over a RAM copy of the region.
 type Reader<'a> = &'a mut dyn FnMut(u32, &mut [u8]) -> bool;
 
@@ -68,6 +71,9 @@ pub struct NvStore {
     data_end: u32,
     /// First free byte (region-relative).
     write_offset: u32,
+    /// A rebuild failed after it started erasing: no copy on flash is known
+    /// to be complete, so writes are refused until the store is opened again.
+    poisoned: bool,
 }
 
 // The boot firmware checks the store size against this before loading MM.
@@ -137,41 +143,40 @@ fn fv_headers(size: u32) -> [u8; HEADERS] {
     b
 }
 
-/// Walk records like crabefi-core's `walk_variables_inner`; stops at the append
-/// point or at the first record it cannot parse. Returns where it stopped.
-fn walk(read: Reader<'_>, data_end: u32, f: &mut dyn FnMut(&Record) -> bool) -> u32 {
+/// Walk the records; returns the offset where it stopped: the append point
+/// (blank flash, or a record still being appended, whose state is 0xFF), or
+/// the record `f` stopped at.
+///
+/// A read failure, or a programmed record that does not parse, is an error
+/// rather than the end of the store: treating it as the end would serve, or
+/// compact into, a store that silently lacks the records after it.
+fn walk(read: Reader<'_>, data_end: u32, f: &mut dyn FnMut(&Record) -> bool) -> Result<u32, Error> {
     let header_size = AUTH_VAR_HEADER_SIZE as u32;
     let mut offset = VARIABLE_DATA_OFFSET;
     let mut h = [0u8; AUTH_VAR_HEADER_SIZE];
     while offset + header_size <= data_end {
         if !read(offset, &mut h) {
-            return offset;
+            return Err(Error::Device);
         }
-        if u16::from_le_bytes([h[0], h[1]]) != VARIABLE_DATA || h[2] == 0xff {
-            return offset;
+        let magic = u16::from_le_bytes([h[0], h[1]]);
+        if magic == 0xffff || (magic == VARIABLE_DATA && h[2] == 0xff) {
+            return Ok(offset);
+        }
+        if magic != VARIABLE_DATA {
+            return Err(Error::Corrupt);
         }
         let (attributes, name_size, data_size) =
             (u32_at(&h, 4), u32_at(&h, 0x24), u32_at(&h, 0x28));
-        if attributes == u32::MAX || name_size == u32::MAX || data_size == u32::MAX {
-            return offset;
-        }
-        let Some(name_offset) = offset.checked_add(header_size) else {
-            return offset;
+        let next = offset.checked_add(header_size).and_then(|name_offset| {
+            let data_offset = name_offset.checked_add(name_size)?;
+            let end = data_offset.checked_add(data_size)?;
+            let next = checked_align_up(end - offset, HEADER_ALIGNMENT)
+                .and_then(|n| offset.checked_add(n))?;
+            (end <= data_end).then_some((name_offset, data_offset, next))
+        });
+        let Some((name_offset, data_offset, next)) = next else {
+            return Err(Error::Corrupt);
         };
-        let Some(data_offset) = name_offset.checked_add(name_size) else {
-            return offset;
-        };
-        let Some(end) = data_offset.checked_add(data_size) else {
-            return offset;
-        };
-        let Some(next) =
-            checked_align_up(end - offset, HEADER_ALIGNMENT).and_then(|n| offset.checked_add(n))
-        else {
-            return offset;
-        };
-        if end > data_end {
-            return offset;
-        }
         let mut guid = [0u8; 16];
         guid.copy_from_slice(&h[0x2c..0x3c]);
         let record = Record {
@@ -187,11 +192,82 @@ fn walk(read: Reader<'_>, data_end: u32, f: &mut dyn FnMut(&Record) -> bool) -> 
             next,
         };
         if !f(&record) {
-            return offset;
+            return Ok(offset);
         }
         offset = next;
     }
-    offset
+    Ok(offset)
+}
+
+/// Call `f` with the bytes of every live record of the store image `copy`
+/// that no later live record of the same name supersedes, in store order,
+/// until `f` returns false.
+fn kept_records(copy: &[u8], data_end: u32, f: &mut dyn FnMut(&[u8]) -> bool) -> Result<(), Error> {
+    let mut read = |o: u32, b: &mut [u8]| match copy.get(o as usize..o as usize + b.len()) {
+        Some(src) => {
+            b.copy_from_slice(src);
+            true
+        }
+        None => false,
+    };
+    let mut result = Ok(());
+    walk(&mut read, data_end, &mut |record| {
+        if record.state != VAR_ADDED {
+            return true;
+        }
+        let units = record.name_size as usize / 2;
+        let mut name = [0u16; MAX_VARIABLE_NAME_LEN + 1];
+        let name_start = record.name_offset as usize;
+        let (Some(name), Some(name_bytes)) = (
+            name.get_mut(..units).filter(|name| !name.is_empty()),
+            copy.get(name_start..name_start + units * 2),
+        ) else {
+            result = Err(Error::Corrupt);
+            return false;
+        };
+        for (unit, bytes) in name.iter_mut().zip(name_bytes.as_chunks::<2>().0) {
+            *unit = u16::from_le_bytes(*bytes);
+        }
+        let name: &[u16] = name;
+        let mut later = false;
+        let mut read = |o: u32, b: &mut [u8]| match copy.get(o as usize..o as usize + b.len()) {
+            Some(src) => {
+                b.copy_from_slice(src);
+                true
+            }
+            None => false,
+        };
+        let scan = walk(&mut read, data_end, &mut |other| {
+            if other.offset > record.offset && other.state == VAR_ADDED && other.guid == record.guid
+            {
+                let mut read =
+                    |o: u32, b: &mut [u8]| match copy.get(o as usize..o as usize + b.len()) {
+                        Some(src) => {
+                            b.copy_from_slice(src);
+                            true
+                        }
+                        None => false,
+                    };
+                later = name_is(&mut read, other, name);
+            }
+            !later
+        });
+        if let Err(error) = scan {
+            result = Err(error);
+            return false;
+        }
+        if later {
+            return true;
+        }
+        match copy.get(record.offset as usize..record.next as usize) {
+            Some(bytes) => f(bytes),
+            None => {
+                result = Err(Error::Corrupt);
+                false
+            }
+        }
+    })?;
+    result
 }
 
 /// The record's name equals `name` (UTF-16 including the terminator).
@@ -205,9 +281,11 @@ fn name_is(read: Reader<'_>, record: &Record, name: &[u16]) -> bool {
     };
     read(record.name_offset, bytes)
         && bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .zip(name)
-            .all(|(b, &unit)| u16::from_le_bytes([b[0], b[1]]) == unit)
+            .all(|(b, &unit)| u16::from_le_bytes(*b) == unit)
 }
 
 impl NvStore {
@@ -219,6 +297,7 @@ impl NvStore {
             half: 0,
             data_end: 0,
             write_offset: 0,
+            poisoned: false,
         }
     }
 
@@ -257,7 +336,7 @@ impl NvStore {
     }
 
     /// First free byte after the records of the store at `base`.
-    fn scan_end(&self, base: u32, data_end: u32) -> u32 {
+    fn scan_end(&self, base: u32, data_end: u32) -> Result<u32, Error> {
         walk(&mut |o, b| self.read_at(base, o, b), data_end, &mut |_| {
             true
         })
@@ -275,7 +354,7 @@ impl NvStore {
     pub fn open(&mut self, flash: Flash, region: u64, size: u32) -> Result<(), Error> {
         let half = size / 2;
         if size as usize > MAX_STORE_SIZE
-            || (half as u64) % ERASE_BLOCK != 0
+            || !(half as u64).is_multiple_of(ERASE_BLOCK)
             || half == 0
             || (half as usize) < HEADERS + RECORD_MAX
         {
@@ -292,7 +371,7 @@ impl NvStore {
             }
         } else if let Some(end) = self.store_at(0, size) {
             self.data_end = end;
-            self.write_offset = self.scan_end(0, end);
+            self.write_offset = self.scan_end(0, end)?;
             self.migrate()?;
         } else if self.store_at(half, half).is_some() {
             self.copy_spare_to_primary()?;
@@ -301,7 +380,7 @@ impl NvStore {
         } else {
             return Err(Error::Corrupt);
         }
-        self.write_offset = self.scan_end(0, self.data_end);
+        self.write_offset = self.scan_end(0, self.data_end)?;
         Ok(())
     }
 
@@ -328,7 +407,9 @@ impl NvStore {
     fn copy_spare_to_primary(&mut self) -> Result<(), Error> {
         let half = self.half;
         let spare_end = self.store_at(half, half).ok_or(Error::Corrupt)?;
-        let end = self.scan_end(half, spare_end);
+        let end = self.scan_end(half, spare_end)?;
+        // Until the primary is rebuilt only the spare holds the store.
+        self.poisoned = true;
         if !self.erase_half(0) {
             return Err(Error::Device);
         }
@@ -347,6 +428,7 @@ impl NvStore {
             return Err(Error::Device);
         }
         self.data_end = half;
+        self.poisoned = false;
         Ok(())
     }
 
@@ -356,7 +438,7 @@ impl NvStore {
         &self,
         name_buf: &mut [u16],
         data_buf: &mut [u8],
-        f: &mut dyn FnMut(&Record, &[u16], &[u8]) -> Result<(), Error>,
+        f: &mut LiveRecordVisitor<'_>,
     ) -> Result<(), Error> {
         let mut result = Ok(());
         let mut reader = |o: u32, b: &mut [u8]| self.read(o, b);
@@ -394,17 +476,22 @@ impl NvStore {
                 result = Err(Error::Invalid);
                 return false;
             };
-            if self.superseded(record, name) {
-                return true;
+            match self.superseded(record, name) {
+                Ok(true) => return true,
+                Ok(false) => {}
+                Err(error) => {
+                    result = Err(error);
+                    return false;
+                }
             }
             result = f(record, name, data);
             result.is_ok()
-        });
+        })?;
         result
     }
 
     /// A later live record has the same GUID and name.
-    fn superseded(&self, record: &Record, name: &[u16]) -> bool {
+    fn superseded(&self, record: &Record, name: &[u16]) -> Result<bool, Error> {
         let mut found = false;
         let mut reader = |o: u32, b: &mut [u8]| self.read(o, b);
         walk(&mut reader, self.data_end, &mut |other| {
@@ -414,8 +501,8 @@ impl NvStore {
                 found = name_is(&mut reader, other, name);
             }
             !found
-        });
-        found
+        })?;
+        Ok(found)
     }
 
     /// Append a record and retire its predecessors. `name` includes the terminator.
@@ -427,6 +514,9 @@ impl NvStore {
         data: &[u8],
         timestamp: Option<VariableTimestamp>,
     ) -> Result<(), Error> {
+        if self.poisoned {
+            return Err(Error::Device);
+        }
         let name_bytes = name.len() * 2;
         if name.last() != Some(&0)
             || name.len() < 2
@@ -512,7 +602,7 @@ impl NvStore {
                 }
             }
             true
-        });
+        })?;
         for &offset in matches.iter().take(count) {
             let state = self.region + offset as u64 + 2;
             if !self.flash.program_bits(state, VAR_DELETED) {
@@ -569,8 +659,13 @@ impl NvStore {
             for (unit, b) in name.iter_mut().zip(bytes.as_chunks::<2>().0) {
                 *unit = u16::from_le_bytes(*b);
             }
-            if self.superseded(record, name) {
-                return true;
+            match self.superseded(record, name) {
+                Ok(true) => return true,
+                Ok(false) => {}
+                Err(error) => {
+                    result = Err(error);
+                    return false;
+                }
             }
             let len = record.next - record.offset;
             if offset + len > half {
@@ -593,7 +688,7 @@ impl NvStore {
             }
             offset += len;
             true
-        });
+        })?;
         result?;
         // The spare becomes the authoritative copy once its header is written.
         if !self
@@ -625,101 +720,42 @@ impl NvStore {
         if !self.read(0, copy) {
             return Err(Error::Device);
         }
+        let copy: &[u8] = copy;
+        let data_end = self.data_end;
+        // Check that every kept record parses and that they fit a half
+        // before anything is erased.
+        let mut needed = VARIABLE_DATA_OFFSET as usize;
+        kept_records(copy, data_end, &mut |bytes| {
+            needed += bytes.len();
+            true
+        })?;
+        if needed > self.half as usize {
+            return Err(Error::Full);
+        }
+
+        // From here on a failure leaves neither store usable until the next
+        // open decides; stop serving writes.
+        self.poisoned = true;
         if !self.erase_half(0) {
             return Err(Error::Device);
         }
-        let old_data_end = self.data_end;
         self.data_end = self.half;
         let mut offset = VARIABLE_DATA_OFFSET;
-        let mut failed = false;
-        let copy_ro: &[u8] = copy;
-        let mut reader = |o: u32, b: &mut [u8]| match copy_ro.get(o as usize..o as usize + b.len())
-        {
-            Some(src) => {
-                b.copy_from_slice(src);
-                true
-            }
-            None => false,
-        };
-        let data_end = old_data_end;
-        walk(&mut reader, data_end, &mut |record| {
-            if record.state != VAR_ADDED {
-                return true;
-            }
-            // Keep only the last live record per name.
-            let units = record.name_size as usize / 2;
-            let mut name = [0u16; MAX_VARIABLE_NAME_LEN + 1];
-            if units == 0 || units > name.len() {
-                return true;
-            }
-            let name_start = record.name_offset as usize;
-            let Some(name_bytes) = copy_ro.get(name_start..name_start + units * 2) else {
-                return true;
-            };
-            let Some(name) = name.get_mut(..units) else {
-                return true;
-            };
-            for (unit, bytes) in name.iter_mut().zip(name_bytes.as_chunks::<2>().0) {
-                *unit = u16::from_le_bytes(*bytes);
-            }
-            let name: &[u16] = name;
-            let mut later = false;
-            let mut reader2 =
-                |o: u32, b: &mut [u8]| match copy_ro.get(o as usize..o as usize + b.len()) {
-                    Some(src) => {
-                        b.copy_from_slice(src);
-                        true
-                    }
-                    None => false,
-                };
-            walk(&mut reader2, data_end, &mut |other| {
-                if other.offset > record.offset
-                    && other.state == VAR_ADDED
-                    && other.guid == record.guid
-                {
-                    let mut reader3 = |o: u32, b: &mut [u8]| match copy_ro
-                        .get(o as usize..o as usize + b.len())
-                    {
-                        Some(src) => {
-                            b.copy_from_slice(src);
-                            true
-                        }
-                        None => false,
-                    };
-                    later = name_is(&mut reader3, other, name);
-                }
-                !later
-            });
-            if later {
-                return true;
-            }
-            let Some(bytes) = copy_ro.get(record.offset as usize..record.next as usize) else {
-                failed = true;
-                return false;
-            };
-            if offset as usize + bytes.len() > self.half as usize {
-                failed = true;
-                return false;
-            }
-            if !self.flash.program(self.region + offset as u64, bytes) {
-                failed = true;
-                return false;
-            }
-            offset = offset.saturating_add(bytes.len() as u32);
-            true
-        });
-        if failed {
-            return Err(Error::Device);
-        }
+        let mut programmed = true;
+        kept_records(copy, data_end, &mut |bytes| {
+            programmed = self.flash.program(self.region + offset as u64, bytes);
+            offset += bytes.len() as u32;
+            programmed
+        })?;
         // The new primary becomes the store once its header is written.
-        if !self
-            .flash
-            .program(self.region, &fv_headers(self.half))
+        if !programmed
+            || !self.flash.program(self.region, &fv_headers(self.half))
             || !self.erase_half(self.half)
         {
             return Err(Error::Device);
         }
         self.write_offset = offset;
+        self.poisoned = false;
         Ok(())
     }
 }

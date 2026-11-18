@@ -16,14 +16,14 @@ use core::ffi::c_void;
 use core::ptr::{
     addr_of, addr_of_mut, read_unaligned, read_volatile, write_unaligned, write_volatile,
 };
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crabefi_runtime_abi::{BridgeRequest, MAX_VARIABLE_NAME_LEN, bridge_operation};
 
 use crate::efi;
 use crate::mm_protocol::{
-    COMM_MAGIC, COMM_VERSION, DATA_OFFSET, NAME_CAPACITY, NAME_OFFSET, Request, STATUS_PENDING,
-    command,
+    COMM_MAGIC, COMM_VERSION, DATA_OFFSET, NAME_CAPACITY, NAME_OFFSET, Request, STATUS_BUSY,
+    STATUS_PENDING, command,
 };
 use crate::services;
 use crate::state::{self, MM_RUNTIME_LATCH, Phase};
@@ -234,7 +234,9 @@ fn init(context: *const CallContext) -> Result<(), ()> {
                 .iter()
                 .position(|&unit| unit == 0)
                 .unwrap_or(name.len());
-            let Some(name) = name.get(..length).filter(|_| length <= MAX_VARIABLE_NAME_LEN)
+            let Some(name) = name
+                .get(..length)
+                .filter(|_| length <= MAX_VARIABLE_NAME_LEN)
             else {
                 return Err(nvstore::Error::Invalid);
             };
@@ -301,7 +303,8 @@ fn persist(request: &BridgeRequest) -> Result<(), efi::Status> {
     }
     let mut terminated = [0u16; MAX_VARIABLE_NAME_LEN + 1];
     // SAFETY: image-owned SMRAM buffers of the given lengths.
-    let source = unsafe { core::slice::from_raw_parts(request.name_address as *const u16, name_len) };
+    let source =
+        unsafe { core::slice::from_raw_parts(request.name_address as *const u16, name_len) };
     for (unit, &source) in terminated.iter_mut().zip(source) {
         *unit = source;
     }
@@ -358,20 +361,31 @@ extern "sysv64" fn mm_runtime(_argument: *mut u8) {
     }
     let comm = context.config.comm_base;
     let header_ptr = comm as *mut Request;
-    // SAFETY: comm_base was checked at init not to overlap SMRAM we own; ring 0
-    // owns this memory, so read it once and work on the copy.
-    let request = unsafe { read_volatile(header_ptr) };
-    if request.magic != COMM_MAGIC || request.status != STATUS_PENDING {
+    // Claim the request before reading anything else: from here on ring 0
+    // leaves the buffer alone until the status below answers it.
+    // SAFETY: comm_base was checked at init not to overlap SMRAM we own and
+    // is page aligned, so its status word is an aligned u64.
+    let status = unsafe { AtomicU64::from_ptr(addr_of_mut!((*header_ptr).status)) };
+    if status
+        .compare_exchange(STATUS_PENDING, STATUS_BUSY, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
         return; // Not addressed to us.
     }
+    // SAFETY: as above; ring 0 owns this memory, so read it once and work on
+    // the copy.
+    let request = unsafe { read_volatile(header_ptr) };
+    if request.magic != COMM_MAGIC {
+        status.store(efi::Status::INVALID_PARAMETER.as_usize() as u64, Ordering::Release);
+        return;
+    }
     let mut reply = request;
-    let status = if request.version != COMM_VERSION {
+    let answer = if request.version != COMM_VERSION {
         efi::Status::INVALID_PARAMETER
     } else {
         dispatch(&context.config, &mut reply)
     };
-    reply.status = status.as_usize() as u64;
-    // SAFETY: as above; the status is written last.
+    // SAFETY: as above; the status is stored last, with release ordering.
     unsafe {
         write_volatile(addr_of_mut!((*header_ptr).guid), reply.guid);
         write_volatile(addr_of_mut!((*header_ptr).attributes), reply.attributes);
@@ -389,8 +403,8 @@ extern "sysv64" fn mm_runtime(_argument: *mut u8) {
             addr_of_mut!((*header_ptr).maximum_variable),
             reply.maximum_variable,
         );
-        write_volatile(addr_of_mut!((*header_ptr).status), reply.status);
     }
+    status.store(answer.as_usize() as u64, Ordering::Release);
 }
 
 fn copy_in(source: u64, target: &mut [u8]) {
@@ -410,11 +424,13 @@ fn copy_out(source: &[u8], target: u64) {
 /// Copy the request name (terminated, at most NAME_CAPACITY bytes) into SMRAM.
 fn load_name(config: &InitConfig, request: &Request, name: &mut [u16]) -> Result<(), efi::Status> {
     let size = request.name_size as usize;
-    if size < 2 || size % 2 != 0 || size > NAME_CAPACITY {
+    if size < 2 || !size.is_multiple_of(2) || size > NAME_CAPACITY {
         return Err(efi::Status::INVALID_PARAMETER);
     }
     let mut bytes = [0u8; NAME_CAPACITY];
-    let bytes = bytes.get_mut(..size).ok_or(efi::Status::INVALID_PARAMETER)?;
+    let bytes = bytes
+        .get_mut(..size)
+        .ok_or(efi::Status::INVALID_PARAMETER)?;
     copy_in(config.comm_base + NAME_OFFSET, bytes);
     name.fill(0);
     for (unit, b) in name.iter_mut().zip(bytes.as_chunks::<2>().0) {
@@ -603,10 +619,10 @@ fn dispatch(config: &InitConfig, request: &mut Request) -> efi::Status {
             );
             request.attributes = attributes;
             request.data_size = size as u64;
-            if status == efi::Status::SUCCESS {
-                if let Some(data) = data.get(..size) {
-                    copy_out(data, config.comm_base + DATA_OFFSET);
-                }
+            if status == efi::Status::SUCCESS
+                && let Some(data) = data.get(..size)
+            {
+                copy_out(data, config.comm_base + DATA_OFFSET);
             }
             status
         }
