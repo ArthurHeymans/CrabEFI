@@ -688,6 +688,75 @@ fn paint_option_row(
     }
 }
 
+/// Pick the strip headline and detail.
+///
+/// A failed save stays visible until the draft changes so its Try again
+/// action remains discoverable; a later status message leads and the failure
+/// becomes the detail. After a successful save, a later status message
+/// replaces the summary.
+fn strip_notice(
+    save_result: Option<(usize, usize)>,
+    status_message: Option<(&'static str, bool)>,
+    changed: usize,
+    names_text: String,
+) -> (Tone, String, String) {
+    match (save_result, status_message) {
+        (Some((saved, failed)), message) if failed > 0 => {
+            let failure = if saved == 0 && failed == 1 {
+                String::from("Could not save the change.")
+            } else if saved == 0 {
+                alloc::format!("Could not save {failed} changes.")
+            } else {
+                alloc::format!("Could not save {failed} of {} changes.", saved + failed)
+            };
+            // The strip is one line and drops the detail when space is short;
+            // lead with the newer message. Try again still marks the failure.
+            match message {
+                Some((text, _)) => (Tone::Bad, String::from(text), failure),
+                None => (
+                    Tone::Bad,
+                    failure,
+                    String::from("Your edits are kept (starred)."),
+                ),
+            }
+        }
+        (Some((saved, _)), None) => (
+            Tone::Ok,
+            alloc::format!(
+                "Saved {saved} {}.",
+                if saved == 1 { "change" } else { "changes" }
+            ),
+            String::from("They apply after restart."),
+        ),
+        (_, Some((message, ok))) => (
+            if ok {
+                if changed > 0 { Tone::Warn } else { Tone::Ok }
+            } else {
+                Tone::Bad
+            },
+            String::from(message),
+            if changed > 0 {
+                alloc::format!("{changed} unsaved: {names_text}")
+            } else {
+                String::new()
+            },
+        ),
+        (None, None) if changed > 0 => (
+            Tone::Warn,
+            alloc::format!(
+                "{changed} unsaved {}",
+                if changed == 1 { "change" } else { "changes" }
+            ),
+            names_text,
+        ),
+        _ => (
+            Tone::Neutral,
+            String::from("No unsaved changes."),
+            String::from("Saved settings apply after restart."),
+        ),
+    }
+}
+
 fn paint_strip(
     fb: &FramebufferInfo,
     l: &FwLayout,
@@ -705,54 +774,8 @@ fn paint_strip(
     if !names_text.is_empty() {
         names_text.push('.');
     }
-    let (tone, headline, detail): (Tone, String, String) =
-        match (state.save_result, state.status_message) {
-            (Some((saved, failed)), _) if failed > 0 => (
-                Tone::Bad,
-                if saved == 0 && failed == 1 {
-                    String::from("Could not save the change.")
-                } else if saved == 0 {
-                    alloc::format!("Could not save {failed} changes.")
-                } else {
-                    alloc::format!("Could not save {failed} of {} changes.", saved + failed)
-                },
-                String::from("Your edits are kept (starred)."),
-            ),
-            (Some((saved, _)), _) => (
-                Tone::Ok,
-                alloc::format!(
-                    "Saved {saved} {}.",
-                    if saved == 1 { "change" } else { "changes" }
-                ),
-                String::from("They apply after restart."),
-            ),
-            (None, Some((message, ok))) => (
-                if ok {
-                    if changed > 0 { Tone::Warn } else { Tone::Ok }
-                } else {
-                    Tone::Bad
-                },
-                String::from(message),
-                if changed > 0 {
-                    alloc::format!("{changed} unsaved: {names_text}")
-                } else {
-                    String::new()
-                },
-            ),
-            (None, None) if changed > 0 => (
-                Tone::Warn,
-                alloc::format!(
-                    "{changed} unsaved {}",
-                    if changed == 1 { "change" } else { "changes" }
-                ),
-                names_text,
-            ),
-            _ => (
-                Tone::Neutral,
-                String::from("No unsaved changes."),
-                String::from("Saved settings apply after restart."),
-            ),
-        };
+    let (tone, headline, detail) =
+        strip_notice(state.save_result, state.status_message, changed, names_text);
     let acts = strip_actions(items, state);
     let buttons: Vec<StripButton<'_>> = acts
         .iter()
@@ -1223,6 +1246,7 @@ pub async fn show_cfr_menu_graphical(
         }
 
         if let Some(mut key) = fb.key() {
+            let selected_before = state.selected;
             let mut viewport_only = matches!(key, KeyPress::MouseScroll(_));
             let acts = actions(cfr_info, &items, &state, fb);
             let mut action = None;
@@ -1244,6 +1268,7 @@ pub async fn show_cfr_menu_graphical(
                     if state.focus.group == Group::Content {
                         keep_graphical_selection_visible(cfr_info, &items, &mut state, fb);
                     }
+                    clear_row_notice(&mut state, selected_before);
                     clickable = cursor
                         .while_hidden(fb, || draw_graphical_menu(cfr_info, &items, &state, fb));
                     hover.reset();
@@ -1254,26 +1279,6 @@ pub async fn show_cfr_menu_graphical(
             }
             if !graphical_key_allowed(state.focus.group, key) {
                 continue;
-            }
-            // Opening a section (Enter/Space in Sections) edits nothing, so it
-            // must not dismiss a failed-save notice or its Try again action.
-            if action.is_none()
-                && matches!(state.focus.group, Group::Content | Group::Actions)
-                && (matches!(
-                    key,
-                    KeyPress::Enter | KeyPress::Char(' ' | 'w' | 'W') | KeyPress::F10
-                ) || (state.focus.group == Group::Content
-                    && matches!(
-                        key,
-                        KeyPress::Left
-                            | KeyPress::Right
-                            | KeyPress::Char('+' | '=' | '-' | 'd' | 'D')
-                    )))
-            {
-                state.status_message = None;
-                if !matches!(key, KeyPress::F10 | KeyPress::Char('w' | 'W')) {
-                    state.save_result = None;
-                }
             }
             if state.focus.group == Group::Sections {
                 let sections = visible_sections(cfr_info, &items);
@@ -1349,13 +1354,20 @@ pub async fn show_cfr_menu_graphical(
                     cursor.hide(fb);
                     edit_graphical_item(cfr_info, &mut items, &mut state, fb).await;
                 }
-                KeyPress::Right | KeyPress::Char('+' | '=') if content => {
-                    if !increment_option(cfr_info, &mut items, state.selected) {
-                        state.status_message = Some(("This option cannot be changed.", false));
-                    }
-                }
-                KeyPress::Left | KeyPress::Char('-') if content => {
-                    if !decrement_option(cfr_info, &mut items, state.selected) {
+                KeyPress::Left | KeyPress::Right | KeyPress::Char('+' | '=' | '-') if content => {
+                    let direction = if matches!(key, KeyPress::Left | KeyPress::Char('-')) {
+                        StepDirection::Backward
+                    } else {
+                        StepDirection::Forward
+                    };
+                    if apply_graphical_edit(
+                        cfr_info,
+                        &mut items,
+                        &mut state,
+                        SettingEdit::Step(direction),
+                    )
+                    .is_none()
+                    {
                         state.status_message = Some(("This option cannot be changed.", false));
                     }
                 }
@@ -1442,10 +1454,6 @@ pub async fn show_cfr_menu_graphical(
                             state.focus.group = Group::Actions;
                             state.focus.action = i;
                         }
-                        state.status_message = None;
-                        if action != FwAction::Save {
-                            state.save_result = None;
-                        }
                         match action {
                             FwAction::Edit => {
                                 edit_graphical_item(cfr_info, &mut items, &mut state, fb).await
@@ -1503,6 +1511,7 @@ pub async fn show_cfr_menu_graphical(
             if !viewport_only {
                 keep_graphical_selection_visible(cfr_info, &items, &mut state, fb);
             }
+            clear_row_notice(&mut state, selected_before);
             let acts = actions(cfr_info, &items, &state, fb);
             // An action that replaced itself (Save -> Restart now) must not
             // hand its focus to a different, consequential button.
@@ -1525,6 +1534,14 @@ pub async fn show_cfr_menu_graphical(
 }
 
 // ─── Operations ─────────────────────────────────────────────────────────
+
+/// Status messages describe the selected row; drop them when the selection
+/// moves. Save results stay until the draft changes.
+fn clear_row_notice(state: &mut GraphicalState, selected_before: usize) {
+    if state.selected != selected_before {
+        state.status_message = None;
+    }
+}
 
 fn save_graphical_changes(cfr: &CfrInfo<'_>, items: &mut [MenuItem], state: &mut GraphicalState) {
     if !has_changes(items) {
@@ -1640,6 +1657,7 @@ async fn leave_graphical(
     match choice {
         1 => {
             discard_graphical_changes(items);
+            state.save_result = None;
             state.status_message = Some(("Unsaved changes discarded.", true));
             fb.set_firmware_dirty(false);
             true
@@ -1801,32 +1819,16 @@ fn restore_graphical_default(
     items: &mut [MenuItem],
     state: &mut GraphicalState,
 ) {
-    state.save_result = None;
-    if !can_edit_item(cfr, items, state.selected) {
-        state.status_message = Some((
-            "Read-only or unavailable; the default cannot be applied.",
-            false,
-        ));
-        return;
-    }
-    match items.get_mut(state.selected) {
-        Some(MenuItem::CrabLogLevel { current_level, .. }) => {
-            *current_level = crate::cfr::DEFAULT_LEVEL;
-        }
-        Some(MenuItem::Option {
-            form_idx,
-            option_idx,
-            current_value,
-            ..
-        }) => {
-            let Some(option) = get_option(cfr, *form_idx, *option_idx) else {
-                return;
-            };
-            *current_value = CfrValue::from_option_type(&option.option_type);
-        }
-        _ => return,
-    }
-    state.status_message = Some(("Default value set; save to keep it.", true));
+    state.status_message = Some(
+        match apply_graphical_edit(cfr, items, state, SettingEdit::RestoreDefault) {
+            Some(true) => ("Default value set; save to keep it.", true),
+            Some(false) => ("Already at the default value.", true),
+            None => (
+                "Read-only or unavailable; the default cannot be applied.",
+                false,
+            ),
+        },
+    );
 }
 
 /// Numeric editors accept an explicit decimal or 0x-prefixed hexadecimal value.
@@ -1838,12 +1840,7 @@ fn parse_graphical_number(text: &str, min: u32, max: u32, step: u32) -> Result<u
         text.parse::<u32>()
     }
     .map_err(|_| "Enter a decimal number or 0x-prefixed hexadecimal.")?;
-    if n < min || n > max {
-        return Err("Value is outside the allowed range.");
-    }
-    if step > 1 && !(n - min).is_multiple_of(step) {
-        return Err("Value must match the step from the minimum.");
-    }
+    validate_number(n, min, max, step)?;
     Ok(n)
 }
 
@@ -1898,7 +1895,7 @@ async fn edit_graphical_item(
     }
     let anchor = selected_anchor(cfr, items, state, fb);
     // Painting the backdrop needs an immutable view; edit afterwards.
-    let result: Option<EditResult> = {
+    let result: Option<SettingEdit> = {
         let snapshot: &[MenuItem] = items;
         let st: &GraphicalState = state;
         let backdrop = || {
@@ -1929,7 +1926,8 @@ async fn edit_graphical_item(
                     &tags,
                 )
                 .await
-                .map(EditResult::Level)
+                .and_then(|index| cfr::LEVEL_CHOICES.get(index).copied())
+                .map(SettingEdit::SetLogLevel)
             }
             Some(MenuItem::Option {
                 form_idx,
@@ -1942,7 +1940,7 @@ async fn edit_graphical_item(
                 };
                 match (&option.option_type, current_value) {
                     (CfrOptionType::Bool { .. }, CfrValue::Bool(value)) => {
-                        Some(EditResult::Bool(!*value))
+                        Some(SettingEdit::Set(CfrValue::Bool(!*value)))
                     }
                     (CfrOptionType::Enum { choices, .. }, CfrValue::Number(value)) => {
                         let current = choices.iter().position(|c| c.value == *value);
@@ -1980,7 +1978,7 @@ async fn edit_graphical_item(
                         .await
                         .and_then(|i| i.checked_sub(extra))
                         .and_then(|i| choices.get(i))
-                        .map(|c| EditResult::Number(c.value))
+                        .map(|c| SettingEdit::Set(CfrValue::Number(c.value)))
                     }
                     (CfrOptionType::Number { min, max, step, .. }, CfrValue::Number(value)) => {
                         let hint =
@@ -1997,7 +1995,7 @@ async fn edit_graphical_item(
                         )
                         .await
                         .and_then(|text| parse_graphical_number(&text, *min, *max, *step).ok())
-                        .map(EditResult::Number)
+                        .map(|n| SettingEdit::Set(CfrValue::Number(n)))
                     }
                     (CfrOptionType::Varchar { .. }, CfrValue::Varchar(value)) => dialog::input(
                         fb,
@@ -2010,7 +2008,7 @@ async fn edit_graphical_item(
                         |_| Ok(()),
                     )
                     .await
-                    .map(EditResult::Text),
+                    .map(|text| SettingEdit::Set(CfrValue::Varchar(text))),
                     _ => {
                         return;
                     }
@@ -2022,38 +2020,22 @@ async fn edit_graphical_item(
     let Some(result) = result else {
         return;
     };
-    apply_graphical_edit(items, state, result);
+    let _ = apply_graphical_edit(cfr, items, state, result);
 }
 
-fn apply_graphical_edit(items: &mut [MenuItem], state: &mut GraphicalState, result: EditResult) {
-    fn replace<T: PartialEq>(old: &mut T, new: T) -> bool {
-        let changed = *old != new;
-        *old = new;
-        changed
-    }
-    let changed = match (items.get_mut(state.selected), result) {
-        (Some(MenuItem::CrabLogLevel { current_level, .. }), EditResult::Level(i)) => {
-            replace(current_level, crate::cfr::LEVEL_CHOICES[i])
-        }
-        (Some(MenuItem::Option { current_value, .. }), result) => match (current_value, result) {
-            (CfrValue::Bool(v), EditResult::Bool(n)) => replace(v, n),
-            (CfrValue::Number(v), EditResult::Number(n)) => replace(v, n),
-            (CfrValue::Varchar(v), EditResult::Text(t)) => replace(v, t),
-            _ => false,
-        },
-        _ => false,
-    };
+fn apply_graphical_edit(
+    cfr: &CfrInfo<'_>,
+    items: &mut [MenuItem],
+    state: &mut GraphicalState,
+    edit: SettingEdit,
+) -> Option<bool> {
+    // Only a changed draft supersedes the previous save attempt.
+    let changed = apply_edit(cfr, items, state.selected, edit)?;
     if changed {
         state.save_result = None;
         state.status_message = None;
     }
-}
-
-enum EditResult {
-    Level(usize),
-    Bool(bool),
-    Number(u32),
-    Text(String),
+    Some(changed)
 }
 
 async fn show_no_options_graphical(fb: &FramebufferInfo) -> ui::ScreenNav {
@@ -2071,6 +2053,26 @@ mod graphical_tests {
     use super::*;
     use crate::cfr::{CfrForm, CfrInfo, OptionStore};
     use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[test]
+    fn later_status_messages_stay_visible_beside_save_results() {
+        let message = Some(("This option cannot be changed.", false));
+        // A newer message leads a failed save, which remains the detail.
+        let (tone, headline, detail) = strip_notice(Some((0, 1)), message, 1, String::new());
+        assert_eq!(tone, Tone::Bad);
+        assert_eq!(headline, "This option cannot be changed.");
+        assert_eq!(detail, "Could not save the change.");
+        let (_, headline, detail) = strip_notice(Some((0, 1)), None, 1, String::new());
+        assert_eq!(headline, "Could not save the change.");
+        assert_eq!(detail, "Your edits are kept (starred).");
+        // A successful save yields to a message raised after it.
+        let (tone, headline, _) = strip_notice(Some((1, 0)), message, 0, String::new());
+        assert_eq!(tone, Tone::Bad);
+        assert_eq!(headline, "This option cannot be changed.");
+        let (tone, headline, _) = strip_notice(Some((1, 0)), None, 0, String::new());
+        assert_eq!(tone, Tone::Ok);
+        assert_eq!(headline, "Saved 1 change.");
+    }
 
     fn option(id: u64) -> CfrOption {
         CfrOption {
@@ -2174,17 +2176,32 @@ mod graphical_tests {
             assert!(graphical_key_allowed(Group::Sections, key));
             assert!(!graphical_key_allowed(Group::Navigation, key));
         }
-        let mut items = [MenuItem::Option {
-            form_idx: 0,
-            option_idx: 0,
-            current_value: CfrValue::Bool(false),
-            original_value: CfrValue::Bool(false),
+        let cfr = CfrInfo::new();
+        let mut items = [MenuItem::CrabLogLevel {
+            current_level: log::LevelFilter::Info,
+            original_level: log::LevelFilter::Info,
         }];
         let mut state = GraphicalState::new(0);
         state.save_result = Some((1, 0));
-        apply_graphical_edit(&mut items, &mut state, EditResult::Bool(false));
+        assert_eq!(
+            apply_graphical_edit(
+                &cfr,
+                &mut items,
+                &mut state,
+                SettingEdit::SetLogLevel(log::LevelFilter::Info)
+            ),
+            Some(false),
+        );
         assert_eq!(state.save_result, Some((1, 0)));
-        apply_graphical_edit(&mut items, &mut state, EditResult::Bool(true));
+        assert_eq!(
+            apply_graphical_edit(
+                &cfr,
+                &mut items,
+                &mut state,
+                SettingEdit::SetLogLevel(log::LevelFilter::Trace)
+            ),
+            Some(true),
+        );
         assert_eq!(state.save_result, None);
     }
 
