@@ -278,6 +278,9 @@ fn no_op_shortcuts_keep_failed_save_feedback_until_a_draft_changes() {
     key(&mut host, "ArrowUp");
     key(&mut host, "ArrowUp");
     assert_eq!(firmware(&host)["selectedId"], 5);
+    // Row feedback leaves with the row; the failed save stays.
+    assert_eq!(firmware(&host)["status"], Value::Null);
+    assert_eq!(firmware(&host)["saveResult"], json!([0, 1]));
     for shortcut in ["ArrowRight", "d"] {
         key(&mut host, shortcut);
         assert_eq!(firmware(&host)["saveResult"], json!([0, 1]));
@@ -290,6 +293,26 @@ fn no_op_shortcuts_keep_failed_save_feedback_until_a_draft_changes() {
     assert_eq!(firmware(&host)["status"], Value::Null);
     assert_eq!(firmware(&host)["dirtyCount"], 2);
     assert_eq!(row(&host, "debug_uart")["value"], 1);
+}
+
+#[test]
+fn discarding_before_a_cancelled_restart_clears_the_failed_save() {
+    let mut host = Playground::new(800, 600, "write-error").unwrap();
+    processor(&mut host);
+    key(&mut host, "ArrowRight");
+    key(&mut host, "F10");
+    assert_eq!(firmware(&host)["saveResult"], json!([0, 1]));
+    key(&mut host, "r");
+    choose(&mut host, 1); // Discard and restart.
+    assert!(state(&host)["dialog"].is_string());
+    key(&mut host, "Escape"); // Cancel the restart.
+    assert_eq!(state(&host)["screen"], "firmware");
+    assert_eq!(firmware(&host)["dirtyCount"], 0);
+    assert_eq!(firmware(&host)["saveResult"], Value::Null);
+    assert_eq!(
+        firmware(&host)["status"],
+        json!(["Unsaved changes discarded.", true])
+    );
 }
 
 #[test]

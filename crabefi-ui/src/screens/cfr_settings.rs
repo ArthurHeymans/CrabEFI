@@ -691,8 +691,9 @@ fn paint_option_row(
 /// Pick the strip headline and detail.
 ///
 /// A failed save stays visible until the draft changes so its Try again
-/// action remains discoverable; a later status message becomes the detail.
-/// After a successful save, a later status message replaces the summary.
+/// action remains discoverable; a later status message leads and the failure
+/// becomes the detail. After a successful save, a later status message
+/// replaces the summary.
 fn strip_notice(
     save_result: Option<(usize, usize)>,
     status_message: Option<(&'static str, bool)>,
@@ -700,17 +701,25 @@ fn strip_notice(
     names_text: String,
 ) -> (Tone, String, String) {
     match (save_result, status_message) {
-        (Some((saved, failed)), message) if failed > 0 => (
-            Tone::Bad,
-            if saved == 0 && failed == 1 {
+        (Some((saved, failed)), message) if failed > 0 => {
+            let failure = if saved == 0 && failed == 1 {
                 String::from("Could not save the change.")
             } else if saved == 0 {
                 alloc::format!("Could not save {failed} changes.")
             } else {
                 alloc::format!("Could not save {failed} of {} changes.", saved + failed)
-            },
-            String::from(message.map_or("Your edits are kept (starred).", |(text, _)| text)),
-        ),
+            };
+            // The strip is one line and drops the detail when space is short;
+            // lead with the newer message. Try again still marks the failure.
+            match message {
+                Some((text, _)) => (Tone::Bad, String::from(text), failure),
+                None => (
+                    Tone::Bad,
+                    failure,
+                    String::from("Your edits are kept (starred)."),
+                ),
+            }
+        }
         (Some((saved, _)), None) => (
             Tone::Ok,
             alloc::format!(
@@ -1237,6 +1246,7 @@ pub async fn show_cfr_menu_graphical(
         }
 
         if let Some(mut key) = fb.key() {
+            let selected_before = state.selected;
             let mut viewport_only = matches!(key, KeyPress::MouseScroll(_));
             let acts = actions(cfr_info, &items, &state, fb);
             let mut action = None;
@@ -1258,6 +1268,7 @@ pub async fn show_cfr_menu_graphical(
                     if state.focus.group == Group::Content {
                         keep_graphical_selection_visible(cfr_info, &items, &mut state, fb);
                     }
+                    clear_row_notice(&mut state, selected_before);
                     clickable = cursor
                         .while_hidden(fb, || draw_graphical_menu(cfr_info, &items, &state, fb));
                     hover.reset();
@@ -1500,6 +1511,7 @@ pub async fn show_cfr_menu_graphical(
             if !viewport_only {
                 keep_graphical_selection_visible(cfr_info, &items, &mut state, fb);
             }
+            clear_row_notice(&mut state, selected_before);
             let acts = actions(cfr_info, &items, &state, fb);
             // An action that replaced itself (Save -> Restart now) must not
             // hand its focus to a different, consequential button.
@@ -1522,6 +1534,14 @@ pub async fn show_cfr_menu_graphical(
 }
 
 // ─── Operations ─────────────────────────────────────────────────────────
+
+/// Status messages describe the selected row; drop them when the selection
+/// moves. Save results stay until the draft changes.
+fn clear_row_notice(state: &mut GraphicalState, selected_before: usize) {
+    if state.selected != selected_before {
+        state.status_message = None;
+    }
+}
 
 fn save_graphical_changes(cfr: &CfrInfo<'_>, items: &mut [MenuItem], state: &mut GraphicalState) {
     if !has_changes(items) {
@@ -1637,6 +1657,7 @@ async fn leave_graphical(
     match choice {
         1 => {
             discard_graphical_changes(items);
+            state.save_result = None;
             state.status_message = Some(("Unsaved changes discarded.", true));
             fb.set_firmware_dirty(false);
             true
@@ -2036,12 +2057,13 @@ mod graphical_tests {
     #[test]
     fn later_status_messages_stay_visible_beside_save_results() {
         let message = Some(("This option cannot be changed.", false));
-        // A failed save keeps its headline; the newer message is the detail.
+        // A newer message leads a failed save, which remains the detail.
         let (tone, headline, detail) = strip_notice(Some((0, 1)), message, 1, String::new());
         assert_eq!(tone, Tone::Bad);
+        assert_eq!(headline, "This option cannot be changed.");
+        assert_eq!(detail, "Could not save the change.");
+        let (_, headline, detail) = strip_notice(Some((0, 1)), None, 1, String::new());
         assert_eq!(headline, "Could not save the change.");
-        assert_eq!(detail, "This option cannot be changed.");
-        let (_, _, detail) = strip_notice(Some((0, 1)), None, 1, String::new());
         assert_eq!(detail, "Your edits are kept (starred).");
         // A successful save yields to a message raised after it.
         let (tone, headline, _) = strip_notice(Some((1, 0)), message, 0, String::new());
