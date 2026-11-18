@@ -9,7 +9,7 @@ use r_efi::protocols::graphics_output;
 
 use crate::efi::allocator::{MemoryType, allocate_pool};
 use crate::efi::protocols::console;
-use crate::efi::utils::allocate_protocol_with_log;
+use crate::efi::utils::allocate_protocol_value_with_log;
 use crate::platform::FramebufferConfig;
 
 /// Graphics Output Protocol GUID supplied by `r-efi`.
@@ -498,7 +498,7 @@ pub fn create_gop(framebuffer: &FramebufferConfig) -> *mut GraphicsOutputProtoco
     };
 
     // Allocate mode info
-    let mode_info_ptr = allocate_protocol_with_log(
+    let mode_info_ptr = allocate_protocol_value_with_log(
         "GopModeInfo",
         GopModeInfo {
             version: 0,
@@ -514,7 +514,7 @@ pub fn create_gop(framebuffer: &FramebufferConfig) -> *mut GraphicsOutputProtoco
     }
 
     // Allocate GOP mode structure
-    let mode_ptr = allocate_protocol_with_log(
+    let mode_ptr = allocate_protocol_value_with_log(
         "GopMode",
         GopMode {
             max_mode: 1, // We support 1 mode (mode 0)
@@ -531,7 +531,7 @@ pub fn create_gop(framebuffer: &FramebufferConfig) -> *mut GraphicsOutputProtoco
     }
 
     // Allocate protocol structure
-    let protocol_ptr = allocate_protocol_with_log(
+    let protocol_ptr = allocate_protocol_value_with_log(
         "GraphicsOutputProtocol",
         GraphicsOutputProtocol {
             query_mode: gop_query_mode,

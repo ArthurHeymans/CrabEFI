@@ -8,7 +8,7 @@
 use r_efi::efi::{Guid, Status};
 
 use crate::arch::rng as arch_rng;
-use crate::efi::utils::allocate_protocol_with_log;
+use crate::efi::utils::allocate_protocol_value_with_log;
 
 /// RNG Protocol GUID
 /// {3152BCA5-EADE-433D-862E-C01CDC291F44}
@@ -122,7 +122,7 @@ pub fn init() {
 /// # Returns
 /// A pointer to the protocol instance, or null on allocation failure
 pub fn create_protocol() -> *mut r_efi::protocols::rng::Protocol {
-    let ptr = allocate_protocol_with_log(
+    let ptr = allocate_protocol_value_with_log(
         "RNGProtocol",
         r_efi::protocols::rng::Protocol {
             get_info: rng_get_info,

@@ -14,7 +14,7 @@ use r_efi::protocols::device_path::Protocol as DevicePathProtocol;
 
 use crate::drivers::usb;
 use crate::efi::protocols::device_path::{self, UsbDevicePathNode};
-use crate::efi::utils::allocate_protocol_with_log;
+use crate::efi::utils::allocate_protocol_value_with_log;
 
 /// Extended SCSI Pass Thru Protocol GUID
 /// {143B7632-B81B-4CB7-ABD3-B625A5B9BFFE}
@@ -638,7 +638,7 @@ pub fn create_scsi_pass_thru_protocol(
     usb_port: u8,
 ) -> *mut ExtScsiPassThruProtocol {
     // Allocate mode structure
-    let mode_ptr = allocate_protocol_with_log(
+    let mode_ptr = allocate_protocol_value_with_log(
         "ExtScsiPassThruMode",
         ExtScsiPassThruMode {
             adapter_id: controller_index as u32,

@@ -14,7 +14,7 @@ use r_efi::protocols::device_path::Protocol as DevicePathProtocol;
 
 use crate::drivers::ahci;
 use crate::efi::protocols::device_path::{self, SataDevicePathNode};
-use crate::efi::utils::allocate_protocol_with_log;
+use crate::efi::utils::allocate_protocol_value_with_log;
 
 /// ATA Pass Thru Protocol GUID
 /// {1D3DE7F0-0807-424F-AA69-11A54E19A46F}
@@ -641,7 +641,7 @@ pub fn create_ata_pass_thru_protocol(
     }
 
     // Allocate mode structure
-    let mode_ptr = allocate_protocol_with_log(
+    let mode_ptr = allocate_protocol_value_with_log(
         "AtaPassThruMode",
         AtaPassThruMode {
             attributes: ATTRIBUTES_PHYSICAL | ATTRIBUTES_LOGICAL,

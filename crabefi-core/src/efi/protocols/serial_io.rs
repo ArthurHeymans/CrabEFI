@@ -10,7 +10,7 @@ use core::ffi::c_void;
 use r_efi::efi::{Guid, Status};
 
 use crate::drivers::serial;
-use crate::efi::utils::allocate_protocol_with_log;
+use crate::efi::utils::allocate_protocol_value_with_log;
 
 /// Serial IO Protocol GUID
 /// {BB25CF6F-F1D4-11D2-9A0C-0090273FC1FD}
@@ -311,7 +311,7 @@ extern "efiapi" fn serial_read(
 /// A pointer to the protocol instance, or null on allocation failure
 pub fn create_protocol() -> *mut Protocol {
     // SAFETY: The helper already operates within an unsafe block for initialization
-    let ptr = allocate_protocol_with_log(
+    let ptr = allocate_protocol_value_with_log(
         "SerialIoProtocol",
         Protocol {
             revision: EFI_SERIAL_IO_PROTOCOL_REVISION1P1,

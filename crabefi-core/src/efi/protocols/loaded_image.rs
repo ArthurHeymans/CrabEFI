@@ -31,9 +31,9 @@ pub fn create_loaded_image_protocol(
 ) -> *mut loaded_image::Protocol {
     // We allocate this using the EFI allocator and leak it
     // In a real implementation, this would be freed when the image is unloaded
-    use crate::efi::utils::allocate_protocol_with_log;
+    use crate::efi::utils::allocate_protocol_value_with_log;
 
-    let ptr = allocate_protocol_with_log(
+    let ptr = allocate_protocol_value_with_log(
         "LoadedImageProtocol",
         loaded_image::Protocol {
             revision: loaded_image::REVISION,

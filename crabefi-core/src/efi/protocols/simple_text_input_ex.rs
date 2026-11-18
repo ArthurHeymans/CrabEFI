@@ -12,7 +12,7 @@
 use crate::drivers::keyboard_common as keyboard;
 use crate::efi::boot_services::KEYBOARD_EVENT_ID;
 use crate::efi::protocols::console;
-use crate::efi::utils::allocate_protocol_with_log;
+use crate::efi::utils::allocate_protocol_value_with_log;
 use core::ffi::c_void;
 use r_efi::efi::{Boolean, Event, Handle, Status};
 use r_efi::protocols::simple_text_input::InputKey;
@@ -303,7 +303,7 @@ fn dispatch_key_notifications(
 ///
 /// Returns a pointer to the allocated protocol, or null on failure.
 pub fn create_protocol() -> *mut c_void {
-    let ptr = allocate_protocol_with_log(
+    let ptr = allocate_protocol_value_with_log(
         "SimpleTextInputExProtocol",
         SimpleTextInputExProtocol {
             reset: text_input_ex_reset,

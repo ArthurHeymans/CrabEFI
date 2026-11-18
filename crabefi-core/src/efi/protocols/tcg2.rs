@@ -36,7 +36,7 @@ use crate::efi::tcg::event_log::{CryptoAgileEventLog, EventLog};
 use crate::efi::tcg::pcr::PcrBanks;
 use crate::efi::tcg::tpm_tis::TpmTis;
 use crate::efi::tcg::types::*;
-use crate::efi::utils::allocate_protocol_with_log;
+use crate::efi::utils::allocate_protocol_value_with_log;
 use crate::platform::{Tpm2Device, TpmDigest, TpmError};
 
 // ============================================================================
@@ -1122,7 +1122,7 @@ pub struct Tcg2ProtocolFfi {
 /// The protocol's internal state must be initialized via [`init_state`] before
 /// calling this.
 pub fn create_protocol() -> *mut c_void {
-    let ptr = allocate_protocol_with_log(
+    let ptr = allocate_protocol_value_with_log(
         "TCG2Protocol",
         Tcg2ProtocolFfi {
             get_capability: tcg2_get_capability,

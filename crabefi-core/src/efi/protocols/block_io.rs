@@ -9,7 +9,7 @@ use r_efi::protocols::block_io;
 
 use super::instance::Registry;
 use crate::drivers::storage::{self, StorageId};
-use crate::efi::utils::allocate_protocol_with_log;
+use crate::efi::utils::allocate_protocol_value_with_log;
 
 /// Block I/O Protocol GUID.
 pub const BLOCK_IO_PROTOCOL_GUID: r_efi::efi::Guid = block_io::PROTOCOL_GUID;
@@ -220,7 +220,7 @@ fn create_block_io_internal(
     is_partition: bool,
 ) -> *mut BlockIoProtocol {
     // Allocate media structure
-    let media_ptr = allocate_protocol_with_log(
+    let media_ptr = allocate_protocol_value_with_log(
         "BlockIoMedia",
         BlockIoMedia {
             media_id,

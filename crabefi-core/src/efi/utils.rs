@@ -44,6 +44,7 @@ pub fn ucs2_eq(a: &[u16], b: &[u16]) -> bool {
 ///
 /// The caller owns the allocation. Returns null on allocation failure or if
 /// the pool cannot provide the alignment required by `T`.
+///
 /// Construct the protocol value first; the former closure-taking
 /// `allocate_protocol` helper is no longer available.
 pub fn allocate_protocol_value<T>(value: T) -> *mut T {
@@ -61,9 +62,6 @@ pub fn allocate_protocol_value<T>(value: T) -> *mut T {
     unsafe { ptr.write(value) };
     ptr
 }
-
-// Keep in-tree imports working without exposing the old initializer name.
-pub(crate) use allocate_protocol_value_with_log as allocate_protocol_with_log;
 
 /// Like [`allocate_protocol_value`], but logs the protocol name on failure.
 pub fn allocate_protocol_value_with_log<T>(name: &str, value: T) -> *mut T {

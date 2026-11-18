@@ -14,7 +14,7 @@ use r_efi::protocols::device_path::Protocol as DevicePathProtocol;
 
 use crate::drivers::nvme;
 use crate::efi::protocols::device_path::{self, NvmeDevicePathNode};
-use crate::efi::utils::allocate_protocol_with_log;
+use crate::efi::utils::allocate_protocol_value_with_log;
 
 /// NVM Express Pass Thru Protocol GUID
 /// {52C78312-8EDC-4233-98F2-1A1AA5E388A5}
@@ -467,7 +467,7 @@ pub fn create_nvme_pass_thru_protocol(
         };
 
     // Allocate mode structure
-    let mode_ptr = allocate_protocol_with_log(
+    let mode_ptr = allocate_protocol_value_with_log(
         "NvmExpressPassThruMode",
         NvmExpressPassThruMode {
             attributes: ATTRIBUTES_PHYSICAL | ATTRIBUTES_LOGICAL | ATTRIBUTES_CMD_SET_NVM,

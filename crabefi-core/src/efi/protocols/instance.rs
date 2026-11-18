@@ -1,7 +1,7 @@
 //! Per-protocol context storage without a fixed instance limit.
 
 use crate::cell::Local;
-use crate::efi::utils::allocate_protocol_with_log;
+use crate::efi::utils::allocate_protocol_value_with_log;
 
 #[repr(C)]
 struct Instance<Proto, Ctx> {
@@ -29,7 +29,7 @@ impl<Proto, Ctx: Copy> Registry<Proto, Ctx> {
     }
 
     pub fn allocate(&self, name: &str, ctx: Ctx, protocol: Proto) -> *mut Proto {
-        let ptr = allocate_protocol_with_log(
+        let ptr = allocate_protocol_value_with_log(
             name,
             Instance {
                 protocol,
