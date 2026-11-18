@@ -1120,8 +1120,19 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         let fbpt = cb_info
             .acpi_rsdp
             // SAFETY: coreboot's ACPI tables are identity mapped.
-            .and_then(|rsdp| unsafe { acpi::find_fbpt(rsdp) });
-        let recorder = timestamps::CorebootTimestampRecorder::new(table_addr)?.with_fbpt(fbpt);
+            .and_then(|rsdp| unsafe { acpi::find_fbpt(rsdp) })
+            // Only write into memory coreboot reserved, never into RAM the
+            // allocator hands out.
+            .filter(|&(fbpt, length)| {
+                cb_info.memory_map.iter().any(|region| {
+                    region.region_type != memory::MemoryType::Ram
+                        && fbpt >= region.start
+                        && fbpt.saturating_add(length) <= region.start.saturating_add(region.size)
+                })
+            })
+            .map(|(fbpt, _)| fbpt);
+        let recorder = timestamps::CorebootTimestampRecorder::new(table_addr)?
+            .with_fbpt(fbpt, crabefi::time::counter_frequency);
         recorder.record_counter(crabefi::timestamp::TS_CRABEFI_START, entry_counter);
         recorder.record_now(crabefi::timestamp::TS_CRABEFI_TABLES_PARSED);
         Some(recorder)
@@ -1363,10 +1374,23 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         capsule_regions: &capsule_regions[..capsule_count],
         capsule_backend: Some(&mut capsule_backend),
         capsule_on_disk_only: cfg!(feature = "capsule-on-disk-only"),
-        // SAFETY: coreboot's CBMEM region persists for the entire boot.
-        boot_events: cb_info.boot_events.map(|(address, size)| unsafe {
-            core::slice::from_raw_parts(address as *const u8, size as usize)
-        }),
+        // SAFETY: the record lies in coreboot-reserved memory, which persists
+        // for the entire boot (checked against the memory map).
+        boot_events: cb_info
+            .boot_events
+            .filter(|_| cfg!(feature = "boot-event-log"))
+            .filter(|&(address, size)| {
+                address != 0
+                    && cb_info.memory_map.iter().any(|region| {
+                        region.region_type != memory::MemoryType::Ram
+                            && address >= region.start
+                            && address.saturating_add(u64::from(size))
+                                <= region.start.saturating_add(region.size)
+                    })
+            })
+            .map(|(address, size)| unsafe {
+                core::slice::from_raw_parts(address as *const u8, size as usize)
+            }),
         hooks: Some(&hooks),
         rng: None,
         ecam_regions: &[], // ACPI/FDT discovery is selected by the library below.

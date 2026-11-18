@@ -92,7 +92,9 @@ def main():
     if len(log) < 9 or log[:6] != b"ELOG\x01\x08":
         sys.exit("%s: not an event log" % path)
     offset = 8
-    while offset + 9 <= len(log) and log[offset] != 0xFF:
+    while offset < len(log) and log[offset] != 0xFF:
+        if offset + 9 > len(log):
+            sys.exit("truncated event at offset %u" % offset)
         kind, length = log[offset], log[offset + 1]
         event = log[offset:offset + length]
         if length < 9 or len(event) != length:
@@ -105,6 +107,8 @@ def main():
             text += ": " + detail(kind, event[8:-1])
         print(("" if kind == 0x17 else "    ") + text + bad)
         offset += length
+    if offset >= len(log):
+        sys.exit("no end marker: the log is truncated")
 
 
 if __name__ == "__main__":

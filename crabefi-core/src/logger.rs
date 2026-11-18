@@ -136,7 +136,8 @@ pub fn init() {
     if log::set_logger(&LOGGER).is_ok() {
         // Record the boot counter for relative timestamps.
         crate::time::set_boot_counter(read_counter());
-        log::set_max_level(DEFAULT_LEVEL);
+        // Through set_level, so max-log-level-error caps the start level too.
+        set_level(DEFAULT_LEVEL);
     }
 }
 

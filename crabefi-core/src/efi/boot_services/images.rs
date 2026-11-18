@@ -988,7 +988,6 @@ pub(super) extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: 
         );
 
         log::info!("ExitBootServices SUCCESS - transitioning to OS");
-        crate::timestamp::record(crate::timestamp::TS_CRABEFI_EXIT_BOOT_SERVICES);
 
         // Clean up hardware state for OS handoff.
         // Re-enable keyboard interrupts so Linux's i8042 driver works.
@@ -1018,6 +1017,10 @@ pub(super) extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: 
         if let Some(hooks) = crate::handoff::callbacks().hooks {
             hooks.on_exit_boot_services();
         }
+
+        // The OS gets control right after this: everything above is part of
+        // ExitBootServices.
+        crate::timestamp::record(crate::timestamp::TS_CRABEFI_EXIT_BOOT_SERVICES);
 
         // CRITICAL: Disable logging only after the final fallible runtime-image
         // transition. The OS generally does not map firmware log devices as

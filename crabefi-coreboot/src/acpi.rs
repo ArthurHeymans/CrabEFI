@@ -564,16 +564,32 @@ struct FbptHeader {
     length: U32,
 }
 
-/// Bytes of an FBPT that holds the basic boot performance record.
+/// Firmware Basic Boot Performance Data Record (ACPI 6.5, 5.2.24.7), right
+/// after the FBPT header.
 #[cfg(target_arch = "x86_64")]
-const FBPT_MIN_LENGTH: u32 = 56;
+#[repr(C)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
+struct BasicBootRecord {
+    header: PerformanceRecordHeader,
+    reserved: U32,
+    reset_end: U64,
+    os_loader_load_image_start: U64,
+    os_loader_start_image_start: U64,
+    exit_boot_services_entry: U64,
+    exit_boot_services_exit: U64,
+}
 
-/// The Firmware Basic Boot Performance Table that the FPDT points to.
+#[cfg(target_arch = "x86_64")]
+const BASIC_BOOT_RECORD_TYPE: u16 = 2;
+
+/// The Firmware Basic Boot Performance Table that the FPDT points to, with
+/// the bytes it spans. Its basic boot record is checked, so its fields lie at
+/// the offsets the timestamp recorder writes.
 ///
 /// # Safety
 /// `rsdp_addr` and the tables it references must be identity mapped.
 #[cfg(target_arch = "x86_64")]
-pub unsafe fn find_fbpt(rsdp_addr: u64) -> Option<u64> {
+pub unsafe fn find_fbpt(rsdp_addr: u64) -> Option<(u64, u64)> {
     let (fpdt, length) = unsafe { find_table(rsdp_addr, b"FPDT") }?;
     let table = unsafe { core::slice::from_raw_parts(fpdt as *const u8, length) };
     let mut records = table.get(size_of::<SdtHeader>()..)?;
@@ -588,17 +604,43 @@ pub unsafe fn find_fbpt(rsdp_addr: u64) -> Option<u64> {
             if fbpt == 0 {
                 return None;
             }
-            let fbpt_header = FbptHeader::ref_from_bytes(unsafe {
-                core::slice::from_raw_parts(fbpt as *const u8, size_of::<FbptHeader>())
-            })
-            .ok()?;
-            return (&fbpt_header.signature == b"FBPT"
-                && fbpt_header.length.get() >= FBPT_MIN_LENGTH)
-                .then_some(fbpt);
+            let span = size_of::<FbptHeader>() + size_of::<BasicBootRecord>();
+            let bytes = unsafe { core::slice::from_raw_parts(fbpt as *const u8, span) };
+            let (fbpt_header, rest) = FbptHeader::ref_from_prefix(bytes).ok()?;
+            let (record, _) = BasicBootRecord::ref_from_prefix(rest).ok()?;
+            let valid = &fbpt_header.signature == b"FBPT"
+                && fbpt_header.length.get() as usize >= span
+                && record.header.kind.get() == BASIC_BOOT_RECORD_TYPE
+                && usize::from(record.header.length) >= size_of::<BasicBootRecord>();
+            return valid.then_some((fbpt, u64::from(fbpt_header.length.get())));
         }
         records = &records[length..];
     }
     None
+}
+
+/// Byte offsets of the basic boot record fields in the FBPT.
+#[cfg(target_arch = "x86_64")]
+pub mod fbpt_offsets {
+    use super::{BasicBootRecord, FbptHeader};
+    use core::mem::{offset_of, size_of};
+
+    const RECORD: usize = size_of::<FbptHeader>();
+    pub const OS_LOADER_LOAD_IMAGE_START: usize =
+        RECORD + offset_of!(BasicBootRecord, os_loader_load_image_start);
+    pub const OS_LOADER_START_IMAGE_START: usize =
+        RECORD + offset_of!(BasicBootRecord, os_loader_start_image_start);
+    pub const EXIT_BOOT_SERVICES_ENTRY: usize =
+        RECORD + offset_of!(BasicBootRecord, exit_boot_services_entry);
+    pub const EXIT_BOOT_SERVICES_EXIT: usize =
+        RECORD + offset_of!(BasicBootRecord, exit_boot_services_exit);
+    // timestamps.rs is also compiled alone, so it repeats these offsets.
+    const _: () = assert!(
+        OS_LOADER_LOAD_IMAGE_START == 24
+            && OS_LOADER_START_IMAGE_START == 32
+            && EXIT_BOOT_SERVICES_ENTRY == 40
+            && EXIT_BOOT_SERVICES_EXIT == 48
+    );
 }
 
 /// Locate a TPM 1.2 event log described by the ACPI TCPA table.
