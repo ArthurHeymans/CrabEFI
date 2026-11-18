@@ -688,6 +688,66 @@ fn paint_option_row(
     }
 }
 
+/// Pick the strip headline and detail.
+///
+/// A failed save stays visible until the draft changes so its Try again
+/// action remains discoverable; a later status message becomes the detail.
+/// After a successful save, a later status message replaces the summary.
+fn strip_notice(
+    save_result: Option<(usize, usize)>,
+    status_message: Option<(&'static str, bool)>,
+    changed: usize,
+    names_text: String,
+) -> (Tone, String, String) {
+    match (save_result, status_message) {
+        (Some((saved, failed)), message) if failed > 0 => (
+            Tone::Bad,
+            if saved == 0 && failed == 1 {
+                String::from("Could not save the change.")
+            } else if saved == 0 {
+                alloc::format!("Could not save {failed} changes.")
+            } else {
+                alloc::format!("Could not save {failed} of {} changes.", saved + failed)
+            },
+            String::from(message.map_or("Your edits are kept (starred).", |(text, _)| text)),
+        ),
+        (Some((saved, _)), None) => (
+            Tone::Ok,
+            alloc::format!(
+                "Saved {saved} {}.",
+                if saved == 1 { "change" } else { "changes" }
+            ),
+            String::from("They apply after restart."),
+        ),
+        (_, Some((message, ok))) => (
+            if ok {
+                if changed > 0 { Tone::Warn } else { Tone::Ok }
+            } else {
+                Tone::Bad
+            },
+            String::from(message),
+            if changed > 0 {
+                alloc::format!("{changed} unsaved: {names_text}")
+            } else {
+                String::new()
+            },
+        ),
+        (None, None) if changed > 0 => (
+            Tone::Warn,
+            alloc::format!(
+                "{changed} unsaved {}",
+                if changed == 1 { "change" } else { "changes" }
+            ),
+            names_text,
+        ),
+        _ => (
+            Tone::Neutral,
+            String::from("No unsaved changes."),
+            String::from("Saved settings apply after restart."),
+        ),
+    }
+}
+
 fn paint_strip(
     fb: &FramebufferInfo,
     l: &FwLayout,
@@ -705,54 +765,8 @@ fn paint_strip(
     if !names_text.is_empty() {
         names_text.push('.');
     }
-    let (tone, headline, detail): (Tone, String, String) =
-        match (state.save_result, state.status_message) {
-            (Some((saved, failed)), _) if failed > 0 => (
-                Tone::Bad,
-                if saved == 0 && failed == 1 {
-                    String::from("Could not save the change.")
-                } else if saved == 0 {
-                    alloc::format!("Could not save {failed} changes.")
-                } else {
-                    alloc::format!("Could not save {failed} of {} changes.", saved + failed)
-                },
-                String::from("Your edits are kept (starred)."),
-            ),
-            (Some((saved, _)), _) => (
-                Tone::Ok,
-                alloc::format!(
-                    "Saved {saved} {}.",
-                    if saved == 1 { "change" } else { "changes" }
-                ),
-                String::from("They apply after restart."),
-            ),
-            (None, Some((message, ok))) => (
-                if ok {
-                    if changed > 0 { Tone::Warn } else { Tone::Ok }
-                } else {
-                    Tone::Bad
-                },
-                String::from(message),
-                if changed > 0 {
-                    alloc::format!("{changed} unsaved: {names_text}")
-                } else {
-                    String::new()
-                },
-            ),
-            (None, None) if changed > 0 => (
-                Tone::Warn,
-                alloc::format!(
-                    "{changed} unsaved {}",
-                    if changed == 1 { "change" } else { "changes" }
-                ),
-                names_text,
-            ),
-            _ => (
-                Tone::Neutral,
-                String::from("No unsaved changes."),
-                String::from("Saved settings apply after restart."),
-            ),
-        };
+    let (tone, headline, detail) =
+        strip_notice(state.save_result, state.status_message, changed, names_text);
     let acts = strip_actions(items, state);
     let buttons: Vec<StripButton<'_>> = acts
         .iter()
@@ -1429,10 +1443,6 @@ pub async fn show_cfr_menu_graphical(
                             state.focus.group = Group::Actions;
                             state.focus.action = i;
                         }
-                        if matches!(action, FwAction::Discard | FwAction::Restart) {
-                            state.status_message = None;
-                            state.save_result = None;
-                        }
                         match action {
                             FwAction::Edit => {
                                 edit_graphical_item(cfr_info, &mut items, &mut state, fb).await
@@ -2022,6 +2032,25 @@ mod graphical_tests {
     use super::*;
     use crate::cfr::{CfrForm, CfrInfo, OptionStore};
     use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[test]
+    fn later_status_messages_stay_visible_beside_save_results() {
+        let message = Some(("This option cannot be changed.", false));
+        // A failed save keeps its headline; the newer message is the detail.
+        let (tone, headline, detail) = strip_notice(Some((0, 1)), message, 1, String::new());
+        assert_eq!(tone, Tone::Bad);
+        assert_eq!(headline, "Could not save the change.");
+        assert_eq!(detail, "This option cannot be changed.");
+        let (_, _, detail) = strip_notice(Some((0, 1)), None, 1, String::new());
+        assert_eq!(detail, "Your edits are kept (starred).");
+        // A successful save yields to a message raised after it.
+        let (tone, headline, _) = strip_notice(Some((1, 0)), message, 0, String::new());
+        assert_eq!(tone, Tone::Bad);
+        assert_eq!(headline, "This option cannot be changed.");
+        let (tone, headline, _) = strip_notice(Some((1, 0)), None, 0, String::new());
+        assert_eq!(tone, Tone::Ok);
+        assert_eq!(headline, "Saved 1 change.");
+    }
 
     fn option(id: u64) -> CfrOption {
         CfrOption {
