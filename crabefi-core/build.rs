@@ -1,7 +1,8 @@
 //! Build script for CrabEFI core library
 //!
 //! Records the build's `SOURCE_DATE_EPOCH` (0 when unset) for the timestamps
-//! the firmware puts on key databases it writes itself. Linker scripts and
+//! the firmware puts on key databases it writes itself, and the build
+//! identifier measured as the S-CRTM version. Linker scripts and
 //! PAYLOAD_BASE are handled by crabefi-coreboot/build.rs.
 
 use std::{env, fs, path::PathBuf};
@@ -20,4 +21,15 @@ fn main() {
         format!("pub(crate) const SOURCE_DATE_EPOCH: u64 = {epoch};\n"),
     )
     .expect("write source_date_epoch.rs");
+
+    // CRABEFI_BUILD_ID (set by the build), else the crate version.
+    println!("cargo:rerun-if-env-changed=CRABEFI_BUILD_ID");
+    let build_id = env::var("CRABEFI_BUILD_ID")
+        .ok()
+        .map(|id| id.trim().to_owned())
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| {
+            env::var("CARGO_PKG_VERSION").expect("CARGO_PKG_VERSION is set by cargo")
+        });
+    println!("cargo:rustc-env=CRABEFI_SCRTM_VERSION={build_id}");
 }

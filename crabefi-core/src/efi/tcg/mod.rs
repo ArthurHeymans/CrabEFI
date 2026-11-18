@@ -43,8 +43,8 @@
 //! # Portability
 //!
 //! This module keeps event-log management and software PCR mirrors separate
-//! from TPM transport. Attestable measured boot requires the built-in TIS MMIO
-//! driver for x86/coreboot and QEMU+swtpm, a Google security chip on a
+//! from TPM transport. Attestable measured boot requires the built-in TIS or
+//! CRB MMIO driver for x86/coreboot and QEMU+swtpm, a Google security chip on a
 //! platform-described I2C bus, or a platform-provided TPM 2.0 driver through
 //! [`crate::platform::Tpm2Device`]. Without a TPM backend,
 //! CrabEFI may expose existing logs for discovery, but it does not present
@@ -54,6 +54,7 @@ pub mod event_log;
 pub mod gsc_i2c;
 pub mod measured_boot;
 pub mod pcr;
+pub mod tpm_crb;
 pub mod tpm_tis;
 pub mod types;
 

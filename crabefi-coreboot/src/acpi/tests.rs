@@ -7,6 +7,53 @@ use acpi::{
 use alloc::{boxed::Box, string::ToString, sync::Arc, vec};
 use core::str::FromStr;
 
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn tpm2_lookup_reads_unaligned_xsdt_entry_and_checks_table_length() {
+    #[repr(align(8))]
+    struct AlignedXsdt([u8; 44]);
+    let mut xsdt = AlignedXsdt([0; 44]);
+    let mut rsdp = [0u8; 36];
+    let mut tpm2 = [0u8; 52];
+    rsdp[..8].copy_from_slice(b"RSD PTR ");
+    rsdp[15] = 2;
+    xsdt.0[..4].copy_from_slice(b"XSDT");
+    xsdt.0[4..8].copy_from_slice(&44u32.to_le_bytes());
+    tpm2[..4].copy_from_slice(b"TPM2");
+    tpm2[4..8].copy_from_slice(&52u32.to_le_bytes());
+    tpm2[40..48].copy_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
+    tpm2[48..52].copy_from_slice(&7u32.to_le_bytes());
+    xsdt.0[36..44].copy_from_slice(&(tpm2.as_ptr() as u64).to_le_bytes());
+    rsdp[24..32].copy_from_slice(&(xsdt.0.as_ptr() as u64).to_le_bytes());
+
+    // SAFETY: The RSDP and all tables it names are in the local buffers.
+    let result = unsafe { find_tpm2_table(rsdp.as_ptr() as u64) }.unwrap();
+    assert_eq!(result.control_area, 0x1122_3344_5566_7788);
+    assert_eq!(result.start_method, 7);
+
+    tpm2[4..8].copy_from_slice(&51u32.to_le_bytes());
+    xsdt.0[36..44].copy_from_slice(&(tpm2.as_ptr() as u64).to_le_bytes());
+    rsdp[24..32].copy_from_slice(&(xsdt.0.as_ptr() as u64).to_le_bytes());
+    // SAFETY: Same buffers as above, now with a short advertised TPM2 prefix.
+    assert!(unsafe { find_tpm2_table(rsdp.as_ptr() as u64) }.is_none());
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn tpm2_log_area_update_checks_length_and_checksums_the_full_table() {
+    let mut table = [0u8; 80];
+    table[..4].copy_from_slice(b"TPM2");
+    table[4..8].copy_from_slice(&80u32.to_le_bytes());
+    table[76..].copy_from_slice(&[1, 2, 3, 4]);
+    assert_eq!(set_tpm2_log_area(&mut table[..75], 1, 2), None);
+    let address = 0x1122_3344_5566_7788u64;
+    assert_eq!(set_tpm2_log_area(&mut table, 4096, address), Some(()));
+    assert_eq!(table[64..68], 4096u32.to_le_bytes());
+    assert_eq!(table[68..76], address.to_le_bytes());
+    assert_eq!(table[76..], [1, 2, 3, 4]);
+    assert_eq!(table.into_iter().fold(0u8, u8::wrapping_add), 0);
+}
+
 fn interpreter() -> Interpreter<CrabEfiHandler> {
     let handler = CrabEfiHandler::new();
     let memory = Box::leak(Box::new([0u64; 512]));

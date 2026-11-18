@@ -12,6 +12,9 @@
 //! - "[PASS] tcg2_hash_log_extend" -- HashLogExtendEvent succeeded
 //! - "[PASS] tcg2_hardware_tpm" -- hardware TPM/swtpm path is active
 //! - "[PASS] tcg2_submit_command" -- SubmitCommand reaches the TPM
+//! - "[PASS] tcg2_log_replay" -- the event log replays TPM PCRs 0-7
+//! - "[PASS] tcg2_boot_measurements" -- firmware measured its boot events
+//! - "[PASS] tcg2_acpi_log" -- the ACPI TPM2 table points at the event log
 //! - "[PASS] tcg1_locate" -- TCG (1.2) protocol found
 //! - "All TCG tests passed!" -- all tests passed
 
@@ -23,6 +26,10 @@ mod tpm;
 use core::panic::PanicInfo;
 use r_efi::efi::{self, Char16, Guid, Handle, Status, SystemTable};
 use sha2::{Digest, Sha256};
+use zerocopy::{
+    little_endian::{U32, U64},
+    FromBytes, Immutable, KnownLayout, Unaligned,
+};
 
 // ============================================================================
 // Protocol GUIDs
@@ -124,20 +131,193 @@ fn be_u32(bytes: &[u8], offset: usize) -> u32 {
     ])
 }
 
-fn read_pcr4_sha256(protocol: *mut Tcg2Protocol) -> Option<[u8; 32]> {
+fn read_pcr_sha256(protocol: *mut Tcg2Protocol, index: u8) -> Option<[u8; 32]> {
+    let command = tpm::read_pcr_sha256(index);
     let mut response = [0u8; 128];
     let status = unsafe {
         ((*protocol).submit_command)(
             protocol,
-            tpm::READ_PCR4_SHA256.len() as u32,
-            tpm::READ_PCR4_SHA256.as_ptr(),
+            command.len() as u32,
+            command.as_ptr(),
             response.len() as u32,
             response.as_mut_ptr(),
         )
     };
     (status == Status::SUCCESS)
-        .then(|| tpm::pcr4_sha256(&response))
+        .then(|| tpm::pcr_sha256(&response, index))
         .flatten()
+}
+
+const ACPI_20_TABLE_GUID: Guid = Guid::from_fields(
+    0x8868e871,
+    0xe4f1,
+    0x11d3,
+    0xbc,
+    0x22,
+    &[0x00, 0x80, 0xc7, 0x3c, 0x88, 0x81],
+);
+
+#[repr(C)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
+struct Acpi20Rsdp {
+    signature: [u8; 8],
+    checksum: u8,
+    oem_id: [u8; 6],
+    revision: u8,
+    rsdt_address: U32,
+    length: U32,
+    xsdt_address: U64,
+    extended_checksum: u8,
+    reserved: [u8; 3],
+}
+
+#[repr(C)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
+struct SdtHeader {
+    signature: [u8; 4],
+    length: U32,
+    revision_and_oem_fields: [u8; 28],
+}
+
+#[repr(C)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
+struct Tpm2LogArea {
+    header: SdtHeader,
+    // Platform class, reserved, control area, start method and its parameters.
+    interface_fields: [u8; 28],
+    minimum_length: U32,
+    start_address: U64,
+}
+
+/// The log area (LASA) of the ACPI TPM2 table, where Linux reads the log.
+///
+/// # Safety
+/// `system_table` must point to the live UEFI system table. Its configuration
+/// table and the referenced ACPI tables must be readable and remain mapped,
+/// including the XSDT's advertised extent.
+unsafe fn acpi_tpm2_log_area(system_table: *mut SystemTable) -> Option<u64> {
+    use core::{mem::size_of, slice::from_raw_parts};
+
+    let configuration_table = unsafe { (*system_table).configuration_table };
+    if configuration_table.is_null() {
+        return None;
+    }
+    let tables =
+        unsafe { from_raw_parts(configuration_table, (*system_table).number_of_table_entries) };
+    let rsdp = tables
+        .iter()
+        .find(|table| table.vendor_guid == ACPI_20_TABLE_GUID)?
+        .vendor_table
+        .cast::<u8>();
+    if rsdp.is_null() {
+        return None;
+    }
+    let rsdp = Acpi20Rsdp::ref_from_bytes(unsafe { from_raw_parts(rsdp, size_of::<Acpi20Rsdp>()) })
+        .ok()?;
+    let xsdt = rsdp.xsdt_address.get() as *const u8;
+    if &rsdp.signature != b"RSD PTR " || rsdp.revision < 2 || xsdt.is_null() {
+        return None;
+    }
+    let header =
+        SdtHeader::ref_from_bytes(unsafe { from_raw_parts(xsdt, size_of::<SdtHeader>()) }).ok()?;
+    if &header.signature != b"XSDT" {
+        return None;
+    }
+    let entry_bytes = (header.length.get() as usize).checked_sub(size_of::<SdtHeader>())?;
+    let entries = unsafe { from_raw_parts(xsdt.add(size_of::<SdtHeader>()), entry_bytes) };
+    let (entries, _) = entries.as_chunks::<8>();
+    entries.iter().find_map(|&entry| {
+        let table = U64::from_bytes(entry).get() as *const u8;
+        if table.is_null() {
+            return None;
+        }
+        let header =
+            SdtHeader::ref_from_bytes(unsafe { from_raw_parts(table, size_of::<SdtHeader>()) })
+                .ok()?;
+        if &header.signature != b"TPM2" || (header.length.get() as usize) < size_of::<Tpm2LogArea>()
+        {
+            return None;
+        }
+        let log =
+            Tpm2LogArea::ref_from_bytes(unsafe { from_raw_parts(table, size_of::<Tpm2LogArea>()) })
+                .ok()?;
+        Some(log.start_address.get())
+    })
+}
+
+const EV_SEPARATOR: u32 = 0x4;
+const EV_EFI_VARIABLE_DRIVER_CONFIG: u32 = 0x8000_0001;
+const EV_EFI_BOOT_SERVICES_APPLICATION: u32 = 0x8000_0003;
+
+/// The firmware's measurements found in the event log.
+#[derive(Default)]
+struct LogReplay {
+    /// SHA-256 PCRs 0-7 the log replays to.
+    pcrs: [[u8; 32]; 8],
+    separators: u8,
+    secure_boot_variables: bool,
+    boot_application: bool,
+}
+
+/// Replay the event log's SHA-256 digests of PCRs 0-7; `image_base` identifies
+/// this application's own measurement.
+fn replay_event_log(protocol: *mut Tcg2Protocol, image_base: u64) -> Option<LogReplay> {
+    let (mut first, mut last, mut truncated) = (0, 0, 0);
+    let status =
+        unsafe { ((*protocol).get_event_log)(protocol, 2, &mut first, &mut last, &mut truncated) };
+    if status != Status::SUCCESS || first == 0 || last < first || truncated != 0 {
+        return None;
+    }
+    let last = usize::try_from(last - first).ok()?;
+    let mut replay = LogReplay::default();
+    let mut complete = true;
+    let walked = tpm::walk_log(
+        |offset, output| {
+            // The last event starts at `last` and holds at most 64 KiB of data.
+            if offset.saturating_add(output.len()) > last.saturating_add(0x10000) {
+                return false;
+            }
+            // SAFETY: GetEventLog supplies the readable log through `last`; the
+            // walker reads only declared fields.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    (first + offset as u64) as *const u8,
+                    output.as_mut_ptr(),
+                    output.len(),
+                );
+            }
+            true
+        },
+        last,
+        |pcr, event_type, sha256, data| {
+            if pcr >= 8 || event_type == tpm::EV_NO_ACTION {
+                return;
+            }
+            let Some(digest) = sha256 else {
+                complete = false;
+                return;
+            };
+            let pcr_value = &mut replay.pcrs[pcr as usize];
+            let mut hash = Sha256::new();
+            hash.update(*pcr_value);
+            hash.update(digest);
+            *pcr_value = hash.finalize().into();
+            match (pcr, event_type) {
+                (_, EV_SEPARATOR) => replay.separators |= 1 << pcr,
+                (7, EV_EFI_VARIABLE_DRIVER_CONFIG) => replay.secure_boot_variables = true,
+                // UEFI_IMAGE_LOAD_EVENT starts with ImageLocationInMemory.
+                (4, EV_EFI_BOOT_SERVICES_APPLICATION)
+                    // SAFETY: the walker read this event's data within the log.
+                    if unsafe { core::ptr::read_unaligned((first + data as u64) as *const u64) }
+                        == image_base =>
+                {
+                    replay.boot_application = true
+                }
+                _ => {}
+            }
+        },
+    );
+    (walked && complete).then_some(replay)
 }
 
 fn measurement_was_logged(protocol: *mut Tcg2Protocol, digest: &[u8; 32], event: &[u8]) -> bool {
@@ -183,7 +363,7 @@ fn measurement_was_logged(protocol: *mut Tcg2Protocol, digest: &[u8; 32], event:
 /// The firmware loader must supply a live System Table and protocol services.
 #[no_mangle]
 pub unsafe extern "efiapi" fn efi_main(
-    _image_handle: Handle,
+    image_handle: Handle,
     system_table: *mut SystemTable,
 ) -> Status {
     let con_out = unsafe { (*system_table).con_out };
@@ -307,7 +487,7 @@ pub unsafe extern "efiapi" fn efi_main(
             data: *EVENT_DATA,
         };
 
-        let before = read_pcr4_sha256(tcg2);
+        let before = read_pcr_sha256(tcg2, 4);
         let status = unsafe {
             ((*tcg2).hash_log_extend_event)(
                 tcg2,
@@ -317,7 +497,7 @@ pub unsafe extern "efiapi" fn efi_main(
                 &test_event as *const _ as *const core::ffi::c_void,
             )
         };
-        let after = read_pcr4_sha256(tcg2);
+        let after = read_pcr_sha256(tcg2, 4);
         let measurement: [u8; 32] = Sha256::digest(test_data).into();
         let extended = before.is_some_and(|before| {
             let mut hash = Sha256::new();
@@ -451,6 +631,84 @@ pub unsafe extern "efiapi" fn efi_main(
                 print(
                     con_out,
                     b"[FAIL] tcg2_submit_command: hardware command failed\r\n",
+                )
+            };
+            fail_count += 1;
+        }
+
+        // -- Event log against the TPM --
+        // This application's image base, as its PCR 4 measurement records it.
+        let mut loaded_image: *mut core::ffi::c_void = core::ptr::null_mut();
+        let image_base = if unsafe {
+            ((*boot_services).handle_protocol)(
+                image_handle,
+                &efi::protocols::loaded_image::PROTOCOL_GUID as *const _ as *mut Guid,
+                &mut loaded_image,
+            )
+        } == Status::SUCCESS
+        {
+            let loaded_image = loaded_image as *const efi::protocols::loaded_image::Protocol;
+            unsafe { (*loaded_image).image_base as u64 }
+        } else {
+            0
+        };
+        let replay = replay_event_log(tcg2, image_base);
+        let replayed = replay.as_ref().is_some_and(|replay| {
+            (0..8u8).all(|pcr| read_pcr_sha256(tcg2, pcr) == Some(replay.pcrs[usize::from(pcr)]))
+        });
+        if replayed {
+            unsafe {
+                print(
+                    con_out,
+                    b"[PASS] tcg2_log_replay: event log replays TPM PCRs 0-7\r\n",
+                )
+            };
+            _pass_count += 1;
+        } else {
+            unsafe {
+                print(
+                    con_out,
+                    b"[FAIL] tcg2_log_replay: event log does not match TPM PCRs 0-7\r\n",
+                )
+            };
+            fail_count += 1;
+        }
+        let (mut first, mut last, mut truncated) = (0, 0, 0);
+        let status =
+            unsafe { ((*tcg2).get_event_log)(tcg2, 2, &mut first, &mut last, &mut truncated) };
+        // SAFETY: still in boot services with the live firmware system table.
+        if status == Status::SUCCESS && unsafe { acpi_tpm2_log_area(system_table) } == Some(first) {
+            unsafe {
+                print(
+                    con_out,
+                    b"[PASS] tcg2_acpi_log: the ACPI TPM2 log area holds the event log\r\n",
+                )
+            };
+            _pass_count += 1;
+        } else {
+            unsafe {
+                print(
+                    con_out,
+                    b"[FAIL] tcg2_acpi_log: the ACPI TPM2 log area is not the event log\r\n",
+                )
+            };
+            fail_count += 1;
+        }
+        if replay.is_some_and(|replay| {
+            replay.separators == 0xff && replay.secure_boot_variables && replay.boot_application
+        }) {
+            unsafe {
+                print(
+                    con_out,
+                    b"[PASS] tcg2_boot_measurements: separators, Secure Boot variables, this image\r\n",
+                )
+            };
+            _pass_count += 1;
+        } else {
+            unsafe {
+                print(
+                    con_out,
+                    b"[FAIL] tcg2_boot_measurements: firmware measurements missing\r\n",
                 )
             };
             fail_count += 1;

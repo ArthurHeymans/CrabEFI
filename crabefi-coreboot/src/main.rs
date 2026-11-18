@@ -1159,8 +1159,28 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         config.acpi_info = Some(acpi_info.clone());
         config.peripherals = peripherals;
 
+        // A CRB TPM, such as an AMD fTPM, is described by the TPM2 table:
+        // its _CRS names the command buffers, not the registers.
         #[cfg(target_arch = "x86_64")]
-        if let Some((tpm_hid, device)) = ["MSFT0101", "PNP0C31"]
+        // SAFETY: coreboot identity maps its ACPI tables.
+        let crb = unsafe { acpi::find_tpm2_table(rsdp) }.and_then(|tpm2| {
+            let start = match tpm2.start_method {
+                7 => crabefi::CrbStart::Crb,
+                2 | 8 => crabefi::CrbStart::Acpi,
+                _ => return None,
+            };
+            (tpm2.control_area != 0).then_some((tpm2.control_area, start))
+        });
+        #[cfg(target_arch = "x86_64")]
+        if let Some((control_area, start)) = crb {
+            log::info!("ACPI TPM2 table describes a CRB TPM at {:#x}", control_area);
+            if let Some(ref mut tpm) = config.tpm_event_log {
+                tpm.tpm2_device = crabefi::Tpm2DeviceConfig::Crb {
+                    control_area,
+                    start,
+                };
+            }
+        } else if let Some((tpm_hid, device)) = ["MSFT0101", "PNP0C31"]
             .iter()
             .find_map(|hid| acpi_info.find_device(hid).map(|device| (*hid, device)))
             && device.mmio_base <= 0xfed4_0000
@@ -1191,6 +1211,18 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
             }
         } else {
             log::info!("No ACPI MMIO TIS TPM resource; skipping unsafe probe");
+        }
+
+        // Linux reads the TPM2 table's log area before the EFI log.
+        #[cfg(target_arch = "x86_64")]
+        if let Some(ref mut tpm) = config.tpm_event_log
+            && tpm.tpm2_device.is_some()
+        {
+            // SAFETY: coreboot's ACPI tables are identity mapped RAM.
+            tpm.log_area = unsafe {
+                acpi::take_tpm2_log_area(rsdp, crabefi::efi::tcg::event_log::DEFAULT_EVENT_LOG_SIZE)
+            }
+            .map(|area| crabefi::PlatformEventLog { area, used: 0 });
         }
     }
 
