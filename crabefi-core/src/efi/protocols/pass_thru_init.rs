@@ -34,7 +34,13 @@ fn publish<P>(handle: Handle, guid: &Guid, protocol: *mut P, discard: impl FnOnc
         return;
     }
     let status = boot_services::install_protocol(handle, guid, protocol.cast());
-    if status != Status::SUCCESS {
+    if status == Status::SUCCESS {
+        log::debug!(
+            "Installed protocol {} on {:?}",
+            crate::efi::guid_fmt::GuidFmt(*guid),
+            handle
+        );
+    } else {
         discard(protocol);
         log::warn!(
             "Failed to install protocol {} on {:?}: {:?}",

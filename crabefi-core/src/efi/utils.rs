@@ -44,9 +44,6 @@ pub fn ucs2_eq(a: &[u16], b: &[u16]) -> bool {
 ///
 /// The caller owns the allocation. Returns null on allocation failure or if
 /// the pool cannot provide the alignment required by `T`.
-///
-/// Construct the protocol value first; the former closure-taking
-/// `allocate_protocol` helper is no longer available.
 pub fn allocate_protocol_value<T>(value: T) -> *mut T {
     let Ok(raw) = allocate_pool(MemoryType::BootServicesData, core::mem::size_of::<T>()) else {
         return core::ptr::null_mut();
