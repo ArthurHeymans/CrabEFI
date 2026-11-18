@@ -16,6 +16,8 @@ xhci = ["dep:xhci"]
 tpm = ["dep:sha1"]
 # UEFI image/key authentication, independent of a host firmware's signed FFS.
 secure-boot = ["pkcs7", "crabefi-runtime-bundle?/secure-boot", "crabefi-ui/secure-boot"]
+# Test only: payload MM never confirms READY_TO_BOOT (mm-seal-test).
+payload-mm-test-lose-ready-to-boot = []
 # Offer CrabEFIExternalBoot (stricter external-boot policy) in the setup menu.
 external-boot-setting = ["cfr"]
 # Signed firmware capsule application requires durable result persistence.

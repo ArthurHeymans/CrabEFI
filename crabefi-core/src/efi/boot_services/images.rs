@@ -459,6 +459,11 @@ pub(super) extern "efiapi" fn start_image(
         image_base
     );
 
+    // Every started image is third-party code: payload MM's firmware phase
+    // must be over before it runs, whichever path loaded it.
+    #[cfg(target_arch = "x86_64")]
+    crate::efi::payload_mm::ready_to_boot();
+
     // Signal EFI_EVENT_GROUP_READY_TO_BOOT before the first image is started
     // and measure boot-attempt action events without duplicating separators.
     let is_application = image_subsystem == 10;

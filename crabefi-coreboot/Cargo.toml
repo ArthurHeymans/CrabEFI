@@ -34,6 +34,8 @@ external-boot-setting = ["crabefi/external-boot-setting"]
 # Load crabefi-mm into coreboot-owned SMRAM (coreboot PAYLOAD_MM_INTERFACE);
 # needs CRABEFI_MM_ELF at build time.
 payload-mm = []
+# Test only: payload MM never confirms READY_TO_BOOT, which must stop the boot.
+payload-mm-test-lose-ready-to-boot = ["crabefi/payload-mm-test-lose-ready-to-boot"]
 
 [dependencies]
 crabefi = { package = "crabefi-core", path = "../crabefi-core", features = [

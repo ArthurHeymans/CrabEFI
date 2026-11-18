@@ -7,20 +7,14 @@
 //! authorizations, firmware (capsule) flash writes and protected status
 //! variables.
 
-use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crabefi_runtime_abi::mm::{
-    COMM_MAGIC, COMM_VERSION, DATA_MAX, DATA_OFFSET, NAME_CAPACITY, NAME_OFFSET, Request,
-    STATUS_PENDING, command,
-};
+use crabefi_runtime_abi::mm::{self, DATA_MAX, DATA_OFFSET, NAME_CAPACITY, Request, command};
 use r_efi::efi::{Guid, Status};
 
+pub use crabefi_runtime_abi::mm::MIN_STORE_SIZE;
+
 static COMM: AtomicU64 = AtomicU64::new(0);
-/// SMIs raised per request, and the time outside SMM to wait for each.
-const SMI_ATTEMPTS: u64 = 3;
-const SMI_WAIT_US: u64 = 50_000;
-const SMI_POLL_US: u64 = 10;
 static COMM_SIZE: AtomicU64 = AtomicU64::new(0);
 static APM_CMD: AtomicU64 = AtomicU64::new(0);
 static READY_TO_BOOT_SENT: AtomicBool = AtomicBool::new(false);
@@ -47,7 +41,7 @@ fn data_capacity() -> usize {
         .min(DATA_MAX)
 }
 
-fn call(mut request: Request, name: &[u16], data: &[u8]) -> Status {
+fn call(request: Request, name: &[u16], data: &[u8]) -> Status {
     let base = COMM.load(Ordering::Acquire);
     if base == 0 {
         return Status::NOT_READY;
@@ -55,47 +49,38 @@ fn call(mut request: Request, name: &[u16], data: &[u8]) -> Status {
     if name.len() * 2 > NAME_CAPACITY || data.len() > data_capacity() {
         return Status::BAD_BUFFER_SIZE;
     }
-    // SAFETY: the buffer is boot-reserved RuntimeServicesData shared only with MM.
-    unsafe {
-        let name_area = (base + NAME_OFFSET) as *mut u8;
-        for (i, unit) in name.iter().enumerate() {
-            let bytes = unit.to_le_bytes();
-            write_volatile(name_area.add(i * 2), bytes[0]);
-            write_volatile(name_area.add(i * 2 + 1), bytes[1]);
-        }
-        let data_area = (base + DATA_OFFSET) as *mut u8;
-        for (i, &byte) in data.iter().enumerate() {
-            write_volatile(data_area.add(i), byte);
-        }
-        request.magic = COMM_MAGIC;
-        request.version = COMM_VERSION;
-        request.status = STATUS_PENDING;
-        write_volatile(base as *mut Request, request);
-        let apm = APM_CMD.load(Ordering::Relaxed) as u8;
-        let status = core::ptr::addr_of!((*(base as *const Request)).status);
-        // The SMI normally completes before the OUT retires. If it comes late or is
-        // lost, wait and raise it again: MM skips a request that is no longer pending,
-        // so a late SMI cannot run it twice.
-        for attempt in 1..=SMI_ATTEMPTS {
-            core::arch::asm!("out 0xb2, al", in("al") apm, options(nostack, preserves_flags));
-            for waited in 0..=SMI_WAIT_US / SMI_POLL_US {
-                let now = read_volatile(status);
-                if now != STATUS_PENDING {
-                    if attempt > 1 || waited > 0 {
-                        log::warn!(
-                            "payload MM: command {} done after SMI {} and {} us",
-                            request.command,
-                            attempt,
-                            waited * SMI_POLL_US
-                        );
-                    }
-                    return Status::from_usize(now as usize);
-                }
-                crate::time::delay_us(SMI_POLL_US);
+    let apm = APM_CMD.load(Ordering::Relaxed) as u8;
+    let mut raise_smi = || {
+        // SAFETY: writing the APM control port only raises a software SMI.
+        unsafe { core::arch::asm!("out 0xb2, al", in("al") apm, options(nostack, preserves_flags)) }
+    };
+    let mut pause = || crate::time::delay_us(10);
+    // SAFETY: the buffer is boot-reserved RuntimeServicesData, page aligned
+    // and shared only with MM.
+    let mut buffer = unsafe {
+        mm::SharedBuffer::new(
+            base,
+            COMM_SIZE.load(Ordering::Relaxed),
+            &mut raise_smi,
+            &mut pause,
+        )
+    };
+    match mm::exchange(&mut buffer, request, name, data) {
+        mm::Outcome::Answered { reply, smis, polls } => {
+            if smis > 1 || polls > 0 {
+                log::warn!(
+                    "payload MM: command {} done after SMI {} and {} us",
+                    request.command,
+                    smis,
+                    polls * 10
+                );
             }
+            Status::from_usize(reply.status as usize)
         }
-        log::error!("payload MM: command {} not handled", request.command);
-        Status::DEVICE_ERROR
+        mm::Outcome::Lost => {
+            log::error!("payload MM: command {} not handled", request.command);
+            Status::DEVICE_ERROR
+        }
     }
 }
 
@@ -118,13 +103,32 @@ fn request(command: u32) -> Request {
 
 /// End the firmware phase before the first boot option or other third-party
 /// code runs. Idempotent.
+///
+/// Until MM confirms, it still accepts firmware-only commands (setup
+/// authorizations, firmware flash writes, protected variables). Third-party
+/// code must never get to send those, so a failure stops the boot here.
 pub fn ready_to_boot() {
-    if !active() || READY_TO_BOOT_SENT.swap(true, Ordering::AcqRel) {
+    if !active() || READY_TO_BOOT_SENT.load(Ordering::Acquire) {
         return;
     }
-    let status = call(request(command::READY_TO_BOOT), &[], &[]);
-    if status != Status::SUCCESS {
-        log::error!("payload MM refused READY_TO_BOOT: {:?}", status);
+    // The fault-injection build sends a command MM refuses, as if the request
+    // had been lost.
+    let command = if cfg!(feature = "payload-mm-test-lose-ready-to-boot") {
+        u32::MAX
+    } else {
+        command::READY_TO_BOOT
+    };
+    let status = call(request(command), &[], &[]);
+    if status == Status::SUCCESS {
+        READY_TO_BOOT_SENT.store(true, Ordering::Release);
+        return;
+    }
+    log::error!(
+        "payload MM did not end the firmware phase ({:?}); not starting third-party code",
+        status
+    );
+    loop {
+        crate::arch::halt();
     }
 }
 

@@ -3,14 +3,11 @@
 //! is the only variable authority (verification and flash writes).
 
 use core::ffi::c_void;
-use core::ptr::{read_volatile, write_volatile};
+use core::ptr::read_volatile;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::efi;
-use crate::mm_protocol::{
-    COMM_MAGIC, COMM_VERSION, DATA_OFFSET, NAME_CAPACITY, NAME_OFFSET, Request, STATUS_PENDING,
-    command,
-};
+use crate::mm_protocol::{self as mm, DATA_OFFSET, NAME_CAPACITY, NAME_OFFSET, Request, command};
 
 /// Current (physical, then virtual after SetVirtualAddressMap) buffer address;
 /// 0 when variables are served locally.
@@ -46,46 +43,41 @@ fn data_capacity() -> usize {
         .saturating_sub(DATA_OFFSET) as usize
 }
 
-fn trigger_smi() {
-    let apm = APM_CMD.load(Ordering::Relaxed) as u8;
-    // SAFETY: the APM control port only raises an SMI; MM writes the reply
-    // into the buffer before the OUT instruction retires.
-    unsafe {
-        core::arch::asm!("out 0xb2, al", in("al") apm, options(nostack, preserves_flags));
-    }
-}
-
-/// One request/reply round trip. `name` (with terminator) and `data` are
-/// copied into the buffer before the SMI.
+/// One request/reply round trip through [`mm::exchange`], with the same
+/// SMI retry policy as the boot firmware. `name` (with terminator) and `data`
+/// are copied into the buffer first; `request` receives the reply.
 fn call(request: &mut Request, name: &[u16], data: &[u8]) -> efi::Status {
     let base = COMM.load(Ordering::Acquire);
     if base == 0 || name.len() * 2 > NAME_CAPACITY || data.len() > data_capacity() {
         return efi::Status::INVALID_PARAMETER;
     }
-    let name_area = (base + NAME_OFFSET) as *mut u8;
-    let data_area = (base + DATA_OFFSET) as *mut u8;
-    // SAFETY: the buffer is runtime memory owned by this image and MM only.
-    unsafe {
-        for (i, unit) in name.iter().enumerate() {
-            let bytes = unit.to_le_bytes();
-            write_volatile(name_area.add(i * 2), bytes[0]);
-            write_volatile(name_area.add(i * 2 + 1), bytes[1]);
+    let apm = APM_CMD.load(Ordering::Relaxed) as u8;
+    let mut raise_smi = || {
+        // SAFETY: writing the APM control port only raises a software SMI.
+        unsafe { core::arch::asm!("out 0xb2, al", in("al") apm, options(nostack, preserves_flags)) }
+    };
+    // No timer at runtime: PAUSE about 10 µs between polls.
+    let mut pause = || {
+        for _ in 0..1000 {
+            core::hint::spin_loop();
         }
-        for (i, &byte) in data.iter().enumerate() {
-            write_volatile(data_area.add(i), byte);
+    };
+    // SAFETY: the buffer is page-aligned runtime memory shared only with MM.
+    let mut buffer = unsafe {
+        mm::SharedBuffer::new(
+            base,
+            COMM_SIZE.load(Ordering::Relaxed),
+            &mut raise_smi,
+            &mut pause,
+        )
+    };
+    match mm::exchange(&mut buffer, *request, name, data) {
+        mm::Outcome::Answered { reply, .. } => {
+            *request = reply;
+            efi::Status::from_usize(request.status as usize)
         }
-        request.magic = COMM_MAGIC;
-        request.version = COMM_VERSION;
-        request.status = STATUS_PENDING;
-        write_volatile(base as *mut Request, *request);
+        mm::Outcome::Lost => efi::Status::DEVICE_ERROR,
     }
-    trigger_smi();
-    // SAFETY: as above.
-    *request = unsafe { read_volatile(base as *const Request) };
-    if request.status == STATUS_PENDING {
-        return efi::Status::DEVICE_ERROR; // MM did not answer.
-    }
-    efi::Status::from_usize(request.status as usize)
 }
 
 fn read_reply(offset: u64, out: &mut [u8]) {
