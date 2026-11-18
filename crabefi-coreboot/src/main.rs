@@ -83,6 +83,21 @@ impl memory_map::Region for crabefi::MemoryRegion {
     }
 }
 
+/// Whether `start..start + length` lies in one region coreboot reserved
+/// (CBMEM tables or reserved memory).
+fn in_table_memory(map: &[memory::MemoryRegion], start: u64, length: u64) -> bool {
+    let Some(end) = start.checked_add(length) else {
+        return false;
+    };
+    map.iter().any(|region| {
+        matches!(
+            region.region_type,
+            memory::MemoryType::Reserved | memory::MemoryType::Table
+        ) && start >= region.start
+            && end <= region.start.saturating_add(region.size)
+    })
+}
+
 fn runtime_image_source() -> crabefi::RuntimeImageSource<'static> {
     #[cfg(feature = "bundled-runtime-image")]
     {
@@ -1117,20 +1132,16 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
 
     #[cfg(target_arch = "x86_64")]
     let timestamp_recorder = cb_info.timestamps.and_then(|table_addr| {
+        // Only touch memory coreboot reserved for tables, never RAM the
+        // allocator hands out or ranges outside the map.
         let fbpt = cb_info
             .acpi_rsdp
             // SAFETY: coreboot's ACPI tables are identity mapped.
-            .and_then(|rsdp| unsafe { acpi::find_fbpt(rsdp) })
-            // Only write into memory coreboot reserved, never into RAM the
-            // allocator hands out.
-            .filter(|&(fbpt, length)| {
-                cb_info.memory_map.iter().any(|region| {
-                    region.region_type != memory::MemoryType::Ram
-                        && fbpt >= region.start
-                        && fbpt.saturating_add(length) <= region.start.saturating_add(region.size)
+            .and_then(|rsdp| unsafe {
+                acpi::find_fbpt(rsdp, |start, length| {
+                    in_table_memory(&cb_info.memory_map, start, length)
                 })
-            })
-            .map(|(fbpt, _)| fbpt);
+            });
         let recorder = timestamps::CorebootTimestampRecorder::new(table_addr)?
             .with_fbpt(fbpt, crabefi::time::counter_frequency);
         recorder.record_counter(crabefi::timestamp::TS_CRABEFI_START, entry_counter);
@@ -1380,13 +1391,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
             .boot_events
             .filter(|_| cfg!(feature = "boot-event-log"))
             .filter(|&(address, size)| {
-                address != 0
-                    && cb_info.memory_map.iter().any(|region| {
-                        region.region_type != memory::MemoryType::Ram
-                            && address >= region.start
-                            && address.saturating_add(u64::from(size))
-                                <= region.start.saturating_add(region.size)
-                    })
+                address != 0 && in_table_memory(&cb_info.memory_map, address, u64::from(size))
             })
             .map(|(address, size)| unsafe {
                 core::slice::from_raw_parts(address as *const u8, size as usize)

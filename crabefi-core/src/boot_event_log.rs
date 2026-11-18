@@ -196,7 +196,8 @@ pub fn record_boot() {
         .unwrap_or_default();
     let platform = crate::handoff::get().boot_events.clone();
     let (log, count) = append(&old, &platform, &now());
-    match crate::efi::varstore::persistence::persist_firmware_variable(
+    // Never compact the store for the log: see persist_firmware_variable_if_room.
+    match crate::efi::varstore::persistence::persist_firmware_variable_if_room(
         &guid,
         EVENT_LOG_VARIABLE_NAME,
         ATTRIBUTES,

@@ -32,6 +32,15 @@ pub fn try_get_variable_timestamp(
     Err(VarStoreError::NotInitialized)
 }
 
+pub(crate) fn persist_firmware_variable_if_room(
+    _guid: &Guid,
+    _name: &[u16],
+    _attributes: u32,
+    _data: &[u8],
+) -> Result<(), VarStoreError> {
+    Err(VarStoreError::NotInitialized)
+}
+
 pub(crate) fn persist_firmware_variable(
     _guid: &Guid,
     _name: &[u16],

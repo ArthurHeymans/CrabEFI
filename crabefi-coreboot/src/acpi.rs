@@ -586,10 +586,13 @@ const BASIC_BOOT_RECORD_TYPE: u16 = 2;
 /// the bytes it spans. Its basic boot record is checked, so its fields lie at
 /// the offsets the timestamp recorder writes.
 ///
+/// `owned(start, length)` must say whether a span lies in memory the
+/// producer reserved for tables; the FBPT is only read and returned if so.
+///
 /// # Safety
 /// `rsdp_addr` and the tables it references must be identity mapped.
 #[cfg(target_arch = "x86_64")]
-pub unsafe fn find_fbpt(rsdp_addr: u64) -> Option<(u64, u64)> {
+pub unsafe fn find_fbpt(rsdp_addr: u64, owned: impl Fn(u64, u64) -> bool) -> Option<u64> {
     let (fpdt, length) = unsafe { find_table(rsdp_addr, b"FPDT") }?;
     let table = unsafe { core::slice::from_raw_parts(fpdt as *const u8, length) };
     let mut records = table.get(size_of::<SdtHeader>()..)?;
@@ -605,14 +608,21 @@ pub unsafe fn find_fbpt(rsdp_addr: u64) -> Option<(u64, u64)> {
                 return None;
             }
             let span = size_of::<FbptHeader>() + size_of::<BasicBootRecord>();
+            if !owned(fbpt, span as u64) {
+                return None;
+            }
             let bytes = unsafe { core::slice::from_raw_parts(fbpt as *const u8, span) };
             let (fbpt_header, rest) = FbptHeader::ref_from_prefix(bytes).ok()?;
             let (record, _) = BasicBootRecord::ref_from_prefix(rest).ok()?;
+            let table_length = fbpt_header.length.get() as usize;
+            let record_length = usize::from(record.header.length);
             let valid = &fbpt_header.signature == b"FBPT"
-                && fbpt_header.length.get() as usize >= span
+                && table_length >= span
                 && record.header.kind.get() == BASIC_BOOT_RECORD_TYPE
-                && usize::from(record.header.length) >= size_of::<BasicBootRecord>();
-            return valid.then_some((fbpt, u64::from(fbpt_header.length.get())));
+                && record_length >= size_of::<BasicBootRecord>()
+                && size_of::<FbptHeader>() + record_length <= table_length
+                && owned(fbpt, table_length as u64);
+            return valid.then_some(fbpt);
         }
         records = &records[length..];
     }
