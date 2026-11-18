@@ -367,7 +367,12 @@ extern "sysv64" fn mm_runtime(_argument: *mut u8) {
     // is page aligned, so its status word is an aligned u64.
     let status = unsafe { AtomicU64::from_ptr(addr_of_mut!((*header_ptr).status)) };
     if status
-        .compare_exchange(STATUS_PENDING, STATUS_BUSY, Ordering::Acquire, Ordering::Relaxed)
+        .compare_exchange(
+            STATUS_PENDING,
+            STATUS_BUSY,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        )
         .is_err()
     {
         return; // Not addressed to us.
@@ -376,7 +381,10 @@ extern "sysv64" fn mm_runtime(_argument: *mut u8) {
     // the copy.
     let request = unsafe { read_volatile(header_ptr) };
     if request.magic != COMM_MAGIC {
-        status.store(efi::Status::INVALID_PARAMETER.as_usize() as u64, Ordering::Release);
+        status.store(
+            efi::Status::INVALID_PARAMETER.as_usize() as u64,
+            Ordering::Release,
+        );
         return;
     }
     let mut reply = request;

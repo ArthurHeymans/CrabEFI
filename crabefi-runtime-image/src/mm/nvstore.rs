@@ -83,7 +83,6 @@ const _: () = assert!(
 );
 
 static mut RECORD: [u8; RECORD_MAX] = [0; RECORD_MAX];
-static mut COMPACT: [u8; MAX_STORE_SIZE] = [0; MAX_STORE_SIZE];
 
 fn timestamp_bytes(t: &VariableTimestamp) -> [u8; 16] {
     let mut b = [0u8; 16];
@@ -202,89 +201,6 @@ fn walk(read: Reader<'_>, data_end: u32, f: &mut dyn FnMut(&Record) -> bool) -> 
     Ok(offset)
 }
 
-/// Call `f` with the bytes of every live record of the store image `copy`
-/// that no later live record of the same name supersedes, in store order,
-/// until `f` returns false.
-fn kept_records(copy: &[u8], data_end: u32, f: &mut dyn FnMut(&[u8]) -> bool) -> Result<(), Error> {
-    let mut read = |o: u32, b: &mut [u8]| match copy.get(o as usize..o as usize + b.len()) {
-        Some(src) => {
-            b.copy_from_slice(src);
-            true
-        }
-        None => false,
-    };
-    let mut result = Ok(());
-    walk(&mut read, data_end, &mut |record| {
-        if record.state != VAR_ADDED {
-            return true;
-        }
-        let units = record.name_size as usize / 2;
-        let mut name = [0u16; MAX_VARIABLE_NAME_LEN + 1];
-        let name_start = record.name_offset as usize;
-        let (Some(name), Some(name_bytes)) = (
-            name.get_mut(..units).filter(|name| !name.is_empty()),
-            copy.get(name_start..name_start + units * 2),
-        ) else {
-            result = Err(Error::Corrupt);
-            return false;
-        };
-        for (unit, bytes) in name.iter_mut().zip(name_bytes.as_chunks::<2>().0) {
-            *unit = u16::from_le_bytes(*bytes);
-        }
-        let name: &[u16] = name;
-        let mut later = false;
-        let mut name_error = None;
-        let mut read = |o: u32, b: &mut [u8]| match copy.get(o as usize..o as usize + b.len()) {
-            Some(src) => {
-                b.copy_from_slice(src);
-                true
-            }
-            None => false,
-        };
-        let scan = walk(&mut read, data_end, &mut |other| {
-            if other.offset > record.offset && other.state == VAR_ADDED && other.guid == record.guid
-            {
-                let mut read =
-                    |o: u32, b: &mut [u8]| match copy.get(o as usize..o as usize + b.len()) {
-                        Some(src) => {
-                            b.copy_from_slice(src);
-                            true
-                        }
-                        None => false,
-                    };
-                match name_is(&mut read, other, name) {
-                    Ok(matched) => later = matched,
-                    Err(error) => {
-                        name_error = Some(error);
-                        return false;
-                    }
-                }
-            }
-            !later
-        });
-        if let Some(error) = name_error.take() {
-            result = Err(error);
-            return false;
-        }
-        if let Err(error) = scan {
-            result = Err(error);
-            return false;
-        }
-        if later {
-            return true;
-        }
-        match copy.get(record.offset as usize..record.next as usize) {
-            Some(bytes) => f(bytes),
-            None => {
-                result = Err(Error::Corrupt);
-                false
-            }
-        }
-    })?;
-    result
-}
-
-/// The record's name equals `name` (UTF-16 including the terminator).
 /// A read failure is an error, not a mismatch: callers deciding what to
 /// retire or keep must not act on a name they could not read.
 fn name_is(read: Reader<'_>, record: &Record, name: &[u16]) -> Result<bool, Error> {
@@ -328,29 +244,33 @@ impl NvStore {
             .read(self.region + base as u64 + offset as u64, buf)
     }
 
-    /// End of the data area if a valid authenticated store of `size` bytes starts at `base`.
-    fn store_at(&self, base: u32, size: u32) -> Option<u32> {
+    /// End of the data area if a valid authenticated store of `size` bytes
+    /// starts at `base`. A read failure is an error: opening must not pick an
+    /// erase path from headers it could not read.
+    fn store_at(&self, base: u32, size: u32) -> Result<Option<u32>, Error> {
         let mut headers = [0u8; HEADERS];
         if !self.read_at(base, 0, &mut headers) {
-            return None;
+            return Err(Error::Device);
         }
-        varstore::validate(&headers, size)
+        Ok(varstore::validate(&headers, size)
             .filter(|valid| valid.auth_format)
-            .map(|valid| VARIABLE_DATA_OFFSET + valid.data_size)
+            .map(|valid| VARIABLE_DATA_OFFSET + valid.data_size))
     }
 
-    fn blank(&self, base: u32, len: u32) -> bool {
+    fn blank(&self, base: u32, len: u32) -> Result<bool, Error> {
         let mut chunk = [0u8; 256];
         let mut offset = 0;
         while offset < len {
             let n = ((len - offset) as usize).min(chunk.len());
-            if !self.read_at(base, offset, &mut chunk[..n]) || chunk[..n].iter().any(|&b| b != 0xff)
-            {
-                return false;
+            if !self.read_at(base, offset, &mut chunk[..n]) {
+                return Err(Error::Device);
+            }
+            if chunk[..n].iter().any(|&b| b != 0xff) {
+                return Ok(false);
             }
             offset += n as u32;
         }
-        true
+        Ok(true)
     }
 
     /// First free byte after the records of the store at `base`.
@@ -382,18 +302,36 @@ impl NvStore {
         self.region = region;
         self.size = size;
         self.half = half;
-        if let Some(end) = self.store_at(0, half) {
+        if let Some(end) = self.store_at(0, half)? {
             self.data_end = end;
-            if !self.blank(half, half) && !self.erase_half(half) {
+            if self.store_at(half, half)?.is_some() {
+                // compact() writes the spare header only once the spare holds
+                // every live record, and erasing the spare starts with that
+                // header. So while it validates, the spare is a complete
+                // copy, whatever the primary holds: the old log, a finished
+                // copy, or an erase that tore past its header block.
+                self.copy_spare_to_primary()?;
+            } else if !self.blank(half, half)? && !self.erase_half(half) {
                 return Err(Error::Device);
             }
-        } else if let Some(end) = self.store_at(0, size) {
+        } else if let Some(end) = self.store_at(0, size)? {
             self.data_end = end;
-            self.write_offset = self.scan_end(0, end)?;
-            self.migrate()?;
-        } else if self.store_at(half, half).is_some() {
+            let records_end = self.scan_end(0, end);
+            if self.store_at(half, half)?.is_some()
+                && !matches!(records_end, Ok(records_end) if records_end > half)
+            {
+                // A committed spare from a migration that stopped while
+                // erasing the primary (whose header survived the torn erase).
+                // A legacy store whose records do reach into the spare half
+                // holds no spare there: migrate() refuses it below.
+                self.copy_spare_to_primary()?;
+            } else {
+                self.write_offset = records_end?;
+                self.migrate()?;
+            }
+        } else if self.store_at(half, half)?.is_some() {
             self.copy_spare_to_primary()?;
-        } else if self.blank(0, size) {
+        } else if self.blank(0, size)? {
             self.format()?;
         } else {
             return Err(Error::Corrupt);
@@ -413,10 +351,14 @@ impl NvStore {
     }
 
     /// Move a full-region store (boot-time writer) into the primary half.
+    ///
+    /// When its records reach into the spare half there is no second place
+    /// to build the new copy in, and any rebuild would erase the only one.
+    /// Opening then fails, so the boot stops; the store has to be compacted
+    /// by a build without payload MM, or backed up and restored, first.
     fn migrate(&mut self) -> Result<(), Error> {
         if self.write_offset > self.half {
-            // Records reach into the spare half, so it cannot hold the copy.
-            return self.compact_in_place();
+            return Err(Error::Full);
         }
         self.compact()
     }
@@ -424,7 +366,7 @@ impl NvStore {
     /// Rebuild the primary from a complete spare, then clear the spare.
     fn copy_spare_to_primary(&mut self) -> Result<(), Error> {
         let half = self.half;
-        let spare_end = self.store_at(half, half).ok_or(Error::Corrupt)?;
+        let spare_end = self.store_at(half, half)?.ok_or(Error::Corrupt)?;
         let end = self.scan_end(half, spare_end)?;
         // Until the primary is rebuilt only the spare holds the store.
         self.poisoned = true;
@@ -442,7 +384,15 @@ impl NvStore {
             }
             offset += n as u32;
         }
-        if !self.flash.program(self.region, &fv_headers(half)) || !self.erase_half(half) {
+        // Zero the spare's headers before erasing it: an erase torn inside
+        // the header block could otherwise leave a valid header over damaged
+        // records, which open() would take as the complete copy.
+        if !self.flash.program(self.region, &fv_headers(half))
+            || !self
+                .flash
+                .program(self.region + half as u64, &[0u8; HEADERS])
+            || !self.erase_half(half)
+        {
             return Err(Error::Device);
         }
         self.data_end = half;
@@ -607,6 +557,7 @@ impl NvStore {
             return Err(Error::Device);
         }
         let mut failed = false;
+        let mut unreadable = false;
         let mut reader = |o: u32, b: &mut [u8]| self.read(o, b);
         let mut matches = [0u32; 16];
         let mut count = 0;
@@ -614,7 +565,7 @@ impl NvStore {
             if Some(record.offset) != keep && record.state == VAR_ADDED && record.guid == *guid {
                 let mut reader = |o: u32, b: &mut [u8]| self.read(o, b);
                 let Ok(matched) = name_is(&mut reader, record, name) else {
-                    failed = true;
+                    unreadable = true;
                     return false;
                 };
                 if matched {
@@ -628,6 +579,11 @@ impl NvStore {
             }
             true
         })?;
+        // Retire nothing unless every candidate's name was read: a partial
+        // deletion would report failure yet take effect.
+        if unreadable {
+            return Err(Error::Device);
+        }
         for &offset in matches.iter().take(count) {
             let state = self.region + offset as u64 + 2;
             if !self.flash.program_bits(state, VAR_DELETED) {
@@ -724,63 +680,6 @@ impl NvStore {
         }
         self.copy_spare_to_primary()?;
         self.write_offset = offset;
-        Ok(())
-    }
-
-    /// Rewrite a full-region store whose records reach into the spare half
-    /// into a fresh primary (one-time migration from the boot-time writer).
-    ///
-    /// There is no room for a second durable copy, so the live records are
-    /// kept in RAM while only the primary half is rebuilt, its header last.
-    /// The spare half still holds old records until the new header is
-    /// written, so a power cut in between leaves flash that is neither a
-    /// store nor blank: [`NvStore::open`] reports it corrupt and the caller
-    /// fails closed, rather than serving a valid store that lacks records
-    /// such as PK. The spare is erased once the primary is complete.
-    fn compact_in_place(&mut self) -> Result<(), Error> {
-        // SAFETY: single-threaded SMM; COMPACT is only used here.
-        let copy = unsafe { &mut *addr_of_mut!(COMPACT) }
-            .get_mut(..self.size as usize)
-            .ok_or(Error::Invalid)?;
-        if !self.read(0, copy) {
-            return Err(Error::Device);
-        }
-        let copy: &[u8] = copy;
-        let data_end = self.data_end;
-        // Check that every kept record parses and that they fit a half
-        // before anything is erased.
-        let mut needed = VARIABLE_DATA_OFFSET as usize;
-        kept_records(copy, data_end, &mut |bytes| {
-            needed += bytes.len();
-            true
-        })?;
-        if needed > self.half as usize {
-            return Err(Error::Full);
-        }
-
-        // From here on a failure leaves neither store usable until the next
-        // open decides; stop serving writes.
-        self.poisoned = true;
-        if !self.erase_half(0) {
-            return Err(Error::Device);
-        }
-        self.data_end = self.half;
-        let mut offset = VARIABLE_DATA_OFFSET;
-        let mut programmed = true;
-        kept_records(copy, data_end, &mut |bytes| {
-            programmed = self.flash.program(self.region + offset as u64, bytes);
-            offset += bytes.len() as u32;
-            programmed
-        })?;
-        // The new primary becomes the store once its header is written.
-        if !programmed
-            || !self.flash.program(self.region, &fv_headers(self.half))
-            || !self.erase_half(self.half)
-        {
-            return Err(Error::Device);
-        }
-        self.write_offset = offset;
-        self.poisoned = false;
         Ok(())
     }
 }

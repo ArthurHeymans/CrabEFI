@@ -245,6 +245,9 @@ fn init_persistence_and_boot(
     let capsule_backend_available = cfg!(feature = "capsule-update") && capsule_backend.is_some();
     let mut capsule_delivery_usable = false;
     let mut retained_staging_ready = false;
+    // Runtime writes the OS made last session were replayed (or there were
+    // none to replay).
+    let mut journal_drained = true;
     if persistence_available && persistence_writable && retained_staging {
         match runtime.prepare_retained_staging() {
             Ok(()) => {
@@ -267,11 +270,25 @@ fn init_persistence_and_boot(
                 log::warn!("Runtime image retained staging setup failed: {:?}", status)
             }
         }
-        if let Err(status) = runtime.replay_deferred() {
+        // With payload MM the local store never imported MM's variables, so
+        // replaying against it could acknowledge a record that did nothing:
+        // leave any journal untouched.
+        #[cfg(target_arch = "x86_64")]
+        let mm_owns_variables = efi::payload_mm::active();
+        #[cfg(not(target_arch = "x86_64"))]
+        let mm_owns_variables = false;
+        if mm_owns_variables {
+            log::info!("Payload MM owns the variables; the retained journal is not replayed");
+        } else if let Err(status) = runtime.replay_deferred() {
             retained_staging_ready = false;
+            journal_drained = false;
             log::warn!("Runtime image deferred replay failed: {:?}", status);
         }
     }
+
+    // Only capsule processing below waits for the journal.
+    #[cfg(not(feature = "capsule-update"))]
+    let _ = journal_drained;
 
     if persistence_available {
         logger::apply_persisted_level();
@@ -295,8 +312,13 @@ fn init_persistence_and_boot(
         }
     }
 
+    // A firmware update must not run before the journal was replayed: the
+    // new firmware may not replay it (payload MM does not), and the OS was
+    // told those writes succeeded.
     #[cfg(feature = "capsule-update")]
-    if persistence_writable {
+    if persistence_writable && !journal_drained {
+        log::error!("Skipping pending capsules: the runtime variable journal was not replayed");
+    } else if persistence_writable {
         if let Some(backend) = capsule_backend {
             // A capsule file may sit on a USB ESP; scanning without USB would
             // consume the request without finding it.
