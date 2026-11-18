@@ -220,7 +220,9 @@ pub struct BootMenu<E> {
     pub entries: Vec<E, MAX_BOOT_ENTRIES>,
     /// Currently selected entry index
     pub selected: usize,
-    /// Timeout in seconds (0 = no timeout)
+    /// Timeout in seconds (0 = no timeout). Menus clear it on any input, so
+    /// a value left after a menu returns means the countdown chose the
+    /// selection.
     pub timeout_seconds: u32,
     /// One-shot command-line edit for the next boot attempt of one entry.
     /// The entry itself keeps its discovered command line; the edit is

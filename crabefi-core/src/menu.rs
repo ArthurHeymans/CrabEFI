@@ -637,6 +637,19 @@ pub fn show_menu(menu: &mut BootMenu) -> Option<usize> {
         // Update mouse cursor on framebuffer
         #[cfg(feature = "ui")]
         update_cursor(&mut cursor_renderer, &fb_info);
+        // Read input before the countdown can expire, so a key queued during
+        // the last second still stops the automatic boot.
+        let key = menu_common::read_key();
+        // Any key stops the automatic boot, as in the graphical menu: only an
+        // explicit choice boots after that. This also keeps a restricted boot
+        // policy from timing out into an external entry the user merely moved
+        // to.
+        if key.is_some() && remaining_seconds > 0 {
+            remaining_seconds = 0;
+            menu.set_timeout(0);
+            clear_countdown(&mut fb_console);
+        }
+
         // Check for timeout (first tick fires after 1 real second)
         if remaining_seconds > 0 && last_second_check.is_expired() {
             remaining_seconds -= 1;
@@ -651,11 +664,7 @@ pub fn show_menu(menu: &mut BootMenu) -> Option<usize> {
             }
         }
 
-        // Check for keypress
-        if let Some(key) = menu_common::read_key() {
-            // Any key resets the timeout
-            remaining_seconds = menu.timeout_seconds;
-
+        if let Some(key) = key {
             match key {
                 KeyPress::Up | KeyPress::Char('k') => {
                     menu.select_previous();
@@ -1122,6 +1131,15 @@ fn draw_countdown(seconds: u32, fb_console: &mut Option<FramebufferConsole>) {
         console.set_fg_color(Color::new(255, 255, 0)); // Yellow
         console.write_centered(row, &msg);
         console.reset_colors();
+    }
+}
+
+/// Remove the countdown line once the automatic boot is cancelled.
+fn clear_countdown(fb_console: &mut Option<FramebufferConsole>) {
+    serial_driver::write_str("\x1b[20;1H\x1b[K");
+    if let Some(console) = fb_console {
+        let row = console.rows().saturating_sub(3);
+        console.clear_line(row);
     }
 }
 
