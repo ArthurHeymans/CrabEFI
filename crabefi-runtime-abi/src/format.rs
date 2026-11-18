@@ -94,7 +94,10 @@ impl fmt::Display for AbiError {
 /// | 28     | exports_offset `u32`    |
 /// | 32     | feature_bits `u64`      |
 /// | 40     | abi_version `u32`       |
-/// | 44     | reserved `u32` (zero)   |
+/// | 44     | reserved `u32` (zero on write) |
+///
+/// ABI v1 readers ignore reserved padding in the header, section, and
+/// relocation records. The relocation addend is not padding and must be zero.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RuntimeImageHeader {
     pub architecture: u16,
@@ -137,6 +140,22 @@ pub struct RuntimeSection {
 }
 
 impl RuntimeSection {
+    /// Serialize a normalized little-endian section table entry.
+    pub fn to_bytes(self) -> [u8; SECTION_SIZE] {
+        let mut bytes = [0; SECTION_SIZE];
+        for (chunk, value) in bytes.as_chunks_mut::<4>().0.iter_mut().zip([
+            self.file_offset,
+            self.image_offset,
+            self.file_size,
+            self.memory_size,
+            self.alignment,
+            self.flags,
+        ]) {
+            *chunk = value.to_le_bytes();
+        }
+        bytes
+    }
+
     pub const fn image_end(self) -> Option<u32> {
         self.image_offset.checked_add(self.memory_size)
     }
@@ -161,6 +180,23 @@ pub struct RuntimeRelocation {
     pub patch_section: u8,
     pub target_section: u8,
     pub kind: RelocationKind,
+}
+
+impl RuntimeRelocation {
+    /// Serialize a normalized little-endian relocation table entry.
+    pub fn to_bytes(self) -> [u8; RELOCATION_SIZE] {
+        let mut bytes = [0; RELOCATION_SIZE];
+        bytes[..4].copy_from_slice(&self.patch_offset.to_le_bytes());
+        bytes[4..8].copy_from_slice(&self.target_offset.to_le_bytes());
+        // Absolute64 has a zero addend. The trailing reserved field is zero too.
+        bytes[16] = self.patch_section;
+        bytes[17] = self.target_section;
+        let wire_kind = match self.kind {
+            RelocationKind::Absolute64 => relocation_kind::ABSOLUTE64,
+        };
+        bytes[18..20].copy_from_slice(&wire_kind.to_le_bytes());
+        bytes
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -16,8 +16,8 @@ use sha2::{Digest, Sha256};
 use crabefi_runtime_abi::exports::{EXPORT_COUNT, ExportOffsets};
 use crabefi_runtime_abi::format::{
     ABI_VERSION, EFI_PAGE_SIZE, EXPORTS_SIZE, HEADER_SIZE, MAX_SECTIONS, RELOCATION_SIZE,
-    RuntimeImageHeader, SECTION_SIZE, ValidatedImage, architecture,
-    relocation_kind as abi_relocation_kind, section_flags as abi_section_flags,
+    RelocationKind as AbiRelocationKind, RuntimeImageHeader, RuntimeRelocation, RuntimeSection,
+    SECTION_SIZE, ValidatedImage, architecture, section_flags as abi_section_flags,
 };
 
 use crate::{Arch, project_root};
@@ -32,14 +32,6 @@ struct Segment {
     data: Vec<u8>,
     flags: u32,
     normalized_offset: u32,
-}
-
-#[derive(Clone, Copy)]
-struct Relocation {
-    patch_offset: u32,
-    target_offset: u32,
-    patch_section: u8,
-    target_section: u8,
 }
 
 pub struct RuntimeArtifact {
@@ -291,20 +283,26 @@ fn normalize(
             bail!("runtime ELF PT_LOAD segments overlap");
         }
     }
-    let linked_image_end = segments
-        .iter()
-        .map(|segment| segment.address + segment.memory_size)
-        .max()
-        .context("missing runtime image segments")?
-        .next_multiple_of(PAGE_SIZE);
+    // The non-overlap check establishes that the last segment ends last.
+    // Bound the rounded extent before allocating any leading zero padding.
+    let last = segments.last().context("missing runtime image segments")?;
+    let image_size = last
+        .address
+        .checked_add(last.memory_size)
+        .and_then(|end| end.checked_next_multiple_of(PAGE_SIZE))
+        .context("runtime image extent overflow")?;
+    let image_size_u32 = u32::try_from(image_size).context("runtime image exceeds 4 GiB")?;
     for index in 0..segments.len() {
         let original_address = segments[index].address;
         let normalized_start = if index == 0 { 0 } else { original_address };
         let normalized_end = segments
             .get(index + 1)
-            .map_or(linked_image_end, |next| next.address);
+            .map_or(image_size, |next| next.address);
         let prefix = usize::try_from(original_address - normalized_start)?;
-        let mut data = vec![0u8; prefix + segments[index].data.len()];
+        let padded_len = prefix
+            .checked_add(segments[index].data.len())
+            .context("runtime segment padding exceeds host address space")?;
+        let mut data = vec![0u8; padded_len];
         data[prefix..].copy_from_slice(&segments[index].data);
         segments[index].address = normalized_start;
         segments[index].memory_size = normalized_end - normalized_start;
@@ -313,9 +311,6 @@ fn normalize(
             segments[index].flags |= abi_section_flags::ZERO_FILL;
         }
     }
-    let image_size = linked_image_end;
-    let image_size_u32 = u32::try_from(image_size).context("runtime image exceeds 4 GiB")?;
-
     let relocations = collect_dynamic_relocations(&file, &segments, arch)?;
     if relocations.len() > crabefi_runtime_abi::MAX_RELOCATIONS {
         bail!(
@@ -357,27 +352,21 @@ fn normalize(
 
     for (index, segment) in segments.iter().enumerate() {
         let offset = section_offset + index * SECTION_SIZE;
-        write_u32(&mut normalized, offset, segment.normalized_offset);
-        write_u32(&mut normalized, offset + 4, segment.address as u32);
-        write_u32(&mut normalized, offset + 8, segment.data.len() as u32);
-        write_u32(&mut normalized, offset + 12, segment.memory_size as u32);
-        write_u32(&mut normalized, offset + 16, segment.alignment as u32);
-        write_u32(&mut normalized, offset + 20, segment.flags);
+        let section = RuntimeSection {
+            file_offset: segment.normalized_offset,
+            image_offset: u32::try_from(segment.address)?,
+            file_size: u32::try_from(segment.data.len())?,
+            memory_size: u32::try_from(segment.memory_size)?,
+            alignment: u32::try_from(segment.alignment)?,
+            flags: segment.flags,
+        };
+        normalized[offset..offset + SECTION_SIZE].copy_from_slice(&section.to_bytes());
         let destination = usize::try_from(segment.normalized_offset)?;
         normalized[destination..destination + segment.data.len()].copy_from_slice(&segment.data);
     }
     for (index, relocation) in relocations.iter().enumerate() {
         let offset = relocation_offset + index * RELOCATION_SIZE;
-        write_u32(&mut normalized, offset, relocation.patch_offset);
-        write_u32(&mut normalized, offset + 4, relocation.target_offset);
-        write_u64(&mut normalized, offset + 8, 0);
-        normalized[offset + 16] = relocation.patch_section;
-        normalized[offset + 17] = relocation.target_section;
-        write_u16(
-            &mut normalized,
-            offset + 18,
-            abi_relocation_kind::ABSOLUTE64,
-        );
+        normalized[offset..offset + RELOCATION_SIZE].copy_from_slice(&relocation.to_bytes());
     }
     for (index, value) in exports.iter().enumerate() {
         write_u32(&mut normalized, exports_offset + index * 4, *value);
@@ -456,7 +445,7 @@ fn collect_dynamic_relocations(
     file: &object::File<'_>,
     segments: &[Segment],
     arch: Arch,
-) -> Result<Vec<Relocation>> {
+) -> Result<Vec<RuntimeRelocation>> {
     let expected = dynamic_relocation_count(file)?;
     let mut output = Vec::with_capacity(expected);
     let relocations = file
@@ -481,11 +470,12 @@ fn collect_dynamic_relocations(
             .with_context(|| format!("relocation patch {patch:#x} is outside PT_LOAD"))?;
         let target_section = containing_segment(segments, target, 1)
             .with_context(|| format!("relocation target {target:#x} is outside PT_LOAD"))?;
-        output.push(Relocation {
+        output.push(RuntimeRelocation {
             patch_offset: u32::try_from(patch)?,
             target_offset: u32::try_from(target)?,
             patch_section: u8::try_from(patch_section)?,
             target_section: u8::try_from(target_section)?,
+            kind: AbiRelocationKind::Absolute64,
         });
     }
     if output.is_empty() || output.len() != expected {
@@ -1045,16 +1035,8 @@ fn write_json(path: PathBuf, value: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
-fn write_u16(bytes: &mut [u8], offset: usize, value: u16) {
-    bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
-}
-
 fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
     bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-}
-
-fn write_u64(bytes: &mut [u8], offset: usize, value: u64) {
-    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
 fn hex(bytes: &[u8]) -> String {

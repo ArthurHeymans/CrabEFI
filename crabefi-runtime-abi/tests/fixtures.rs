@@ -1,7 +1,8 @@
 use crabefi_runtime_abi::{
     ABI_VERSION, AbiError, EXPORT_COUNT, EXPORTS_SIZE, HEADER_SIZE, HandoffError, RELOCATION_SIZE,
-    RuntimeExternalRange, RuntimeHandoff, RuntimeImageHeader, SECTION_SIZE, ValidatedImage,
-    architecture, feature_bits, reset_mechanism, time_mechanism,
+    RelocationKind, RuntimeExternalRange, RuntimeHandoff, RuntimeImageHeader, RuntimeRelocation,
+    RuntimeSection, SECTION_SIZE, ValidatedImage, architecture, feature_bits, reset_mechanism,
+    time_mechanism,
 };
 
 fn write_u16(bytes: &mut [u8], offset: usize, value: u16) {
@@ -54,6 +55,69 @@ fn valid_image() -> Vec<u8> {
     let data_offset = bytes.len() - 4;
     bytes[data_offset..].copy_from_slice(b"code");
     bytes
+}
+
+#[test]
+fn section_and_relocation_encoders_match_wire_layout() {
+    // The public Rust discriminant predates the wire encoder.
+    assert_eq!(RelocationKind::Absolute64 as u16, 0);
+    let section = RuntimeSection {
+        file_offset: 0x1234,
+        image_offset: 0x2000,
+        file_size: 0x44,
+        memory_size: 0x3000,
+        alignment: 0x1000,
+        flags: 0x19,
+    };
+    assert_eq!(
+        section.to_bytes(),
+        [
+            0x34, 0x12, 0, 0, 0, 0x20, 0, 0, 0x44, 0, 0, 0, 0, 0x30, 0, 0, 0, 0x10, 0, 0, 0x19, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        ],
+    );
+    let relocation = RuntimeRelocation {
+        patch_offset: 0x1258,
+        target_offset: 0xc080,
+        patch_section: 1,
+        target_section: 2,
+        kind: RelocationKind::Absolute64,
+    };
+    assert_eq!(
+        relocation.to_bytes(),
+        [
+            0x58, 0x12, 0, 0, 0x80, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 1, 0, 0, 0, 0, 0
+        ],
+    );
+}
+
+#[test]
+fn encoded_section_and_relocation_round_trip_through_the_parser() {
+    let header = header(1);
+    let section = RuntimeSection {
+        file_offset: header.exports_offset + EXPORTS_SIZE as u32,
+        image_offset: 0,
+        file_size: 8,
+        memory_size: 4096,
+        alignment: 4096,
+        flags: 1 | 4 | 8 | 16,
+    };
+    let relocation = RuntimeRelocation {
+        patch_offset: 0,
+        target_offset: 8,
+        patch_section: 0,
+        target_section: 0,
+        kind: RelocationKind::Absolute64,
+    };
+    let mut bytes = image(header, 8, 0);
+    let section_offset = header.section_offset as usize;
+    let relocation_offset = header.relocation_offset as usize;
+    bytes[section_offset..section_offset + SECTION_SIZE].copy_from_slice(&section.to_bytes());
+    bytes[relocation_offset..relocation_offset + RELOCATION_SIZE]
+        .copy_from_slice(&relocation.to_bytes());
+    let image = ValidatedImage::parse(&bytes, architecture::X86_64).unwrap();
+    assert_eq!(image.section(0).unwrap(), section);
+    assert_eq!(image.relocation(0).unwrap(), relocation);
 }
 
 #[test]
