@@ -1016,7 +1016,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     // coreboot's SMMSTORE handler writes the same flash region raw, so it
     // would let the OS change variables around payload MM's verification.
     #[cfg(feature = "payload-mm")]
-    if let Err(error) = if cb_info.smmstorev2.is_some() {
+    if let Err(error) = if cb_info.smmstorev2_offered {
         Err("coreboot also offers SMMSTORE, which writes the variable store around payload MM")
     } else {
         payload_mm::load(

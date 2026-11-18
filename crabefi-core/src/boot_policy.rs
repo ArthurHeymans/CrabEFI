@@ -103,16 +103,27 @@ pub(crate) fn apply_variable() {
     use crate::efi::runtime_image::client::variables;
 
     let mut policy = get();
-    if let Some((attributes, data)) =
-        variables::get(&crate::logger::CRABEFI_SETTINGS_GUID, &variable_name())
-    {
-        if parse_external_boot(attributes, &data).is_none() {
-            log::error!(
-                "Malformed {}: denying external boot",
-                EXTERNAL_BOOT_VARIABLE_NAME
-            );
+    match variables::try_get(&crate::logger::CRABEFI_SETTINGS_GUID, &variable_name()) {
+        Ok(Some((attributes, data))) => {
+            if parse_external_boot(attributes, &data).is_none() {
+                log::error!(
+                    "Malformed {}: denying external boot",
+                    EXTERNAL_BOOT_VARIABLE_NAME
+                );
+            }
+            policy.external_boot = tightened(policy.external_boot, attributes, &data);
         }
-        policy.external_boot = tightened(policy.external_boot, attributes, &data);
+        Ok(None) => {}
+        // A saved Deny must not fall back to the build setting because the
+        // read failed (payload MM missing an SMI, for one).
+        Err(status) => {
+            log::error!(
+                "Cannot read {} ({:?}): denying external boot",
+                EXTERNAL_BOOT_VARIABLE_NAME,
+                status
+            );
+            policy.external_boot = ExternalBoot::Deny;
+        }
     }
     POLICY.set(policy);
     log::info!(

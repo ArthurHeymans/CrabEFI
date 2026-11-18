@@ -158,8 +158,11 @@ fn walk(read: Reader<'_>, data_end: u32, f: &mut dyn FnMut(&Record) -> bool) -> 
         if !read(offset, &mut h) {
             return Err(Error::Device);
         }
+        // A record's state is only programmed after the whole record, so
+        // 0xFF there means an append that never committed (possibly torn
+        // inside its header, magic included): the end of the store.
         let magic = u16::from_le_bytes([h[0], h[1]]);
-        if magic == 0xffff || (magic == VARIABLE_DATA && h[2] == 0xff) {
+        if magic == 0xffff || h[2] == 0xff {
             return Ok(offset);
         }
         if magic != VARIABLE_DATA {
@@ -230,6 +233,7 @@ fn kept_records(copy: &[u8], data_end: u32, f: &mut dyn FnMut(&[u8]) -> bool) ->
         }
         let name: &[u16] = name;
         let mut later = false;
+        let mut name_error = None;
         let mut read = |o: u32, b: &mut [u8]| match copy.get(o as usize..o as usize + b.len()) {
             Some(src) => {
                 b.copy_from_slice(src);
@@ -248,10 +252,20 @@ fn kept_records(copy: &[u8], data_end: u32, f: &mut dyn FnMut(&[u8]) -> bool) ->
                         }
                         None => false,
                     };
-                later = name_is(&mut read, other, name);
+                match name_is(&mut read, other, name) {
+                    Ok(matched) => later = matched,
+                    Err(error) => {
+                        name_error = Some(error);
+                        return false;
+                    }
+                }
             }
             !later
         });
+        if let Some(error) = name_error.take() {
+            result = Err(error);
+            return false;
+        }
         if let Err(error) = scan {
             result = Err(error);
             return false;
@@ -271,21 +285,25 @@ fn kept_records(copy: &[u8], data_end: u32, f: &mut dyn FnMut(&[u8]) -> bool) ->
 }
 
 /// The record's name equals `name` (UTF-16 including the terminator).
-fn name_is(read: Reader<'_>, record: &Record, name: &[u16]) -> bool {
+/// A read failure is an error, not a mismatch: callers deciding what to
+/// retire or keep must not act on a name they could not read.
+fn name_is(read: Reader<'_>, record: &Record, name: &[u16]) -> Result<bool, Error> {
     if record.name_size as usize != name.len() * 2 || name.len() > MAX_VARIABLE_NAME_LEN + 1 {
-        return false;
+        return Ok(false);
     }
     let mut bytes = [0u8; NAME_BYTES_MAX];
     let Some(bytes) = bytes.get_mut(..name.len() * 2) else {
-        return false;
+        return Ok(false);
     };
-    read(record.name_offset, bytes)
-        && bytes
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .zip(name)
-            .all(|(b, &unit)| u16::from_le_bytes(*b) == unit)
+    if !read(record.name_offset, bytes) {
+        return Err(Error::Device);
+    }
+    Ok(bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .zip(name)
+        .all(|(b, &unit)| u16::from_le_bytes(*b) == unit))
 }
 
 impl NvStore {
@@ -492,7 +510,7 @@ impl NvStore {
 
     /// A later live record has the same GUID and name.
     fn superseded(&self, record: &Record, name: &[u16]) -> Result<bool, Error> {
-        let mut found = false;
+        let mut found = Ok(false);
         let mut reader = |o: u32, b: &mut [u8]| self.read(o, b);
         walk(&mut reader, self.data_end, &mut |other| {
             if other.offset > record.offset && other.state == VAR_ADDED && other.guid == record.guid
@@ -500,9 +518,9 @@ impl NvStore {
                 let mut reader = |o: u32, b: &mut [u8]| self.read(o, b);
                 found = name_is(&mut reader, other, name);
             }
-            !found
+            found == Ok(false)
         })?;
-        Ok(found)
+        found
     }
 
     /// Append a record and retire its predecessors. `name` includes the terminator.
@@ -585,6 +603,9 @@ impl NvStore {
         name: &[u16],
         keep: Option<u32>,
     ) -> Result<(), Error> {
+        if self.poisoned {
+            return Err(Error::Device);
+        }
         let mut failed = false;
         let mut reader = |o: u32, b: &mut [u8]| self.read(o, b);
         let mut matches = [0u32; 16];
@@ -592,7 +613,11 @@ impl NvStore {
         walk(&mut reader, self.data_end, &mut |record| {
             if Some(record.offset) != keep && record.state == VAR_ADDED && record.guid == *guid {
                 let mut reader = |o: u32, b: &mut [u8]| self.read(o, b);
-                if name_is(&mut reader, record, name) {
+                let Ok(matched) = name_is(&mut reader, record, name) else {
+                    failed = true;
+                    return false;
+                };
+                if matched {
                     if count < matches.len() {
                         matches[count] = record.offset;
                         count += 1;

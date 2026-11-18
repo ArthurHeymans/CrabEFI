@@ -480,6 +480,9 @@ pub struct CorebootInfo {
     pub smbios: Option<u64>,
     /// SMMSTORE v2 information for UEFI variable storage
     pub smmstorev2: Option<Smmstorev2Info>,
+    /// coreboot published an SMMSTORE v2 record, whether or not it parsed:
+    /// its SMI handler then writes the store.
+    pub smmstorev2_offered: bool,
     /// SPI flash information
     pub spi_flash: Option<SpiFlashInfo>,
     /// Boot media parameters (includes FMAP location)
@@ -528,6 +531,7 @@ impl CorebootInfo {
             payload_mm: PayloadMmInfo::default(),
             smbios: None,
             smmstorev2: None,
+            smmstorev2_offered: false,
             spi_flash: None,
             boot_media: None,
             cfr_raw: None,
@@ -864,6 +868,7 @@ fn parse_record(record_bytes: &[u8], info: &mut CorebootInfo, depth: usize) {
             parse_tpm_cb_log_ref(record_bytes, info);
         }
         tags::CB_TAG_SMMSTOREV2 => {
+            info.smmstorev2_offered = true;
             parse_smmstorev2(record_bytes, info);
         }
         tags::CB_TAG_SPI_FLASH => {
