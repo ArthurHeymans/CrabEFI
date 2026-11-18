@@ -28,40 +28,39 @@ use super::types::{
     CryptoAgileEvent, SHA1_DIGEST_SIZE, SpecIdEvent, TaggedDigest, TcgError, TcgPcrEventHdr,
     digest_size_for_algorithm,
 };
+use zerocopy::{
+    FromBytes, Immutable, KnownLayout, Unaligned,
+    little_endian::{U16, U32},
+};
 
-fn read_le_u16(data: &[u8], offset: usize) -> Option<u16> {
-    let end = offset.checked_add(2)?;
-    let bytes = data.get(offset..end)?;
-    Some(u16::from_le_bytes([bytes[0], bytes[1]]))
+#[repr(C)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
+struct LegacyEventHeader {
+    pcr_index: U32,
+    event_type: U32,
+    digest: [u8; SHA1_DIGEST_SIZE],
+    event_data_size: U32,
 }
 
-fn read_le_u32(data: &[u8], offset: usize) -> Option<u32> {
-    let end = offset.checked_add(4)?;
-    let bytes = data.get(offset..end)?;
-    Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+#[repr(C)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
+struct CryptoAgileEventPrefix {
+    pcr_index: U32,
+    event_type: U32,
+    digest_count: U32,
 }
 
-fn legacy_event_total_size(data: &[u8], offset: usize) -> Option<usize> {
-    let header_size = core::mem::size_of::<TcgPcrEventHdr>();
-    let size_offset = offset.checked_add(4 + 4 + SHA1_DIGEST_SIZE)?;
-    let event_data_size = read_le_u32(data, size_offset)? as usize;
-    let total = header_size.checked_add(event_data_size)?;
-    let end = offset.checked_add(total)?;
-    data.get(offset..end)?;
-    Some(total)
+fn after_legacy_event(data: &[u8]) -> Option<&[u8]> {
+    let (header, tail) = LegacyEventHeader::ref_from_prefix(data).ok()?;
+    tail.get(header.event_data_size.get() as usize..)
 }
 
 fn parse_sha1_last_entry_offset(data: &[u8]) -> Result<Option<usize>, ()> {
-    if data.is_empty() {
-        return Ok(None);
-    }
-
-    let mut offset = 0usize;
+    let mut remaining = data;
     let mut last_entry = None;
-    while offset < data.len() {
-        let total = legacy_event_total_size(data, offset).ok_or(())?;
-        last_entry = Some(offset);
-        offset = offset.checked_add(total).ok_or(())?;
+    while !remaining.is_empty() {
+        last_entry = Some(data.len() - remaining.len());
+        remaining = after_legacy_event(remaining).ok_or(())?;
     }
 
     Ok(last_entry)
@@ -72,35 +71,21 @@ fn parse_crypto_agile_last_entry_offset(data: &[u8]) -> Result<Option<usize>, ()
         return Ok(None);
     }
 
-    let first_total = legacy_event_total_size(data, 0).ok_or(())?;
-    if first_total == data.len() {
-        return Ok(None);
-    }
-
-    let mut offset = first_total;
+    // Skip the legacy wrapper around the Spec ID event.
+    let mut remaining = after_legacy_event(data).ok_or(())?;
     let mut last_entry = None;
-    while offset < data.len() {
-        let event_start = offset;
-        let header_end = offset.checked_add(12).ok_or(())?;
-        data.get(offset..header_end).ok_or(())?;
-        let digest_count_offset = offset.checked_add(8).ok_or(())?;
-        let digest_count = read_le_u32(data, digest_count_offset).ok_or(())? as usize;
-        offset = header_end;
-
-        for _ in 0..digest_count {
-            let algorithm = read_le_u16(data, offset).ok_or(())?;
-            offset = offset.checked_add(2).ok_or(())?;
-            let digest_size = digest_size_for_algorithm(algorithm).ok_or(())?;
-            let digest_end = offset.checked_add(digest_size).ok_or(())?;
-            data.get(offset..digest_end).ok_or(())?;
-            offset = digest_end;
+    while !remaining.is_empty() {
+        let event_start = data.len() - remaining.len();
+        let (header, mut tail) =
+            CryptoAgileEventPrefix::ref_from_prefix(remaining).map_err(|_| ())?;
+        for _ in 0..header.digest_count.get() {
+            let (algorithm, digest) = U16::read_from_prefix(tail).map_err(|_| ())?;
+            let digest_size = digest_size_for_algorithm(algorithm.get()).ok_or(())?;
+            tail = digest.get(digest_size..).ok_or(())?;
         }
 
-        let event_data_size = read_le_u32(data, offset).ok_or(())? as usize;
-        offset = offset.checked_add(4).ok_or(())?;
-        let event_end = offset.checked_add(event_data_size).ok_or(())?;
-        data.get(offset..event_end).ok_or(())?;
-        offset = event_end;
+        let (event_size, body) = U32::read_from_prefix(tail).map_err(|_| ())?;
+        remaining = body.get(event_size.get() as usize..).ok_or(())?;
         last_entry = Some(event_start);
     }
 
@@ -535,5 +520,34 @@ impl EventLog for Sha1EventLog {
         self.used += event_data.len();
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod parse_tests {
+    use super::{parse_crypto_agile_last_entry_offset, parse_sha1_last_entry_offset};
+    use crate::efi::tcg::types::TPM_ALG_SHA256;
+
+    #[test]
+    fn legacy_log_tracks_an_unaligned_entry_and_rejects_a_short_body() {
+        let mut log = [0u8; 66];
+        log[28] = 1;
+        log[61] = 1;
+        assert_eq!(parse_sha1_last_entry_offset(&log), Ok(Some(33)));
+        assert_eq!(parse_sha1_last_entry_offset(&log[..65]), Err(()));
+    }
+
+    #[test]
+    fn crypto_agile_log_skips_the_spec_id_and_checks_digest_and_event_lengths() {
+        let mut log = [0u8; 84];
+        log[28] = 1;
+        assert_eq!(parse_crypto_agile_last_entry_offset(&log[..33]), Ok(None));
+        log[41] = 1;
+        log[45..47].copy_from_slice(&TPM_ALG_SHA256.to_le_bytes());
+        log[79] = 1;
+        assert_eq!(parse_crypto_agile_last_entry_offset(&log), Ok(Some(33)));
+        for end in [44, 46, 78, 82, 83] {
+            assert_eq!(parse_crypto_agile_last_entry_offset(&log[..end]), Err(()));
+        }
     }
 }
