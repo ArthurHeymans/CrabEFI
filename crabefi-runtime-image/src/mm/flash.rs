@@ -252,21 +252,12 @@ impl Flash {
 
     /// Read back through the same path that wrote and compare byte by byte.
     fn verify(&self, offset: u64, data: &[u8], ok: fn(u8, u8) -> bool) -> bool {
-        let mut chunk = [0u8; 64];
-        let mut done = 0;
-        while done < data.len() {
-            let n = (data.len() - done).min(chunk.len());
-            if !self.read(offset + done as u64, &mut chunk[..n])
-                || !chunk[..n]
-                    .iter()
-                    .zip(&data[done..done + n])
-                    .all(|(&now, &byte)| ok(now, byte))
-            {
-                return false;
-            }
-            done += n;
-        }
-        true
+        let mut buffer = [0u8; 64];
+        data.chunks(buffer.len()).enumerate().all(|(index, expected)| {
+            let now = &mut buffer[..expected.len().min(64)];
+            self.read(offset + (index * 64) as u64, now)
+                && now.iter().zip(expected).all(|(&now, &byte)| ok(now, byte))
+        })
     }
 
     /// Clear bits in one already programmed byte (EDK2 record state). NOR

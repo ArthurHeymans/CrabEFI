@@ -102,6 +102,20 @@ static READY_TO_BOOT: AtomicBool = AtomicBool::new(false);
 /// Setup authorization opened by the firmware (bridge operation), 0 if none.
 static SETUP_AUTHORIZATION: AtomicU32 = AtomicU32::new(0);
 
+/// Full reset through the PCH/FCH reset control register (0xCF9), from the
+/// panic handler: a panic in SMM must not leave every CPU spinning here.
+pub fn reset_after_panic() -> ! {
+    // SAFETY: port 0xCF9 on x86 PC platforms; 0x02 then 0x0E requests a full
+    // reset, after which nothing here runs again.
+    unsafe {
+        core::arch::asm!("out dx, al", in("dx") 0xcf9u16, in("al") 0x02u8, options(nomem, nostack));
+        core::arch::asm!("out dx, al", in("dx") 0xcf9u16, in("al") 0x0eu8, options(nomem, nostack));
+    }
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
 /// Firmware-only commands are refused once third-party code may have run.
 fn firmware_phase() -> bool {
     !READY_TO_BOOT.load(Ordering::Acquire)
@@ -220,7 +234,11 @@ fn init(context: *const CallContext) -> Result<(), ()> {
                 .iter()
                 .position(|&unit| unit == 0)
                 .unwrap_or(name.len());
-            if length == 0 || length > MAX_VARIABLE_NAME_LEN {
+            let Some(name) = name.get(..length).filter(|_| length <= MAX_VARIABLE_NAME_LEN)
+            else {
+                return Err(nvstore::Error::Invalid);
+            };
+            if length == 0 {
                 return Err(nvstore::Error::Invalid);
             }
             let mut lease =
@@ -231,7 +249,7 @@ fn init(context: *const CallContext) -> Result<(), ()> {
                 .import(
                     &mut variables.transaction,
                     record.guid,
-                    &name[..length],
+                    name,
                     efi::VariableAttributes::from_bits_retain(record.attributes),
                     data,
                     Some(record.timestamp),
@@ -281,12 +299,15 @@ fn persist(request: &BridgeRequest) -> Result<(), efi::Status> {
     if name_len == 0 || name_len > MAX_VARIABLE_NAME_LEN || request.name_address == 0 {
         return Err(efi::Status::INVALID_PARAMETER);
     }
-    let mut name = [0u16; MAX_VARIABLE_NAME_LEN + 1];
+    let mut terminated = [0u16; MAX_VARIABLE_NAME_LEN + 1];
     // SAFETY: image-owned SMRAM buffers of the given lengths.
-    name[..name_len].copy_from_slice(unsafe {
-        core::slice::from_raw_parts(request.name_address as *const u16, name_len)
-    });
-    let name = &name[..=name_len];
+    let source = unsafe { core::slice::from_raw_parts(request.name_address as *const u16, name_len) };
+    for (unit, &source) in terminated.iter_mut().zip(source) {
+        *unit = source;
+    }
+    let name = terminated
+        .get(..=name_len)
+        .ok_or(efi::Status::INVALID_PARAMETER)?;
     let data_len = request.data_len as usize;
     let data = if data_len == 0 {
         &[][..]
@@ -393,10 +414,11 @@ fn load_name(config: &InitConfig, request: &Request, name: &mut [u16]) -> Result
         return Err(efi::Status::INVALID_PARAMETER);
     }
     let mut bytes = [0u8; NAME_CAPACITY];
-    copy_in(config.comm_base + NAME_OFFSET, &mut bytes[..size]);
+    let bytes = bytes.get_mut(..size).ok_or(efi::Status::INVALID_PARAMETER)?;
+    copy_in(config.comm_base + NAME_OFFSET, bytes);
     name.fill(0);
-    for (unit, b) in name.iter_mut().zip(bytes[..size].chunks_exact(2)) {
-        *unit = u16::from_le_bytes([b[0], b[1]]);
+    for (unit, b) in name.iter_mut().zip(bytes.as_chunks::<2>().0) {
+        *unit = u16::from_le_bytes(*b);
     }
     // Always terminated inside the buffer, whatever ring 0 sent.
     if let Some(last) = name.last_mut() {
@@ -431,12 +453,14 @@ fn firmware_flash(
     let done = if request.command == command::FIRMWARE_ERASE {
         flash.erase(offset, length)
     } else {
-        let length = length as usize;
-        if length > data_capacity {
+        let Some(chunk) = data
+            .get_mut(..length as usize)
+            .filter(|chunk| chunk.len() <= data_capacity)
+        else {
             return efi::Status::BAD_BUFFER_SIZE;
-        }
-        copy_in(config.comm_base + DATA_OFFSET, &mut data[..length]);
-        flash.program(offset, &data[..length])
+        };
+        copy_in(config.comm_base + DATA_OFFSET, chunk);
+        flash.program(offset, chunk)
     };
     if done {
         efi::Status::SUCCESS
@@ -445,31 +469,39 @@ fn firmware_flash(
     }
 }
 
-/// Persist and publish a firmware status variable that SetVariable protects
-/// (for example ESRT last-attempt status). Key databases and Secure Boot state
-/// are never written this way.
+/// Variables the boot firmware writes through SET_FIRMWARE_VARIABLE: status
+/// it owns that SetVariable refuses, and its capsule staging reservation.
+/// Everything else, Secure Boot keys and signer bindings included, only
+/// changes through the verified variable services.
+fn firmware_owned(guid: &[u8; 16], name: &[u16]) -> bool {
+    crabefi_runtime_abi::capsule::is_esrt_last_attempt_variable(guid, name)
+        || services::is_capsule_staging_variable(guid, name)
+}
+
+/// Persist and publish a firmware-owned variable ([`firmware_owned`]) that
+/// SetVariable protects, for example the ESRT last-attempt status.
 fn set_firmware_variable(request: &Request, name: &[u16], data: &[u8]) -> efi::Status {
-    use crabefi_efi_types::secure_boot;
     let length = name
         .iter()
         .position(|&unit| unit == 0)
         .unwrap_or(name.len());
+    let (Some(unterminated), Some(terminated)) = (name.get(..length), name.get(..=length)) else {
+        return efi::Status::INVALID_PARAMETER;
+    };
     if length == 0 || length > MAX_VARIABLE_NAME_LEN {
         return efi::Status::INVALID_PARAMETER;
     }
     let guid = request.guid;
-    let unterminated = &name[..length];
-    if secure_boot::identify_key_database(&guid, unterminated).is_some()
-        || secure_boot::is_status_variable(&guid, unterminated)
-        || (guid == secure_boot::EFI_GLOBAL_VARIABLE_GUID
-            && secure_boot::name_matches(unterminated, secure_boot::SECURE_BOOT_ENABLE_NAME))
-        || request.attributes & efi::VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS != 0
+    if !firmware_owned(&guid, unterminated)
+        || request.attributes
+            & (efi::VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS | efi::VARIABLE_APPEND_WRITE)
+            != 0
     {
         return efi::Status::ACCESS_DENIED;
     }
     // SAFETY: single-threaded SMM.
     let store = unsafe { &mut *addr_of_mut!(STORE) };
-    if let Err(error) = store.write(&guid, &name[..=length], request.attributes, data, None) {
+    if let Err(error) = store.write(&guid, terminated, request.attributes, data, None) {
         return match error {
             nvstore::Error::Full => efi::Status::OUT_OF_RESOURCES,
             _ => efi::Status::DEVICE_ERROR,
@@ -550,8 +582,11 @@ fn dispatch(config: &InitConfig, request: &mut Request) -> efi::Status {
             if size == 0 || size > data_capacity.min(crabefi_runtime_abi::MAX_VARIABLE_DATA_SIZE) {
                 return efi::Status::INVALID_PARAMETER;
             }
-            copy_in(config.comm_base + DATA_OFFSET, &mut data[..size]);
-            set_firmware_variable(request, name, &data[..size])
+            let Some(data) = data.get_mut(..size) else {
+                return efi::Status::INVALID_PARAMETER;
+            };
+            copy_in(config.comm_base + DATA_OFFSET, data);
+            set_firmware_variable(request, name, data)
         }
         command::GET_VARIABLE => {
             if let Err(status) = load_name(config, request, name) {
@@ -569,7 +604,9 @@ fn dispatch(config: &InitConfig, request: &mut Request) -> efi::Status {
             request.attributes = attributes;
             request.data_size = size as u64;
             if status == efi::Status::SUCCESS {
-                copy_out(&data[..size], config.comm_base + DATA_OFFSET);
+                if let Some(data) = data.get(..size) {
+                    copy_out(data, config.comm_base + DATA_OFFSET);
+                }
             }
             status
         }
@@ -582,13 +619,12 @@ fn dispatch(config: &InitConfig, request: &mut Request) -> efi::Status {
             request.name_size = size as u32;
             if status == efi::Status::SUCCESS {
                 let mut bytes = [0u8; NAME_CAPACITY];
-                for (b, unit) in bytes.chunks_exact_mut(2).zip(name.iter()) {
-                    b.copy_from_slice(&unit.to_le_bytes());
+                for (b, unit) in bytes.as_chunks_mut::<2>().0.iter_mut().zip(name.iter()) {
+                    *b = unit.to_le_bytes();
                 }
-                copy_out(
-                    &bytes[..size.min(NAME_CAPACITY)],
-                    config.comm_base + NAME_OFFSET,
-                );
+                if let Some(bytes) = bytes.get(..size) {
+                    copy_out(bytes, config.comm_base + NAME_OFFSET);
+                }
                 request.guid = *guid.as_bytes();
             }
             status
@@ -601,7 +637,10 @@ fn dispatch(config: &InitConfig, request: &mut Request) -> efi::Status {
             if size > data_capacity {
                 return efi::Status::OUT_OF_RESOURCES;
             }
-            copy_in(config.comm_base + DATA_OFFSET, &mut data[..size]);
+            let Some(staged) = data.get_mut(..size) else {
+                return efi::Status::OUT_OF_RESOURCES;
+            };
+            copy_in(config.comm_base + DATA_OFFSET, staged);
             services::set_variable(
                 name.as_mut_ptr(),
                 &mut guid,

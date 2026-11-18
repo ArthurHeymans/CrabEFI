@@ -56,6 +56,11 @@ const CAPSULE_UPDATE_NAME: &[u16] = &[
     b'a' as u16,
 ];
 
+/// The retained capsule staging reservation (`CapsuleUpdateData`).
+pub fn is_capsule_staging_variable(guid: &[u8; 16], name: &[u16]) -> bool {
+    guid == CAPSULE_UPDATE_GUID.as_bytes() && name == CAPSULE_UPDATE_NAME
+}
+
 pub extern "efiapi" fn get_time(
     time: *mut efi::Time,
     capabilities: *mut efi::TimeCapabilities,

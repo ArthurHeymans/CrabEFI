@@ -56,6 +56,10 @@ crabefi_runtime_abi::runtime_exports!(check_export_signatures);
 #[inline(never)]
 fn panic(_info: &PanicInfo<'_>) -> ! {
     crabefi_runtime_panic_is_possible();
+    // In SMM a spin would hold every CPU forever; reset the machine instead.
+    #[cfg(all(feature = "mm", target_arch = "x86_64"))]
+    mm::reset_after_panic();
+    #[allow(unreachable_code)]
     loop {
         core::hint::spin_loop();
     }

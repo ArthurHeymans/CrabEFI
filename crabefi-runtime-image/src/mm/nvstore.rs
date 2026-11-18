@@ -70,6 +70,12 @@ pub struct NvStore {
     write_offset: u32,
 }
 
+// The boot firmware checks the store size against this before loading MM.
+const _: () = assert!(
+    2 * (HEADERS + RECORD_MAX).div_ceil(ERASE_BLOCK as usize) * ERASE_BLOCK as usize
+        == crabefi_runtime_abi::mm::MIN_STORE_SIZE as usize
+);
+
 static mut RECORD: [u8; RECORD_MAX] = [0; RECORD_MAX];
 static mut COMPACT: [u8; MAX_STORE_SIZE] = [0; MAX_STORE_SIZE];
 
@@ -194,7 +200,9 @@ fn name_is(read: Reader<'_>, record: &Record, name: &[u16]) -> bool {
         return false;
     }
     let mut bytes = [0u8; NAME_BYTES_MAX];
-    let bytes = &mut bytes[..name.len() * 2];
+    let Some(bytes) = bytes.get_mut(..name.len() * 2) else {
+        return false;
+    };
     read(record.name_offset, bytes)
         && bytes
             .chunks_exact(2)
@@ -367,21 +375,29 @@ impl NvStore {
                 return false;
             }
             let mut bytes = [0u8; NAME_BYTES_MAX];
-            if units * 2 > bytes.len()
-                || !self.read(record.name_offset, &mut bytes[..units * 2])
-                || (data_len != 0 && !self.read(record.data_offset, &mut data_buf[..data_len]))
+            let (Some(bytes), Some(data)) =
+                (bytes.get_mut(..units * 2), data_buf.get_mut(..data_len))
+            else {
+                result = Err(Error::Invalid);
+                return false;
+            };
+            if !self.read(record.name_offset, bytes)
+                || (data_len != 0 && !self.read(record.data_offset, data))
             {
                 result = Err(Error::Device);
                 return false;
             }
-            for (unit, b) in name_buf.iter_mut().zip(bytes[..units * 2].chunks_exact(2)) {
-                *unit = u16::from_le_bytes([b[0], b[1]]);
+            for (unit, b) in name_buf.iter_mut().zip(bytes.as_chunks::<2>().0) {
+                *unit = u16::from_le_bytes(*b);
             }
-            let name = &name_buf[..units];
+            let Some(name) = name_buf.get(..units) else {
+                result = Err(Error::Invalid);
+                return false;
+            };
             if self.superseded(record, name) {
                 return true;
             }
-            result = f(record, name, &data_buf[..data_len]);
+            result = f(record, name, data);
             result.is_ok()
         });
         result
@@ -422,23 +438,33 @@ impl NvStore {
         let raw = AUTH_VAR_HEADER_SIZE + name_bytes + data.len();
         let len = checked_align_up(raw as u32, HEADER_ALIGNMENT).ok_or(Error::Invalid)?;
         // SAFETY: single-threaded SMM; RECORD is only used here.
-        let record = unsafe { &mut (&mut *addr_of_mut!(RECORD))[..len as usize] };
+        let record = unsafe { &mut *addr_of_mut!(RECORD) }
+            .get_mut(..len as usize)
+            .ok_or(Error::Invalid)?;
         record.fill(0xff);
-        record[0..2].copy_from_slice(&VARIABLE_DATA.to_le_bytes());
-        record[3] = 0;
-        record[4..8].copy_from_slice(&attributes.to_le_bytes());
-        record[8..0x10].fill(0);
-        record[0x10..0x20].copy_from_slice(&timestamp_bytes(&timestamp.unwrap_or_default()));
-        record[0x20..0x24].fill(0);
-        record[0x24..0x28].copy_from_slice(&(name_bytes as u32).to_le_bytes());
-        record[0x28..0x2c].copy_from_slice(&(data.len() as u32).to_le_bytes());
-        record[0x2c..0x3c].copy_from_slice(guid);
-        for (i, unit) in name.iter().enumerate() {
-            let o = AUTH_VAR_HEADER_SIZE + i * 2;
-            record[o..o + 2].copy_from_slice(&unit.to_le_bytes());
+        let (header, body) = record
+            .split_first_chunk_mut::<AUTH_VAR_HEADER_SIZE>()
+            .ok_or(Error::Invalid)?;
+        header[0..2].copy_from_slice(&VARIABLE_DATA.to_le_bytes());
+        header[3] = 0;
+        header[4..8].copy_from_slice(&attributes.to_le_bytes());
+        header[8..0x10].fill(0);
+        header[0x10..0x20].copy_from_slice(&timestamp_bytes(&timestamp.unwrap_or_default()));
+        header[0x20..0x24].fill(0);
+        header[0x24..0x28].copy_from_slice(&(name_bytes as u32).to_le_bytes());
+        header[0x28..0x2c].copy_from_slice(&(data.len() as u32).to_le_bytes());
+        header[0x2c..0x3c].copy_from_slice(guid);
+        let (name_area, data_area) = body
+            .split_at_mut_checked(name_bytes)
+            .ok_or(Error::Invalid)?;
+        for (bytes, unit) in name_area.as_chunks_mut::<2>().0.iter_mut().zip(name) {
+            *bytes = unit.to_le_bytes();
         }
-        let data_at = AUTH_VAR_HEADER_SIZE + name_bytes;
-        record[data_at..data_at + data.len()].copy_from_slice(data);
+        data_area
+            .get_mut(..data.len())
+            .ok_or(Error::Invalid)?
+            .copy_from_slice(data);
+        let record: &[u8] = record;
 
         if !self.slot_free(len) {
             self.compact()?;
@@ -487,7 +513,7 @@ impl NvStore {
             }
             true
         });
-        for &offset in &matches[..count] {
+        for &offset in matches.iter().take(count) {
             let state = self.region + offset as u64 + 2;
             if !self.flash.program_bits(state, VAR_DELETED) {
                 failed = true;
@@ -531,17 +557,19 @@ impl NvStore {
             let units = record.name_size as usize / 2;
             let mut name = [0u16; MAX_VARIABLE_NAME_LEN + 1];
             let mut bytes = [0u8; NAME_BYTES_MAX];
-            if units == 0
-                || units > name.len()
-                || !self.read(record.name_offset, &mut bytes[..units * 2])
-            {
+            let (Some(name), Some(bytes)) = (name.get_mut(..units), bytes.get_mut(..units * 2))
+            else {
+                result = Err(Error::Device);
+                return false;
+            };
+            if units == 0 || !self.read(record.name_offset, bytes) {
                 result = Err(Error::Device);
                 return false;
             }
-            for (unit, b) in name[..units].iter_mut().zip(bytes.chunks_exact(2)) {
-                *unit = u16::from_le_bytes([b[0], b[1]]);
+            for (unit, b) in name.iter_mut().zip(bytes.as_chunks::<2>().0) {
+                *unit = u16::from_le_bytes(*b);
             }
-            if self.superseded(record, &name[..units]) {
+            if self.superseded(record, name) {
                 return true;
             }
             let len = record.next - record.offset;
@@ -579,15 +607,29 @@ impl NvStore {
         Ok(())
     }
 
-    /// Rewrite a full-region store's live records into a fresh primary (one-time
-    /// migration only; not power-fail safe, like the boot-time writer).
+    /// Rewrite a full-region store whose records reach into the spare half
+    /// into a fresh primary (one-time migration from the boot-time writer).
+    ///
+    /// There is no room for a second durable copy, so the live records are
+    /// kept in RAM while only the primary half is rebuilt, its header last.
+    /// The spare half still holds old records until the new header is
+    /// written, so a power cut in between leaves flash that is neither a
+    /// store nor blank: [`NvStore::open`] reports it corrupt and the caller
+    /// fails closed, rather than serving a valid store that lacks records
+    /// such as PK. The spare is erased once the primary is complete.
     fn compact_in_place(&mut self) -> Result<(), Error> {
         // SAFETY: single-threaded SMM; COMPACT is only used here.
-        let copy = unsafe { &mut (&mut *addr_of_mut!(COMPACT))[..self.size as usize] };
+        let copy = unsafe { &mut *addr_of_mut!(COMPACT) }
+            .get_mut(..self.size as usize)
+            .ok_or(Error::Invalid)?;
         if !self.read(0, copy) {
             return Err(Error::Device);
         }
-        self.format()?;
+        if !self.erase_half(0) {
+            return Err(Error::Device);
+        }
+        let old_data_end = self.data_end;
+        self.data_end = self.half;
         let mut offset = VARIABLE_DATA_OFFSET;
         let mut failed = false;
         let copy_ro: &[u8] = copy;
@@ -599,7 +641,7 @@ impl NvStore {
             }
             None => false,
         };
-        let data_end = self.data_end;
+        let data_end = old_data_end;
         walk(&mut reader, data_end, &mut |record| {
             if record.state != VAR_ADDED {
                 return true;
@@ -610,10 +652,17 @@ impl NvStore {
             if units == 0 || units > name.len() {
                 return true;
             }
-            for (i, unit) in name[..units].iter_mut().enumerate() {
-                let o = record.name_offset as usize + i * 2;
-                *unit = u16::from_le_bytes([copy_ro[o], copy_ro[o + 1]]);
+            let name_start = record.name_offset as usize;
+            let Some(name_bytes) = copy_ro.get(name_start..name_start + units * 2) else {
+                return true;
+            };
+            let Some(name) = name.get_mut(..units) else {
+                return true;
+            };
+            for (unit, bytes) in name.iter_mut().zip(name_bytes.as_chunks::<2>().0) {
+                *unit = u16::from_le_bytes(*bytes);
             }
+            let name: &[u16] = name;
             let mut later = false;
             let mut reader2 =
                 |o: u32, b: &mut [u8]| match copy_ro.get(o as usize..o as usize + b.len()) {
@@ -637,14 +686,17 @@ impl NvStore {
                         }
                         None => false,
                     };
-                    later = name_is(&mut reader3, other, &name[..units]);
+                    later = name_is(&mut reader3, other, name);
                 }
                 !later
             });
             if later {
                 return true;
             }
-            let bytes = &copy_ro[record.offset as usize..record.next as usize];
+            let Some(bytes) = copy_ro.get(record.offset as usize..record.next as usize) else {
+                failed = true;
+                return false;
+            };
             if offset as usize + bytes.len() > self.half as usize {
                 failed = true;
                 return false;
@@ -656,7 +708,18 @@ impl NvStore {
             offset = offset.saturating_add(bytes.len() as u32);
             true
         });
+        if failed {
+            return Err(Error::Device);
+        }
+        // The new primary becomes the store once its header is written.
+        if !self
+            .flash
+            .program(self.region, &fv_headers(self.half))
+            || !self.erase_half(self.half)
+        {
+            return Err(Error::Device);
+        }
         self.write_offset = offset;
-        if failed { Err(Error::Device) } else { Ok(()) }
+        Ok(())
     }
 }
