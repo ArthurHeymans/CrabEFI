@@ -251,7 +251,10 @@ fn try_boot_option_resolving_usb(
     let result = try_boot_load_option(load_option, file_path, Scope::Available);
     // A file-only option may be on any device, so look on USB unless it
     // started. One bound to a partition only if that partition was not found.
-    let unbound = boot_vars::partition_target(load_option) == boot_vars::PartitionTarget::Any;
+    let unbound = matches!(
+        boot_vars::partition_target(load_option),
+        boot_vars::PartitionTarget::Any | boot_vars::PartitionTarget::Unsigned { .. }
+    );
     let look_on_usb = match result {
         boot_vars::BootAttemptResult::Success | boot_vars::BootAttemptResult::Skipped => false,
         boot_vars::BootAttemptResult::Failed => unbound,
@@ -566,11 +569,13 @@ fn try_boot_file_from_esps(
         p
     };
 
+    // Internal storage first, so the copy that starts does not depend on
+    // whether USB came up early.
+    let mut devices = crate::drivers::storage::devices();
+    devices.retain(|device| scope.includes(device));
+    devices.sort_by_key(|device| device.external);
     let mut result = boot_vars::BootAttemptResult::NotFound;
-    for device in crate::drivers::storage::devices()
-        .iter()
-        .filter(|device| scope.includes(device))
-    {
+    for device in &devices {
         match try_boot_file_on_device(device, &fat_path, target) {
             boot_vars::BootAttemptResult::NotFound => {}
             boot_vars::BootAttemptResult::Success => {
@@ -614,7 +619,7 @@ fn try_boot_file_on_device(
         return BootAttemptResult::NotFound;
     };
 
-    for (i, partition) in partitions.iter().enumerate() {
+    for partition in partitions.iter() {
         let bound = match target {
             PartitionTarget::Any => false,
             PartitionTarget::Gpt(guid) => {
@@ -634,11 +639,13 @@ fn try_boot_file_on_device(
                 }
                 true
             }
+            // Geometry alone does not identify a partition: a same-layout
+            // partition on another disk may match, so keep looking.
             PartitionTarget::Unsigned { start_lba, size } => {
                 if partition.first_lba != start_lba || partition.size_sectors() != size {
                     continue;
                 }
-                true
+                false
             }
             PartitionTarget::Unsupported => return BootAttemptResult::NotFound,
         };
@@ -646,7 +653,7 @@ fn try_boot_file_on_device(
             continue;
         }
 
-        let partition_num = (i + 1) as u32;
+        let partition_num = partition.number;
 
         // Try to mount FAT and check for the file
         let found = storage::with_disk(device.id, |disk| {

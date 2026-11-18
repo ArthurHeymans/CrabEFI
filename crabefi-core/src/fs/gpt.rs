@@ -222,6 +222,9 @@ pub struct Partition {
     pub block_size: u32,
     /// Disk signature of the MBR this partition comes from, if any.
     pub mbr_disk_signature: Option<u32>,
+    /// 1-based number in its partition table (the GPT entry or MBR slot),
+    /// as HardDrive device path nodes name it; unused entries count too.
+    pub number: u32,
 }
 
 impl Partition {
@@ -572,6 +575,7 @@ pub(crate) fn read_partitions_with(
                 is_esp: entry.is_esp(),
                 block_size: block_size as u32,
                 mbr_disk_signature: None,
+                number: entry_index as u32 + 1,
             };
 
             log::debug!(
@@ -657,6 +661,7 @@ pub fn read_mbr_partitions(
             is_esp: is_boot_candidate,
             block_size: block_size as u32,
             mbr_disk_signature: Some(disk_signature),
+            number: index as u32 + 1,
         };
 
         log::debug!(

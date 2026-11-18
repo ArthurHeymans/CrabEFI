@@ -112,8 +112,8 @@ pub fn install_block_io_protocols(
     };
 
     // Create BlockIO for each partition
-    for (i, partition) in partitions.iter().enumerate() {
-        let partition_num = (i + 1) as u32;
+    for partition in &partitions {
+        let partition_num = partition.number;
         let partition_blocks = partition.size_sectors();
 
         let partition_block_io = block_io::create_partition_block_io(

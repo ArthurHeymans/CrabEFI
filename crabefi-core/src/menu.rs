@@ -273,8 +273,8 @@ fn discover_entries_on_disk(
     partitions: &[gpt::Partition],
     menu: &mut BootMenu,
 ) {
-    for (i, partition) in partitions.iter().enumerate() {
-        let partition_num = (i + 1) as u32;
+    for partition in partitions {
+        let partition_num = partition.number;
 
         if !partition.is_esp && !is_potential_esp(partition) {
             continue;
@@ -341,6 +341,7 @@ fn try_el_torito_fallback(device: &StorageDevice, menu: &mut BootMenu) {
             is_esp: true,
             block_size,
             mbr_disk_signature: None,
+            number: 0,
         };
 
         if !check_bootloader_exists(disk, efi_image.start_sector) {
