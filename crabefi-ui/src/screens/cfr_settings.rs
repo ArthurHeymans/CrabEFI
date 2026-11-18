@@ -1255,24 +1255,6 @@ pub async fn show_cfr_menu_graphical(
             if !graphical_key_allowed(state.focus.group, key) {
                 continue;
             }
-            // Opening an editor is not an edit. Only clear its saved feedback
-            // after a changed value is applied, not when the dialog opens.
-            if action.is_none()
-                && matches!(state.focus.group, Group::Content | Group::Actions)
-                && (matches!(key, KeyPress::Char('w' | 'W') | KeyPress::F10)
-                    || (state.focus.group == Group::Content
-                        && matches!(
-                            key,
-                            KeyPress::Left
-                                | KeyPress::Right
-                                | KeyPress::Char('+' | '=' | '-' | 'd' | 'D')
-                        )))
-            {
-                state.status_message = None;
-                if !matches!(key, KeyPress::F10 | KeyPress::Char('w' | 'W')) {
-                    state.save_result = None;
-                }
-            }
             if state.focus.group == Group::Sections {
                 let sections = visible_sections(cfr_info, &items);
                 let pos = sections
@@ -1347,13 +1329,20 @@ pub async fn show_cfr_menu_graphical(
                     cursor.hide(fb);
                     edit_graphical_item(cfr_info, &mut items, &mut state, fb).await;
                 }
-                KeyPress::Right | KeyPress::Char('+' | '=') if content => {
-                    if !increment_option(cfr_info, &mut items, state.selected) {
-                        state.status_message = Some(("This option cannot be changed.", false));
-                    }
-                }
-                KeyPress::Left | KeyPress::Char('-') if content => {
-                    if !decrement_option(cfr_info, &mut items, state.selected) {
+                KeyPress::Left | KeyPress::Right | KeyPress::Char('+' | '=' | '-') if content => {
+                    let direction = if matches!(key, KeyPress::Left | KeyPress::Char('-')) {
+                        StepDirection::Backward
+                    } else {
+                        StepDirection::Forward
+                    };
+                    if apply_graphical_edit(
+                        cfr_info,
+                        &mut items,
+                        &mut state,
+                        SettingEdit::Step(direction),
+                    )
+                    .is_none()
+                    {
                         state.status_message = Some(("This option cannot be changed.", false));
                     }
                 }
@@ -1440,11 +1429,9 @@ pub async fn show_cfr_menu_graphical(
                             state.focus.group = Group::Actions;
                             state.focus.action = i;
                         }
-                        if action != FwAction::Edit {
+                        if matches!(action, FwAction::Discard | FwAction::Restart) {
                             state.status_message = None;
-                            if action != FwAction::Save {
-                                state.save_result = None;
-                            }
+                            state.save_result = None;
                         }
                         match action {
                             FwAction::Edit => {
@@ -1801,15 +1788,14 @@ fn restore_graphical_default(
     items: &mut [MenuItem],
     state: &mut GraphicalState,
 ) {
-    state.save_result = None;
     state.status_message = Some(
-        if apply_edit(cfr, items, state.selected, SettingEdit::RestoreDefault).is_some() {
-            ("Default value set; save to keep it.", true)
-        } else {
-            (
+        match apply_graphical_edit(cfr, items, state, SettingEdit::RestoreDefault) {
+            Some(true) => ("Default value set; save to keep it.", true),
+            Some(false) => ("Already at the default value.", true),
+            None => (
                 "Read-only or unavailable; the default cannot be applied.",
                 false,
-            )
+            ),
         },
     );
 }
@@ -2003,7 +1989,7 @@ async fn edit_graphical_item(
     let Some(result) = result else {
         return;
     };
-    apply_graphical_edit(cfr, items, state, result);
+    let _ = apply_graphical_edit(cfr, items, state, result);
 }
 
 fn apply_graphical_edit(
@@ -2011,11 +1997,14 @@ fn apply_graphical_edit(
     items: &mut [MenuItem],
     state: &mut GraphicalState,
     edit: SettingEdit,
-) {
-    if apply_edit(cfr, items, state.selected, edit) == Some(true) {
+) -> Option<bool> {
+    // Only a changed draft supersedes the previous save attempt.
+    let changed = apply_edit(cfr, items, state.selected, edit)?;
+    if changed {
         state.save_result = None;
         state.status_message = None;
     }
+    Some(changed)
 }
 
 async fn show_no_options_graphical(fb: &FramebufferInfo) -> ui::ScreenNav {
@@ -2143,18 +2132,24 @@ mod graphical_tests {
         }];
         let mut state = GraphicalState::new(0);
         state.save_result = Some((1, 0));
-        apply_graphical_edit(
-            &cfr,
-            &mut items,
-            &mut state,
-            SettingEdit::SetLogLevel(log::LevelFilter::Info),
+        assert_eq!(
+            apply_graphical_edit(
+                &cfr,
+                &mut items,
+                &mut state,
+                SettingEdit::SetLogLevel(log::LevelFilter::Info)
+            ),
+            Some(false),
         );
         assert_eq!(state.save_result, Some((1, 0)));
-        apply_graphical_edit(
-            &cfr,
-            &mut items,
-            &mut state,
-            SettingEdit::SetLogLevel(log::LevelFilter::Trace),
+        assert_eq!(
+            apply_graphical_edit(
+                &cfr,
+                &mut items,
+                &mut state,
+                SettingEdit::SetLogLevel(log::LevelFilter::Trace)
+            ),
+            Some(true),
         );
         assert_eq!(state.save_result, None);
     }

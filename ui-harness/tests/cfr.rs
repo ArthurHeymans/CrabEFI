@@ -253,6 +253,46 @@ fn failed_save_cannot_leave_and_repair_retries_the_existing_draft() {
 }
 
 #[test]
+fn no_op_shortcuts_keep_failed_save_feedback_until_a_draft_changes() {
+    let mut host = Playground::new(800, 600, "write-error").unwrap();
+    processor(&mut host);
+    key(&mut host, "End");
+    assert_eq!(firmware(&host)["selectedId"], 6);
+    key(&mut host, "ArrowRight"); // Enable Advanced options and reveal Debug UART.
+    key(&mut host, "F10");
+    assert_eq!(firmware(&host)["saveResult"], json!([0, 1]));
+
+    key(&mut host, "End");
+    assert_eq!(firmware(&host)["selectedId"], 7);
+    for shortcut in ["ArrowLeft", "-", "d"] {
+        key(&mut host, shortcut);
+        assert_eq!(firmware(&host)["saveResult"], json!([0, 1]));
+        assert_eq!(firmware(&host)["dirtyCount"], 1);
+        assert_eq!(row(&host, "debug_uart")["value"], 0);
+    }
+    assert_eq!(
+        firmware(&host)["status"],
+        json!(["Already at the default value.", true])
+    );
+
+    key(&mut host, "ArrowUp");
+    key(&mut host, "ArrowUp");
+    assert_eq!(firmware(&host)["selectedId"], 5);
+    for shortcut in ["ArrowRight", "d"] {
+        key(&mut host, shortcut);
+        assert_eq!(firmware(&host)["saveResult"], json!([0, 1]));
+        assert_eq!(firmware(&host)["dirtyCount"], 1);
+    }
+
+    key(&mut host, "End");
+    key(&mut host, "+");
+    assert_eq!(firmware(&host)["saveResult"], Value::Null);
+    assert_eq!(firmware(&host)["status"], Value::Null);
+    assert_eq!(firmware(&host)["dirtyCount"], 2);
+    assert_eq!(row(&host, "debug_uart")["value"], 1);
+}
+
+#[test]
 fn logging_is_simulated_and_no_settings_fixture_remains_available() {
     let mut host = fresh();
     let original = state(&host)["configuredLogLevel"].clone();
