@@ -92,6 +92,35 @@ fn section_and_relocation_encoders_match_wire_layout() {
 }
 
 #[test]
+fn encoded_section_and_relocation_round_trip_through_the_parser() {
+    let header = header(1);
+    let section = RuntimeSection {
+        file_offset: header.exports_offset + EXPORTS_SIZE as u32,
+        image_offset: 0,
+        file_size: 8,
+        memory_size: 4096,
+        alignment: 4096,
+        flags: 1 | 4 | 8 | 16,
+    };
+    let relocation = RuntimeRelocation {
+        patch_offset: 0,
+        target_offset: 8,
+        patch_section: 0,
+        target_section: 0,
+        kind: RelocationKind::Absolute64,
+    };
+    let mut bytes = image(header, 8, 0);
+    let section_offset = header.section_offset as usize;
+    let relocation_offset = header.relocation_offset as usize;
+    bytes[section_offset..section_offset + SECTION_SIZE].copy_from_slice(&section.to_bytes());
+    bytes[relocation_offset..relocation_offset + RELOCATION_SIZE]
+        .copy_from_slice(&relocation.to_bytes());
+    let image = ValidatedImage::parse(&bytes, architecture::X86_64).unwrap();
+    assert_eq!(image.section(0).unwrap(), section);
+    assert_eq!(image.relocation(0).unwrap(), relocation);
+}
+
+#[test]
 fn parses_checked_fixture() {
     let bytes = valid_image();
     // Wire ABI v1 at its defined byte offset, independent of the serializer's
