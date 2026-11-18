@@ -301,6 +301,11 @@ power-loss-safe runtime flash writes. See [capabilities](capabilities.md).
 ./crabefi run --app hello --ahci --headless
 ```
 
+To debug the two-boot runtime test using a disk image you already prepared,
+use `./crabefi run --headless --disk path/to/test.img --runtime-replay` on
+x86-64. Replay enables writable snapshot flash and warm reset without
+changing the source ROM. The disk filename does not influence the run.
+
 ### UEFI SCT smoke subset
 
 CrabEFI can run a small public UEFI Self-Certification Test subset in QEMU. The

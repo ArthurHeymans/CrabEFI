@@ -112,11 +112,11 @@ pub extern "efiapi" fn efi_main(image: Handle, system: *mut SystemTable) -> Stat
             cleanup_replayed_runtime_writes(runtime);
             serial("RUNTIME DEFERRED VARIABLE REPLAY PASSED\r\n");
             serial("RUNTIME CAPSULE CONSUMPTION PASSED\r\n");
-            qemu_debug_exit();
+            qemu_debug_exit(0x10);
         }
         cleanup_replayed_runtime_writes(runtime);
         serial("RUNTIME TWO BOOT REPLAY FAILED\r\n");
-        qemu_debug_exit();
+        qemu_debug_exit(0x11);
     } else if !set_replay_marker(runtime) {
         return Status::DEVICE_ERROR;
     }
@@ -492,12 +492,12 @@ fn delete_variable<const N: usize>(
 }
 
 #[cfg(target_arch = "x86_64")]
-fn qemu_debug_exit() -> ! {
+fn qemu_debug_exit(code: u8) -> ! {
     unsafe {
         core::arch::asm!(
             "out dx, al",
             in("dx") 0xf4u16,
-            in("al") 0x10u8,
+            in("al") code,
             options(nomem, nostack, preserves_flags)
         )
     };
