@@ -507,33 +507,34 @@ pub fn set_timeout(seconds: u16) {
 /// Media/HardDrive node (type 4, subtype 1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PartitionTarget {
-    /// No hard-drive node: a file-only short form that any ESP may serve.
+    /// Only file path nodes: a file-only short form that any ESP may serve.
     Any,
-    /// A GPT partition, by its unique partition GUID.
+    /// A GPT partition, by its unique partition GUID. The number is not
+    /// compared: earlier CrabEFI numbered only populated slots, and the
+    /// options saved then must keep booting.
     Gpt([u8; 16]),
-    /// An MBR partition, by disk signature and start LBA.
-    Mbr { disk_signature: u32, start_lba: u64 },
-    /// A hard-drive node without a signature: a partition with this start
-    /// and size, on any disk.
-    Unsigned { start_lba: u64, size: u64 },
-    /// A node CrabEFI cannot match (a CD-ROM node, a malformed hard-drive
-    /// node); the option is not booted.
+    /// An MBR partition, by its table number, disk signature and start LBA.
+    Mbr {
+        number: u32,
+        disk_signature: u32,
+        start_lba: u64,
+    },
+    /// A path CrabEFI cannot resolve to one partition: a hard-drive node
+    /// without a usable signature (none, or a zero MBR signature), a CD-ROM
+    /// node, or hardware nodes without a hard-drive node. The option is not
+    /// booted rather than served from whatever ESP holds the same file.
     Unsupported,
 }
 
 pub fn partition_target(load_option: &LoadOption) -> PartitionTarget {
     const HARD_DRIVE_LENGTH: usize = 42;
     let mut rest: &[u8] = &load_option.file_path;
+    let mut file_only = true;
     while let Some((header, _)) = rest.split_first_chunk::<4>() {
         let (node_type, subtype) = (header[0], header[1]);
         let length = usize::from(u16::from_le_bytes([header[2], header[3]]));
         if length < 4 || length > rest.len() || (node_type == 0x7F && subtype == 0xFF) {
             break;
-        }
-        // Media/CD-ROM: an El Torito image CrabEFI does not resolve from a
-        // load option.
-        if node_type == 4 && subtype == 2 {
-            return PartitionTarget::Unsupported;
         }
         if node_type == 4 && subtype == 1 {
             let Some(node) = rest
@@ -543,28 +544,34 @@ pub fn partition_target(load_option: &LoadOption) -> PartitionTarget {
                 return PartitionTarget::Unsupported;
             };
             // Partition number, start, size, signature, MBR type, signature type.
+            let number = u32::from_le_bytes(node[4..8].try_into().unwrap_or_default());
             let start_lba = u64::from_le_bytes(node[8..16].try_into().unwrap_or_default());
-            let size = u64::from_le_bytes(node[16..24].try_into().unwrap_or_default());
             let mut signature = [0u8; 16];
             signature.copy_from_slice(&node[24..40]);
+            let disk_signature =
+                u32::from_le_bytes([signature[0], signature[1], signature[2], signature[3]]);
             return match node[41] {
-                0x02 => PartitionTarget::Gpt(signature),
-                0x01 => PartitionTarget::Mbr {
-                    disk_signature: u32::from_le_bytes([
-                        signature[0],
-                        signature[1],
-                        signature[2],
-                        signature[3],
-                    ]),
+                // MBR partitions have an all-zero GUID: it names nothing.
+                0x02 if signature != [0; 16] => PartitionTarget::Gpt(signature),
+                0x01 if disk_signature != 0 => PartitionTarget::Mbr {
+                    number,
+                    disk_signature,
                     start_lba,
                 },
-                0x00 => PartitionTarget::Unsigned { start_lba, size },
                 _ => PartitionTarget::Unsupported,
             };
         }
+        // Media/FilePath nodes are the file; any other node names hardware.
+        if !(node_type == 4 && subtype == 4) {
+            file_only = false;
+        }
         rest = &rest[length..];
     }
-    PartitionTarget::Any
+    if file_only {
+        PartitionTarget::Any
+    } else {
+        PartitionTarget::Unsupported
+    }
 }
 
 /// Extract a file path string from the FilePathList in a LoadOption.
@@ -729,27 +736,35 @@ mod tests {
             optional_data: HeaplessVec::new(),
         };
         option.file_path.extend_from_slice(&path).unwrap();
+        // The ACPI node names hardware, the hard-drive node the partition.
         assert_eq!(partition_target(&option), PartitionTarget::Gpt(guid));
-        // An MBR signature names the disk signature and the start LBA.
+        // An all-zero GUID (as MBR partitions have) names no partition.
+        let mut zero = option.clone();
+        zero.file_path[12 + 24..12 + 40].fill(0);
+        assert_eq!(partition_target(&zero), PartitionTarget::Unsupported);
+        // An MBR signature names the slot, the disk signature and the start.
         option.file_path[12 + 41] = 1;
         assert_eq!(
             partition_target(&option),
             PartitionTarget::Mbr {
+                number: 1,
                 disk_signature: 0x5a5a_5a5a,
                 start_lba: 2048
             }
         );
-        // Without a signature, the start and size name the partition.
+        // No signature, or a zero MBR signature, cannot be matched.
         option.file_path[12 + 41] = 0;
-        assert_eq!(
-            partition_target(&option),
-            PartitionTarget::Unsigned {
-                start_lba: 2048,
-                size: 4096
-            }
-        );
-        // An unknown signature type cannot be matched.
-        option.file_path[12 + 41] = 7;
+        assert_eq!(partition_target(&option), PartitionTarget::Unsupported);
+        option.file_path[12 + 41] = 1;
+        option.file_path[12 + 24..12 + 28].fill(0);
+        assert_eq!(partition_target(&option), PartitionTarget::Unsupported);
+        // Hardware nodes without a hard-drive node cannot be matched either.
+        option.file_path.clear();
+        option.file_path.extend_from_slice(&path[..12]).unwrap();
+        option
+            .file_path
+            .extend_from_slice(&path[12 + 42..])
+            .unwrap();
         assert_eq!(partition_target(&option), PartitionTarget::Unsupported);
         // A file-only short form may boot from any ESP.
         option.file_path.clear();

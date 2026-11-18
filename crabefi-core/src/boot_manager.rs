@@ -251,10 +251,7 @@ fn try_boot_option_resolving_usb(
     let result = try_boot_load_option(load_option, file_path, Scope::Available);
     // A file-only option may be on any device, so look on USB unless it
     // started. One bound to a partition only if that partition was not found.
-    let unbound = matches!(
-        boot_vars::partition_target(load_option),
-        boot_vars::PartitionTarget::Any | boot_vars::PartitionTarget::Unsigned { .. }
-    );
+    let unbound = boot_vars::partition_target(load_option) == boot_vars::PartitionTarget::Any;
     let look_on_usb = match result {
         boot_vars::BootAttemptResult::Success | boot_vars::BootAttemptResult::Skipped => false,
         boot_vars::BootAttemptResult::Failed => unbound,
@@ -569,11 +566,16 @@ fn try_boot_file_from_esps(
         p
     };
 
-    // Internal storage first, so the copy that starts does not depend on
-    // whether USB came up early.
+    // Internal storage first, then other external media, USB last: the copy
+    // that starts must not depend on whether USB came up early.
     let mut devices = crate::drivers::storage::devices();
     devices.retain(|device| scope.includes(device));
-    devices.sort_by_key(|device| device.external);
+    devices.sort_by_key(|device| {
+        (
+            device.external,
+            matches!(device.id, crate::drivers::storage::StorageId::Usb { .. }),
+        )
+    });
     let mut result = boot_vars::BootAttemptResult::NotFound;
     for device in &devices {
         match try_boot_file_on_device(device, &fat_path, target) {
@@ -629,23 +631,17 @@ fn try_boot_file_on_device(
                 true
             }
             PartitionTarget::Mbr {
+                number,
                 disk_signature,
                 start_lba,
             } => {
                 if partition.mbr_disk_signature != Some(disk_signature)
                     || partition.first_lba != start_lba
+                    || number != partition.number
                 {
                     continue;
                 }
                 true
-            }
-            // Geometry alone does not identify a partition: a same-layout
-            // partition on another disk may match, so keep looking.
-            PartitionTarget::Unsigned { start_lba, size } => {
-                if partition.first_lba != start_lba || partition.size_sectors() != size {
-                    continue;
-                }
-                false
             }
             PartitionTarget::Unsupported => return BootAttemptResult::NotFound,
         };

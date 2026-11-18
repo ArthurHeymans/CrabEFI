@@ -124,6 +124,7 @@ pub(crate) fn apply_variable() {
 
 /// The setup menu's floor and current value, as variable bytes: the
 /// platform setting and the effective policy.
+#[cfg(feature = "cfr")]
 pub(crate) fn external_boot_setting() -> (u8, u8) {
     (
         PLATFORM_EXTERNAL_BOOT.get() as u8,
@@ -133,6 +134,7 @@ pub(crate) fn external_boot_setting() -> (u8, u8) {
 
 /// Persist a setup-menu choice and apply it to this boot. Only a byte
 /// [`parse_external_boot`] accepts is written, with its attributes.
+#[cfg(feature = "cfr")]
 pub(crate) fn set_external_boot(byte: u8) -> Result<(), r_efi::efi::Status> {
     use crate::efi::runtime_image::client::variables;
 

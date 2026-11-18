@@ -334,7 +334,10 @@ pub extern "efiapi" fn efi_main(image: Handle, system: *mut SystemTable) -> Stat
         }
         // The runtime writes above did not change the policy.
         5 => {
-            check(media == Media::Nvme, "MenuOnly policy booted external media");
+            check(
+                media == Media::Nvme,
+                "MenuOnly policy booted external media",
+            );
             check(
                 get(rt, &SETTINGS, "CrabEFIExternalBoot").is_some_and(|data| data[0] == 1),
                 "the policy changed at runtime",
@@ -347,7 +350,10 @@ pub extern "efiapi" fn efi_main(image: Handle, system: *mut SystemTable) -> Stat
         }
         // A malformed policy denies external boot.
         6 => {
-            check(media == Media::Nvme, "malformed policy booted external media");
+            check(
+                media == Media::Nvme,
+                "malformed policy booted external media",
+            );
             serial("BPOL MALFORMED PASSED\r\nBPOL TEST PASSED\r\n");
             exit();
         }
