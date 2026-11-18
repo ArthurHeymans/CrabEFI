@@ -20,6 +20,11 @@ use crabefi::PciEcamRegion;
 use crabefi::fdt::PciDmaDomain;
 use crabefi::fdt::{DsdtDevice, MAX_ECAM_REGIONS, PlatformInfo};
 use crabefi::peripheral::Peripheral;
+#[cfg(target_arch = "x86_64")]
+use zerocopy::{
+    FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned,
+    little_endian::{U16, U32, U64},
+};
 
 mod connections;
 mod peripherals;
@@ -400,50 +405,134 @@ pub unsafe fn discover_platform(rsdp_addr: u64) -> Discovery {
 }
 
 #[cfg(target_arch = "x86_64")]
-unsafe fn read_u32(address: u64) -> u32 {
-    unsafe { core::ptr::read_unaligned(address as *const u32) }
+#[repr(C)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
+struct RsdpV1 {
+    signature: [u8; 8],
+    checksum: u8,
+    oem_id: [u8; 6],
+    revision: u8,
+    rsdt_address: U32,
 }
 
 #[cfg(target_arch = "x86_64")]
-unsafe fn read_u64(address: u64) -> u64 {
-    unsafe { core::ptr::read_unaligned(address as *const u64) }
+#[repr(C)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
+struct RsdpV2 {
+    v1: RsdpV1,
+    length: U32,
+    xsdt_address: U64,
+    extended_checksum: u8,
+    reserved: [u8; 3],
 }
 
-/// The address of the first ACPI table with `signature`.
+#[cfg(target_arch = "x86_64")]
+#[repr(C)]
+#[derive(FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
+struct SdtHeader {
+    signature: [u8; 4],
+    length: U32,
+    revision: u8,
+    checksum: u8,
+    oem_id: [u8; 6],
+    oem_table_id: [u8; 8],
+    oem_revision: U32,
+    creator_id: U32,
+    creator_revision: U32,
+}
+
+#[cfg(target_arch = "x86_64")]
+#[repr(C)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
+struct TcpaClientTable {
+    header: SdtHeader,
+    platform_class: U16,
+    log_area_minimum_length: U32,
+    log_area_start_address: U64,
+}
+
+#[cfg(target_arch = "x86_64")]
+#[repr(C)]
+#[derive(FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
+struct Tpm2Prefix {
+    header: SdtHeader,
+    platform_class: U16,
+    reserved: U16,
+    control_area: U64,
+    start_method: U32,
+}
+
+#[cfg(target_arch = "x86_64")]
+#[repr(C)]
+#[derive(FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
+struct Tpm2WithLogArea {
+    prefix: Tpm2Prefix,
+    start_method_parameters: [u8; 12],
+    log_area_minimum_length: U32,
+    log_area_start_address: U64,
+}
+
+/// Locate the first ACPI table with `signature`, returning its address and length.
 ///
 /// # Safety
-/// `rsdp_addr` and the tables it references must be identity mapped.
+/// The RSDP, root table, and each referenced SDT header must be readable and
+/// identity mapped. The root table must be readable for its advertised length.
 #[cfg(target_arch = "x86_64")]
-unsafe fn find_table(rsdp_addr: u64, signature: &[u8; 4]) -> Option<u64> {
-    let rsdp = rsdp_addr as *const u8;
-    if unsafe { core::slice::from_raw_parts(rsdp, 8) } != b"RSD PTR " {
+unsafe fn find_table(rsdp_addr: u64, signature: &[u8; 4]) -> Option<(u64, usize)> {
+    if rsdp_addr == 0 {
         return None;
     }
-    let revision = unsafe { core::ptr::read_unaligned(rsdp.add(15)) };
-    let (root, entry_size) = if revision >= 2 {
-        (unsafe { read_u64(rsdp_addr + 24) }, 8usize)
+    let rsdp = rsdp_addr as *const u8;
+    let v1 =
+        RsdpV1::ref_from_bytes(unsafe { core::slice::from_raw_parts(rsdp, size_of::<RsdpV1>()) })
+            .ok()?;
+    if &v1.signature != b"RSD PTR " {
+        return None;
+    }
+    let xsdt = v1.revision >= 2;
+    let root = if xsdt {
+        RsdpV2::ref_from_bytes(unsafe { core::slice::from_raw_parts(rsdp, size_of::<RsdpV2>()) })
+            .ok()?
+            .xsdt_address
+            .get()
     } else {
-        (unsafe { read_u32(rsdp_addr + 16) } as u64, 4usize)
+        u64::from(v1.rsdt_address.get())
     };
     if root == 0 {
         return None;
     }
 
-    let root_length = unsafe { read_u32(root + 4) } as usize;
-    if root_length < 36 {
-        return None;
-    }
-    let entry_count = (root_length - 36) / entry_size;
-    (0..entry_count).find_map(|index| {
-        let entry_address = root + 36 + (index * entry_size) as u64;
-        let table = if entry_size == 8 {
-            unsafe { read_u64(entry_address) }
-        } else {
-            (unsafe { read_u32(entry_address) }) as u64
-        };
-        (table != 0 && unsafe { core::slice::from_raw_parts(table as *const u8, 4) } == signature)
-            .then_some(table)
+    let root = root as *const u8;
+    let header = SdtHeader::ref_from_bytes(unsafe {
+        core::slice::from_raw_parts(root, size_of::<SdtHeader>())
     })
+    .ok()?;
+    let entry_bytes = (header.length.get() as usize).checked_sub(size_of::<SdtHeader>())?;
+    let entries =
+        unsafe { core::slice::from_raw_parts(root.add(size_of::<SdtHeader>()), entry_bytes) };
+    let find = |address: u64| {
+        if address == 0 {
+            return None;
+        }
+        let header = SdtHeader::ref_from_bytes(unsafe {
+            core::slice::from_raw_parts(address as *const u8, size_of::<SdtHeader>())
+        })
+        .ok()?;
+        (&header.signature == signature).then_some((address, header.length.get() as usize))
+    };
+    // XSDT entries start immediately after the 36-byte header, so they need
+    // not be naturally aligned even when the table itself is aligned.
+    if xsdt {
+        let (entries, _) = entries.as_chunks::<8>();
+        entries
+            .iter()
+            .find_map(|&entry| find(U64::from_bytes(entry).get()))
+    } else {
+        let (entries, _) = entries.as_chunks::<4>();
+        entries
+            .iter()
+            .find_map(|&entry| find(u64::from(U32::from_bytes(entry).get())))
+    }
 }
 
 /// Locate a TPM 1.2 event log described by the ACPI TCPA table.
@@ -458,16 +547,16 @@ unsafe fn find_table(rsdp_addr: u64, signature: &[u8; 4]) -> Option<u64> {
 /// remain valid for the firmware boot-services lifetime.
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn find_tcpa_event_log(rsdp_addr: u64) -> Option<&'static [u8]> {
-    let table = unsafe { find_table(rsdp_addr, b"TCPA") }?;
-
-    // ACPI TCPA client table: header(36), platform_class(2),
-    // log_area_minimum_length(4), log_area_start_address(8).
-    let table_length = unsafe { read_u32(table + 4) } as usize;
-    if table_length < 50 {
+    let (address, length) = unsafe { find_table(rsdp_addr, b"TCPA") }?;
+    if length < size_of::<TcpaClientTable>() {
         return None;
     }
-    let maximum_length = unsafe { read_u32(table + 38) } as usize;
-    let log_address = unsafe { read_u64(table + 42) };
+    let table = TcpaClientTable::ref_from_bytes(unsafe {
+        core::slice::from_raw_parts(address as *const u8, size_of::<TcpaClientTable>())
+    })
+    .ok()?;
+    let maximum_length = table.log_area_minimum_length.get() as usize;
+    let log_address = table.log_area_start_address.get();
     if maximum_length == 0 || log_address == 0 {
         return None;
     }
@@ -494,19 +583,22 @@ pub struct Tpm2Table {
 /// Read the ACPI TPM2 table.
 ///
 /// # Safety
-/// `rsdp_addr` and the tables it references must be identity mapped.
+/// The RSDP, root table, and referenced SDT headers must be readable and
+/// identity mapped. The root table and TPM2 table must be readable for their
+/// advertised lengths.
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn find_tpm2_table(rsdp_addr: u64) -> Option<Tpm2Table> {
-    let table = unsafe { find_table(rsdp_addr, b"TPM2") }?;
-
-    // header(36), platform_class(2), reserved(2), control_area(8),
-    // start_method(4).
-    if unsafe { read_u32(table + 4) } < 52 {
+    let (address, length) = unsafe { find_table(rsdp_addr, b"TPM2") }?;
+    if length < size_of::<Tpm2Prefix>() {
         return None;
     }
+    let table = Tpm2Prefix::ref_from_bytes(unsafe {
+        core::slice::from_raw_parts(address as *const u8, size_of::<Tpm2Prefix>())
+    })
+    .ok()?;
     Some(Tpm2Table {
-        start_method: unsafe { read_u32(table + 48) },
-        control_area: unsafe { read_u64(table + 40) },
+        start_method: table.start_method.get(),
+        control_area: table.control_area.get(),
     })
 }
 
@@ -518,16 +610,20 @@ pub unsafe fn find_tpm2_table(rsdp_addr: u64) -> Option<Tpm2Table> {
 /// has no room for the payload's.
 ///
 /// # Safety
-/// `rsdp_addr` and the tables it references must be identity mapped and the
-/// TPM2 table writable.
+/// The RSDP, root table, and referenced SDT headers must be readable and
+/// identity mapped. The root table must be readable for its advertised
+/// length, and the TPM2 table must be exclusively accessible and writable
+/// for its advertised length while this function runs.
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn take_tpm2_log_area(rsdp_addr: u64, size: usize) -> Option<&'static mut [u8]> {
     use crabefi::efi::allocator::{AllocateType, MemoryType, allocate_pages};
 
-    let table = unsafe { find_table(rsdp_addr, b"TPM2") }?;
-    let length = unsafe { read_u32(table + 4) } as usize;
-    // Revision 4 tables end with LAML(4) at 64 and LASA(8) at 68.
-    if length < 76 {
+    let (table, length) = unsafe { find_table(rsdp_addr, b"TPM2") }?;
+    if length < size_of::<Tpm2WithLogArea>() {
+        return None;
+    }
+    let log_length = u32::try_from(size).ok()?;
+    if log_length == 0 {
         return None;
     }
     let mut address = 0;
@@ -548,17 +644,30 @@ pub unsafe fn take_tpm2_log_area(rsdp_addr: u64, size: usize) -> Option<&'static
 
     // SAFETY: the caller's contract; `length` bytes are the table.
     let table = unsafe { core::slice::from_raw_parts_mut(table as *mut u8, length) };
-    table[64..68].copy_from_slice(&(size as u32).to_le_bytes());
-    table[68..76].copy_from_slice(&address.to_le_bytes());
-    table[9] = 0;
-    let sum = table.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte));
-    table[9] = sum.wrapping_neg();
+    // The length was checked before allocating the log area.
+    set_tpm2_log_area(table, log_length, address).expect("complete TPM2 log area fields");
     log::info!(
         "ACPI TPM2 log area moved to {:#x} ({} bytes)",
         address,
         size
     );
     Some(area)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn set_tpm2_log_area(table: &mut [u8], length: u32, address: u64) -> Option<()> {
+    let (fields, tail) = Tpm2WithLogArea::mut_from_prefix(table).ok()?;
+    fields.log_area_minimum_length.set(length);
+    fields.log_area_start_address.set(address);
+    fields.prefix.header.checksum = 0;
+    let sum = fields
+        .as_bytes()
+        .iter()
+        .chain(tail.iter())
+        .copied()
+        .fold(0u8, u8::wrapping_add);
+    fields.prefix.header.checksum = sum.wrapping_neg();
+    Some(())
 }
 
 #[cfg(target_arch = "x86_64")]
