@@ -7,6 +7,11 @@
 
 use crate::efi::dma::DmaDomain;
 use crate::platform::PciEcamRegion;
+#[cfg(any(test, target_arch = "aarch64", target_arch = "riscv64"))]
+use zerocopy::{
+    FromBytes,
+    big_endian::{U32, U64},
+};
 
 /// Maximum number of devices discovered from DSDT.
 pub const MAX_DSDT_DEVICES: usize = 16;
@@ -185,19 +190,31 @@ impl PlatformInfo {
     }
 }
 
-/// Parse an FDT blob and extract platform information.
+/// Parse an FDT blob and extract platform information. No-op on x86_64.
 ///
 /// # Safety
 ///
-/// `fdt_addr` must point to a valid FDT blob of at least `fdt_size` bytes.
-#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+/// On AArch64 and RISC-V, a nonzero `fdt_addr` with `fdt_size >= 40` must
+/// point to a readable FDT blob of at least `fdt_size` bytes.
 pub unsafe fn parse(fdt_addr: u64, fdt_size: u32) -> Option<PlatformInfo> {
-    if fdt_addr == 0 || fdt_size < 40 {
-        return None;
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+    {
+        if fdt_addr == 0 || fdt_size < 40 {
+            return None;
+        }
+        // SAFETY: the caller guarantees the extent is readable.
+        let blob = unsafe { core::slice::from_raw_parts(fdt_addr as *const u8, fdt_size as usize) };
+        parse_blob(blob)
     }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
+    {
+        let _ = (fdt_addr, fdt_size);
+        None
+    }
+}
 
-    let blob = unsafe { core::slice::from_raw_parts(fdt_addr as *const u8, fdt_size as usize) };
-
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+fn parse_blob(blob: &[u8]) -> Option<PlatformInfo> {
     let dt = match fdt::Fdt::new(blob) {
         Ok(dt) => dt,
         Err(e) => {
@@ -245,18 +262,6 @@ pub unsafe fn parse(fdt_addr: u64, fdt_size: u32) -> Option<PlatformInfo> {
     }
 
     Some(info)
-}
-
-/// No-op on targets that don't use FDT (x86_64).
-///
-/// # Safety
-///
-/// Same contract as the real variant — `fdt_addr` must point to a valid
-/// FDT blob.  On x86_64, this is a no-op and never dereferences the
-/// pointer.
-#[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
-pub unsafe fn parse(_fdt_addr: u64, _fdt_size: u32) -> Option<PlatformInfo> {
-    None
 }
 
 // ---------------------------------------------------------------------------
@@ -365,15 +370,14 @@ fn extract_pcie(dt: &fdt::Fdt, info: &mut PlatformInfo) {
                 .filter(|((child, parent), size)| {
                     *child == 3 && (1..=2).contains(parent) && (1..=2).contains(size)
                 });
-            if let Some(((child, parent), size_cells)) = shape {
-                let entry_bytes = (child + parent + size_cells) * 4;
-                if data.len() == entry_bytes {
-                    let pci_hi = u32::from_be_bytes(data[0..4].try_into().expect("four bytes"));
-                    let kind = (pci_hi >> 24) & 0x03;
-                    let device_base = read_cells(data, 4, child - 1);
-                    let cpu_off = child * 4;
-                    let cpu_base = read_cells(data, cpu_off, parent);
-                    let size = read_cells(data, cpu_off + parent * 4, size_cells);
+            if let Some(((_, parent), size_cells)) = shape {
+                if let Some(PciRange {
+                    kind,
+                    device_base,
+                    cpu_base,
+                    size,
+                }) = PciRange::parse(data, parent, size_cells)
+                {
                     let domain = DmaDomain {
                         cpu_base,
                         device_base,
@@ -462,19 +466,18 @@ fn extract_pcie(dt: &fdt::Fdt, info: &mut PlatformInfo) {
                 continue;
             }
 
-            for off in (0..data.len()).step_by(entry_bytes) {
-                let pci_hi = u32::from_be_bytes(data[off..off + 4].try_into().expect("four bytes"));
-                let kind = match (pci_hi >> 24) & 0x03 {
+            for entry in data.chunks_exact(entry_bytes) {
+                let Some(range) = PciRange::parse(entry, parent_ac, child_sc) else {
+                    continue;
+                };
+                let kind = match range.kind {
                     0x01 => PciWindowKind::Pio,
                     0x02 => PciWindowKind::Mmio32,
                     0x03 => PciWindowKind::Mmio64,
                     _ => continue,
                 };
-                let cpu_off = off + child_ac * 4;
-                let cpu_addr = read_cells(data, cpu_off, parent_ac);
-                let size_off = cpu_off + parent_ac * 4;
-                let size = read_cells(data, size_off, child_sc);
-                if size == 0 || cpu_addr.checked_add(size).is_none() {
+                let PciRange { cpu_base, size, .. } = range;
+                if size == 0 || cpu_base.checked_add(size).is_none() {
                     log::warn!("FDT PCI: invalid {:?} window for host {}", kind, node.name);
                     continue;
                 }
@@ -483,7 +486,7 @@ fn extract_pcie(dt: &fdt::Fdt, info: &mut PlatformInfo) {
                     .push(PciWindow {
                         segment,
                         kind,
-                        base: cpu_addr,
+                        base: cpu_base,
                         size,
                     })
                     .is_err()
@@ -555,12 +558,73 @@ fn extract_uart(dt: &fdt::Fdt, info: &mut PlatformInfo) {
     }
 }
 
-/// Read a big-endian cell value (1 or 2 cells) from a byte slice.
-#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-fn read_cells(data: &[u8], off: usize, cells: usize) -> u64 {
-    match cells {
-        1 => u32::from_be_bytes(data[off..off + 4].try_into().unwrap_or_default()) as u64,
-        2 => u64::from_be_bytes(data[off..off + 8].try_into().unwrap_or_default()),
-        _ => 0,
+#[cfg(any(test, target_arch = "aarch64", target_arch = "riscv64"))]
+#[derive(Debug, PartialEq, Eq)]
+struct PciRange {
+    kind: u32,
+    device_base: u64,
+    cpu_base: u64,
+    size: u64,
+}
+
+#[cfg(any(test, target_arch = "aarch64", target_arch = "riscv64"))]
+impl PciRange {
+    fn parse(bytes: &[u8], parent_cells: usize, size_cells: usize) -> Option<Self> {
+        // A PCI child address is three cells: flags followed by a 64-bit base.
+        let (flags, tail) = U32::read_from_prefix(bytes).ok()?;
+        let (device_base, tail) = U64::read_from_prefix(tail).ok()?;
+        let (cpu_base, tail) = take_cells(tail, parent_cells)?;
+        let (size, tail) = take_cells(tail, size_cells)?;
+        tail.is_empty().then_some(Self {
+            kind: (flags.get() >> 24) & 0x03,
+            device_base: device_base.get(),
+            cpu_base,
+            size,
+        })
+    }
+}
+
+#[cfg(any(test, target_arch = "aarch64", target_arch = "riscv64"))]
+fn take_cells(bytes: &[u8], count: usize) -> Option<(u64, &[u8])> {
+    match count {
+        1 => U32::read_from_prefix(bytes)
+            .ok()
+            .map(|(value, tail)| (u64::from(value.get()), tail)),
+        2 => U64::read_from_prefix(bytes)
+            .ok()
+            .map(|(value, tail)| (value.get(), tail)),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod pci_range_tests {
+    use super::PciRange;
+
+    #[test]
+    fn parses_big_endian_ranges_with_mixed_cell_widths() {
+        let entry = [0x0300_0000u32, 1, 2, 3, 4, 5].map(u32::to_be_bytes);
+        let entry = entry.as_flattened();
+        assert_eq!(
+            PciRange::parse(entry, 1, 2),
+            Some(PciRange {
+                kind: 3,
+                device_base: 0x1_0000_0002,
+                cpu_base: 3,
+                size: 0x4_0000_0005,
+            })
+        );
+        assert_eq!(
+            PciRange::parse(entry, 2, 1),
+            Some(PciRange {
+                kind: 3,
+                device_base: 0x1_0000_0002,
+                cpu_base: 0x3_0000_0004,
+                size: 5,
+            })
+        );
+        assert_eq!(PciRange::parse(&entry[..23], 1, 2), None);
+        assert_eq!(PciRange::parse(entry, 1, 1), None);
+        assert_eq!(PciRange::parse(entry, 0, 3), None);
     }
 }
