@@ -8,7 +8,7 @@
 use r_efi::efi::{PhysicalAddress, Status};
 use r_efi::protocols::memory_attribute;
 
-use crate::efi::utils::allocate_protocol_with_log;
+use crate::efi::utils::allocate_protocol_value_with_log;
 
 /// Memory Attribute Protocol GUID supplied by `r-efi`.
 pub const MEMORY_ATTRIBUTE_PROTOCOL_GUID: r_efi::efi::Guid = memory_attribute::PROTOCOL_GUID;
@@ -165,11 +165,14 @@ extern "efiapi" fn clear_memory_attributes(
 /// # Returns
 /// A pointer to the protocol instance, or null on allocation failure
 pub fn create_protocol() -> *mut Protocol {
-    let ptr = allocate_protocol_with_log::<Protocol>("MemoryAttributeProtocol", |p| {
-        p.get_memory_attributes = get_memory_attributes;
-        p.set_memory_attributes = set_memory_attributes;
-        p.clear_memory_attributes = clear_memory_attributes;
-    });
+    let ptr = allocate_protocol_value_with_log(
+        "MemoryAttributeProtocol",
+        Protocol {
+            get_memory_attributes,
+            set_memory_attributes,
+            clear_memory_attributes,
+        },
+    );
     if ptr.is_null() {
         return ptr;
     }

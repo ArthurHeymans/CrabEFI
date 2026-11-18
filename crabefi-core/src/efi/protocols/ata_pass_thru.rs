@@ -14,7 +14,7 @@ use r_efi::protocols::device_path::Protocol as DevicePathProtocol;
 
 use crate::drivers::ahci;
 use crate::efi::protocols::device_path::{self, SataDevicePathNode};
-use crate::efi::utils::allocate_protocol_with_log;
+use crate::efi::utils::allocate_protocol_value_with_log;
 
 /// ATA Pass Thru Protocol GUID
 /// {1D3DE7F0-0807-424F-AA69-11A54E19A46F}
@@ -621,15 +621,14 @@ extern "efiapi" fn ata_reset_device(
 // Protocol Creation
 // ============================================================================
 
-/// Create an ATA Pass Thru Protocol instance
-///
-/// # Arguments
-/// * `controller_index` - Index of the AHCI controller
-/// * `pci_device` - PCI device number
-/// * `pci_function` - PCI function number
-///
-/// # Returns
-/// Pointer to the protocol instance, or null on failure
+pub(super) fn discard_unpublished(protocol: *mut AtaPassThruProtocol) {
+    INSTANCES.remove_with(protocol, |protocol, _| {
+        let _ = crate::efi::allocator::free_pool(protocol.mode as *mut u8);
+    });
+}
+
+/// Create an ATA Pass Thru Protocol instance.
+/// Returns null on failure.
 pub fn create_ata_pass_thru_protocol(
     controller_index: usize,
     pci_device: u8,
@@ -642,10 +641,13 @@ pub fn create_ata_pass_thru_protocol(
     }
 
     // Allocate mode structure
-    let mode_ptr = allocate_protocol_with_log::<AtaPassThruMode>("AtaPassThruMode", |m| {
-        m.attributes = ATTRIBUTES_PHYSICAL | ATTRIBUTES_LOGICAL;
-        m.io_align = 4; // 4-byte alignment
-    });
+    let mode_ptr = allocate_protocol_value_with_log(
+        "AtaPassThruMode",
+        AtaPassThruMode {
+            attributes: ATTRIBUTES_PHYSICAL | ATTRIBUTES_LOGICAL,
+            io_align: 4, // 4-byte alignment
+        },
+    );
 
     if mode_ptr.is_null() {
         return core::ptr::null_mut();
@@ -659,15 +661,15 @@ pub fn create_ata_pass_thru_protocol(
             pci_device,
             pci_function,
         },
-        |p| {
-            p.mode = mode_ptr;
-            p.pass_thru = ata_pass_thru;
-            p.get_next_port = ata_get_next_port;
-            p.get_next_device = ata_get_next_device;
-            p.build_device_path = ata_build_device_path;
-            p.get_device = ata_get_device;
-            p.reset_port = ata_reset_port;
-            p.reset_device = ata_reset_device;
+        AtaPassThruProtocol {
+            mode: mode_ptr,
+            pass_thru: ata_pass_thru,
+            get_next_port: ata_get_next_port,
+            get_next_device: ata_get_next_device,
+            build_device_path: ata_build_device_path,
+            get_device: ata_get_device,
+            reset_port: ata_reset_port,
+            reset_device: ata_reset_device,
         },
     );
     if protocol_ptr.is_null() {

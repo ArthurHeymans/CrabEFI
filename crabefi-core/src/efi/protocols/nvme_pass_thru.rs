@@ -14,7 +14,7 @@ use r_efi::protocols::device_path::Protocol as DevicePathProtocol;
 
 use crate::drivers::nvme;
 use crate::efi::protocols::device_path::{self, NvmeDevicePathNode};
-use crate::efi::utils::allocate_protocol_with_log;
+use crate::efi::utils::allocate_protocol_value_with_log;
 
 /// NVM Express Pass Thru Protocol GUID
 /// {52C78312-8EDC-4233-98F2-1A1AA5E388A5}
@@ -443,15 +443,14 @@ extern "efiapi" fn nvme_get_namespace(
 // Protocol Creation
 // ============================================================================
 
-/// Create an NVM Express Pass Thru Protocol instance
-///
-/// # Arguments
-/// * `controller_index` - Index of the NVMe controller
-/// * `pci_device` - PCI device number
-/// * `pci_function` - PCI function number
-///
-/// # Returns
-/// Pointer to the protocol instance, or null on failure
+pub(super) fn discard_unpublished(protocol: *mut NvmExpressPassThruProtocol) {
+    INSTANCES.remove_with(protocol, |protocol, _| {
+        let _ = crate::efi::allocator::free_pool(protocol.mode as *mut u8);
+    });
+}
+
+/// Create an NVM Express Pass Thru Protocol instance.
+/// Returns null on failure.
 pub fn create_nvme_pass_thru_protocol(
     controller_index: usize,
     pci_device: u8,
@@ -468,12 +467,14 @@ pub fn create_nvme_pass_thru_protocol(
         };
 
     // Allocate mode structure
-    let mode_ptr =
-        allocate_protocol_with_log::<NvmExpressPassThruMode>("NvmExpressPassThruMode", |m| {
-            m.attributes = ATTRIBUTES_PHYSICAL | ATTRIBUTES_LOGICAL | ATTRIBUTES_CMD_SET_NVM;
-            m.io_align = 4; // 4-byte alignment
-            m.nvme_version = nvme_version;
-        });
+    let mode_ptr = allocate_protocol_value_with_log(
+        "NvmExpressPassThruMode",
+        NvmExpressPassThruMode {
+            attributes: ATTRIBUTES_PHYSICAL | ATTRIBUTES_LOGICAL | ATTRIBUTES_CMD_SET_NVM,
+            io_align: 4, // 4-byte alignment
+            nvme_version,
+        },
+    );
 
     if mode_ptr.is_null() {
         return core::ptr::null_mut();
@@ -487,12 +488,12 @@ pub fn create_nvme_pass_thru_protocol(
             pci_device,
             pci_function,
         },
-        |p| {
-            p.mode = mode_ptr;
-            p.pass_thru = nvme_pass_thru;
-            p.get_next_namespace = nvme_get_next_namespace;
-            p.build_device_path = nvme_build_device_path;
-            p.get_namespace = nvme_get_namespace;
+        NvmExpressPassThruProtocol {
+            mode: mode_ptr,
+            pass_thru: nvme_pass_thru,
+            get_next_namespace: nvme_get_next_namespace,
+            build_device_path: nvme_build_device_path,
+            get_namespace: nvme_get_namespace,
         },
     );
     if protocol_ptr.is_null() {

@@ -9,7 +9,7 @@ use r_efi::protocols::block_io;
 
 use super::instance::Registry;
 use crate::drivers::storage::{self, StorageId};
-use crate::efi::utils::allocate_protocol_with_log;
+use crate::efi::utils::allocate_protocol_value_with_log;
 
 /// Block I/O Protocol GUID.
 pub const BLOCK_IO_PROTOCOL_GUID: r_efi::efi::Guid = block_io::PROTOCOL_GUID;
@@ -220,20 +220,23 @@ fn create_block_io_internal(
     is_partition: bool,
 ) -> *mut BlockIoProtocol {
     // Allocate media structure
-    let media_ptr = allocate_protocol_with_log::<BlockIoMedia>("BlockIoMedia", |m| {
-        m.media_id = media_id;
-        m.removable_media = true; // Assume removable for now
-        m.media_present = true;
-        m.logical_partition = is_partition;
-        m.read_only = true; // We only support read for booting
-        m.write_caching = false;
-        m.block_size = block_size;
-        m.io_align = 0;
-        m.last_block = num_blocks.saturating_sub(1);
-        m.lowest_aligned_lba = 0;
-        m.logical_blocks_per_physical_block = 1;
-        m.optimal_transfer_length_granularity = 0;
-    });
+    let media_ptr = allocate_protocol_value_with_log(
+        "BlockIoMedia",
+        BlockIoMedia {
+            media_id,
+            removable_media: true, // Assume removable for now
+            media_present: true,
+            logical_partition: is_partition,
+            read_only: true, // We only support read for booting
+            write_caching: false,
+            block_size,
+            io_align: 0,
+            last_block: num_blocks.saturating_sub(1),
+            lowest_aligned_lba: 0,
+            logical_blocks_per_physical_block: 1,
+            optimal_transfer_length_granularity: 0,
+        },
+    );
     if media_ptr.is_null() {
         return core::ptr::null_mut();
     }
@@ -248,13 +251,13 @@ fn create_block_io_internal(
             num_blocks,
             block_size,
         },
-        |p| {
-            p.revision = BLOCK_IO_REVISION;
-            p.media = media_ptr;
-            p.reset = block_io_reset;
-            p.read_blocks = block_io_read_blocks;
-            p.write_blocks = block_io_write_blocks;
-            p.flush_blocks = block_io_flush_blocks;
+        BlockIoProtocol {
+            revision: BLOCK_IO_REVISION,
+            media: media_ptr,
+            reset: block_io_reset,
+            read_blocks: block_io_read_blocks,
+            write_blocks: block_io_write_blocks,
+            flush_blocks: block_io_flush_blocks,
         },
     );
     if protocol_ptr.is_null() {

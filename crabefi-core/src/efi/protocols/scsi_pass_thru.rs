@@ -14,7 +14,7 @@ use r_efi::protocols::device_path::Protocol as DevicePathProtocol;
 
 use crate::drivers::usb;
 use crate::efi::protocols::device_path::{self, UsbDevicePathNode};
-use crate::efi::utils::allocate_protocol_with_log;
+use crate::efi::utils::allocate_protocol_value_with_log;
 
 /// Extended SCSI Pass Thru Protocol GUID
 /// {143B7632-B81B-4CB7-ABD3-B625A5B9BFFE}
@@ -621,17 +621,15 @@ extern "efiapi" fn scsi_get_next_target(
 // Protocol Creation
 // ============================================================================
 
-/// Create an Extended SCSI Pass Thru Protocol instance
-///
-/// # Arguments
-/// * `controller_index` - Index of the USB controller
-/// * `device_addr` - USB device address (slot ID)
-/// * `pci_device` - PCI device number
-/// * `pci_function` - PCI function number
-/// * `usb_port` - USB port number
-///
-/// # Returns
-/// Pointer to the protocol instance, or null on failure
+pub(super) fn discard_unpublished(protocol: *mut ExtScsiPassThruProtocol) {
+    INSTANCES.remove_with(protocol, |protocol, ctx| {
+        let _ = crate::efi::allocator::free_pool(ctx.target_id);
+        let _ = crate::efi::allocator::free_pool(protocol.mode as *mut u8);
+    });
+}
+
+/// Create an Extended SCSI Pass Thru Protocol instance.
+/// Returns null on failure.
 pub fn create_scsi_pass_thru_protocol(
     controller_index: usize,
     device_addr: u8,
@@ -640,11 +638,14 @@ pub fn create_scsi_pass_thru_protocol(
     usb_port: u8,
 ) -> *mut ExtScsiPassThruProtocol {
     // Allocate mode structure
-    let mode_ptr = allocate_protocol_with_log::<ExtScsiPassThruMode>("ExtScsiPassThruMode", |m| {
-        m.adapter_id = controller_index as u32;
-        m.attributes = ATTRIBUTES_PHYSICAL | ATTRIBUTES_LOGICAL;
-        m.io_align = 4; // 4-byte alignment
-    });
+    let mode_ptr = allocate_protocol_value_with_log(
+        "ExtScsiPassThruMode",
+        ExtScsiPassThruMode {
+            adapter_id: controller_index as u32,
+            attributes: ATTRIBUTES_PHYSICAL | ATTRIBUTES_LOGICAL,
+            io_align: 4, // 4-byte alignment
+        },
+    );
 
     if mode_ptr.is_null() {
         return core::ptr::null_mut();
@@ -673,15 +674,15 @@ pub fn create_scsi_pass_thru_protocol(
             usb_port,
             target_id,
         },
-        |p| {
-            p.mode = mode_ptr;
-            p.pass_thru = scsi_pass_thru;
-            p.get_next_target_lun = scsi_get_next_target_lun;
-            p.build_device_path = scsi_build_device_path;
-            p.get_target_lun = scsi_get_target_lun;
-            p.reset_channel = scsi_reset_channel;
-            p.reset_target_lun = scsi_reset_target_lun;
-            p.get_next_target = scsi_get_next_target;
+        ExtScsiPassThruProtocol {
+            mode: mode_ptr,
+            pass_thru: scsi_pass_thru,
+            get_next_target_lun: scsi_get_next_target_lun,
+            build_device_path: scsi_build_device_path,
+            get_target_lun: scsi_get_target_lun,
+            reset_channel: scsi_reset_channel,
+            reset_target_lun: scsi_reset_target_lun,
+            get_next_target: scsi_get_next_target,
         },
     );
     if protocol_ptr.is_null() {

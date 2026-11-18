@@ -31,7 +31,7 @@ use crate::efi::tcg::event_log::{EventLog, Sha1EventLog};
 use crate::efi::tcg::pcr::Sha1PcrBank;
 use crate::efi::tcg::tpm_tis::Tpm12Tis;
 use crate::efi::tcg::types::*;
-use crate::efi::utils::allocate_protocol_with_log;
+use crate::efi::utils::allocate_protocol_value_with_log;
 
 // ============================================================================
 // Global TCG state
@@ -593,13 +593,16 @@ pub struct TcgProtocolFfi {
 /// The protocol's internal state must be initialized via [`init_state`] before
 /// calling this.
 pub fn create_protocol() -> *mut c_void {
-    let ptr = allocate_protocol_with_log::<TcgProtocolFfi>("TCGProtocol", |p| {
-        p.status_check = tcg_status_check;
-        p.hash_all = tcg_hash_all;
-        p.log_event = tcg_log_event;
-        p.pass_through_to_tpm = tcg_pass_through_to_tpm;
-        p.hash_log_extend_event = tcg_hash_log_extend_event;
-    });
+    let ptr = allocate_protocol_value_with_log(
+        "TCGProtocol",
+        TcgProtocolFfi {
+            status_check: tcg_status_check,
+            hash_all: tcg_hash_all,
+            log_event: tcg_log_event,
+            pass_through_to_tpm: tcg_pass_through_to_tpm,
+            hash_log_extend_event: tcg_hash_log_extend_event,
+        },
+    );
 
     if ptr.is_null() {
         return core::ptr::null_mut();

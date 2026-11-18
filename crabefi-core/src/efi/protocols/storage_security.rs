@@ -406,14 +406,12 @@ fn usb_security_send(
 // Protocol Creation
 // ============================================================================
 
-/// Create a Storage Security Command Protocol instance
-///
-/// # Arguments
-/// * `media_id` - Media ID for validation
-/// * `storage_type` - Storage type and device identifier
-///
-/// # Returns
-/// Pointer to the protocol instance, or null on failure
+pub(super) fn discard_unpublished(protocol: *mut StorageSecurityCommandProtocol) {
+    INSTANCES.remove(protocol);
+}
+
+/// Create a Storage Security Command Protocol instance.
+/// Returns null on failure.
 pub fn create_storage_security_protocol(
     media_id: u32,
     storage_type: StorageId,
@@ -424,9 +422,9 @@ pub fn create_storage_security_protocol(
             media_id,
             storage_type,
         },
-        |p| {
-            p.receive_data = storage_security_receive_data;
-            p.send_data = storage_security_send_data;
+        StorageSecurityCommandProtocol {
+            receive_data: storage_security_receive_data,
+            send_data: storage_security_send_data,
         },
     );
     if protocol_ptr.is_null() {

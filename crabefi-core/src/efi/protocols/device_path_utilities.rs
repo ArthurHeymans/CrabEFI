@@ -15,7 +15,7 @@ use r_efi::protocols::device_path;
 use r_efi::protocols::device_path_utilities;
 
 use crate::efi::allocator;
-use crate::efi::utils::allocate_protocol_with_log;
+use crate::efi::utils::allocate_protocol_value_with_log;
 
 // Re-use shared helpers from device_path.rs
 use super::device_path::{
@@ -360,16 +360,18 @@ extern "efiapi" fn create_device_node(
 ///
 /// Returns a pointer suitable for `install_protocol`, or null on allocation failure.
 pub fn create_protocol() -> *mut c_void {
-    let proto =
-        allocate_protocol_with_log::<device_path_utilities::Protocol>("DevicePathUtilities", |p| {
-            p.get_device_path_size = get_device_path_size;
-            p.duplicate_device_path = duplicate_device_path;
-            p.append_device_path = append_device_path;
-            p.append_device_node = append_device_node;
-            p.append_device_path_instance = append_device_path_instance;
-            p.get_next_device_path_instance = get_next_device_path_instance;
-            p.is_device_path_multi_instance = is_device_path_multi_instance;
-            p.create_device_node = create_device_node;
-        });
+    let proto = allocate_protocol_value_with_log(
+        "DevicePathUtilities",
+        device_path_utilities::Protocol {
+            get_device_path_size,
+            duplicate_device_path,
+            append_device_path,
+            append_device_node,
+            append_device_path_instance,
+            get_next_device_path_instance,
+            is_device_path_multi_instance,
+            create_device_node,
+        },
+    );
     proto as *mut c_void
 }

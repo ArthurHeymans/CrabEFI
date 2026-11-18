@@ -8,7 +8,7 @@ use core::ffi::c_void;
 use r_efi::efi::{Boolean, Guid, Status};
 
 use crate::efi::protocols::console::{self, ScreenMode};
-use crate::efi::utils::allocate_protocol_with_log;
+use crate::efi::utils::allocate_protocol_value_with_log;
 
 /// Console Control Protocol GUID
 /// {F42F7782-012E-4C12-9956-49F94304F721}
@@ -151,11 +151,14 @@ extern "efiapi" fn console_lock_std_in(
 
 /// Create a Console Control Protocol instance
 pub fn create_protocol() -> *mut c_void {
-    let ptr = allocate_protocol_with_log::<ConsoleControlProtocol>("ConsoleControlProtocol", |p| {
-        p.get_mode = console_get_mode;
-        p.set_mode = console_set_mode;
-        p.lock_std_in = console_lock_std_in;
-    });
+    let ptr = allocate_protocol_value_with_log(
+        "ConsoleControlProtocol",
+        ConsoleControlProtocol {
+            get_mode: console_get_mode,
+            set_mode: console_set_mode,
+            lock_std_in: console_lock_std_in,
+        },
+    );
     if ptr.is_null() {
         return core::ptr::null_mut();
     }

@@ -4,6 +4,7 @@
 //! These protocols are used by TCG Opal and other security applications.
 
 use core::ffi::c_void;
+use r_efi::efi::{Guid, Handle, Status};
 
 use crate::drivers::storage::StorageId;
 use crate::drivers::{ahci, nvme, usb};
@@ -26,6 +27,28 @@ pub fn init() {
     init_usb_pass_thru();
 
     log::info!("Pass-through protocol initialization complete");
+}
+
+fn publish<P>(handle: Handle, guid: &Guid, protocol: *mut P, discard: impl FnOnce(*mut P)) {
+    if protocol.is_null() {
+        return;
+    }
+    let status = boot_services::install_protocol(handle, guid, protocol.cast());
+    if status == Status::SUCCESS {
+        log::debug!(
+            "Installed protocol {} on {:?}",
+            crate::efi::guid_fmt::GuidFmt(*guid),
+            handle
+        );
+    } else {
+        discard(protocol);
+        log::warn!(
+            "Failed to install protocol {} on {:?}: {:?}",
+            crate::efi::guid_fmt::GuidFmt(*guid),
+            handle,
+            status
+        );
+    }
 }
 
 /// Initialize NVMe pass-through protocols
@@ -85,17 +108,12 @@ fn init_nvme_pass_thru() {
             pci_addr.device(),
             pci_addr.function(),
         );
-        if !pass_thru.is_null() {
-            boot_services::install_protocol(
-                controller_handle,
-                &NVM_EXPRESS_PASS_THRU_GUID,
-                pass_thru as *mut c_void,
-            );
-            log::debug!(
-                "Installed NVM Express Pass Thru Protocol on handle {:?}",
-                controller_handle
-            );
-        }
+        publish(
+            controller_handle,
+            &NVM_EXPRESS_PASS_THRU_GUID,
+            pass_thru,
+            nvme_pass_thru::discard_unpublished,
+        );
 
         // Install Storage Security Command Protocol on each namespace
         for ns in namespaces.iter() {
@@ -130,18 +148,12 @@ fn init_nvme_pass_thru() {
                     nsid: ns.nsid,
                 },
             );
-            if !storage_security.is_null() {
-                boot_services::install_protocol(
-                    ns_handle,
-                    &STORAGE_SECURITY_COMMAND_GUID,
-                    storage_security as *mut c_void,
-                );
-                log::debug!(
-                    "Installed Storage Security Protocol on NVMe namespace {} handle {:?}",
-                    ns.nsid,
-                    ns_handle
-                );
-            }
+            publish(
+                ns_handle,
+                &STORAGE_SECURITY_COMMAND_GUID,
+                storage_security,
+                storage_security::discard_unpublished,
+            );
         }
     }
 }
@@ -199,17 +211,12 @@ fn init_ahci_pass_thru() {
             pci_addr.device(),
             pci_addr.function(),
         );
-        if !ata_pass_thru.is_null() {
-            boot_services::install_protocol(
-                controller_handle,
-                &ATA_PASS_THRU_GUID,
-                ata_pass_thru as *mut c_void,
-            );
-            log::debug!(
-                "Installed ATA Pass Thru Protocol on handle {:?}",
-                controller_handle
-            );
-        }
+        publish(
+            controller_handle,
+            &ATA_PASS_THRU_GUID,
+            ata_pass_thru,
+            ata_pass_thru::discard_unpublished,
+        );
 
         // For each active port, install Storage Security Command Protocol
         for port_index in 0..num_ports {
@@ -260,18 +267,12 @@ fn init_ahci_pass_thru() {
                     port: port_index,
                 },
             );
-            if !storage_security.is_null() {
-                boot_services::install_protocol(
-                    device_handle,
-                    &STORAGE_SECURITY_COMMAND_GUID,
-                    storage_security as *mut c_void,
-                );
-                log::debug!(
-                    "Installed Storage Security Protocol on AHCI port {} handle {:?}",
-                    port_num,
-                    device_handle
-                );
-            }
+            publish(
+                device_handle,
+                &STORAGE_SECURITY_COMMAND_GUID,
+                storage_security,
+                storage_security::discard_unpublished,
+            );
         }
     }
 }
@@ -329,17 +330,12 @@ fn init_usb_device_pass_thru(controller_index: usize, device_addr: u8) {
         pci_function,
         usb_port,
     );
-    if !scsi_pass_thru.is_null() {
-        boot_services::install_protocol(
-            device_handle,
-            &EXT_SCSI_PASS_THRU_GUID,
-            scsi_pass_thru as *mut c_void,
-        );
-        log::debug!(
-            "Installed Ext SCSI Pass Thru Protocol on handle {:?}",
-            device_handle
-        );
-    }
+    publish(
+        device_handle,
+        &EXT_SCSI_PASS_THRU_GUID,
+        scsi_pass_thru,
+        scsi_pass_thru::discard_unpublished,
+    );
 
     // Install Storage Security Command Protocol for USB device
     let storage_security = storage_security::create_storage_security_protocol(
@@ -349,15 +345,10 @@ fn init_usb_device_pass_thru(controller_index: usize, device_addr: u8) {
             device_addr,
         },
     );
-    if !storage_security.is_null() {
-        boot_services::install_protocol(
-            device_handle,
-            &STORAGE_SECURITY_COMMAND_GUID,
-            storage_security as *mut c_void,
-        );
-        log::debug!(
-            "Installed Storage Security Protocol on USB device handle {:?}",
-            device_handle
-        );
-    }
+    publish(
+        device_handle,
+        &STORAGE_SECURITY_COMMAND_GUID,
+        storage_security,
+        storage_security::discard_unpublished,
+    );
 }

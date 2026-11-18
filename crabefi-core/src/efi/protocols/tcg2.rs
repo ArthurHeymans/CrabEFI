@@ -36,7 +36,7 @@ use crate::efi::tcg::event_log::{CryptoAgileEventLog, EventLog};
 use crate::efi::tcg::pcr::PcrBanks;
 use crate::efi::tcg::tpm_tis::TpmTis;
 use crate::efi::tcg::types::*;
-use crate::efi::utils::allocate_protocol_with_log;
+use crate::efi::utils::allocate_protocol_value_with_log;
 use crate::platform::{Tpm2Device, TpmDigest, TpmError};
 
 // ============================================================================
@@ -1122,15 +1122,18 @@ pub struct Tcg2ProtocolFfi {
 /// The protocol's internal state must be initialized via [`init_state`] before
 /// calling this.
 pub fn create_protocol() -> *mut c_void {
-    let ptr = allocate_protocol_with_log::<Tcg2ProtocolFfi>("TCG2Protocol", |p| {
-        p.get_capability = tcg2_get_capability;
-        p.get_event_log = tcg2_get_event_log;
-        p.hash_log_extend_event = tcg2_hash_log_extend_event;
-        p.submit_command = tcg2_submit_command;
-        p.get_active_pcr_banks = tcg2_get_active_pcr_banks;
-        p.set_active_pcr_banks = tcg2_set_active_pcr_banks;
-        p.get_result_of_set_active_pcr_banks = tcg2_get_result_of_set_active_pcr_banks;
-    });
+    let ptr = allocate_protocol_value_with_log(
+        "TCG2Protocol",
+        Tcg2ProtocolFfi {
+            get_capability: tcg2_get_capability,
+            get_event_log: tcg2_get_event_log,
+            hash_log_extend_event: tcg2_hash_log_extend_event,
+            submit_command: tcg2_submit_command,
+            get_active_pcr_banks: tcg2_get_active_pcr_banks,
+            set_active_pcr_banks: tcg2_set_active_pcr_banks,
+            get_result_of_set_active_pcr_banks: tcg2_get_result_of_set_active_pcr_banks,
+        },
+    );
 
     if ptr.is_null() {
         return core::ptr::null_mut();

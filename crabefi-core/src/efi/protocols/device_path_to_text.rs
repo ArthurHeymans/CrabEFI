@@ -16,7 +16,7 @@ use r_efi::protocols::device_path;
 use r_efi::protocols::device_path_to_text;
 
 use crate::efi::allocator::{self, MemoryType};
-use crate::efi::utils::allocate_protocol_with_log;
+use crate::efi::utils::allocate_protocol_value_with_log;
 
 // Re-use shared helpers from device_path.rs
 use super::device_path::{MAX_DEVICE_PATH_SIZE, SUBTYPE_END_INSTANCE, device_path_size};
@@ -516,10 +516,12 @@ extern "efiapi" fn convert_device_path_to_text(
 ///
 /// Returns a pointer suitable for `install_protocol`, or null on allocation failure.
 pub fn create_protocol() -> *mut c_void {
-    let proto =
-        allocate_protocol_with_log::<device_path_to_text::Protocol>("DevicePathToText", |p| {
-            p.convert_device_node_to_text = convert_device_node_to_text;
-            p.convert_device_path_to_text = convert_device_path_to_text;
-        });
+    let proto = allocate_protocol_value_with_log(
+        "DevicePathToText",
+        device_path_to_text::Protocol {
+            convert_device_node_to_text,
+            convert_device_path_to_text,
+        },
+    );
     proto as *mut c_void
 }
