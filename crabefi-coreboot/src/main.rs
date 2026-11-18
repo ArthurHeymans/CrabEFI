@@ -628,6 +628,18 @@ impl crabefi::CapsuleBackend for CorebootCapsuleBackend {
     }
 
     #[cfg(feature = "payload-mm")]
+    fn firmware_slots_expected(&mut self) -> bool {
+        #[cfg(feature = "ab-test-slots")]
+        return true;
+        #[cfg(not(feature = "ab-test-slots"))]
+        self.boot_media.is_some_and(|boot_media| {
+            amd_ab::lists_slots(&mut |offset, buf: &mut [u8]| {
+                payload_mm::read_flash(boot_media, offset, buf)
+            })
+        })
+    }
+
+    #[cfg(feature = "payload-mm")]
     fn activate_slot(&mut self, slot: &crabefi::FmapRegion) -> Result<(), crabefi::StorageError> {
         #[cfg(feature = "ab-test-slots")]
         return ab_test::activate_slot(self, slot);
@@ -651,15 +663,13 @@ impl crabefi::CapsuleBackend for CorebootCapsuleBackend {
             return Err(crabefi::StorageError::InvalidArgument);
         }
         let at = region.offset + offset;
+        // Through MM, which reaches all of the flash the writes reach (the
+        // window mapped below 4 GiB holds at most 16 MiB).
         #[cfg(feature = "payload-mm")]
         if crabefi::efi::payload_mm::active() {
-            let boot_media = self
-                .boot_media
-                .ok_or(crabefi::StorageError::NotInitialized)?;
-            return if payload_mm::read_flash(boot_media, at, buffer) {
-                Ok(())
-            } else {
-                Err(crabefi::StorageError::IoError)
+            return match crabefi::efi::payload_mm::firmware_read(u64::from(at), buffer) {
+                r_efi::efi::Status::SUCCESS => Ok(()),
+                _ => Err(crabefi::StorageError::IoError),
             };
         }
         crabefi::efi::varstore::with_spi_storage_mut(|storage| {

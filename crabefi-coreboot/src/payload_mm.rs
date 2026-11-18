@@ -76,6 +76,8 @@ const REQUEST_APM_CMD: u8 = 0;
 static LOADED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// Host address of flash offset 0 once loaded (see `flash_mapping`).
 static MAPPED_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Size of the window at [`MAPPED_BASE`].
+static MAPPED_SIZE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Host address of flash offset 0 and the size mapped from there: the SPI
 /// mmap window that starts at flash offset 0 and holds the FMAP (AMD maps the
@@ -225,7 +227,16 @@ pub fn for_each_fmap_area(
 
 /// Read `buf.len()` bytes at flash `offset` from the memory-mapped flash.
 pub fn read_flash(boot_media: BootMediaInfo, offset: u32, buf: &mut [u8]) -> bool {
-    let Some((base, size)) = flash_mapping(boot_media, None) else {
+    // The window MM was loaded through (from coreboot's SPI flash table),
+    // else the default one.
+    let mapped = match MAPPED_BASE.load(core::sync::atomic::Ordering::Acquire) {
+        0 => flash_mapping(boot_media, None),
+        base => Some((
+            base,
+            MAPPED_SIZE.load(core::sync::atomic::Ordering::Relaxed),
+        )),
+    };
+    let Some((base, size)) = mapped else {
         return false;
     };
     if u64::from(offset) + buf.len() as u64 > size {
@@ -272,6 +283,7 @@ pub fn load(
     // MM gets the mapped part; offsets beyond it need coreboot's flash services.
     let (flash_base, flash_size) =
         flash_mapping(boot_media, spi_flash).ok_or("flash is not mapped below 4 GiB")?;
+    MAPPED_SIZE.store(flash_size, core::sync::atomic::Ordering::Relaxed);
     MAPPED_BASE.store(flash_base, core::sync::atomic::Ordering::Release);
     let (store_offset, store_size) = fmap_area(flash_base, boot_media.fmap_offset, b"SMMSTORE")
         .ok_or("no SMMSTORE FMAP area")?;

@@ -69,6 +69,10 @@ pub mod command {
     /// timestamp is in `maximum_storage` and `remaining_storage`, see
     /// [`super::unpack_timestamp`].
     pub const AUTH_TIMESTAMP: u32 = 12;
+    /// Firmware phase only: read `data_size` bytes at flash `offset` into
+    /// the data area, through the same flash access the firmware writes
+    /// use (the whole flash, not just the part mapped below 4 GiB).
+    pub const FIRMWARE_READ: u32 = 13;
 }
 
 /// Carry a 16-byte EFI timestamp in the `maximum_storage` and

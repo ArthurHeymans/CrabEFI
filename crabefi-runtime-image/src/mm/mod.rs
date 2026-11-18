@@ -576,6 +576,7 @@ fn dispatch(config: &InitConfig, request: &mut Request) -> efi::Status {
         | command::FIRMWARE_ERASE
         | command::FIRMWARE_WRITE
         | command::SET_FIRMWARE_VARIABLE
+        | command::FIRMWARE_READ
             if !firmware_phase() =>
         {
             efi::Status::ACCESS_DENIED
@@ -602,6 +603,28 @@ fn dispatch(config: &InitConfig, request: &mut Request) -> efi::Status {
         },
         command::FIRMWARE_ERASE | command::FIRMWARE_WRITE => {
             firmware_flash(config, request, data_capacity, data)
+        }
+        command::FIRMWARE_READ => {
+            // SAFETY: single-threaded SMM; set once at init.
+            let flash = unsafe { *addr_of!(FLASH) };
+            let Some(chunk) = data
+                .get_mut(..request.data_size as usize)
+                .filter(|chunk| !chunk.is_empty() && chunk.len() <= data_capacity)
+            else {
+                return efi::Status::BAD_BUFFER_SIZE;
+            };
+            if request
+                .offset
+                .checked_add(request.data_size)
+                .is_none_or(|end| end > flash.limit())
+            {
+                return efi::Status::INVALID_PARAMETER;
+            }
+            if !flash.read(request.offset, chunk) {
+                return efi::Status::DEVICE_ERROR;
+            }
+            copy_out(chunk, config.comm_base + DATA_OFFSET);
+            efi::Status::SUCCESS
         }
         command::SET_FIRMWARE_VARIABLE => {
             if let Err(status) = load_name(config, request, name) {

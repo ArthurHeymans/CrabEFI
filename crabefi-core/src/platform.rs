@@ -531,6 +531,14 @@ pub trait CapsuleBackend {
         None
     }
 
+    /// Whether the flash is laid out for A/B slots, even when
+    /// [`firmware_slots`](Self::firmware_slots) cannot resolve them (a slot
+    /// header lost to a power cut). Updates are then refused rather than
+    /// written as one image over the running copy.
+    fn firmware_slots_expected(&mut self) -> bool {
+        false
+    }
+
     /// Read back `buffer.len()` bytes at `offset` within the named region.
     /// Required in A/B mode: a slot is only activated once its contents match
     /// the authenticated image.

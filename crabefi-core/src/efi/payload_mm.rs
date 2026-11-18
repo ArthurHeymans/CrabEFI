@@ -50,6 +50,17 @@ fn call(request: Request, name: &[u16], data: &[u8]) -> Status {
 
 /// Run `request` and return MM's reply header.
 fn call_for_reply(request: Request, name: &[u16], data: &[u8]) -> Result<Request, Status> {
+    call_with_output(request, name, data, &mut [])
+}
+
+/// Run `request`, return MM's reply header and copy the start of its data
+/// area into `output`.
+fn call_with_output(
+    request: Request,
+    name: &[u16],
+    data: &[u8],
+    output: &mut [u8],
+) -> Result<Request, Status> {
     let base = COMM.load(Ordering::Acquire);
     if base == 0 {
         return Err(Status::NOT_READY);
@@ -73,8 +84,14 @@ fn call_for_reply(request: Request, name: &[u16], data: &[u8]) -> Result<Request
             &mut pause,
         )
     };
+    if output.len() > data_capacity() {
+        return Err(Status::BAD_BUFFER_SIZE);
+    }
     match mm::exchange(&mut buffer, request, name, data) {
         mm::Outcome::Answered { reply, smis, polls } => {
+            if !output.is_empty() {
+                mm::Transport::read(&mut buffer, DATA_OFFSET, output);
+            }
             if smis > 1 || polls > 0 {
                 log::warn!(
                     "payload MM: command {} done after SMI {} and {} us",
@@ -184,6 +201,25 @@ pub fn firmware_erase(offset: u64, length: u64) -> Status {
             return status;
         }
         done += erase.data_size;
+    }
+    Status::SUCCESS
+}
+
+/// Read flash through MM's flash access (firmware phase only), which reaches
+/// all of it, unlike the window mapped below 4 GiB.
+pub fn firmware_read(offset: u64, buffer: &mut [u8]) -> Status {
+    let chunk = data_capacity().max(1);
+    for (index, part) in buffer.chunks_mut(chunk).enumerate() {
+        let mut read = request(command::FIRMWARE_READ);
+        read.offset = offset + (index * chunk) as u64;
+        read.data_size = part.len() as u64;
+        let status = match call_with_output(read, &[], &[], part) {
+            Ok(reply) => Status::from_usize(reply.status as usize),
+            Err(status) => status,
+        };
+        if status != Status::SUCCESS {
+            return status;
+        }
     }
     Status::SUCCESS
 }

@@ -127,6 +127,13 @@ fn apply_fmp_capsule(
         return CapsuleResult::failure(CapsuleResultStatus::ErrorInvalidImage, 0);
     }
 
+    // An A/B update activates the new slot from its payload item, so a later
+    // item failing would leave a switched slot reported as a failure.
+    if fmp_hdr.payload_item_count > 1 && backend.firmware_slots().is_some() {
+        log::error!("A/B firmware update capsules must hold one payload item");
+        return CapsuleResult::failure(CapsuleResultStatus::ErrorInvalidImage, 0);
+    }
+
     // Process each payload item
     let driver_count = fmp_hdr.embedded_driver_count as usize;
     let mut last_result = CapsuleResult::success(0);
@@ -283,6 +290,13 @@ fn apply_fmp_payload_item(
             &slots,
             &approved_regions,
             clean_image,
+            attempted_version,
+        );
+    }
+    if backend.firmware_slots_expected() {
+        log::error!("A/B flash layout without resolvable slots; refusing the update");
+        return CapsuleResult::failure(
+            CapsuleResultStatus::ErrorFlashWriteFailed,
             attempted_version,
         );
     }
