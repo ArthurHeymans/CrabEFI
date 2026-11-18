@@ -460,6 +460,13 @@ pub(super) extern "efiapi" fn start_image(
         log::error!("BS.StartImage: image failed Secure Boot verification");
         return Status::SECURITY_VIOLATION;
     }
+    // An enforced build never runs an image without enforcement, whatever
+    // left it off (no persistent store, a failed key enrollment).
+    #[cfg(feature = "secure-boot-enforced")]
+    if !crate::efi::auth::is_secure_boot_enabled() {
+        log::error!("BS.StartImage: Secure Boot is not enforcing in an enforced build");
+        return Status::SECURITY_VIOLATION;
+    }
 
     let mark_status = STARTED.with_mut(|started| {
         if started.iter().any(|(handle, _)| *handle == image_handle) {

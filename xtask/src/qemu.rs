@@ -1494,6 +1494,11 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
         }
         "runtime-image-test" | "runtime-replay-interrupt-test" => {
             if app_name == "runtime-replay-interrupt-test" {
+                // Payload MM persists runtime writes at once; there is no
+                // journal replay to interrupt.
+                if std::env::var_os("CRABEFI_PAYLOAD_MM").is_some() {
+                    bail!("runtime-replay-interrupt-test needs the retained journal, not payload MM");
+                }
                 if result
                     .output
                     .contains("replay fault injection: reset before the journal acknowledgement")

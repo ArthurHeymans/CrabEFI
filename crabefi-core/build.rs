@@ -47,11 +47,21 @@ fn certificates(var: &str) -> Vec<String> {
         .map(|path| {
             let path = fs::canonicalize(path).unwrap_or_else(|_| panic!("{var}: {path} not found"));
             let der = fs::read(&path).expect("read certificate");
-            assert!(
-                der.first() == Some(&0x30),
-                "{var}: {} is not DER",
-                path.display()
-            );
+            // A key the verifier cannot use would be enrolled anyway and, as
+            // PK, leave User Mode unable to authenticate any PK update.
+            let certificate =
+                crabefi_pkcs7::x509::Certificate::parse(&der).unwrap_or_else(|error| {
+                    panic!(
+                        "{var}: {} is not a DER X.509 certificate: {error:?}",
+                        path.display()
+                    )
+                });
+            certificate.rsa_public_key().unwrap_or_else(|error| {
+                panic!(
+                    "{var}: {} does not hold an RSA key CrabEFI can verify with: {error:?}",
+                    path.display()
+                )
+            });
             println!("cargo:rerun-if-changed={}", path.display());
             format!("include_bytes!({:?})", path.display().to_string())
         })

@@ -119,12 +119,15 @@ pub fn init_secure_boot(config: &SecureBootConfig) -> Result<EnrollmentStatus, A
         // A saved preference also records an explicit setup choice. In
         // particular, clear-all persists false so a later boot must not
         // silently re-enroll the keys the user deliberately removed.
+        // An enforced build has no "keys deliberately removed" choice: it
+        // always enrolls its keys again.
         if config.auto_enroll_defaults
-            && get_variable_data(
-                &Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID),
-                SECURE_BOOT_ENABLE_NAME,
-            )
-            .is_none()
+            && (cfg!(feature = "secure-boot-enforced")
+                || get_variable_data(
+                    &Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID),
+                    SECURE_BOOT_ENABLE_NAME,
+                )
+                .is_none())
         {
             log::info!("Auto-enrolling Microsoft default keys...");
             match enroll_and_persist_default_keys() {

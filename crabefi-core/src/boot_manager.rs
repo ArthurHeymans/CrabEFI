@@ -801,7 +801,7 @@ fn boot_linux_entry(
     // when Secure Boot is active (filtered in scan_partition_for_entries), but
     // check here as well in case an entry somehow makes it through.
     // Direct boot bypasses signature verification which violates Secure Boot.
-    if efi::auth::is_secure_boot_enabled() {
+    if cfg!(feature = "secure-boot-enforced") || efi::auth::is_secure_boot_enabled() {
         log::warn!("Direct Linux boot disabled: Secure Boot is active");
         log::info!("Falling back to UEFI boot path for secure verification");
         // The entry path is the direct kernel, not a UEFI loader. Start the

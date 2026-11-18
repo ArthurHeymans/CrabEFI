@@ -149,6 +149,11 @@ pub fn private_signer(pkcs7_data: &[u8]) -> Result<PrivateSigner<'_>, AuthError>
         return Err(AuthError::NoSuitableKey);
     }
     let signer = find_signer(signer.identifier, certificates)?.ok_or(AuthError::NoSuitableKey)?;
+    // UEFI 2.10 8.2.2 binds the signer's CN and the top-level issuer of the
+    // chain in the envelope. OpenSSL-backed EDK2 (Pkcs7GetSigners) picks the
+    // top certificate from the signer certificates it is given, so for a
+    // chain the two digests can differ: a certdb written by EDK2 is not
+    // interchangeable with this one for such variables.
     let mut top = signer;
     let mut depth = 0usize;
     while top.certificate.issuer != top.certificate.subject {

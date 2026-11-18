@@ -1177,6 +1177,11 @@ fn replay_record(
     // acknowledging it; skipping instead would lose appends whose timestamp
     // equals the floor.
     let replayable = record.attributes & efi::VARIABLE_APPEND_WRITE != 0;
+    // Persisted before a reset lost its acknowledgement: applying the
+    // append again would duplicate its data. The data alone does not prove
+    // it: an append that only advances the timestamp (signatures the
+    // database already holds) leaves the data as it was, so the stored
+    // timestamp must have reached the envelope's too.
     if authenticated
         && replayable
         && record.result_digest != 0
@@ -1184,9 +1189,10 @@ fn replay_record(
             .find(&record.guid.bytes, name, false)
             .and_then(|slot| store.data(slot))
             .is_some_and(|data| append_result_digest(data) == record.result_digest)
+        && store
+            .auth_history_timestamp(&record.guid.bytes, name)
+            .is_some_and(|stored| !timestamp_is_after(record.timestamp, stored))
     {
-        // Persisted before a reset lost its acknowledgement: applying the
-        // append again would duplicate its data.
         return Ok(());
     }
     if authenticated && !replayable {
@@ -2475,6 +2481,39 @@ mod tests {
             }
         }
         assert!(binding(&fixture.store, true, &name).is_some());
+    }
+
+    /// A newer append that only repeats signatures dbx holds leaves its data
+    /// as it was but advances its timestamp. The data alone must not make
+    /// replay take it as applied.
+    #[test]
+    fn replay_applies_an_append_that_only_advances_the_timestamp() {
+        let dbx = SecureBootVariable::Dbx;
+        let append = AUTH_ATTRIBUTES | VariableAttributes::APPEND_WRITE;
+        let stored = hash_list(&[1, 2]);
+        let mut fixture = Fixture::retained();
+        let mut reboot = Fixture::new();
+        for target in [&mut fixture, &mut reboot] {
+            target.import(
+                *dbx.guid(),
+                dbx.name(),
+                AUTH_ATTRIBUTES,
+                &stored,
+                Some(timestamp(2025)),
+            );
+        }
+        assert_eq!(
+            fixture.apply(
+                Phase::SealedPhysical,
+                dbx,
+                append,
+                &dbx_envelope(2026, &[2])
+            ),
+            efi::Status::SUCCESS
+        );
+        assert_eq!(replay_into(&mut fixture, &mut reboot, |_, _, _| ()), 1);
+        assert_eq!(reboot.store.key_database_data(dbx), Some(&stored[..]));
+        assert_eq!(reboot.store.auth_timestamp(dbx), timestamp(2026));
     }
 
     #[test]

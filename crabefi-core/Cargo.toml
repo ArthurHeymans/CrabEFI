@@ -101,3 +101,6 @@ fdt = "0.1.5"
 # code can depend on package `crabefi-core` as `crabefi` without a large rename.
 name = "crabefi"
 path = "src/lib.rs"
+
+[build-dependencies]
+crabefi-pkcs7 = { path = "../crabefi-pkcs7" }
