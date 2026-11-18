@@ -26,6 +26,10 @@ mod tpm;
 use core::panic::PanicInfo;
 use r_efi::efi::{self, Char16, Guid, Handle, Status, SystemTable};
 use sha2::{Digest, Sha256};
+use zerocopy::{
+    little_endian::{U32, U64},
+    FromBytes, Immutable, KnownLayout, Unaligned,
+};
 
 // ============================================================================
 // Protocol GUIDs
@@ -153,28 +157,92 @@ const ACPI_20_TABLE_GUID: Guid = Guid::from_fields(
     &[0x00, 0x80, 0xc7, 0x3c, 0x88, 0x81],
 );
 
+#[repr(C)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
+struct Acpi20Rsdp {
+    signature: [u8; 8],
+    checksum: u8,
+    oem_id: [u8; 6],
+    revision: u8,
+    rsdt_address: U32,
+    length: U32,
+    xsdt_address: U64,
+    extended_checksum: u8,
+    reserved: [u8; 3],
+}
+
+#[repr(C)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
+struct SdtHeader {
+    signature: [u8; 4],
+    length: U32,
+    revision_and_oem_fields: [u8; 28],
+}
+
+#[repr(C)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
+struct Tpm2LogArea {
+    header: SdtHeader,
+    // Platform class, reserved, control area, start method and its parameters.
+    interface_fields: [u8; 28],
+    minimum_length: U32,
+    start_address: U64,
+}
+
 /// The log area (LASA) of the ACPI TPM2 table, where Linux reads the log.
-fn acpi_tpm2_log_area(system_table: *mut SystemTable) -> Option<u64> {
-    // SAFETY: the firmware's configuration table and the ACPI tables it
-    // names stay mapped during boot services.
-    let read32 = |address: u64| unsafe { core::ptr::read_unaligned(address as *const u32) };
-    let read64 = |address: u64| unsafe { core::ptr::read_unaligned(address as *const u64) };
-    let tables = unsafe {
-        core::slice::from_raw_parts(
-            (*system_table).configuration_table,
-            (*system_table).number_of_table_entries,
-        )
-    };
+///
+/// # Safety
+/// `system_table` must point to the live UEFI system table. Its configuration
+/// table and the referenced ACPI tables must be readable and remain mapped,
+/// including the XSDT's advertised extent.
+unsafe fn acpi_tpm2_log_area(system_table: *mut SystemTable) -> Option<u64> {
+    use core::{mem::size_of, slice::from_raw_parts};
+
+    let configuration_table = unsafe { (*system_table).configuration_table };
+    if configuration_table.is_null() {
+        return None;
+    }
+    let tables =
+        unsafe { from_raw_parts(configuration_table, (*system_table).number_of_table_entries) };
     let rsdp = tables
         .iter()
         .find(|table| table.vendor_guid == ACPI_20_TABLE_GUID)?
-        .vendor_table as u64;
-    let xsdt = read64(rsdp + 24);
-    let entries = u64::from(read32(xsdt + 4)).checked_sub(36)? / 8;
-    (0..entries)
-        .map(|index| read64(xsdt + 36 + index * 8))
-        .find(|&table| read32(table) == u32::from_le_bytes(*b"TPM2") && read32(table + 4) >= 76)
-        .map(|table| read64(table + 68))
+        .vendor_table
+        .cast::<u8>();
+    if rsdp.is_null() {
+        return None;
+    }
+    let rsdp = Acpi20Rsdp::ref_from_bytes(unsafe { from_raw_parts(rsdp, size_of::<Acpi20Rsdp>()) })
+        .ok()?;
+    let xsdt = rsdp.xsdt_address.get() as *const u8;
+    if &rsdp.signature != b"RSD PTR " || rsdp.revision < 2 || xsdt.is_null() {
+        return None;
+    }
+    let header =
+        SdtHeader::ref_from_bytes(unsafe { from_raw_parts(xsdt, size_of::<SdtHeader>()) }).ok()?;
+    if &header.signature != b"XSDT" {
+        return None;
+    }
+    let entry_bytes = (header.length.get() as usize).checked_sub(size_of::<SdtHeader>())?;
+    let entries = unsafe { from_raw_parts(xsdt.add(size_of::<SdtHeader>()), entry_bytes) };
+    let (entries, _) = entries.as_chunks::<8>();
+    entries.iter().find_map(|&entry| {
+        let table = U64::from_bytes(entry).get() as *const u8;
+        if table.is_null() {
+            return None;
+        }
+        let header =
+            SdtHeader::ref_from_bytes(unsafe { from_raw_parts(table, size_of::<SdtHeader>()) })
+                .ok()?;
+        if &header.signature != b"TPM2" || (header.length.get() as usize) < size_of::<Tpm2LogArea>()
+        {
+            return None;
+        }
+        let log =
+            Tpm2LogArea::ref_from_bytes(unsafe { from_raw_parts(table, size_of::<Tpm2LogArea>()) })
+                .ok()?;
+        Some(log.start_address.get())
+    })
 }
 
 const EV_SEPARATOR: u32 = 0x4;
@@ -608,7 +676,8 @@ pub unsafe extern "efiapi" fn efi_main(
         let (mut first, mut last, mut truncated) = (0, 0, 0);
         let status =
             unsafe { ((*tcg2).get_event_log)(tcg2, 2, &mut first, &mut last, &mut truncated) };
-        if status == Status::SUCCESS && acpi_tpm2_log_area(system_table) == Some(first) {
+        // SAFETY: still in boot services with the live firmware system table.
+        if status == Status::SUCCESS && unsafe { acpi_tpm2_log_area(system_table) } == Some(first) {
             unsafe {
                 print(
                     con_out,
