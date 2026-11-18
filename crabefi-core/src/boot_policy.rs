@@ -274,6 +274,17 @@ mod tests {
     }
 
     #[test]
+    fn the_runtime_image_reserves_this_variable() {
+        use crabefi_runtime_abi::settings::{EXTERNAL_BOOT_NAME, SETTINGS_GUID};
+        assert_eq!(
+            &SETTINGS_GUID,
+            crate::logger::CRABEFI_SETTINGS_GUID.as_bytes()
+        );
+        let name = variable_name();
+        assert_eq!(&name[..name.len() - 1], EXTERNAL_BOOT_NAME);
+    }
+
+    #[test]
     fn policy_matrix() {
         use ExternalBoot::*;
         for policy in [Allow, MenuOnly, Deny] {

@@ -13,6 +13,7 @@ pub mod capsule;
 pub mod exports;
 pub mod format;
 pub mod handoff;
+pub mod settings;
 
 pub use exports::*;
 pub use format::*;

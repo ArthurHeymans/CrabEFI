@@ -503,28 +503,57 @@ pub fn set_timeout(seconds: u16) {
 // Device Path Extraction
 // ============================================================================
 
-/// The GPT partition a LoadOption's FilePathList names, from its first
-/// Media/HardDrive node (type 4, subtype 1) with a GUID signature.
-pub fn gpt_partition(load_option: &LoadOption) -> Option<[u8; 16]> {
+/// The partition a LoadOption's FilePathList names, from its first
+/// Media/HardDrive node (type 4, subtype 1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PartitionTarget {
+    /// No hard-drive node: a file-only short form that any ESP may serve.
+    Any,
+    /// A GPT partition, by its unique partition GUID.
+    Gpt([u8; 16]),
+    /// An MBR partition, by disk signature and start LBA.
+    Mbr { disk_signature: u32, start_lba: u64 },
+    /// A hard-drive node CrabEFI cannot match; the option is not booted.
+    Unsupported,
+}
+
+pub fn partition_target(load_option: &LoadOption) -> PartitionTarget {
     const HARD_DRIVE_LENGTH: usize = 42;
-    const SIGNATURE_TYPE_GUID: u8 = 0x02;
     let mut rest: &[u8] = &load_option.file_path;
     while let Some((header, _)) = rest.split_first_chunk::<4>() {
         let (node_type, subtype) = (header[0], header[1]);
         let length = usize::from(u16::from_le_bytes([header[2], header[3]]));
         if length < 4 || length > rest.len() || (node_type == 0x7F && subtype == 0xFF) {
-            return None;
+            break;
         }
-        if node_type == 4 && subtype == 1 && length == HARD_DRIVE_LENGTH {
-            // Partition number, start and size precede the signature.
-            let node = rest.get(..HARD_DRIVE_LENGTH)?;
-            if node[41] == SIGNATURE_TYPE_GUID {
-                return node.get(24..40)?.try_into().ok();
-            }
+        if node_type == 4 && subtype == 1 {
+            let Some(node) = rest
+                .get(..HARD_DRIVE_LENGTH)
+                .filter(|_| length == HARD_DRIVE_LENGTH)
+            else {
+                return PartitionTarget::Unsupported;
+            };
+            // Partition number, start, size, signature, MBR type, signature type.
+            let start_lba = u64::from_le_bytes(node[8..16].try_into().unwrap_or_default());
+            let mut signature = [0u8; 16];
+            signature.copy_from_slice(&node[24..40]);
+            return match node[41] {
+                0x02 => PartitionTarget::Gpt(signature),
+                0x01 => PartitionTarget::Mbr {
+                    disk_signature: u32::from_le_bytes([
+                        signature[0],
+                        signature[1],
+                        signature[2],
+                        signature[3],
+                    ]),
+                    start_lba,
+                },
+                _ => PartitionTarget::Unsupported,
+            };
         }
         rest = &rest[length..];
     }
-    None
+    PartitionTarget::Any
 }
 
 /// Extract a file path string from the FilePathList in a LoadOption.
@@ -589,8 +618,10 @@ pub fn extract_file_path(load_option: &LoadOption) -> Option<heapless::String<12
 pub enum BootAttemptResult {
     /// Boot was successful (image ran and returned SUCCESS)
     Success,
-    /// Boot failed (image not found, verification failed, etc.)
+    /// Boot failed (verification failed, the image returned an error, etc.)
     Failed,
+    /// No device in scope holds the option's file on the partition it names.
+    NotFound,
     /// Option was skipped (inactive, wrong category, etc.)
     Skipped,
 }
@@ -666,7 +697,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn gpt_partition_comes_from_the_hard_drive_node() {
+    fn partition_target_comes_from_the_hard_drive_node() {
         let guid = [0x5a; 16];
         let mut path = alloc::vec::Vec::new();
         // ACPI node, then HD(1,GPT,guid), file path, end.
@@ -687,15 +718,25 @@ mod tests {
             optional_data: HeaplessVec::new(),
         };
         option.file_path.extend_from_slice(&path).unwrap();
-        assert_eq!(gpt_partition(&option), Some(guid));
-        // An MBR signature, or a file-only short form, names no GPT partition.
+        assert_eq!(partition_target(&option), PartitionTarget::Gpt(guid));
+        // An MBR signature names the disk signature and the start LBA.
         option.file_path[12 + 41] = 1;
-        assert_eq!(gpt_partition(&option), None);
+        assert_eq!(
+            partition_target(&option),
+            PartitionTarget::Mbr {
+                disk_signature: 0x5a5a_5a5a,
+                start_lba: 2048
+            }
+        );
+        // No signature cannot be matched.
+        option.file_path[12 + 41] = 0;
+        assert_eq!(partition_target(&option), PartitionTarget::Unsupported);
+        // A file-only short form may boot from any ESP.
         option.file_path.clear();
         option
             .file_path
             .extend_from_slice(&path[12 + 42..])
             .unwrap();
-        assert_eq!(gpt_partition(&option), None);
+        assert_eq!(partition_target(&option), PartitionTarget::Any);
     }
 }

@@ -70,12 +70,12 @@ Platforms set `PlatformConfig::boot_policy`; the coreboot payload maps Cargo
 features onto it.
 
 `usb-on-demand` (`UsbInit::OnDemand`) leaves USB controllers untouched while
-BootNext or BootOrder starts an image from other storage. USB comes up when
-BootNext or every BootOrder option failed (they are then retried on USB only),
-for the boot menu and the removable-media path `\EFI\BOOT\BOOTX64.EFI`, and for
-a pending firmware UI or shim MokManager request. BootOrder options on internal storage therefore
-win over USB options, and USB keyboards do not reach GRUB or shim during such a
-boot; the serial console does. The boot menu appears when nothing starts
+BootNext or BootOrder starts an image from other storage. USB comes up when a
+boot option is on no other storage (it is then retried on USB before the next
+option, so BootOrder keeps its order), for the boot menu and the
+removable-media path `\EFI\BOOT\BOOTX64.EFI`, and for a pending firmware UI,
+capsule-on-disk or shim MokManager request. USB keyboards do not reach GRUB or
+shim when an image starts without USB; the serial console does. The boot menu appears when nothing starts
 without USB, or after `systemctl reboot --firmware-setup` (OsIndications
 `BOOT_TO_FW_UI`); USB keyboards work in it. There is no pre-boot hotkey.
 

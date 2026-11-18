@@ -192,9 +192,9 @@ pub(crate) fn run(boot_var_state: boot_vars::BootVarState, firmware_ui_requested
 
 /// Automatic boot is deliberately separate: setup must not even delete BootNext.
 ///
-/// With USB deferred, BootOrder runs over the other devices first; USB only
-/// comes up when none of them started an image, and then only USB devices
-/// are searched again.
+/// With USB deferred, each option is first looked for on the other devices;
+/// one that none of them holds brings USB up and is retried there before the
+/// next option.
 fn try_automatic_boot(boot_var_state: &boot_vars::BootVarState) {
     // ---- Phase 1: BootNext ----
     if let Some(boot_next_num) = boot_var_state.boot_next {
@@ -214,15 +214,7 @@ fn try_automatic_boot(boot_var_state: &boot_vars::BootVarState) {
                 );
             } else if let Some(file_path) = boot_vars::extract_file_path(&load_option) {
                 log::info!("BootNext: '{}' -> {}", load_option.description, file_path);
-                let mut result = try_boot_load_option(&load_option, &file_path, Scope::Available);
-                // BootNext is one-shot: retry it on USB before BootOrder runs.
-                if result != boot_vars::BootAttemptResult::Success
-                    && !usb_ready()
-                    && boot_policy::automatic_external_allowed()
-                {
-                    ensure_usb("BootNext did not start");
-                    result = try_boot_load_option(&load_option, &file_path, Scope::Usb);
-                }
+                let result = try_boot_option_resolving_usb(&load_option, &file_path);
                 if result == boot_vars::BootAttemptResult::Success {
                     log::info!("BootNext succeeded, returning to boot manager");
                     // edk2 would show BootManagerMenu here; we fall through to menu
@@ -246,22 +238,36 @@ fn try_automatic_boot(boot_var_state: &boot_vars::BootVarState) {
         "=== BootOrder: trying {} entries ===",
         boot_var_state.boot_order.len()
     );
-    if try_boot_order(boot_var_state, Scope::Available) || usb_ready() {
-        return;
-    }
-    if !boot_policy::automatic_external_allowed() {
-        log::info!("Boot policy: not retrying BootOrder on USB");
-        return;
-    }
-    ensure_usb("no BootOrder option started");
-    log::info!("=== BootOrder: retrying on USB ===");
-    try_boot_order(boot_var_state, Scope::Usb);
+    try_boot_order(boot_var_state);
 }
 
-/// Try each active BootOrder option on the devices in `scope`.
+/// Try a load option on the devices that are up. With USB deferred, an
+/// option that none of them holds brings USB up and is retried there before
+/// the next option, so BootOrder keeps its priority.
+fn try_boot_option_resolving_usb(
+    load_option: &boot_vars::LoadOption,
+    file_path: &str,
+) -> boot_vars::BootAttemptResult {
+    let result = try_boot_load_option(load_option, file_path, Scope::Available);
+    if result != boot_vars::BootAttemptResult::NotFound || usb_ready() {
+        return result;
+    }
+    if !boot_policy::automatic_external_allowed() {
+        log::info!(
+            "Boot policy: not looking for Boot{:04X} on USB",
+            load_option.option_number
+        );
+        return result;
+    }
+    ensure_usb("a boot option is not on other storage");
+    log::info!("Boot{:04X}: retrying on USB", load_option.option_number);
+    try_boot_load_option(load_option, file_path, Scope::Usb)
+}
+
+/// Try each active BootOrder option in order.
 ///
 /// Returns whether an image started (and returned).
-fn try_boot_order(boot_var_state: &boot_vars::BootVarState, scope: Scope) -> bool {
+fn try_boot_order(boot_var_state: &boot_vars::BootVarState) -> bool {
     for &option_num in boot_var_state.boot_order.iter() {
         let Some(load_option) = boot_vars::read_boot_option(option_num) else {
             log::debug!("Boot{:04X}: not found, skipping", option_num);
@@ -290,7 +296,7 @@ fn try_boot_order(boot_var_state: &boot_vars::BootVarState, scope: Scope) -> boo
             file_path
         );
 
-        let result = try_boot_load_option(&load_option, &file_path, scope);
+        let result = try_boot_option_resolving_usb(&load_option, &file_path);
         match result {
             boot_vars::BootAttemptResult::Success => {
                 log::info!("Boot{:04X} succeeded", option_num);
@@ -298,7 +304,7 @@ fn try_boot_order(boot_var_state: &boot_vars::BootVarState, scope: Scope) -> boo
                 // we fall through to the menu instead
                 return true;
             }
-            boot_vars::BootAttemptResult::Failed => {
+            boot_vars::BootAttemptResult::Failed | boot_vars::BootAttemptResult::NotFound => {
                 log::warn!(
                     "Boot{:04X} '{}' failed, trying next",
                     option_num,
@@ -313,12 +319,12 @@ fn try_boot_order(boot_var_state: &boot_vars::BootVarState, scope: Scope) -> boo
 
 /// Discover boot entries and show setup indefinitely only on an explicit request.
 fn show_boot_menu(timeout_seconds: u32, firmware_ui_requested: bool) {
-    let mut timeout_seconds = timeout_seconds;
     // A choice the boot policy refuses (the setup menu may have tightened it
     // since the entries were listed) shows the menu again, rebuilt under the
-    // current policy and without the original countdown.
-    while show_boot_menu_once(timeout_seconds, firmware_ui_requested) == MenuOutcome::Refused {
-        timeout_seconds = 0;
+    // current policy and waiting for the user.
+    let mut countdown = Some(timeout_seconds);
+    while show_boot_menu_once(countdown, firmware_ui_requested) == MenuOutcome::Refused {
+        countdown = None;
     }
 }
 
@@ -328,7 +334,8 @@ enum MenuOutcome {
     Refused,
 }
 
-fn show_boot_menu_once(timeout_seconds: u32, firmware_ui_requested: bool) -> MenuOutcome {
+/// `countdown` is the configured timeout, or `None` to wait for the user.
+fn show_boot_menu_once(countdown: Option<u32>, firmware_ui_requested: bool) -> MenuOutcome {
     // ---- Phase 3: Fallback to device discovery and interactive menu ----
     log::info!("=== Fallback: discovering boot entries from storage ===");
 
@@ -346,9 +353,16 @@ fn show_boot_menu_once(timeout_seconds: u32, firmware_ui_requested: bool) -> Men
     let (graphical, timeout_seconds) = menu_configuration(
         cfg!(feature = "ui"),
         crate::handoff::framebuffer().is_some(),
-        timeout_seconds,
+        countdown.unwrap_or(0),
         firmware_ui_requested,
     );
+    // A headless menu normally never waits forever; after a refused choice
+    // it must, or its countdown would start an entry nobody chose.
+    let timeout_seconds = if countdown.is_some() {
+        timeout_seconds
+    } else {
+        0
+    };
     boot_menu.set_timeout(timeout_seconds);
     // A timeout is an automatic boot: default to an entry it may start (a
     // BLS default can point at external media), or make the user pick.
@@ -494,11 +508,16 @@ fn try_boot_load_option(
     boot_vars::set_boot_current(load_option.option_number);
 
     // Try to find this file on the named partition, or on any discovered ESP
-    let result = try_boot_file_from_esps(
-        file_path,
-        boot_vars::gpt_partition(load_option).as_ref(),
-        scope,
-    );
+    let target = boot_vars::partition_target(load_option);
+    let result = if target == boot_vars::PartitionTarget::Unsupported {
+        log::warn!(
+            "Boot{:04X}: its hard-drive device path cannot be matched; not booting it",
+            load_option.option_number
+        );
+        boot_vars::BootAttemptResult::Failed
+    } else {
+        try_boot_file_from_esps(file_path, target, scope)
+    };
 
     // Clear BootCurrent after boot returns
     boot_vars::clear_boot_current();
@@ -513,7 +532,7 @@ fn try_boot_load_option(
 /// device path resolution yet.
 fn try_boot_file_from_esps(
     file_path: &str,
-    partition_guid: Option<&[u8; 16]>,
+    target: boot_vars::PartitionTarget,
     scope: Scope,
 ) -> boot_vars::BootAttemptResult {
     // Convert forward slashes to backslashes for FAT
@@ -536,15 +555,20 @@ fn try_boot_file_from_esps(
         p
     };
 
-    if crate::drivers::storage::devices()
+    let mut result = boot_vars::BootAttemptResult::NotFound;
+    for device in crate::drivers::storage::devices()
         .iter()
         .filter(|device| scope.includes(device))
-        .any(|device| try_boot_file_on_device(device, &fat_path, partition_guid))
     {
-        return boot_vars::BootAttemptResult::Success;
+        match try_boot_file_on_device(device, &fat_path, target) {
+            boot_vars::BootAttemptResult::NotFound => {}
+            boot_vars::BootAttemptResult::Success => {
+                return boot_vars::BootAttemptResult::Success;
+            }
+            other => result = other,
+        }
     }
-
-    boot_vars::BootAttemptResult::Failed
+    result
 }
 
 /// Try to boot a specific file from ESPs on a given device.
@@ -554,10 +578,11 @@ fn try_boot_file_from_esps(
 fn try_boot_file_on_device(
     device: &crate::drivers::storage::StorageDevice,
     file_path: &str,
-    partition_guid: Option<&[u8; 16]>,
-) -> bool {
+    target: boot_vars::PartitionTarget,
+) -> boot_vars::BootAttemptResult {
     use crate::drivers::storage;
     use crate::fs::{fat::FatFilesystem, gpt};
+    use boot_vars::{BootAttemptResult, PartitionTarget};
 
     // Read GPT/MBR partitions
     let Some(partitions) =
@@ -565,13 +590,33 @@ fn try_boot_file_on_device(
             .ok()
             .flatten()
     else {
-        return false;
+        return BootAttemptResult::NotFound;
+    };
+    // An MBR target names its disk by the signature at offset 440 of LBA 0.
+    let disk_signature = match target {
+        PartitionTarget::Mbr { .. } => {
+            let mut sector = alloc::vec![0u8; device.info.block_size as usize];
+            storage::with_disk(device.id, |disk| disk.read_blocks(0, 1, &mut sector))
+                .ok()
+                .and_then(Result::ok)
+                .and_then(|()| sector.get(440..444)?.try_into().ok())
+                .map(u32::from_le_bytes)
+        }
+        _ => None,
     };
 
     // Look for ESPs containing the target file
     for (i, partition) in partitions.iter().enumerate() {
-        if !partition.is_esp || partition_guid.is_some_and(|guid| *guid != partition.partition_guid)
-        {
+        let targeted = match target {
+            PartitionTarget::Any => true,
+            PartitionTarget::Gpt(guid) => guid == partition.partition_guid,
+            PartitionTarget::Mbr {
+                disk_signature: wanted,
+                start_lba,
+            } => disk_signature == Some(wanted) && start_lba == partition.first_lba,
+            PartitionTarget::Unsupported => false,
+        };
+        if !partition.is_esp || !targeted {
             continue;
         }
 
@@ -604,13 +649,14 @@ fn try_boot_file_on_device(
             partition.clone(),
         );
 
-        boot_uefi_entry(&entry);
-
-        // If boot_uefi_entry returned, the boot failed
-        return false;
+        return if boot_uefi_entry(&entry) {
+            BootAttemptResult::Success
+        } else {
+            BootAttemptResult::Failed
+        };
     }
 
-    false
+    BootAttemptResult::NotFound
 }
 
 /// Boot a selected menu entry
@@ -665,11 +711,12 @@ fn boot_selected_entry(entry: &menu::BootEntry) {
 ///
 /// Installs BlockIO protocols for the entry's disk, then boots from its ESP
 /// through the storage-agnostic boot module.
-fn boot_uefi_entry(entry: &menu::BootEntry) {
-    boot_uefi_path(entry, &entry.path);
+/// Boot a UEFI entry; `true` when the image ran and returned EFI_SUCCESS.
+fn boot_uefi_entry(entry: &menu::BootEntry) -> bool {
+    boot_uefi_path(entry, &entry.path)
 }
 
-fn boot_uefi_path(entry: &menu::BootEntry, path: &str) {
+fn boot_uefi_path(entry: &menu::BootEntry, path: &str) -> bool {
     use crate::boot;
     use crate::drivers::storage;
 
@@ -679,7 +726,7 @@ fn boot_uefi_path(entry: &menu::BootEntry, path: &str) {
         Ok(info) => info,
         Err(error) => {
             log::error!("Failed to access {:?}: {}", entry.storage, error);
-            return;
+            return false;
         }
     };
     boot::install_block_io_protocols(entry.storage, info, &path_info);
@@ -692,9 +739,10 @@ fn boot_uefi_path(entry: &menu::BootEntry, path: &str) {
         info.block_size,
         path,
     ) {
-        return;
+        return true;
     }
     log::error!("Failed to boot UEFI entry");
+    false
 }
 
 /// Boot a direct Linux entry (BLS Type #1 or GRUB)

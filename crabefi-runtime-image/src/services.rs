@@ -782,6 +782,10 @@ fn check_runtime_target(
     store: &VariableStore,
     request: &VariableRequest<'_>,
 ) -> Result<(), efi::Status> {
+    // Boot-only settings are never runtime-writable, even while absent.
+    if crabefi_runtime_abi::settings::is_boot_only_setting(&request.guid, request.name) {
+        return Err(efi::Status::WRITE_PROTECTED);
+    }
     if store
         .find(&request.guid, request.name, false)
         .is_some_and(|slot| !slot.attributes.contains(RUNTIME_WRITABLE))
@@ -2254,6 +2258,62 @@ mod tests {
             DeferredRegion::new(&mut fixture.buffer)
                 .replay(|_, _, _| panic!("a rejected runtime write was journaled")),
             Ok(0)
+        );
+    }
+
+    #[test]
+    fn the_external_boot_policy_cannot_be_created_at_runtime() {
+        use crabefi_runtime_abi::settings::{EXTERNAL_BOOT_NAME, SETTINGS_GUID};
+        let mut fixture = Fixture::retained();
+        assert_eq!(
+            fixture.write(
+                Phase::SealedPhysical,
+                SETTINGS_GUID,
+                EXTERNAL_BOOT_NAME,
+                RAW_ATTRIBUTES,
+                &[2]
+            ),
+            efi::Status::WRITE_PROTECTED
+        );
+        assert!(
+            fixture
+                .store
+                .find(&SETTINGS_GUID, EXTERNAL_BOOT_NAME, false)
+                .is_none()
+        );
+        // Nor through a journal record.
+        DeferredRegion::new(&mut fixture.buffer)
+            .queue_write(
+                &mut fixture.deferred_transaction,
+                deferred::DeferredWrite {
+                    guid: SETTINGS_GUID,
+                    name: EXTERNAL_BOOT_NAME,
+                    attributes: RAW_ATTRIBUTES,
+                    data: &[2],
+                    timestamp: VariableTimestamp::default(),
+                    authenticated: false,
+                    deletion: false,
+                },
+            )
+            .unwrap();
+        let mut reboot = Fixture::new();
+        assert_eq!(replay_into(&mut fixture, &mut reboot, |_, _, _| {}), 1);
+        assert!(
+            reboot
+                .store
+                .find(&SETTINGS_GUID, EXTERNAL_BOOT_NAME, false)
+                .is_none()
+        );
+        // Boot-time code still writes it.
+        assert_eq!(
+            reboot.write(
+                Phase::BootActive,
+                SETTINGS_GUID,
+                EXTERNAL_BOOT_NAME,
+                VariableAttributes::NON_VOLATILE | VariableAttributes::BOOTSERVICE_ACCESS,
+                &[2]
+            ),
+            efi::Status::SUCCESS
         );
     }
 

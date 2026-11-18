@@ -146,8 +146,8 @@ pub(super) fn run(config: &QemuConfig, disk: &Path) -> Result<()> {
         &log,
         "failed internal BootOrder falls back to USB",
         &[
-            "USB: initializing on demand (no BootOrder option started)",
-            "=== BootOrder: retrying on USB ===",
+            "USB: initializing on demand (a boot option is not on other storage)",
+            "Boot0003: retrying on USB",
             "BPOL USB FALLBACK PASSED",
         ],
         &[],
@@ -159,13 +159,13 @@ pub(super) fn run(config: &QemuConfig, disk: &Path) -> Result<()> {
         "Deny refuses the USB boot option and hides USB",
         &[
             "external boot Deny",
-            "Boot policy: not retrying BootOrder on USB",
+            "Boot policy: not looking for Boot0003 on USB",
             "Boot policy: xHCI USB is external; hiding it",
             "Boot policy: SATA port 0 is external; hiding it",
             "Found 1 boot entries",
             "BPOL DENY PASSED",
         ],
-        &["=== BootOrder: retrying on USB ==="],
+        &["retrying on USB"],
     )?;
 
     let log = boot("menu-only")?;
@@ -180,7 +180,7 @@ pub(super) fn run(config: &QemuConfig, disk: &Path) -> Result<()> {
             "Found 2 boot entries",
             "BPOL MENU ONLY PASSED",
         ],
-        &["=== BootOrder: retrying on USB ==="],
+        &["retrying on USB"],
     )?;
 
     let log = boot("runtime-writes")?;
@@ -201,7 +201,7 @@ pub(super) fn run(config: &QemuConfig, disk: &Path) -> Result<()> {
             "BPOL MALFORMED PASSED",
             "BPOL TEST PASSED",
         ],
-        &["=== BootOrder: retrying on USB ==="],
+        &["retrying on USB"],
     )?;
     Ok(())
 }
