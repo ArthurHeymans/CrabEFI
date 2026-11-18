@@ -104,29 +104,39 @@ fn embed_runtime_image(expected_architecture: u16) {
 
 /// Embed the capsule signing roots listed in CRABEFI_CAPSULE_TRUST_CERTS
 /// (`:`-separated DER certificate files). Without it every capsule is refused.
+///
+/// The bytes read here are copied into OUT_DIR and embedded from there, and
+/// the build reruns when the listed path, the file it resolves to or the
+/// directory holding it changes. Retargeting a symlink to another certificate
+/// therefore rebuilds with the new root rather than keeping the retired one.
 fn embed_capsule_trust_store() {
     println!("cargo:rerun-if-env-changed=CRABEFI_CAPSULE_TRUST_CERTS");
+    let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
     let mut source = String::from("pub static CAPSULE_TRUST_STORE: &[&[u8]] = &[\n");
-    for path in std::env::var("CRABEFI_CAPSULE_TRUST_CERTS")
+    for (index, path) in std::env::var("CRABEFI_CAPSULE_TRUST_CERTS")
         .unwrap_or_default()
         .split(':')
         .filter(|path| !path.is_empty())
+        .enumerate()
     {
-        let path = std::fs::canonicalize(path).expect("read capsule trust certificate");
-        let der = std::fs::read(&path).expect("read capsule trust certificate");
+        let path = std::path::Path::new(path);
+        let resolved = std::fs::canonicalize(path).expect("read capsule trust certificate");
+        let der = std::fs::read(&resolved).expect("read capsule trust certificate");
         assert!(
             der.first() == Some(&0x30),
             "{} is not a DER certificate",
             path.display()
         );
         println!("cargo:rerun-if-changed={}", path.display());
-        source.push_str(&format!(
-            "    include_bytes!({:?}),\n",
-            path.display().to_string()
-        ));
+        println!("cargo:rerun-if-changed={}", resolved.display());
+        if let Some(directory) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+            println!("cargo:rerun-if-changed={}", directory.display());
+        }
+        let copy = out.join(format!("capsule_trust_{index}.der"));
+        std::fs::write(&copy, &der).expect("copy capsule trust certificate");
+        source.push_str(&format!("    include_bytes!({:?}),\n", copy.display().to_string()));
     }
     source.push_str("];\n");
-    let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
     std::fs::write(out.join("capsule_trust.rs"), source).expect("write capsule trust store");
 }
 

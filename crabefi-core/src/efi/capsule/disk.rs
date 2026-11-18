@@ -62,7 +62,9 @@ impl PageBuffer {
             pages,
             &mut address,
         );
-        (status == r_efi::efi::Status::SUCCESS).then_some(Self {
+        // Lazily: a buffer built for a failed allocation would free pages
+        // it never owned when dropped.
+        (status == r_efi::efi::Status::SUCCESS).then(|| Self {
             address,
             pages,
             len,
@@ -298,7 +300,8 @@ pub fn install_os_indications_supported(capsule_delivery_usable: bool, firmware_
 /// Clear the capsule-related bits in `OsIndications` after processing.
 ///
 /// This prevents re-processing on subsequent boots.
-pub fn clear_os_indications_capsule_bits() {
+/// Returns whether no capsule bit is left set (also when there was none).
+pub fn clear_os_indications_capsule_bits() -> bool {
     let os_ind_name: &[u16] = &[
         'O' as u16, 's' as u16, 'I' as u16, 'n' as u16, 'd' as u16, 'i' as u16, 'c' as u16,
         'a' as u16, 't' as u16, 'i' as u16, 'o' as u16, 'n' as u16, 's' as u16, 0,
@@ -317,12 +320,13 @@ pub fn clear_os_indications_capsule_bits() {
             attributes,
             &bytes,
         );
-        if status == r_efi::efi::Status::SUCCESS {
-            log::info!("Cleared capsule bits in OsIndications");
-        } else {
-            log::warn!("Failed to clear OsIndications: {:?}", status);
+        if status != r_efi::efi::Status::SUCCESS {
+            log::error!("Failed to clear OsIndications: {:?}", status);
+            return false;
         }
+        log::info!("Cleared capsule bits in OsIndications");
     }
+    true
 }
 
 /// Request a capsule-update boot (file capsule delivery) for the next boot.

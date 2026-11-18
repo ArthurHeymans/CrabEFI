@@ -107,8 +107,15 @@ pub fn process_pending_capsules(backend: &mut dyn CapsuleBackend) -> usize {
         // Clear the OsIndications bits *before* applying anything: if
         // processing crashes or power is lost part-way, the next boot must
         // not re-enter capsule processing for the same request. The OS
-        // re-requests delivery if no capsule result reports success.
-        disk::clear_os_indications_capsule_bits();
+        // re-requests delivery if no capsule result reports success. If the
+        // request cannot be cleared, applying would repeat on every boot,
+        // since a successful update resets: apply nothing.
+        let disk_capsules = if disk::clear_os_indications_capsule_bits() {
+            disk_capsules
+        } else {
+            log::error!("Not applying ESP capsules: the request could not be cleared");
+            alloc::vec::Vec::new()
+        };
 
         for (i, capsule) in disk_capsules.iter().enumerate() {
             log::info!(
