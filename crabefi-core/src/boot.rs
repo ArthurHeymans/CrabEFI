@@ -154,7 +154,7 @@ pub fn install_block_io_protocols(
             partition_num,
             partition.first_lba,
             partition_blocks,
-            &partition.partition_guid,
+            partition.signature(),
         );
 
         if !part_device_path.is_null() {
@@ -260,7 +260,7 @@ pub(crate) fn try_boot_path_from_esp(
         partition_num,
         esp.first_lba,
         partition_size,
-        &esp.partition_guid,
+        esp.signature(),
     );
 
     if !dp.is_null() {

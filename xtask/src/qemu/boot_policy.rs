@@ -146,8 +146,8 @@ pub(super) fn run(config: &QemuConfig, disk: &Path) -> Result<()> {
         &log,
         "failed internal BootOrder falls back to USB",
         &[
-            "USB: initializing on demand (a boot option is not on other storage)",
-            "Boot0003: retrying on USB",
+            "USB: initializing on demand (a boot option did not start without USB)",
+            "Boot0002: retrying on USB",
             "BPOL USB FALLBACK PASSED",
         ],
         &[],

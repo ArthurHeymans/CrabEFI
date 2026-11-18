@@ -249,7 +249,15 @@ fn try_boot_option_resolving_usb(
     file_path: &str,
 ) -> boot_vars::BootAttemptResult {
     let result = try_boot_load_option(load_option, file_path, Scope::Available);
-    if result != boot_vars::BootAttemptResult::NotFound || usb_ready() {
+    // A file-only option may be on any device, so look on USB unless it
+    // started. One bound to a partition only if that partition was not found.
+    let unbound = boot_vars::partition_target(load_option) == boot_vars::PartitionTarget::Any;
+    let look_on_usb = match result {
+        boot_vars::BootAttemptResult::Success | boot_vars::BootAttemptResult::Skipped => false,
+        boot_vars::BootAttemptResult::Failed => unbound,
+        boot_vars::BootAttemptResult::NotFound => true,
+    };
+    if !look_on_usb || usb_ready() {
         return result;
     }
     if !boot_policy::automatic_external_allowed() {
@@ -259,7 +267,7 @@ fn try_boot_option_resolving_usb(
         );
         return result;
     }
-    ensure_usb("a boot option is not on other storage");
+    ensure_usb("a boot option did not start without USB");
     log::info!("Boot{:04X}: retrying on USB", load_option.option_number);
     try_boot_load_option(load_option, file_path, Scope::Usb)
 }
@@ -340,8 +348,11 @@ fn show_boot_menu_once(countdown: Option<u32>, firmware_ui_requested: bool) -> M
     log::info!("=== Fallback: discovering boot entries from storage ===");
 
     let mut boot_menu = menu::discover_boot_entries();
+    // After a refused choice the user is in the menu on purpose, like an
+    // explicit setup request: keep the menu even without media.
+    let keep_menu = firmware_ui_requested || countdown.is_none();
 
-    if boot_menu.entry_count() == 0 && !firmware_ui_requested {
+    if boot_menu.entry_count() == 0 && !keep_menu {
         log::warn!("No bootable media found!");
 
         #[cfg(feature = "ui")]
@@ -397,7 +408,7 @@ fn show_boot_menu_once(countdown: Option<u32>, firmware_ui_requested: bool) -> M
         },
         boot_menu.timeout_seconds
     );
-    if firmware_ui_requested && boot_menu.entry_count() == 0 {
+    if keep_menu && boot_menu.entry_count() == 0 {
         #[cfg(feature = "ui")]
         if graphical {
             crate::ui::show_no_media_screen();
@@ -511,10 +522,10 @@ fn try_boot_load_option(
     let target = boot_vars::partition_target(load_option);
     let result = if target == boot_vars::PartitionTarget::Unsupported {
         log::warn!(
-            "Boot{:04X}: its hard-drive device path cannot be matched; not booting it",
+            "Boot{:04X}: its device path cannot be matched; not booting it",
             load_option.option_number
         );
-        boot_vars::BootAttemptResult::Failed
+        boot_vars::BootAttemptResult::Skipped
     } else {
         try_boot_file_from_esps(file_path, target, scope)
     };
@@ -574,7 +585,12 @@ fn try_boot_file_from_esps(
 /// Try to boot a specific file from ESPs on a given device.
 ///
 /// Reads GPT/MBR partitions, finds ESP partitions, mounts FAT, checks if the file exists,
-/// and if so, boots it through the standard UEFI boot path.
+/// Boot `file_path` from the partition `target` names on `device`, or from
+/// any ESP holding it for a file-only option.
+///
+/// `NotFound` means the device does not hold the target: no matching
+/// partition, or for a file-only option no ESP with the file. A bound target
+/// that is here but fails to boot is `Failed`.
 fn try_boot_file_on_device(
     device: &crate::drivers::storage::StorageDevice,
     file_path: &str,
@@ -584,39 +600,49 @@ fn try_boot_file_on_device(
     use crate::fs::{fat::FatFilesystem, gpt};
     use boot_vars::{BootAttemptResult, PartitionTarget};
 
-    // Read GPT/MBR partitions
-    let Some(partitions) =
-        storage::with_disk(device.id, |disk| gpt::read_partitions_auto(disk).ok())
+    // An MBR target is matched against the MBR itself, also on a hybrid disk
+    // whose GPT would otherwise win.
+    let partitions = storage::with_disk(device.id, |disk| match target {
+        PartitionTarget::Mbr { .. } => gpt::read_mbr_partitions(disk)
             .ok()
-            .flatten()
-    else {
+            .map(|partitions| partitions.into_iter().collect::<heapless::Vec<_, 16>>()),
+        _ => gpt::read_partitions_auto(disk).ok(),
+    })
+    .ok()
+    .flatten();
+    let Some(partitions) = partitions else {
         return BootAttemptResult::NotFound;
     };
-    // An MBR target names its disk by the signature at offset 440 of LBA 0.
-    let disk_signature = match target {
-        PartitionTarget::Mbr { .. } => {
-            let mut sector = alloc::vec![0u8; device.info.block_size as usize];
-            storage::with_disk(device.id, |disk| disk.read_blocks(0, 1, &mut sector))
-                .ok()
-                .and_then(Result::ok)
-                .and_then(|()| sector.get(440..444)?.try_into().ok())
-                .map(u32::from_le_bytes)
-        }
-        _ => None,
-    };
 
-    // Look for ESPs containing the target file
     for (i, partition) in partitions.iter().enumerate() {
-        let targeted = match target {
-            PartitionTarget::Any => true,
-            PartitionTarget::Gpt(guid) => guid == partition.partition_guid,
+        let bound = match target {
+            PartitionTarget::Any => false,
+            PartitionTarget::Gpt(guid) => {
+                if guid != partition.partition_guid {
+                    continue;
+                }
+                true
+            }
             PartitionTarget::Mbr {
-                disk_signature: wanted,
+                disk_signature,
                 start_lba,
-            } => disk_signature == Some(wanted) && start_lba == partition.first_lba,
-            PartitionTarget::Unsupported => false,
+            } => {
+                if partition.mbr_disk_signature != Some(disk_signature)
+                    || partition.first_lba != start_lba
+                {
+                    continue;
+                }
+                true
+            }
+            PartitionTarget::Unsigned { start_lba, size } => {
+                if partition.first_lba != start_lba || partition.size_sectors() != size {
+                    continue;
+                }
+                true
+            }
+            PartitionTarget::Unsupported => return BootAttemptResult::NotFound,
         };
-        if !partition.is_esp || !targeted {
+        if !partition.is_esp && !bound {
             continue;
         }
 
@@ -630,6 +656,14 @@ fn try_boot_file_on_device(
         .unwrap_or(false);
 
         if !found {
+            if bound {
+                log::warn!(
+                    "'{}' is not readable on the partition {} names",
+                    file_path,
+                    device.id.description()
+                );
+                return BootAttemptResult::Failed;
+            }
             continue;
         }
 

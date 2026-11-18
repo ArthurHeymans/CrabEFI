@@ -340,6 +340,7 @@ fn try_el_torito_fallback(device: &StorageDevice, menu: &mut BootMenu) {
             attributes: 0,
             is_esp: true,
             block_size,
+            mbr_disk_signature: None,
         };
 
         if !check_bootloader_exists(disk, efi_image.start_sector) {

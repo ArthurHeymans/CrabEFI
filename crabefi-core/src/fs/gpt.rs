@@ -192,6 +192,17 @@ impl GptPartitionEntry {
     }
 }
 
+/// What a HardDrive device path node identifies a partition by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PartitionSignature {
+    /// No signature, for example a synthetic El Torito partition.
+    None,
+    /// An MBR partition: the disk signature at offset 440 of LBA 0.
+    Mbr(u32),
+    /// A GPT partition: its unique partition GUID.
+    Gpt([u8; 16]),
+}
+
 /// Parsed partition information
 #[derive(Debug, Clone)]
 pub struct Partition {
@@ -209,9 +220,20 @@ pub struct Partition {
     pub is_esp: bool,
     /// Block size of the device (for size calculations)
     pub block_size: u32,
+    /// Disk signature of the MBR this partition comes from, if any.
+    pub mbr_disk_signature: Option<u32>,
 }
 
 impl Partition {
+    /// The signature a HardDrive device path node names this partition by.
+    pub fn signature(&self) -> PartitionSignature {
+        match self.mbr_disk_signature {
+            Some(signature) => PartitionSignature::Mbr(signature),
+            None if self.partition_guid != [0; 16] => PartitionSignature::Gpt(self.partition_guid),
+            None => PartitionSignature::None,
+        }
+    }
+
     /// Get partition size in blocks
     pub fn size_sectors(&self) -> u64 {
         if self.last_lba >= self.first_lba {
@@ -549,6 +571,7 @@ pub(crate) fn read_partitions_with(
                 attributes: entry.attributes,
                 is_esp: entry.is_esp(),
                 block_size: block_size as u32,
+                mbr_disk_signature: None,
             };
 
             log::debug!(
@@ -597,6 +620,7 @@ pub fn read_mbr_partitions(
         );
         return Err(GptError::InvalidMbr);
     }
+    let disk_signature = u32::from_le_bytes([buffer[440], buffer[441], buffer[442], buffer[443]]);
 
     let mut partitions = heapless::Vec::new();
     for index in 0..4 {
@@ -632,6 +656,7 @@ pub fn read_mbr_partitions(
             // boot candidates and verify by mounting FAT and checking paths.
             is_esp: is_boot_candidate,
             block_size: block_size as u32,
+            mbr_disk_signature: Some(disk_signature),
         };
 
         log::debug!(

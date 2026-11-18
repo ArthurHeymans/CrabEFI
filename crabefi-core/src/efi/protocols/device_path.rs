@@ -12,6 +12,7 @@ use r_efi::protocols::device_path::{
 };
 
 use crate::efi::allocator::{MemoryType, allocate_pool};
+pub use crate::fs::gpt::PartitionSignature;
 
 /// Allocate a device path on the EFI heap and write a stack-built value into it.
 ///
@@ -43,11 +44,17 @@ const SIGNATURE_TYPE_NONE: u8 = 0x00;
 /// Signature type for GPT partitions
 const SIGNATURE_TYPE_GUID: u8 = 0x02;
 
+/// HardDrive node signature type: 32-bit MBR disk signature.
+const SIGNATURE_TYPE_MBR: u8 = 0x01;
+
 /// No defined partition format
 const PARTITION_FORMAT_NONE: u8 = 0x00;
 
 /// Partition format for GPT
 const PARTITION_FORMAT_GPT: u8 = 0x02;
+
+/// HardDrive node partition format: legacy MBR.
+const PARTITION_FORMAT_MBR: u8 = 0x01;
 
 /// Device path for a hard drive partition (ESP)
 ///
@@ -67,7 +74,7 @@ pub struct HardDriveDevicePath {
 /// * `partition_number` - The partition number (1-based)
 /// * `partition_start` - Start LBA of the partition
 /// * `partition_size` - Size of the partition in sectors
-/// * `partition_guid` - The GPT partition GUID (unique identifier)
+/// * `signature` - What identifies the partition (GPT GUID, MBR disk signature)
 ///
 /// # Returns
 /// A pointer to the device path protocol, or null on failure
@@ -75,14 +82,14 @@ pub fn create_hard_drive_device_path(
     partition_number: u32,
     partition_start: u64,
     partition_size: u64,
-    partition_guid: &[u8; 16],
+    signature: PartitionSignature,
 ) -> *mut Protocol {
     let dp = HardDriveDevicePath {
         hard_drive: create_hard_drive_node(
             partition_number,
             partition_start,
             partition_size,
-            partition_guid,
+            signature,
         ),
         end: create_end_node(),
     };
@@ -231,18 +238,23 @@ fn create_hard_drive_node(
     partition_number: u32,
     partition_start: u64,
     partition_size: u64,
-    partition_guid: &[u8; 16],
+    signature: PartitionSignature,
 ) -> HardDriveMedia {
-    // Use GPT signature type when we have a real partition GUID,
-    // otherwise use no signature (e.g., El Torito synthetic partitions).
-    let has_guid = partition_guid.iter().any(|&b| b != 0);
-    let (sig_type, fmt) = if has_guid {
-        (SIGNATURE_TYPE_GUID, PARTITION_FORMAT_GPT)
-    } else {
-        (SIGNATURE_TYPE_NONE, PARTITION_FORMAT_NONE)
+    let mut partition_signature = [0u8; 16];
+    let (sig_type, fmt) = match signature {
+        PartitionSignature::Gpt(guid) => {
+            partition_signature = guid;
+            (SIGNATURE_TYPE_GUID, PARTITION_FORMAT_GPT)
+        }
+        PartitionSignature::Mbr(disk_signature) => {
+            partition_signature[..4].copy_from_slice(&disk_signature.to_le_bytes());
+            (SIGNATURE_TYPE_MBR, PARTITION_FORMAT_MBR)
+        }
+        // For example El Torito synthetic partitions.
+        PartitionSignature::None => (SIGNATURE_TYPE_NONE, PARTITION_FORMAT_NONE),
     };
 
-    let mut node = HardDriveMedia {
+    HardDriveMedia {
         header: Protocol {
             r#type: TYPE_MEDIA,
             sub_type: Media::SUBTYPE_HARDDRIVE,
@@ -251,12 +263,10 @@ fn create_hard_drive_node(
         partition_number,
         partition_start,
         partition_size,
-        partition_signature: [0; 16],
+        partition_signature,
         partition_format: fmt,
         signature_type: sig_type,
-    };
-    node.partition_signature.copy_from_slice(partition_guid);
-    node
+    }
 }
 
 /// Create a device path for a USB mass storage device (whole disk)
@@ -314,7 +324,7 @@ pub struct FullUsbPartitionDevicePath {
 /// * `partition_number` - The partition number (1-based)
 /// * `partition_start` - Start LBA of the partition
 /// * `partition_size` - Size of the partition in sectors
-/// * `partition_guid` - The GPT partition GUID (unique identifier)
+/// * `signature` - What identifies the partition (GPT GUID, MBR disk signature)
 ///
 /// # Returns
 /// A pointer to the device path protocol, or null on failure
@@ -325,7 +335,7 @@ pub fn create_usb_partition_device_path(
     partition_number: u32,
     partition_start: u64,
     partition_size: u64,
-    partition_guid: &[u8; 16],
+    signature: PartitionSignature,
 ) -> *mut Protocol {
     let dp = FullUsbPartitionDevicePath {
         acpi: AcpiDevicePathNode::new(0),
@@ -335,7 +345,7 @@ pub fn create_usb_partition_device_path(
             partition_number,
             partition_start,
             partition_size,
-            partition_guid,
+            signature,
         ),
         end: create_end_node(),
     };
@@ -467,7 +477,7 @@ pub fn create_nvme_device_path(
 /// * `partition_number` - The partition number (1-based)
 /// * `partition_start` - Start LBA of the partition
 /// * `partition_size` - Size of the partition in sectors
-/// * `partition_guid` - The GPT partition GUID (unique identifier)
+/// * `signature` - What identifies the partition (GPT GUID, MBR disk signature)
 ///
 /// # Returns
 /// A pointer to the device path protocol, or null on failure
@@ -478,7 +488,7 @@ pub fn create_nvme_partition_device_path(
     partition_number: u32,
     partition_start: u64,
     partition_size: u64,
-    partition_guid: &[u8; 16],
+    signature: PartitionSignature,
 ) -> *mut Protocol {
     let dp = FullNvmePartitionDevicePath {
         acpi: AcpiDevicePathNode::new(0),
@@ -488,7 +498,7 @@ pub fn create_nvme_partition_device_path(
             partition_number,
             partition_start,
             partition_size,
-            partition_guid,
+            signature,
         ),
         end: create_end_node(),
     };
@@ -600,7 +610,7 @@ pub fn create_sata_device_path(pci_device: u8, pci_function: u8, port: u16) -> *
 /// * `partition_number` - The partition number (1-based)
 /// * `partition_start` - Start LBA of the partition
 /// * `partition_size` - Size of the partition in sectors
-/// * `partition_guid` - The GPT partition GUID (unique identifier)
+/// * `signature` - What identifies the partition (GPT GUID, MBR disk signature)
 ///
 /// # Returns
 /// A pointer to the device path protocol, or null on failure
@@ -611,7 +621,7 @@ pub fn create_sata_partition_device_path(
     partition_number: u32,
     partition_start: u64,
     partition_size: u64,
-    partition_guid: &[u8; 16],
+    signature: PartitionSignature,
 ) -> *mut Protocol {
     let dp = FullSataPartitionDevicePath {
         acpi: AcpiDevicePathNode::new(0),
@@ -621,7 +631,7 @@ pub fn create_sata_partition_device_path(
             partition_number,
             partition_start,
             partition_size,
-            partition_guid,
+            signature,
         ),
         end: create_end_node(),
     };
@@ -1160,7 +1170,7 @@ pub fn create_disk_device_path(info: &DevicePathInfo) -> *mut Protocol {
 /// * `partition_number` - 1-based partition number
 /// * `partition_start` - Start LBA of the partition
 /// * `partition_size` - Size of the partition in sectors
-/// * `partition_guid` - GPT partition GUID
+/// * `signature` - What identifies the partition (GPT GUID, MBR disk signature)
 ///
 /// # Returns
 /// A pointer to the device path protocol, or null on failure
@@ -1169,7 +1179,7 @@ pub fn create_partition_device_path(
     partition_number: u32,
     partition_start: u64,
     partition_size: u64,
-    partition_guid: &[u8; 16],
+    signature: PartitionSignature,
 ) -> *mut Protocol {
     match *info {
         DevicePathInfo::Nvme {
@@ -1183,7 +1193,7 @@ pub fn create_partition_device_path(
             partition_number,
             partition_start,
             partition_size,
-            partition_guid,
+            signature,
         ),
         DevicePathInfo::Ahci {
             pci_device,
@@ -1196,7 +1206,7 @@ pub fn create_partition_device_path(
             partition_number,
             partition_start,
             partition_size,
-            partition_guid,
+            signature,
         ),
         DevicePathInfo::AhciCdrom {
             pci_device,
@@ -1224,7 +1234,7 @@ pub fn create_partition_device_path(
             partition_number,
             partition_start,
             partition_size,
-            partition_guid,
+            signature,
         ),
         DevicePathInfo::Sdhci {
             pci_device,
@@ -1236,7 +1246,7 @@ pub fn create_partition_device_path(
             partition_number,
             partition_start,
             partition_size,
-            partition_guid,
+            signature,
         ),
         DevicePathInfo::Platform { index } => {
             allocate_device_path(PlatformBlockPartitionDevicePath {
@@ -1245,7 +1255,7 @@ pub fn create_partition_device_path(
                     partition_number,
                     partition_start,
                     partition_size,
-                    partition_guid,
+                    signature,
                 ),
                 end: create_end_node(),
             })
