@@ -295,6 +295,9 @@ pub extern "efiapi" fn efi_main(image: Handle, system: *mut SystemTable) -> Stat
                 media == Media::Nvme,
                 "MenuOnly policy booted external media",
             );
+            // Each boot is a new QEMU process, so the deferred journal of
+            // runtime writes does not survive: move on before ExitBootServices.
+            set(rt, &TEST, "BootPolicyTestPhase", NV_BS_RT, &[5]);
             exit_boot_services(image, bs);
             check(
                 try_set(rt, &SETTINGS, "CrabEFIExternalBoot", NV_BS_RT, &[0]) != Status::SUCCESS,
@@ -304,7 +307,48 @@ pub extern "efiapi" fn efi_main(image: Handle, system: *mut SystemTable) -> Stat
                 try_set(rt, &SETTINGS, "CrabEFIExternalBoot", 0, &[]) != Status::SUCCESS,
                 "OS deleted the policy",
             );
-            serial("BPOL MENU ONLY PASSED\r\nBPOL TEST PASSED\r\n");
+            // An append keeps the stored NV+BS attributes; it must fail too,
+            // or it would leave a malformed policy for the next boot.
+            check(
+                try_set(
+                    rt,
+                    &SETTINGS,
+                    "CrabEFIExternalBoot",
+                    NV_BS_RT | efi::VARIABLE_APPEND_WRITE,
+                    &[0],
+                ) != Status::SUCCESS,
+                "OS appended to the policy",
+            );
+            check(
+                try_set(
+                    rt,
+                    &SETTINGS,
+                    "CrabEFIExternalBoot",
+                    NV_BS | efi::VARIABLE_APPEND_WRITE,
+                    &[0],
+                ) != Status::SUCCESS,
+                "OS appended to the policy without runtime access",
+            );
+            serial("BPOL MENU ONLY PASSED\r\n");
+            reset(rt);
+        }
+        // The runtime writes above did not change the policy.
+        5 => {
+            check(media == Media::Nvme, "MenuOnly policy booted external media");
+            check(
+                get(rt, &SETTINGS, "CrabEFIExternalBoot").is_some_and(|data| data[0] == 1),
+                "the policy changed at runtime",
+            );
+            // Boot-time code wrote something CrabEFI cannot read.
+            set(rt, &SETTINGS, "CrabEFIExternalBoot", NV_BS, &[9]);
+            set(rt, &TEST, "BootPolicyTestPhase", NV_BS_RT, &[6]);
+            serial("BPOL RUNTIME WRITES PASSED\r\n");
+            reset(rt);
+        }
+        // A malformed policy denies external boot.
+        6 => {
+            check(media == Media::Nvme, "malformed policy booted external media");
+            serial("BPOL MALFORMED PASSED\r\nBPOL TEST PASSED\r\n");
             exit();
         }
         _ => check(false, "unexpected phase"),

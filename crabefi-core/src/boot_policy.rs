@@ -38,11 +38,18 @@ pub enum ExternalBoot {
 pub struct BootPolicy {
     pub usb_init: UsbInit,
     pub external_boot: ExternalBoot,
+    /// Treat SATA ports the controller reports as hot-plug capable as
+    /// internal. Hot-plug ports are usually drive bays and count as external
+    /// media, but some desktop boards mark every connector hot-plug capable;
+    /// such boards set this so the external-boot policy does not hide their
+    /// system disk. eSATA ports and removable media stay external.
+    pub internal_hot_plug_sata: bool,
 }
 
 static POLICY: LocalCell<BootPolicy> = LocalCell::new(BootPolicy {
     usb_init: UsbInit::Always,
     external_boot: ExternalBoot::Allow,
+    internal_hot_plug_sata: false,
 });
 
 /// The platform's external-boot setting, before `CrabEFIExternalBoot`.
@@ -77,9 +84,11 @@ fn parse_external_boot(attributes: u32, data: &[u8]) -> Option<ExternalBoot> {
     }
 }
 
-/// The platform setting tightened by a well-formed variable, never loosened.
-fn tightened(platform: ExternalBoot, attributes: u32, data: &[u8]) -> Option<ExternalBoot> {
-    parse_external_boot(attributes, data).map(|value| platform.max(value))
+/// The platform setting tightened by the variable, never loosened. The
+/// variable exists only to tighten, so a malformed one fails closed to
+/// [`ExternalBoot::Deny`]; the setup menu rewrites it.
+fn tightened(platform: ExternalBoot, attributes: u32, data: &[u8]) -> ExternalBoot {
+    platform.max(parse_external_boot(attributes, data).unwrap_or(ExternalBoot::Deny))
 }
 
 fn variable_name() -> alloc::vec::Vec<u16> {
@@ -97,10 +106,13 @@ pub(crate) fn apply_variable() {
     if let Some((attributes, data)) =
         variables::get(&crate::logger::CRABEFI_SETTINGS_GUID, &variable_name())
     {
-        match tightened(policy.external_boot, attributes, &data) {
-            Some(value) => policy.external_boot = value,
-            None => log::warn!("Ignoring malformed {}", EXTERNAL_BOOT_VARIABLE_NAME),
+        if parse_external_boot(attributes, &data).is_none() {
+            log::error!(
+                "Malformed {}: denying external boot",
+                EXTERNAL_BOOT_VARIABLE_NAME
+            );
         }
+        policy.external_boot = tightened(policy.external_boot, attributes, &data);
     }
     POLICY.set(policy);
     log::info!(
@@ -127,6 +139,18 @@ pub(crate) fn set_external_boot(byte: u8) -> Result<(), r_efi::efi::Status> {
     let data = [byte];
     let value = parse_external_boot(EXTERNAL_BOOT_VARIABLE_ATTRS, &data)
         .ok_or(r_efi::efi::Status::INVALID_PARAMETER)?;
+    // A variable with other attributes (say one the OS created at runtime)
+    // denies external boot as malformed, and SetVariable refuses to change
+    // its attributes: replace it.
+    if let Some((attributes, _)) =
+        variables::get(&crate::logger::CRABEFI_SETTINGS_GUID, &variable_name())
+        && attributes != EXTERNAL_BOOT_VARIABLE_ATTRS
+    {
+        let status = variables::delete(&crate::logger::CRABEFI_SETTINGS_GUID, &variable_name());
+        if status != r_efi::efi::Status::SUCCESS {
+            return Err(status);
+        }
+    }
     let status = variables::set(
         &crate::logger::CRABEFI_SETTINGS_GUID,
         &variable_name(),
@@ -142,20 +166,15 @@ pub(crate) fn set_external_boot(byte: u8) -> Result<(), r_efi::efi::Status> {
     Ok(())
 }
 
-/// USB and removable media count as external.
-pub(crate) fn is_external(id: StorageId, removable: bool) -> bool {
-    matches!(id, StorageId::Usb { .. }) || removable
-}
-
+/// USB, removable media and SATA devices on external or hot-plug capable
+/// ports count as external ([`StorageDevice::external`]).
 pub(crate) fn device_is_external(device: &StorageDevice) -> bool {
-    is_external(device.id, device.info.removable)
+    device.external
 }
 
+/// Like [`device_is_external`]; a device that is gone counts as external.
 pub(crate) fn storage_is_external(id: StorageId) -> bool {
-    is_external(
-        id,
-        storage::with_disk(id, |disk| disk.info().removable).unwrap_or(true),
-    )
+    storage::is_external(id).unwrap_or(true)
 }
 
 const fn automatic_allowed(policy: ExternalBoot, external: bool) -> bool {
@@ -187,6 +206,18 @@ pub(crate) fn menu_boot_allowed(device: &StorageDevice) -> bool {
     allowed
 }
 
+/// May the menu start the entry on `id` now? `automatic` when its countdown
+/// chose the entry rather than the user.
+pub(crate) fn dispatch_allowed(id: StorageId, automatic: bool) -> bool {
+    let policy = get().external_boot;
+    let external = storage_is_external(id);
+    if automatic {
+        automatic_allowed(policy, external)
+    } else {
+        menu_allowed(policy, external)
+    }
+}
+
 /// May automatic boot use external media at all?
 pub(crate) fn automatic_external_allowed() -> bool {
     automatic_allowed(get().external_boot, true)
@@ -216,12 +247,22 @@ mod tests {
     #[test]
     fn variable_only_tightens() {
         use ExternalBoot::*;
-        assert_eq!(tightened(Allow, NV_BS, &[2]), Some(Deny));
-        assert_eq!(tightened(Allow, NV_BS, &[1]), Some(MenuOnly));
-        assert_eq!(tightened(MenuOnly, NV_BS, &[0]), Some(MenuOnly));
-        assert_eq!(tightened(Deny, NV_BS, &[0]), Some(Deny));
-        assert_eq!(tightened(Deny, NV_BS, &[1]), Some(Deny));
-        assert_eq!(tightened(Allow, NV_BS | 4, &[2]), None);
+        assert_eq!(tightened(Allow, NV_BS, &[2]), Deny);
+        assert_eq!(tightened(Allow, NV_BS, &[1]), MenuOnly);
+        assert_eq!(tightened(MenuOnly, NV_BS, &[0]), MenuOnly);
+        assert_eq!(tightened(Deny, NV_BS, &[0]), Deny);
+        assert_eq!(tightened(Deny, NV_BS, &[1]), Deny);
+    }
+
+    #[test]
+    fn malformed_variable_denies_external_boot() {
+        use ExternalBoot::*;
+        for platform in [Allow, MenuOnly, Deny] {
+            assert_eq!(tightened(platform, NV_BS | 4, &[0]), Deny);
+            assert_eq!(tightened(platform, NV_BS, &[3]), Deny);
+            assert_eq!(tightened(platform, NV_BS, &[0, 0]), Deny);
+            assert_eq!(tightened(platform, NV_BS, &[]), Deny);
+        }
     }
 
     #[test]
@@ -230,23 +271,6 @@ mod tests {
         for value in [Allow, MenuOnly, Deny] {
             assert_eq!(parse_external_boot(NV_BS, &[value as u8]), Some(value));
         }
-    }
-
-    #[test]
-    fn usb_and_removable_media_are_external() {
-        let usb = StorageId::Usb {
-            controller_id: 0,
-            device_addr: 1,
-        };
-        let nvme = StorageId::Nvme {
-            controller_id: 0,
-            nsid: 1,
-        };
-        let sd = StorageId::Sdhci { controller_id: 0 };
-        assert!(is_external(usb, false));
-        assert!(!is_external(nvme, false));
-        assert!(is_external(sd, true));
-        assert!(!is_external(sd, false));
     }
 
     #[test]

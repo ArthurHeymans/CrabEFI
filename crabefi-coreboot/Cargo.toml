@@ -26,6 +26,9 @@ usb-on-demand = []
 external-boot-menu-only = []
 # Never boot USB or removable media; takes precedence over menu-only.
 external-boot-deny = []
+# Count SATA ports the controller reports as hot-plug capable as internal, for
+# boards that mark every connector hot-plug capable.
+internal-hot-plug-sata = []
 # Offer the external-boot policy in the setup menu (stricter values only).
 external-boot-setting = ["crabefi/external-boot-setting"]
 

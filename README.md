@@ -79,15 +79,21 @@ boot; the serial console does. The boot menu appears when nothing starts
 without USB, or after `systemctl reboot --firmware-setup` (OsIndications
 `BOOT_TO_FW_UI`); USB keyboards work in it. There is no pre-boot hotkey.
 
-`external-boot-menu-only` (`ExternalBoot::MenuOnly`) keeps USB and removable
-media out of BootNext, BootOrder and menu timeouts; the menu lists them after
-internal entries and waits for the user when its default entry is external.
-`external-boot-deny` (`ExternalBoot::Deny`) never boots them and hides them in
-the menu. CrabEFI has no network boot.
+External media are USB storage, removable media such as SATA optical drives
+and SD cards, and SATA devices on ports the controller reports as external
+(eSATA) or hot-plug capable. Boards that mark internal connectors hot-plug
+capable build with `internal-hot-plug-sata`
+(`BootPolicy::internal_hot_plug_sata`).
+`external-boot-menu-only` (`ExternalBoot::MenuOnly`) keeps them out of
+BootNext, BootOrder and menu timeouts; the menu lists them after internal
+entries and waits for the user when its default entry is external. Any key in
+the menu stops its countdown. `external-boot-deny` (`ExternalBoot::Deny`) never
+boots them and hides them in the menu. CrabEFI has no network boot.
 
 The variable `CrabEFIExternalBoot` (GUID `9e80634c-cdc7-41d5-a345-4a297f9c7d1a`,
 attributes NV+BS, one byte: 0 allow, 1 menu-only, 2 deny) tightens the build
 setting and can never loosen it. Only boot-time code can write it, not the OS.
+A malformed value denies external boot until the setup menu rewrites it.
 
 ## Workspace Structure
 

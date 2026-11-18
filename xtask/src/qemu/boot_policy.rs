@@ -62,6 +62,16 @@ fn boot(
         ),
     ]);
     cmd.args(["-device", "usb-storage,drive=usbdisk,bus=xhci.0"]);
+    // A SATA optical drive with a blank disc: removable media on the q35
+    // AHCI controller, which the policy must treat as external.
+    cmd.args([
+        "-drive",
+        &format!(
+            "file={},if=none,id=cd0,media=cdrom,format=raw,readonly=on",
+            report.join("blank.iso").display()
+        ),
+    ]);
+    cmd.args(["-device", "ide-cd,drive=cd0,bus=ide.0"]);
     fs::write(
         report.join(format!("{label}.command.txt")),
         format!("{cmd:?}\n"),
@@ -108,6 +118,7 @@ pub(super) fn run(config: &QemuConfig, disk: &Path) -> Result<()> {
     let report = crate::project_root().join(format!("target/boot-policy-reports/{stamp}"));
     fs::create_dir_all(&report)?;
     println!("Boot policy logs: {}", report.display());
+    fs::write(report.join("blank.iso"), vec![0u8; 1024 * 1024])?;
     let flash = prepare_runtime_test_flash(Path::new(&config.coreboot_rom))?;
     let boot = |label: &str| boot(config, flash.path(), disk, &report, label);
 
@@ -149,7 +160,8 @@ pub(super) fn run(config: &QemuConfig, disk: &Path) -> Result<()> {
         &[
             "external boot Deny",
             "Boot policy: not retrying BootOrder on USB",
-            "is external; hiding it",
+            "Boot policy: xHCI USB is external; hiding it",
+            "Boot policy: SATA port 0 is external; hiding it",
             "Found 1 boot entries",
             "BPOL DENY PASSED",
         ],
@@ -167,6 +179,26 @@ pub(super) fn run(config: &QemuConfig, disk: &Path) -> Result<()> {
             "xHCI USB is external; not booting it automatically",
             "Found 2 boot entries",
             "BPOL MENU ONLY PASSED",
+        ],
+        &["=== BootOrder: retrying on USB ==="],
+    )?;
+
+    let log = boot("runtime-writes")?;
+    expect(
+        &log,
+        "runtime writes and appends left the policy at MenuOnly",
+        &["external boot MenuOnly", "BPOL RUNTIME WRITES PASSED"],
+        &["Malformed CrabEFIExternalBoot"],
+    )?;
+
+    let log = boot("malformed")?;
+    expect(
+        &log,
+        "a malformed policy denies external boot",
+        &[
+            "Malformed CrabEFIExternalBoot: denying external boot",
+            "external boot Deny",
+            "BPOL MALFORMED PASSED",
             "BPOL TEST PASSED",
         ],
         &["=== BootOrder: retrying on USB ==="],

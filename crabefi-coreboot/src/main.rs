@@ -107,6 +107,7 @@ fn boot_policy() -> crabefi::BootPolicy {
         } else {
             crabefi::ExternalBoot::Allow
         },
+        internal_hot_plug_sata: cfg!(feature = "internal-hot-plug-sata"),
     }
 }
 
