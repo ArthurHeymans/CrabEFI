@@ -16,7 +16,7 @@
 //!    f. Write firmware image to approved flash regions
 //! 4. Record result
 
-use crate::platform::CapsuleBackend;
+use crate::platform::{CapsuleBackend, FirmwareSlots, FmapRegion, StorageError};
 
 use super::auth;
 use super::fmp;
@@ -277,21 +277,14 @@ fn apply_fmp_payload_item(
         return CapsuleResult::failure(CapsuleResultStatus::ErrorInvalidImage, attempted_version);
     }
 
-    let slots = backend.firmware_slots();
-    if slots.is_some() && super::trial::pending() {
-        log::error!("The last firmware update is not confirmed yet; refusing another one");
-        return CapsuleResult::failure(CapsuleResultStatus::Error, attempted_version);
-    }
-    if let Some(slots) = &slots
-        && !approved_regions
-            .iter()
-            .any(|region| region.name == slots.inactive)
-    {
-        log::error!(
-            "Capsule has no image for the inactive slot '{}'",
-            slots.inactive
+    if let Some(slots) = backend.firmware_slots() {
+        return apply_to_inactive_slot(
+            backend,
+            &slots,
+            &approved_regions,
+            clean_image,
+            attempted_version,
         );
-        return CapsuleResult::failure(CapsuleResultStatus::ErrorInvalidImage, attempted_version);
     }
 
     // Write firmware image to approved flash regions.
@@ -301,13 +294,6 @@ fn apply_fmp_payload_item(
     let mut regions_written = 0usize;
     for (index, write_start) in write_order(&approved_regions, backend.running_firmware_offset()) {
         let region = &approved_regions[index];
-        if slots
-            .as_ref()
-            .is_some_and(|slots| region.name == slots.running)
-        {
-            log::info!("Keeping region '{}' of the running slot", region.name);
-            continue;
-        }
         if region.offset.checked_add(region.size).is_none() {
             log::error!(
                 "RMAP region '{}' overflows flash address space: offset={:#x}, size={:#x}",
@@ -322,8 +308,7 @@ fn apply_fmp_payload_item(
         }
 
         let write_size = region.size as usize;
-        let write_end = write_start + write_size;
-        let region_data = &clean_image[write_start..write_end];
+        let region_data = &clean_image[write_start..write_start + write_size];
 
         log::info!(
             "Writing {} bytes to region '{}' at flash offset {:#x}",
@@ -344,20 +329,6 @@ fn apply_fmp_payload_item(
         regions_written += 1;
     }
 
-    if let Some(slots) = &slots {
-        if let Err(e) = backend.activate_slot(slots.inactive.as_str()) {
-            log::error!("Activating slot '{}' failed: {:?}", slots.inactive, e);
-            return CapsuleResult::failure(
-                CapsuleResultStatus::ErrorFlashWriteFailed,
-                attempted_version,
-            );
-        }
-        log::info!("Slot '{}' boots from the next reset", slots.inactive);
-        if !super::trial::start(slots.inactive.as_str(), attempted_version) {
-            log::warn!("No trial record: this update cannot roll back");
-        }
-    }
-
     log::info!(
         "Capsule applied successfully: {} bytes written to {} region(s)",
         total_written,
@@ -365,6 +336,136 @@ fn apply_fmp_payload_item(
     );
 
     CapsuleResult::success(attempted_version)
+}
+
+/// Whether `region` lies entirely inside `slot`.
+fn inside(slot: &FmapRegion, region: &rmap::ApprovedRegion) -> bool {
+    let end = |offset: u32, size: u32| u64::from(offset) + u64::from(size);
+    region.offset >= slot.offset && end(region.offset, region.size) <= end(slot.offset, slot.size)
+}
+
+/// Install the image into the inactive slot of an A/B platform.
+///
+/// Every approved region must lie inside one slot: those inside the running
+/// slot are skipped, those inside the inactive slot are written, and anything
+/// else (a shared region, or one spanning both slots) rejects the capsule
+/// before flash is touched. The written regions are read back and compared
+/// with the authenticated image, then the trial record is stored, and only
+/// then is the slot activated. A trial record that cannot be stored leaves
+/// the old slot active; a failed activation keeps the record, so the next
+/// boot finds out which slot actually runs.
+fn apply_to_inactive_slot(
+    backend: &mut dyn CapsuleBackend,
+    slots: &FirmwareSlots,
+    regions: &[rmap::ApprovedRegion],
+    image: &[u8],
+    version: u32,
+) -> CapsuleResult {
+    let fail = |status| CapsuleResult::failure(status, version);
+    if super::trial::pending() {
+        log::error!("The last firmware update is not confirmed yet; refusing another one");
+        return fail(CapsuleResultStatus::Error);
+    }
+    let mut writes = alloc::vec::Vec::new();
+    for (region, start) in regions.iter().zip(image_offsets(regions)) {
+        if inside(&slots.inactive, region) {
+            writes.push((region, start));
+        } else if inside(&slots.running, region) {
+            log::info!("Keeping region '{}' of the running slot", region.name);
+        } else {
+            log::error!(
+                "RMAP region '{}' is not inside one firmware slot",
+                region.name
+            );
+            return fail(CapsuleResultStatus::ErrorInvalidImage);
+        }
+    }
+    if writes.is_empty() {
+        log::error!(
+            "Capsule has no image for the inactive slot '{}'",
+            slots.inactive.name
+        );
+        return fail(CapsuleResultStatus::ErrorInvalidImage);
+    }
+
+    for &(region, start) in &writes {
+        let data = &image[start..start + region.size as usize];
+        log::info!(
+            "Writing {} bytes to region '{}' at flash offset {:#x}",
+            data.len(),
+            region.name,
+            region.offset
+        );
+        if let Err(error) = backend.write_firmware_region(region.name.as_str(), 0, data) {
+            log::error!(
+                "Flash write failed for region '{}': {:?}",
+                region.name,
+                error
+            );
+            return fail(CapsuleResultStatus::ErrorFlashWriteFailed);
+        }
+    }
+    for &(region, start) in &writes {
+        let data = &image[start..start + region.size as usize];
+        if let Err(error) = verify_region(backend, region, data) {
+            log::error!(
+                "Region '{}' does not read back as written: {:?}",
+                region.name,
+                error
+            );
+            return fail(CapsuleResultStatus::ErrorFlashWriteFailed);
+        }
+    }
+
+    if !super::trial::start(&slots.inactive, version) {
+        log::error!(
+            "Cannot store the trial record; slot '{}' stays inactive",
+            slots.inactive.name
+        );
+        return fail(CapsuleResultStatus::Error);
+    }
+    if let Err(error) = backend.activate_slot(&slots.inactive) {
+        log::error!(
+            "Activating slot '{}' failed: {:?}; the next boot checks which slot runs",
+            slots.inactive.name,
+            error
+        );
+        return fail(CapsuleResultStatus::ErrorFlashWriteFailed);
+    }
+    log::info!("Slot '{}' boots from the next reset", slots.inactive.name);
+    log::info!(
+        "Capsule applied successfully: {} region(s) written to slot '{}'",
+        writes.len(),
+        slots.inactive.name
+    );
+    CapsuleResult::success(version)
+}
+
+/// Compare a written region with `expected`, in chunks.
+fn verify_region(
+    backend: &mut dyn CapsuleBackend,
+    region: &rmap::ApprovedRegion,
+    expected: &[u8],
+) -> Result<(), StorageError> {
+    let mut buffer = [0u8; 4096];
+    for (index, chunk) in expected.chunks(buffer.len()).enumerate() {
+        let read = &mut buffer[..chunk.len()];
+        backend.read_firmware_region(region.name.as_str(), (index * 4096) as u32, read)?;
+        if read != chunk {
+            return Err(StorageError::IoError);
+        }
+    }
+    Ok(())
+}
+
+/// Image offset of each region: the image is their concatenation in
+/// manifest order.
+fn image_offsets(regions: &[rmap::ApprovedRegion]) -> impl Iterator<Item = usize> + '_ {
+    regions.iter().scan(0usize, |start, region| {
+        let offset = *start;
+        *start += region.size as usize;
+        Some(offset)
+    })
 }
 
 /// Region indices with their image offsets (manifest order), the regions that
@@ -376,12 +477,7 @@ fn write_order(
     let holds_running = |region: &rmap::ApprovedRegion| {
         running.is_some_and(|at| at >= region.offset && at - region.offset < region.size)
     };
-    let mut order = alloc::vec::Vec::with_capacity(regions.len());
-    let mut start = 0usize;
-    for (index, region) in regions.iter().enumerate() {
-        order.push((index, start));
-        start += region.size as usize;
-    }
+    let mut order: alloc::vec::Vec<_> = image_offsets(regions).enumerate().collect();
     order.sort_by_key(|&(index, _)| holds_running(&regions[index]));
     order
 }
@@ -405,7 +501,7 @@ fn guid_matches(guid: &r_efi::efi::Guid, bytes: &[u8; 16]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::{FirmwareInfo, FmapRegion, StorageError};
+    use crate::platform::{FirmwareInfo, FirmwareSlots, FmapRegion, StorageError};
     use alloc::vec::Vec;
     use r_efi::efi::Guid;
 
@@ -460,6 +556,172 @@ mod tests {
             write_order(&regions, Some(0x101_0000)),
             [(1, 0x10_0000), (0, 0)]
         );
+    }
+
+    /// An A/B backend over a RAM "flash" that records what it is asked to do.
+    struct SlotBackend {
+        flash: Vec<u8>,
+        regions: Vec<FmapRegion>,
+        slots: FirmwareSlots,
+        /// Corrupt this flash offset after each write (a bad read-back).
+        corrupt: Option<usize>,
+        activated: Vec<heapless::String<32>>,
+    }
+
+    fn fmap(name: &str, offset: u32, size: u32) -> FmapRegion {
+        let mut region_name = heapless::String::new();
+        region_name.push_str(name).unwrap();
+        FmapRegion {
+            name: region_name,
+            offset,
+            size,
+        }
+    }
+
+    impl SlotBackend {
+        fn new() -> Self {
+            let regions = alloc::vec![
+                fmap("A", 0x1000, 0x1000),
+                fmap("B", 0x2000, 0x1000),
+                fmap("SHARED", 0x3000, 0x1000),
+                fmap("BOTH", 0x1000, 0x2000),
+            ];
+            Self {
+                flash: alloc::vec![0xff; 0x4000],
+                slots: FirmwareSlots {
+                    running: regions[0].clone(),
+                    inactive: regions[1].clone(),
+                },
+                regions,
+                corrupt: None,
+                activated: Vec::new(),
+            }
+        }
+
+        fn region(&self, name: &str) -> Result<&FmapRegion, StorageError> {
+            self.regions
+                .iter()
+                .find(|region| region.name == name)
+                .ok_or(StorageError::InvalidArgument)
+        }
+    }
+
+    impl CapsuleBackend for SlotBackend {
+        fn firmware_info(&self) -> Option<&FirmwareInfo> {
+            None
+        }
+
+        fn capsule_trust_store(&self) -> &[&[u8]] {
+            &[]
+        }
+
+        fn write_firmware_region(
+            &mut self,
+            region_name: &str,
+            offset: u32,
+            data: &[u8],
+        ) -> Result<(), StorageError> {
+            let at = (self.region(region_name)?.offset + offset) as usize;
+            self.flash[at..at + data.len()].copy_from_slice(data);
+            if let Some(corrupt) = self.corrupt {
+                self.flash[corrupt] ^= 0xff;
+            }
+            Ok(())
+        }
+
+        fn read_firmware_region(
+            &mut self,
+            region_name: &str,
+            offset: u32,
+            buffer: &mut [u8],
+        ) -> Result<(), StorageError> {
+            let at = (self.region(region_name)?.offset + offset) as usize;
+            buffer.copy_from_slice(&self.flash[at..at + buffer.len()]);
+            Ok(())
+        }
+
+        fn fmap_regions(&mut self) -> &[FmapRegion] {
+            &self.regions
+        }
+
+        fn firmware_slots(&mut self) -> Option<FirmwareSlots> {
+            Some(self.slots.clone())
+        }
+
+        fn activate_slot(&mut self, slot: &FmapRegion) -> Result<(), StorageError> {
+            self.activated.push(slot.name.clone());
+            Ok(())
+        }
+    }
+
+    fn approved(backend: &SlotBackend, names: &[&str]) -> Vec<rmap::ApprovedRegion> {
+        names
+            .iter()
+            .map(|name| {
+                let fmap = backend.region(name).unwrap();
+                region(name, fmap.offset, fmap.size)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_b_updates_write_only_regions_inside_the_inactive_slot() {
+        for outside in ["SHARED", "BOTH"] {
+            let mut backend = SlotBackend::new();
+            let slots = backend.slots.clone();
+            let regions = approved(&backend, &["B", outside]);
+            let image = alloc::vec![0x5a; 0x1000 + regions[1].size as usize];
+            let result = apply_to_inactive_slot(&mut backend, &slots, &regions, &image, 7);
+            assert_eq!(
+                result.status,
+                CapsuleResultStatus::ErrorInvalidImage,
+                "{outside}"
+            );
+            assert!(backend.flash.iter().all(|&byte| byte == 0xff), "{outside}");
+            assert!(backend.activated.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_b_updates_skip_the_running_slot_and_need_an_inactive_image() {
+        let mut backend = SlotBackend::new();
+        let slots = backend.slots.clone();
+        let regions = approved(&backend, &["A"]);
+        let result = apply_to_inactive_slot(&mut backend, &slots, &regions, &[0x11; 0x1000], 7);
+        assert_eq!(result.status, CapsuleResultStatus::ErrorInvalidImage);
+        assert!(backend.flash.iter().all(|&byte| byte == 0xff));
+    }
+
+    #[test]
+    fn a_slot_is_activated_only_after_read_back_and_a_stored_trial() {
+        // A bad read-back stops before the trial record and the activation.
+        let mut backend = SlotBackend::new();
+        backend.corrupt = Some(0x2010);
+        let slots = backend.slots.clone();
+        let regions = approved(&backend, &["A", "B"]);
+        let mut image = alloc::vec![0x11; 0x1000];
+        image.extend_from_slice(&[0x22; 0x1000]);
+        let result = apply_to_inactive_slot(&mut backend, &slots, &regions, &image, 7);
+        assert_eq!(result.status, CapsuleResultStatus::ErrorFlashWriteFailed);
+        assert!(backend.activated.is_empty());
+        // The running slot was never written.
+        assert!(
+            backend.flash[0x1000..0x2000]
+                .iter()
+                .all(|&byte| byte == 0xff)
+        );
+
+        // Without a variable store the trial record cannot be stored, so the
+        // written slot stays inactive.
+        backend.corrupt = None;
+        let result = apply_to_inactive_slot(&mut backend, &slots, &regions, &image, 7);
+        assert_eq!(result.status, CapsuleResultStatus::Error);
+        assert!(
+            backend.flash[0x2000..0x3000]
+                .iter()
+                .all(|&byte| byte == 0x22)
+        );
+        assert!(backend.activated.is_empty());
     }
 
     /// A capsule of `wrappers` nested capsule-on-disk headers around an

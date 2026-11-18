@@ -57,6 +57,26 @@ pub use result::{CapsuleResult, CapsuleResultStatus};
 ///
 /// The number of capsules successfully applied. If any capsule was applied,
 /// the caller should trigger a system reset.
+/// Whether this boot started with a capsule-on-disk request, before capsule
+/// processing cleared it. Backends whose slots may only change in a
+/// capsule-update boot can ask this. Set by [`latch_update_boot`].
+static UPDATE_BOOT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Record whether this is a capsule-update boot; call once before
+/// [`trial::check`] and [`process_pending_capsules`].
+#[cfg(feature = "capsule-update")]
+pub fn latch_update_boot() {
+    UPDATE_BOOT.store(
+        disk::is_file_capsule_delivery_requested(),
+        core::sync::atomic::Ordering::Release,
+    );
+}
+
+/// See [`latch_update_boot`].
+pub fn update_boot() -> bool {
+    UPDATE_BOOT.load(core::sync::atomic::Ordering::Acquire)
+}
+
 #[cfg(feature = "capsule-update")]
 pub fn process_pending_capsules(backend: &mut dyn CapsuleBackend) -> usize {
     let mut applied_count = 0;

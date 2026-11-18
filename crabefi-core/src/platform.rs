@@ -454,13 +454,20 @@ pub struct FmapRegion {
     pub size: u32,
 }
 
-/// Firmware slots of a platform that boots one of several copies (A/B).
+/// Firmware slots of a platform that boots one of two copies (A/B).
+///
+/// Each slot is a flash range. In A/B mode a capsule may only write regions
+/// that lie entirely inside the inactive slot; regions inside the running
+/// slot are skipped and anything else is rejected, so the running copy and
+/// shared regions are never touched. The regions need not come from an
+/// on-flash FMAP: a platform without one describes its layout through
+/// [`CapsuleBackend::fmap_regions`] and these slots.
 #[derive(Debug, Clone)]
 pub struct FirmwareSlots {
-    /// FMAP region of the running copy; a capsule never writes it.
-    pub running: heapless::String<32>,
-    /// FMAP region a capsule writes and then activates.
-    pub inactive: heapless::String<32>,
+    /// The copy that booted; a capsule never writes it.
+    pub running: FmapRegion,
+    /// The copy a capsule writes and then activates.
+    pub inactive: FmapRegion,
 }
 
 /// Capsule update backend.
@@ -513,14 +520,38 @@ pub trait CapsuleBackend {
     }
 
     /// A/B firmware slots, if the platform boots by slot. A capsule then
-    /// writes only the inactive slot and activates it; the running copy stays
-    /// as the fallback.
+    /// writes only the inactive slot, reads it back, records a trial and
+    /// activates the slot; the running copy stays as the fallback.
+    ///
+    /// CrabEFI counts the trial boots of the new slot and rolls back when the
+    /// OS does not confirm it. It can only do that when the new firmware
+    /// reaches CrabEFI: a slot that hangs earlier needs the platform's own
+    /// fallback (its slot selector or a watchdog) to boot the other copy.
     fn firmware_slots(&mut self) -> Option<FirmwareSlots> {
         None
     }
 
-    /// Boot the slot in `region_name` from the next reset on.
-    fn activate_slot(&mut self, _region_name: &str) -> Result<(), StorageError> {
+    /// Read back `buffer.len()` bytes at `offset` within the named region.
+    /// Required in A/B mode: a slot is only activated once its contents match
+    /// the authenticated image.
+    fn read_firmware_region(
+        &mut self,
+        _region_name: &str,
+        _offset: u32,
+        _buffer: &mut [u8],
+    ) -> Result<(), StorageError> {
+        Err(StorageError::NotSupported)
+    }
+
+    /// Boot `slot` from the next reset on. CrabEFI calls this only after the
+    /// slot was written and verified and its trial record is stored, or to
+    /// roll back to the previous slot.
+    ///
+    /// Return [`StorageError::WriteProtected`] when slot selection can only
+    /// change in a capsule-update boot; CrabEFI then requests one and resets.
+    /// After any other error either slot may boot next: CrabEFI keeps the
+    /// trial record, and the next boot compares it with the slot that runs.
+    fn activate_slot(&mut self, _slot: &FmapRegion) -> Result<(), StorageError> {
         Err(StorageError::NotSupported)
     }
 }

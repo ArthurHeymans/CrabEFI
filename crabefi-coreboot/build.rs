@@ -129,12 +129,18 @@ fn embed_capsule_trust_store() {
         );
         println!("cargo:rerun-if-changed={}", path.display());
         println!("cargo:rerun-if-changed={}", resolved.display());
-        if let Some(directory) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        if let Some(directory) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             println!("cargo:rerun-if-changed={}", directory.display());
         }
         let copy = out.join(format!("capsule_trust_{index}.der"));
         std::fs::write(&copy, &der).expect("copy capsule trust certificate");
-        source.push_str(&format!("    include_bytes!({:?}),\n", copy.display().to_string()));
+        source.push_str(&format!(
+            "    include_bytes!({:?}),\n",
+            copy.display().to_string()
+        ));
     }
     source.push_str("];\n");
     std::fs::write(out.join("capsule_trust.rs"), source).expect("write capsule trust store");

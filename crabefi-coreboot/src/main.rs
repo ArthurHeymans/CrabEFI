@@ -20,9 +20,11 @@ extern crate alloc;
 static HOST_CHECK_ALLOCATOR: linked_list_allocator::LockedHeap =
     linked_list_allocator::LockedHeap::empty();
 
+#[cfg(feature = "ab-test-slots")]
+mod ab_test;
 #[cfg(not(target_arch = "riscv64"))]
 mod acpi;
-#[cfg(feature = "payload-mm")]
+#[cfg(all(feature = "payload-mm", not(feature = "ab-test-slots")))]
 mod amd_ab;
 #[cfg(target_arch = "aarch64")]
 #[path = "arch/aarch64/entry.rs"]
@@ -440,6 +442,8 @@ impl CorebootCapsuleBackend {
             return;
         }
         self.fmap_loaded = true;
+        #[cfg(feature = "ab-test-slots")]
+        self.fmap_regions.extend(ab_test::regions());
         // Payload MM owns the flash; the FMAP is read from the mapped flash.
         #[cfg(feature = "payload-mm")]
         if crabefi::efi::payload_mm::active()
@@ -484,6 +488,7 @@ impl CorebootCapsuleBackend {
 impl CorebootCapsuleBackend {
     /// AMD PSP A/B slot headers and the FMAP region of each slot: the largest
     /// area holding that slot's PSP L2 directory but not the other's.
+    #[cfg(not(feature = "ab-test-slots"))]
     fn slot_regions(&mut self) -> Option<([amd_ab::Ish; 2], [crabefi::FmapRegion; 2])> {
         if !crabefi::efi::payload_mm::active() {
             return None;
@@ -507,24 +512,12 @@ impl CorebootCapsuleBackend {
         let b = region_of(ishes[1].pl2, ishes[0].pl2)?;
         Some((ishes, [a, b]))
     }
-}
 
-// Capsule signing roots from CRABEFI_CAPSULE_TRUST_CERTS (build.rs).
-include!(concat!(env!("OUT_DIR"), "/capsule_trust.rs"));
-
-impl crabefi::CapsuleBackend for CorebootCapsuleBackend {
-    fn firmware_info(&self) -> Option<&crabefi::FirmwareInfo> {
-        self.firmware_info.as_ref()
-    }
-
-    fn capsule_trust_store(&self) -> &[&[u8]] {
-        CAPSULE_TRUST_STORE
-    }
-
-    #[cfg(feature = "payload-mm")]
-    fn firmware_slots(&mut self) -> Option<crabefi::FirmwareSlots> {
+    /// AMD PSP A/B: the running slot holds the CBFS coreboot booted from.
+    #[cfg(not(feature = "ab-test-slots"))]
+    fn psp_firmware_slots(&mut self) -> Option<crabefi::FirmwareSlots> {
         let (ishes, regions) = self.slot_regions()?;
-        let running = self.running_firmware_offset()?;
+        let running = crabefi::CapsuleBackend::running_firmware_offset(self)?;
         let index = regions
             .iter()
             .position(|region| (region.offset..region.offset + region.size).contains(&running))?;
@@ -536,19 +529,25 @@ impl crabefi::CapsuleBackend for CorebootCapsuleBackend {
             ishes[1 - index].priority
         );
         Some(crabefi::FirmwareSlots {
-            running: regions[index].name.clone(),
-            inactive: regions[1 - index].name.clone(),
+            running: regions[index].clone(),
+            inactive: regions[1 - index].clone(),
         })
     }
 
-    #[cfg(feature = "payload-mm")]
-    fn activate_slot(&mut self, region_name: &str) -> Result<(), crabefi::StorageError> {
+    /// AMD PSP A/B: raise the slot's directory priority over the other's.
+    /// Only a capsule-update boot may write the slot headers
+    /// (`WriteProtected` otherwise).
+    #[cfg(not(feature = "ab-test-slots"))]
+    fn psp_activate_slot(
+        &mut self,
+        slot: &crabefi::FmapRegion,
+    ) -> Result<(), crabefi::StorageError> {
         let (ishes, regions) = self
             .slot_regions()
             .ok_or(crabefi::StorageError::NotSupported)?;
         let target = regions
             .iter()
-            .position(|region| region.name.as_str() == region_name)
+            .position(|region| region.name == slot.name && region.offset == slot.offset)
             .ok_or(crabefi::StorageError::InvalidArgument)?;
         let boot_media = self
             .boot_media
@@ -605,6 +604,68 @@ impl crabefi::CapsuleBackend for CorebootCapsuleBackend {
             }
         }
         Ok(())
+    }
+}
+
+// Capsule signing roots from CRABEFI_CAPSULE_TRUST_CERTS (build.rs).
+include!(concat!(env!("OUT_DIR"), "/capsule_trust.rs"));
+
+impl crabefi::CapsuleBackend for CorebootCapsuleBackend {
+    fn firmware_info(&self) -> Option<&crabefi::FirmwareInfo> {
+        self.firmware_info.as_ref()
+    }
+
+    fn capsule_trust_store(&self) -> &[&[u8]] {
+        CAPSULE_TRUST_STORE
+    }
+
+    #[cfg(feature = "payload-mm")]
+    fn firmware_slots(&mut self) -> Option<crabefi::FirmwareSlots> {
+        #[cfg(feature = "ab-test-slots")]
+        return ab_test::firmware_slots(self);
+        #[cfg(not(feature = "ab-test-slots"))]
+        self.psp_firmware_slots()
+    }
+
+    #[cfg(feature = "payload-mm")]
+    fn activate_slot(&mut self, slot: &crabefi::FmapRegion) -> Result<(), crabefi::StorageError> {
+        #[cfg(feature = "ab-test-slots")]
+        return ab_test::activate_slot(self, slot);
+        #[cfg(not(feature = "ab-test-slots"))]
+        self.psp_activate_slot(slot)
+    }
+
+    fn read_firmware_region(
+        &mut self,
+        region_name: &str,
+        offset: u32,
+        buffer: &mut [u8],
+    ) -> Result<(), crabefi::StorageError> {
+        self.load_fmap();
+        let region = self
+            .fmap_regions
+            .iter()
+            .find(|region| region.name.as_str() == region_name)
+            .ok_or(crabefi::StorageError::InvalidArgument)?;
+        if u64::from(offset) + buffer.len() as u64 > u64::from(region.size) {
+            return Err(crabefi::StorageError::InvalidArgument);
+        }
+        let at = region.offset + offset;
+        #[cfg(feature = "payload-mm")]
+        if crabefi::efi::payload_mm::active() {
+            let boot_media = self
+                .boot_media
+                .ok_or(crabefi::StorageError::NotInitialized)?;
+            return if payload_mm::read_flash(boot_media, at, buffer) {
+                Ok(())
+            } else {
+                Err(crabefi::StorageError::IoError)
+            };
+        }
+        crabefi::efi::varstore::with_spi_storage_mut(|storage| {
+            crabefi::FirmwareStorage::read(storage.controller_mut(), u64::from(at), buffer)
+        })
+        .ok_or(crabefi::StorageError::NotInitialized)?
     }
 
     fn running_firmware_offset(&self) -> Option<u32> {

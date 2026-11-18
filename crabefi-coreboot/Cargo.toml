@@ -37,6 +37,9 @@ capsule-on-disk-only = []
 # Load crabefi-mm into coreboot-owned SMRAM (coreboot PAYLOAD_MM_INTERFACE);
 # needs CRABEFI_MM_ELF at build time.
 payload-mm = []
+# Test only: emulated A/B slots and selector in the payload MM fixture's
+# spare flash (ab-update-test).
+ab-test-slots = ["payload-mm"]
 # Test only: reset during deferred replay before acknowledging a record.
 replay-test-reset-after-persist = ["crabefi/replay-test-reset-after-persist"]
 # Test only: payload MM never confirms READY_TO_BOOT, which must stop the boot.

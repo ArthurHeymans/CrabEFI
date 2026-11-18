@@ -14,7 +14,7 @@ use super::disk;
 use super::result::{self, CapsuleResultStatus};
 use crate::efi::runtime_image::client::variables;
 use crate::logger::CRABEFI_SETTINGS_GUID;
-use crate::platform::{CapsuleBackend, StorageError};
+use crate::platform::{CapsuleBackend, FmapRegion, StorageError};
 
 /// Unconfirmed boots of the new slot before the previous one boots again.
 pub const MAX_ATTEMPTS: u8 = 3;
@@ -98,12 +98,14 @@ pub fn pending() -> bool {
     load().is_some()
 }
 
-/// Start the trial of `slot`, just activated with firmware `version`.
-pub fn start(slot: &str, version: u32) -> bool {
+/// Record the trial of `slot`, about to be activated with firmware
+/// `version`. Stored before the activation, so a reset in between leaves a
+/// record the next boot checks against the slot that actually runs.
+pub fn start(slot: &FmapRegion, version: u32) -> bool {
     // A confirmation left from an earlier update must not count.
     let _ = variables::delete(&CRABEFI_SETTINGS_GUID, &name(CONFIRM));
     let mut name = heapless::String::new();
-    name.push_str(slot).is_ok()
+    name.push_str(&slot.name).is_ok()
         && store(&Trial {
             attempts: 0,
             rollback: false,
@@ -132,24 +134,24 @@ pub fn check(backend: &mut dyn CapsuleBackend) -> bool {
         finish();
         return false;
     }
-    if slots.running != trial.slot {
+    if slots.running.name != trial.slot {
         log::error!(
             "Firmware {} in slot '{}' did not boot; running '{}'",
             trial.version,
             trial.slot,
-            slots.running
+            slots.running.name
         );
         failed(&trial);
         return false;
     }
     if trial.rollback || trial.attempts >= MAX_ATTEMPTS {
-        return match backend.activate_slot(slots.inactive.as_str()) {
+        return match backend.activate_slot(&slots.inactive) {
             Ok(()) => {
                 log::warn!(
                     "Firmware {} not confirmed after {} boots: slot '{}' boots again",
                     trial.version,
                     trial.attempts,
-                    slots.inactive
+                    slots.inactive.name
                 );
                 failed(&trial);
                 disk::clear_os_indications_capsule_bits();
@@ -173,7 +175,7 @@ pub fn check(backend: &mut dyn CapsuleBackend) -> bool {
             Err(error) => {
                 log::error!(
                     "Rolling back to slot '{}' failed: {:?}",
-                    slots.inactive,
+                    slots.inactive.name,
                     error
                 );
                 failed(&trial);
