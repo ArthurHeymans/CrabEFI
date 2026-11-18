@@ -131,6 +131,8 @@ proptest! {
         exercise_parsers(&bytes);
     }
 
+    // SignedData::parse ignores bytes after the outer SEQUENCE, such as
+    // WIN_CERTIFICATE alignment padding; a certificate must be exact.
     #[test]
     fn only_cms_allows_a_suffix(suffix in prop::collection::vec(any::<u8>(), 1..65)) {
         for &fixture in CERTIFICATES {
