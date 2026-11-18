@@ -89,6 +89,7 @@ jobs:
           cd "$HOME"
           cargo test --manifest-path "$GITHUB_WORKSPACE/crabefi-runtime-abi/Cargo.toml"
           cargo test --manifest-path "$GITHUB_WORKSPACE/crabefi-runtime-image/Cargo.toml"
+          cargo test --manifest-path "$GITHUB_WORKSPACE/crabefi-runtime-image/Cargo.toml" --features secure-boot
           cargo test --manifest-path "$GITHUB_WORKSPACE/crabefi-runtime-bundle/Cargo.toml"
           cargo test --manifest-path "$GITHUB_WORKSPACE/xtask/Cargo.toml"
       - name: Check additive capability boundaries

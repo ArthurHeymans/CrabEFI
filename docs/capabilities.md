@@ -155,10 +155,10 @@ mutation. Capsule service availability requires a configured retained buffer,
 writable variable persistence for result recording, and a boot-time capsule
 backend; ESRT contents are a discovery table and never disable it.
 `QueryVariableInfo` still answers from the runtime RAM store when staging is
-disabled: volatile writes remain possible there and `SetVariable` stays the
-authority on NV failures. Existing-variable reads, volatile writes, time/reset
-and SVAM remain
-available; active boot-time NV backends still perform real writes. Disabling the
+disabled, and `SetVariable` stays the authority on NV failures. Runtime-visible
+volatile variables stay readable after ExitBootServices but, as UEFI requires,
+are writable only before it. Existing-variable reads, time/reset and SVAM
+remain available; active boot-time NV backends still perform real writes. Disabling the
 retained journal is **not** native runtime persistence, and is independent of
 Secure Boot and of fstart's final runtime-persistence policy. Full coreboot keeps
 its explicit nonzero retained-buffer configuration. A host must explicitly decide

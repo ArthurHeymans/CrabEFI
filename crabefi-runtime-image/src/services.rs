@@ -530,6 +530,9 @@ fn apply_variable(
         mut deferred,
     } = context;
     validate_set_arguments(request.attributes, request.data.len())?;
+    if !phase.boot_services() {
+        check_runtime_target(store, &request)?;
+    }
     if !phase.boot_services() && request.nonvolatile(store) {
         deferred
             .as_ref()
@@ -560,10 +563,17 @@ fn apply_variable(
         return Err(efi::Status::OUT_OF_RESOURCES);
     }
     if !phase.boot_services() {
-        let delete = verified.payload.is_empty() && !request.append();
-        check_runtime_access(store, &request, delete)?;
+        check_runtime_access(store, &request, verified.payload.is_empty())?;
     }
 
+    // As in EDK2, appending nothing to a variable that does not exist
+    // succeeds without creating it.
+    if request.append()
+        && verified.payload.is_empty()
+        && store.find(&request.guid, request.name, false).is_none()
+    {
+        return Ok(());
+    }
     let mut prepared = store.prepare(
         request.guid,
         request.name,
@@ -758,27 +768,51 @@ fn verify<'a>(
     })
 }
 
-/// After ExitBootServices only runtime-accessible variables may be written or
-/// deleted.
+const RUNTIME_WRITABLE: VariableAttributes =
+    VariableAttributes::NON_VOLATILE.union(VariableAttributes::RUNTIME_ACCESS);
+
+/// After ExitBootServices only non-volatile, runtime-accessible variables
+/// may be written, appended to or deleted (UEFI 2.10, 8.2). As in EDK2's
+/// `VariableServiceSetVariable`, the stored variable decides first, before any
+/// other check: boot-only variables are invisible at runtime and volatile ones
+/// read-only, so both answer `WRITE_PROTECTED` whatever the request says.
+/// Checking only the request let an append change a boot-only variable,
+/// because an append keeps the stored attributes.
+fn check_runtime_target(
+    store: &VariableStore,
+    request: &VariableRequest<'_>,
+) -> Result<(), efi::Status> {
+    if store
+        .find(&request.guid, request.name, false)
+        .is_some_and(|slot| !slot.attributes.contains(RUNTIME_WRITABLE))
+    {
+        return Err(efi::Status::WRITE_PROTECTED);
+    }
+    Ok(())
+}
+
+/// [`check_runtime_target`], then the request, as in EDK2: with nothing
+/// stored, a deletion fails with `NOT_FOUND` and an empty append succeeds
+/// without effect; otherwise a request that could only create a variable the
+/// runtime may not write fails with `INVALID_PARAMETER` (attributes 0 is a
+/// deletion). `payload_empty` refers to the authenticated payload.
 fn check_runtime_access(
     store: &VariableStore,
     request: &VariableRequest<'_>,
-    delete: bool,
+    payload_empty: bool,
 ) -> Result<(), efi::Status> {
-    if delete {
-        match store.find(&request.guid, request.name, false) {
-            Some(slot) if slot.attributes.contains(VariableAttributes::RUNTIME_ACCESS) => Ok(()),
-            Some(_) => Err(efi::Status::INVALID_PARAMETER),
-            None => Err(efi::Status::NOT_FOUND),
-        }
-    } else if !request
-        .attributes
-        .contains(VariableAttributes::RUNTIME_ACCESS)
-    {
-        Err(efi::Status::INVALID_PARAMETER)
-    } else {
-        Ok(())
+    check_runtime_target(store, request)?;
+    if payload_empty && store.find(&request.guid, request.name, false).is_none() {
+        return if request.append() {
+            Ok(())
+        } else {
+            Err(efi::Status::NOT_FOUND)
+        };
     }
+    if !request.attributes.is_empty() && !request.attributes.contains(RUNTIME_WRITABLE) {
+        return Err(efi::Status::INVALID_PARAMETER);
+    }
+    Ok(())
 }
 
 fn persist_through_bridge(
@@ -923,19 +957,32 @@ fn replay_record(
             return Ok(());
         }
     }
-    let result = VariableAttributes::from_bits(record.attributes)
-        .ok_or(efi::Status::INVALID_PARAMETER)
-        .and_then(|attributes| {
-            apply_variable(
-                VariableContext::boot(store, transaction, bridge),
-                VariableRequest {
-                    guid: record.guid.bytes,
-                    name,
-                    attributes,
-                    data: record.data,
-                },
-            )
-        });
+    let Some(attributes) = VariableAttributes::from_bits(record.attributes) else {
+        return replay_apply_result(Err(efi::Status::INVALID_PARAMETER), authenticated, deletion);
+    };
+    let request = VariableRequest {
+        guid: record.guid.bytes,
+        name,
+        attributes,
+        data: record.data,
+    };
+    // Only runtime writes are journaled, and replay runs with boot-time
+    // rights. Hold each record to the runtime rules against the imported
+    // store, so a record the runtime would refuse (one queued by an older
+    // runtime, or written into the journal directly) changes nothing.
+    // Consume it so later records still replay.
+    // A deletion record carries no payload; others carry data or an
+    // authenticated envelope.
+    if check_runtime_access(store, &request, deletion).is_err() {
+        return Ok(());
+    }
+    // An older runtime journaled an empty append to a missing variable as an
+    // empty raw write without APPEND_WRITE. Applying it would delete a
+    // variable of that name, or stall replay on NOT_FOUND; it meant nothing.
+    if !authenticated && !deletion && record.data.is_empty() {
+        return Ok(());
+    }
+    let result = apply_variable(VariableContext::boot(store, transaction, bridge), request);
     replay_apply_result(result, authenticated, deletion)
 }
 
@@ -1123,8 +1170,9 @@ fn variable_info(
     }
     validate_query_attributes(attributes, Phase::current().boot_services())?;
     let lease = state::lease()?;
-    // Without retained staging the RAM store still answers: volatile writes
-    // remain possible and SetVariable stays the authority on NV failures.
+    // Without retained staging the RAM store still answers: runtime-visible
+    // volatile variables stay readable (they are writable only before
+    // ExitBootServices) and SetVariable stays the authority on NV failures.
     // SAFETY: all required outputs were checked non-null.
     unsafe {
         maximum_variable_storage_size.write(VariableStore::maximum_storage());
@@ -2154,6 +2202,336 @@ mod tests {
                 )
             })
             .unwrap()
+    }
+
+    const TEST_GUID: [u8; 16] = [
+        0x3a, 0x1d, 0x56, 0x0b, 0x2b, 0x8f, 0x4c, 0x47, 0x9f, 0x0e, 0x52, 0x7b, 0x9d, 0x04, 0xb2,
+        0x31,
+    ];
+    const BOOT_ONLY: VariableAttributes =
+        VariableAttributes::NON_VOLATILE.union(VariableAttributes::BOOTSERVICE_ACCESS);
+    const VOLATILE_RT: VariableAttributes =
+        VariableAttributes::BOOTSERVICE_ACCESS.union(VariableAttributes::RUNTIME_ACCESS);
+
+    #[test]
+    fn runtime_writes_cannot_change_boot_services_only_variables() {
+        const NAME: &[u16] = &[b'B' as u16, b'o' as u16, b'o' as u16, b't' as u16];
+        let append = RAW_ATTRIBUTES | VariableAttributes::APPEND_WRITE;
+
+        let mut fixture = Fixture::retained();
+        assert_eq!(
+            fixture.write(Phase::BootActive, TEST_GUID, NAME, BOOT_ONLY, &[1]),
+            efi::Status::SUCCESS
+        );
+        for phase in [Phase::SealedPhysical, Phase::Virtual] {
+            for (attributes, data, status) in [
+                (append, &[2][..], efi::Status::WRITE_PROTECTED),
+                (RAW_ATTRIBUTES, &[2][..], efi::Status::WRITE_PROTECTED),
+                (RAW_ATTRIBUTES, &[][..], efi::Status::WRITE_PROTECTED),
+                (
+                    VariableAttributes::empty(),
+                    &[][..],
+                    efi::Status::WRITE_PROTECTED,
+                ),
+                (
+                    BOOT_ONLY | VariableAttributes::APPEND_WRITE,
+                    &[2][..],
+                    efi::Status::WRITE_PROTECTED,
+                ),
+                (BOOT_ONLY, &[2][..], efi::Status::WRITE_PROTECTED),
+            ] {
+                assert_eq!(
+                    fixture.write(phase, TEST_GUID, NAME, attributes, data),
+                    status,
+                    "{phase:?} {attributes:?} {data:?}"
+                );
+            }
+        }
+        let slot = fixture.store.find(&TEST_GUID, NAME, false).unwrap();
+        assert_eq!(slot.attributes, BOOT_ONLY);
+        assert_eq!(fixture.store.data(slot), Some(&[1][..]));
+        assert_eq!(
+            DeferredRegion::new(&mut fixture.buffer)
+                .replay(|_, _, _| panic!("a rejected runtime write was journaled")),
+            Ok(0)
+        );
+    }
+
+    /// The runtime guard on its own, for every stored and requested
+    /// attribute combination that matters.
+    #[test]
+    fn runtime_access_checks_the_stored_variable_and_the_request() {
+        const NAME: &[u16] = &[b'G' as u16];
+        let empty = VariableStore::new();
+        let check = |store: &VariableStore, attributes: VariableAttributes, payload_empty: bool| {
+            check_runtime_access(
+                store,
+                &VariableRequest {
+                    guid: TEST_GUID,
+                    name: NAME,
+                    attributes,
+                    data: &[],
+                },
+                payload_empty,
+            )
+        };
+        let append = RAW_ATTRIBUTES | VariableAttributes::APPEND_WRITE;
+        assert_eq!(check(&empty, RAW_ATTRIBUTES, false), Ok(()));
+        assert_eq!(check(&empty, append, false), Ok(()));
+        assert_eq!(
+            check(&empty, VOLATILE_RT, false),
+            Err(efi::Status::INVALID_PARAMETER)
+        );
+        assert_eq!(
+            check(&empty, BOOT_ONLY, false),
+            Err(efi::Status::INVALID_PARAMETER)
+        );
+        assert_eq!(
+            check(&empty, VariableAttributes::empty(), true),
+            Err(efi::Status::NOT_FOUND)
+        );
+        // With nothing stored, an empty request is a missing deletion or an
+        // empty append, whatever its attributes.
+        assert_eq!(
+            check(&empty, VOLATILE_RT, true),
+            Err(efi::Status::NOT_FOUND)
+        );
+        assert_eq!(
+            check(&empty, VOLATILE_RT | VariableAttributes::APPEND_WRITE, true),
+            Ok(())
+        );
+        for (stored, allowed) in [
+            (RAW_ATTRIBUTES, true),
+            (BOOT_ONLY, false),
+            (VOLATILE_RT, false),
+        ] {
+            let mut store = VariableStore::new();
+            let mut transaction = VariableTransaction::new();
+            assert_eq!(
+                store.import(&mut transaction, TEST_GUID, NAME, stored, &[1], None),
+                Ok(())
+            );
+            let expected = if allowed {
+                Ok(())
+            } else {
+                Err(efi::Status::WRITE_PROTECTED)
+            };
+            assert_eq!(check(&store, append, false), expected, "{stored:?}");
+            // The stored variable decides before the request's attributes.
+            assert_eq!(check(&store, stored, false), expected, "{stored:?}");
+            assert_eq!(check(&store, RAW_ATTRIBUTES, true), expected, "{stored:?}");
+            assert_eq!(
+                check(&store, VariableAttributes::empty(), true),
+                expected,
+                "{stored:?}"
+            );
+        }
+    }
+
+    /// Without a runtime NV backend, writes to a stored boot-only or
+    /// volatile variable still answer WRITE_PROTECTED, not UNSUPPORTED.
+    #[test]
+    fn write_protection_wins_over_a_missing_backend() {
+        const NAME: &[u16] = &[b'N' as u16, b'B' as u16];
+        for stored in [BOOT_ONLY, VOLATILE_RT] {
+            let mut store = VariableStore::new();
+            let mut transaction = VariableTransaction::new();
+            assert_eq!(
+                store.import(&mut transaction, TEST_GUID, NAME, stored, &[1], None),
+                Ok(())
+            );
+            let status = efi::status(apply_variable(
+                VariableContext {
+                    phase: Phase::SealedPhysical,
+                    ..VariableContext::boot(&mut store, &mut transaction, 0)
+                },
+                VariableRequest {
+                    guid: TEST_GUID,
+                    name: NAME,
+                    attributes: RAW_ATTRIBUTES,
+                    data: &[2],
+                },
+            ));
+            assert_eq!(status, efi::Status::WRITE_PROTECTED, "{stored:?}");
+        }
+    }
+
+    #[test]
+    fn volatile_variables_are_read_only_at_runtime() {
+        const NAME: &[u16] = &[b'V' as u16, b'o' as u16, b'l' as u16];
+        let mut fixture = Fixture::retained();
+        assert_eq!(
+            fixture.write(Phase::BootActive, TEST_GUID, NAME, VOLATILE_RT, &[1]),
+            efi::Status::SUCCESS
+        );
+        assert_eq!(
+            fixture.write(Phase::SealedPhysical, TEST_GUID, NAME, VOLATILE_RT, &[2]),
+            efi::Status::WRITE_PROTECTED
+        );
+        assert_eq!(
+            fixture.write(
+                Phase::SealedPhysical,
+                TEST_GUID,
+                NAME,
+                VariableAttributes::empty(),
+                &[]
+            ),
+            efi::Status::WRITE_PROTECTED
+        );
+        assert_eq!(
+            fixture.write(
+                Phase::SealedPhysical,
+                TEST_GUID,
+                &[b'N' as u16, b'e' as u16, b'w' as u16],
+                VOLATILE_RT,
+                &[1]
+            ),
+            efi::Status::INVALID_PARAMETER
+        );
+        let slot = fixture.store.find(&TEST_GUID, NAME, false).unwrap();
+        assert_eq!(fixture.store.data(slot), Some(&[1][..]));
+    }
+
+    #[test]
+    fn appending_nothing_does_not_create_a_variable() {
+        const NAME: &[u16] = &[
+            b'E' as u16,
+            b'm' as u16,
+            b'p' as u16,
+            b't' as u16,
+            b'y' as u16,
+        ];
+        let mut fixture = Fixture::retained();
+        for phase in [Phase::BootActive, Phase::SealedPhysical] {
+            assert_eq!(
+                fixture.write(
+                    phase,
+                    TEST_GUID,
+                    NAME,
+                    RAW_ATTRIBUTES | VariableAttributes::APPEND_WRITE,
+                    &[]
+                ),
+                efi::Status::SUCCESS
+            );
+            assert!(fixture.store.find(&TEST_GUID, NAME, false).is_none());
+        }
+    }
+
+    /// A journal record the runtime would have refused, such as an append
+    /// to a boot-only variable queued by an older runtime, is consumed on
+    /// replay without changing anything, and later records still apply.
+    #[test]
+    fn replay_drops_records_the_runtime_would_refuse() {
+        const BOOT_NAME: &[u16] = &[b'B' as u16, b'o' as u16, b'o' as u16, b't' as u16];
+        const RT_NAME: &[u16] = &[b'R' as u16, b'T' as u16];
+
+        let mut journal = Fixture::retained();
+        const EMPTY_NAME: &[u16] = &[b'E' as u16];
+        let records: [(&[u16], VariableAttributes, &[u8], bool); 5] = [
+            // What an older runtime queued for an NV|BS|RT|APPEND request.
+            (BOOT_NAME, BOOT_ONLY, &[1, 9], false),
+            (BOOT_NAME, VariableAttributes::empty(), &[], true),
+            // An older runtime's empty append to a missing variable, once for
+            // a name that is still missing and once for one created since.
+            (EMPTY_NAME, RAW_ATTRIBUTES, &[], false),
+            (RT_NAME, RAW_ATTRIBUTES, &[], false),
+            (
+                RT_NAME,
+                RAW_ATTRIBUTES | VariableAttributes::APPEND_WRITE,
+                &[7],
+                false,
+            ),
+        ];
+        for (name, attributes, data, deletion) in records {
+            DeferredRegion::new(&mut journal.buffer)
+                .queue_write(
+                    &mut journal.deferred_transaction,
+                    deferred::DeferredWrite {
+                        guid: TEST_GUID,
+                        name,
+                        attributes,
+                        data,
+                        timestamp: VariableTimestamp::default(),
+                        authenticated: false,
+                        deletion,
+                    },
+                )
+                .unwrap();
+        }
+
+        let mut reboot = Fixture::new();
+        assert_eq!(
+            reboot.write(Phase::BootActive, TEST_GUID, BOOT_NAME, BOOT_ONLY, &[1]),
+            efi::Status::SUCCESS
+        );
+        assert_eq!(
+            reboot.write(Phase::BootActive, TEST_GUID, RT_NAME, RAW_ATTRIBUTES, &[6]),
+            efi::Status::SUCCESS
+        );
+        assert_eq!(replay_into(&mut journal, &mut reboot, |_, _, _| {}), 5);
+        let slot = reboot.store.find(&TEST_GUID, BOOT_NAME, false).unwrap();
+        assert_eq!(slot.attributes, BOOT_ONLY);
+        assert_eq!(reboot.store.data(slot), Some(&[1][..]));
+        assert!(reboot.store.find(&TEST_GUID, EMPTY_NAME, false).is_none());
+        let slot = reboot.store.find(&TEST_GUID, RT_NAME, false).unwrap();
+        assert_eq!(reboot.store.data(slot), Some(&[6, 7][..]));
+    }
+
+    #[test]
+    fn appends_must_keep_the_attributes_of_the_variable() {
+        const GUID: [u8; 16] = [
+            0x7e, 0x41, 0x0c, 0x93, 0x5d, 0x2a, 0x4b, 0x1f, 0x8c, 0x66, 0x30, 0xe1, 0x4a, 0x92,
+            0x0d, 0x57,
+        ];
+        const NAME: &[u16] = &[b'L' as u16, b'o' as u16, b'g' as u16];
+
+        let mut fixture = Fixture::retained();
+        assert_eq!(
+            fixture.write(Phase::BootActive, GUID, NAME, BOOT_ONLY, &[1]),
+            efi::Status::SUCCESS
+        );
+        assert_eq!(
+            fixture.write(
+                Phase::BootActive,
+                GUID,
+                NAME,
+                RAW_ATTRIBUTES | VariableAttributes::APPEND_WRITE,
+                &[2]
+            ),
+            efi::Status::INVALID_PARAMETER
+        );
+        assert_eq!(
+            fixture.write(
+                Phase::BootActive,
+                GUID,
+                NAME,
+                BOOT_ONLY | VariableAttributes::APPEND_WRITE,
+                &[3]
+            ),
+            efi::Status::SUCCESS
+        );
+        let slot = fixture.store.find(&GUID, NAME, false).unwrap();
+        assert_eq!(slot.attributes, BOOT_ONLY);
+        assert_eq!(fixture.store.data(slot), Some(&[1, 3][..]));
+
+        // Runtime-accessible variables still take runtime appends.
+        const RT_NAME: &[u16] = &[b'R' as u16, b'T' as u16];
+        assert_eq!(
+            fixture.write(Phase::BootActive, GUID, RT_NAME, RAW_ATTRIBUTES, &[1]),
+            efi::Status::SUCCESS
+        );
+        assert_eq!(
+            fixture.write(
+                Phase::SealedPhysical,
+                GUID,
+                RT_NAME,
+                RAW_ATTRIBUTES | VariableAttributes::APPEND_WRITE,
+                &[2]
+            ),
+            efi::Status::SUCCESS
+        );
+        let slot = fixture.store.find(&GUID, RT_NAME, false).unwrap();
+        assert_eq!(fixture.store.data(slot), Some(&[1, 2][..]));
     }
 
     #[test]
