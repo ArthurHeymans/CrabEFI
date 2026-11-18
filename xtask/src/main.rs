@@ -406,6 +406,7 @@ fn cmd_build_with_entry(
 /// Payload Cargo features a test app needs beyond the default build.
 fn test_payload_features(app: &str) -> Vec<&'static str> {
     let mut features = match app {
+        "ab-update-test" => vec!["ab-test-slots"],
         "boot-policy-test" => vec!["usb-on-demand"],
         "fwui-test" => vec!["external-boot-setting"],
         "mm-seal-test" => vec!["payload-mm-test-lose-ready-to-boot"],
@@ -784,6 +785,11 @@ fn cmd_test(
 
     // Create temp dir for ROM and disk
     let temp_dir = tempfile::tempdir()?;
+
+    // The payload must trust the test capsule signer.
+    if app == "ab-update-test" {
+        qemu::ab_update::prepare_trust_root()?;
+    }
 
     // Prepare the ROM
     let firmware = if let Some(rom) = coreboot_rom {

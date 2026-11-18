@@ -39,6 +39,9 @@
             # (Rust has no riscv64gc-unknown-uefi target)
             pkgsCross.riscv64.buildPackages.binutils
 
+            # Test capsule signing (ab-update-test)
+            openssl
+
             # Compression/archive tools for firmware and SCT assets
             zstd
             p7zip

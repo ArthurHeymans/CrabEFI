@@ -788,7 +788,7 @@ fn mtools_dir_exists(disk_with_offset: &str, path: &str) -> Result<bool> {
     Ok(output.status.success())
 }
 
-fn create_mtools_dir(disk_with_offset: &str, path: &str) -> Result<()> {
+pub(crate) fn create_mtools_dir(disk_with_offset: &str, path: &str) -> Result<()> {
     // `mmd` fails when the directory already exists and offers no reliable way
     // to tell that apart from a real failure, so probe first and only create
     // when missing. Callers ensure parent directories repeatedly, so this needs

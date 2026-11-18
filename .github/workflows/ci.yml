@@ -239,7 +239,7 @@ jobs:
       - name: Install test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 mtools dosfstools zstd coreboot-utils
+          sudo apt-get install -y qemu-system-x86 mtools dosfstools zstd coreboot-utils openssl
       - name: Clippy on the payload MM build
         run: |
           cd "$GITHUB_WORKSPACE/crabefi-runtime-image"
@@ -257,6 +257,8 @@ jobs:
         run: ./crabefi test --app boot-policy-test --disable-kvm --timeout 180
       - name: Capsules through payload MM
         run: ./crabefi test --app capsule-test --disable-kvm --timeout 180
+      - name: A/B firmware updates, rollback and confirmation
+        run: ./crabefi test --app ab-update-test --disable-kvm --timeout 180
       - name: Secure Boot through payload MM
         run: ./crabefi test --app secure-boot-test --disable-kvm --timeout 180
   test-ahci:

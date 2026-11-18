@@ -11,6 +11,7 @@ use std::process::{Child, Command, Stdio};
 
 use crate::{Arch, Machine};
 
+pub(crate) mod ab_update;
 pub(crate) mod boot_policy;
 mod filesystem;
 mod fwui;
@@ -887,6 +888,9 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
     }
     if app_name == "boot-policy-test" {
         return boot_policy::run(config, disk_path);
+    }
+    if app_name == "ab-update-test" {
+        return ab_update::run(config, disk_path);
     }
     if app_name == "secure-boot-auth-test" {
         return secure_boot_auth::run(config, disk_path);
