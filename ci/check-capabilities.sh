@@ -20,14 +20,15 @@ if grep -E '^(rsa |crypto-bigint |allocator-api2 |sha2 )' "$TMP/runtime-tree"; t
     exit 1
 fi
 
-# Stack-backed schoolbook RSA replaced the allocator-backed fork: neither
-# may re-enter through any runtime capability on any target, since Cargo
-# resolves target-specific edges independently.
+# The runtime and boot verifiers share the small crabefi-pkcs7 parser. Guard
+# normal edges only: host-side tests may use independent implementations.
+LEGACY_AUTH='^(asn1 |cms |der |x509-cert |num-bigint(-dig)? )'
+# Check every runtime target; Cargo resolves target-specific edges separately.
 for target in x86_64-unknown-none aarch64-unknown-none riscv64gc-unknown-none-elf; do
     cargo tree --locked --manifest-path crabefi-runtime-image/Cargo.toml --target "$target" \
         --no-default-features --features full --edges normal --prefix none > "$TMP/runtime-full-tree"
-    if grep -E '^(crypto-bigint |allocator-api2 )' "$TMP/runtime-full-tree"; then
-        echo "Allocator-backed bigint fork present in the secure runtime for $target" >&2
+    if grep -E "$LEGACY_AUTH|^(rsa |crypto-bigint |allocator-api2 )" "$TMP/runtime-full-tree"; then
+        echo "Unexpected crypto dependency in the secure runtime for $target" >&2
         exit 1
     fi
 done
@@ -44,7 +45,7 @@ fi
 for features in secure-boot capsule-update; do
     cargo tree --locked -p crabefi-core --target x86_64-unknown-none --no-default-features \
         --features "$features" --edges normal --prefix none > "$TMP/auth-tree"
-    if grep -E '^(x509-cert |cms |num-bigint)' "$TMP/auth-tree"; then
+    if grep -E "$LEGACY_AUTH" "$TMP/auth-tree"; then
         echo "Legacy CMS/X.509 framework present under feature $features" >&2
         exit 1
     fi

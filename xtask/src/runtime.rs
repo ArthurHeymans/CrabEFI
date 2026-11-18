@@ -406,9 +406,18 @@ fn normalize(
         .collect();
     write_json(output.join("sections.json"), &json!(section_report))?;
     write_json(output.join("relocations.json"), &json!(relocation_report))?;
+    // Sum executable sections, including architecture-specific text sections.
+    let text_size = file
+        .sections()
+        .filter(|section| {
+            matches!(section.flags(), object::SectionFlags::Elf { sh_flags, .. }
+                if sh_flags.0 & object::elf::SHF_EXECINSTR.0 != 0)
+        })
+        .map(|section| section.size())
+        .sum::<u64>();
     write_json(
         output.join("size.json"),
-        &json!({ "elf": elf_bytes.len(), "normalized": normalized.len(), "memory": image_size }),
+        &json!({ "elf": elf_bytes.len(), "normalized": normalized.len(), "memory": image_size, "text": text_size }),
     )?;
     write_json(
         output.join("build.json"),
@@ -435,6 +444,13 @@ fn normalize(
         anyhow::anyhow!("normalized runtime image failed ABI self-validation: {error}")
     })?;
     run_audit_tools(elf_path, output, arch, relocations.len())?;
+    println!(
+        "Runtime size ({}, {}): {} bytes normalized, {} bytes executable sections",
+        arch.dir_name(),
+        if secure_boot { "secure boot" } else { "basic" },
+        normalized.len(),
+        text_size,
+    );
     Ok(RuntimeArtifact {
         image: image_path,
         digest,

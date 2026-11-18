@@ -8,3 +8,6 @@ description = "Allocation-free DER, X.509, PKCS#7 SignedData and RSA PKCS#1 v1.5
 
 [dependencies]
 sha2 = { version = "0.11", default-features = false }
+
+[dev-dependencies]
+proptest = { version = "1.10", default-features = false, features = ["std"] }

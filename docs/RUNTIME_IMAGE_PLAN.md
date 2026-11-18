@@ -149,6 +149,13 @@ section and relocation manifests, digest, size report, disassembly, and stack
 report. The reports are derived from the built image: undefined imports,
 relocation metadata/counts, indirect-call bounds, native relocation domains,
 and stack budget are enforced rather than represented by placeholder JSON.
+When evaluating changes to the verifier, compare `size.json` for the same
+architecture and capability profile: `normalized` is the packaged image size,
+and `text` is the sum of executable ELF section sizes, both in bytes.
+
+Run `cargo test -p crabefi-pkcs7` for host-only parser property tests over
+arbitrary bytes, fixture prefixes, and mutated fixtures. The test dependencies
+are not linked into the firmware or runtime image.
 
 The repository verifies ABI parsing/relocation fixtures, authenticated-variable
 and deferred-journal host tests, adversarial host tests for the bounded PKCS#7
