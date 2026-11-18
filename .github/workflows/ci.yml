@@ -219,6 +219,44 @@ jobs:
         run: ./crabefi test --app runtime-image-test --disable-kvm --timeout 120
       - name: Test on-demand USB and the external boot policy
         run: ./crabefi test --app boot-policy-test --disable-kvm --timeout 120
+  test-payload-mm:
+    name: Test x86_64 (payload MM)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: build
+    env:
+      # Variables and firmware writes go through crabefi-mm in SMM; the flash
+      # only accepts writes from SMM (firmware/coreboot-qemu-q35-payload-mm).
+      CRABEFI_PAYLOAD_MM: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchains
+        uses: ./.github/actions/setup-rust
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 mtools dosfstools zstd coreboot-utils
+      - name: Clippy on the payload MM build
+        run: |
+          cd "$GITHUB_WORKSPACE/crabefi-runtime-image"
+          cargo -Z build-std=core,compiler_builtins \
+            -Z build-std-features=compiler-builtins-mem \
+            clippy --release --target x86_64-unknown-none --no-default-features --features mm \
+            -- -D warnings
+      - name: Runtime services and deferred replay through payload MM
+        run: ./crabefi test --app runtime-image-test --disable-kvm --timeout 180
+      - name: Firmware-only MM commands are closed to boot options
+        run: ./crabefi test --app mm-gate-test --disable-kvm --timeout 180
+      - name: A lost READY_TO_BOOT stops the boot
+        run: ./crabefi test --app mm-seal-test --disable-kvm --timeout 60
+      - name: Boot policy with SMM-only flash writes
+        run: ./crabefi test --app boot-policy-test --disable-kvm --timeout 180
+      - name: Capsules through payload MM
+        run: ./crabefi test --app capsule-test --disable-kvm --timeout 180
+      - name: Secure Boot through payload MM
+        run: ./crabefi test --app secure-boot-test --disable-kvm --timeout 180
   test-ahci:
     name: Test x86_64 (AHCI Storage)
     runs-on: ubuntu-latest

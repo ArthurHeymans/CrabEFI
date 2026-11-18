@@ -59,14 +59,15 @@ fn prepare_rom_x86_64(crabefi_elf: &Path, output_dir: &Path) -> Result<PreparedF
             tfa_flash: None,
         });
     }
-    let compressed_rom = project_root().join("firmware/coreboot-qemu-q35.rom.zst");
+    // Payload MM runs need coreboot's payload MM interface (see firmware/README.md).
+    let compressed_rom = project_root().join(if std::env::var_os("CRABEFI_PAYLOAD_MM").is_some() {
+        "firmware/coreboot-qemu-q35-payload-mm.rom.zst"
+    } else {
+        "firmware/coreboot-qemu-q35.rom.zst"
+    });
 
     if !compressed_rom.exists() {
-        bail!(
-            "Base coreboot ROM not found: {}\n\
-            Please ensure firmware/coreboot-qemu-q35.rom.zst exists",
-            compressed_rom.display()
-        );
+        bail!("Base coreboot ROM not found: {}", compressed_rom.display());
     }
 
     // Decompress the ROM

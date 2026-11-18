@@ -1,0 +1,39 @@
+From 10ef5cd456c926dd70186dca9340061f3e21516d Mon Sep 17 00:00:00 2001
+From: Arthur Heymans <arthur@aheymans.xyz>
+Date: Wed, 18 Nov 2026 17:40:20 +0100
+Subject: [PATCH 2/3] drivers/efi/capsules: Do not coalesce capsules into
+ reserved RAM
+
+The capsule memory map takes every cacheable resource as RAM, including
+reserved RAM ranges such as TSEG. With TSEG on QEMU q35, which sits
+above CBMEM in a reserved RAM resource, the coalescing buffer lands in
+SMRAM: ramstage writes there are dropped once TSEG is enabled and the
+payload reads back garbage.
+
+Add the reserved resources on top, as bootmem does.
+
+TEST=CrabEFI runtime-image-test with CRABEFI_PAYLOAD_MM=1 on QEMU q35
+(SMM in TSEG): capsules are coalesced below CBMEM and consumed.
+
+Signed-off-by: Arthur Heymans <arthur@aheymans.xyz>
+---
+ src/drivers/efi/capsules.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/src/drivers/efi/capsules.c b/src/drivers/efi/capsules.c
+index c53e1b0246..0d2769200d 100644
+--- a/src/drivers/efi/capsules.c
++++ b/src/drivers/efi/capsules.c
+@@ -722,6 +722,9 @@ void efi_parse_capsules(void)
+ 		       IORESOURCE_ASSIGNED | IORESOURCE_CACHEABLE, IORESOURCE_MEM |
+ 		       IORESOURCE_FIXED | IORESOURCE_STORED | IORESOURCE_ASSIGNED |
+ 		       IORESOURCE_CACHEABLE, BM_MEM_RAM);
++	/* Like bootmem: reserved RAM (e.g. TSEG) is not usable for capsules. */
++	memranges_add_resources(&memory_map, IORESOURCE_RESERVE, IORESOURCE_RESERVE,
++				BM_MEM_RESERVED);
+ 
+ 	if (ENV_X86_32)
+ 		init_pae_pagetables(&pae_page_tables);
+-- 
+2.56.0
+

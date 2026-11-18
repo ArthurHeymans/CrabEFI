@@ -180,16 +180,9 @@ fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
     ))
 }
 
-/// Visit every FMAP area (name, offset, size) in the memory-mapped flash.
-pub fn for_each_fmap_area(
-    boot_media: BootMediaInfo,
-    mut f: impl FnMut(&str, u32, u32),
-) -> Option<()> {
-    let base = match MAPPED_BASE.load(core::sync::atomic::Ordering::Acquire) {
-        0 => flash_mapping(boot_media, None)?.0,
-        base => base,
-    };
-    let fmap = (base + boot_media.fmap_offset) as *const u8;
+/// Visit every FMAP area (name, offset, size) of the FMAP at `fmap` in the
+/// memory-mapped flash.
+fn walk_fmap(fmap: *const u8, mut f: impl FnMut(&[u8], u32, u32)) -> Option<()> {
     let read = |offset: usize, buf: &mut [u8]| {
         for (i, byte) in buf.iter_mut().enumerate() {
             // SAFETY: the FMAP lies in the memory-mapped flash coreboot described.
@@ -207,38 +200,36 @@ pub fn for_each_fmap_area(
         read(56 + i * 42, &mut area);
         let name = &area[8..40];
         let len = name.iter().position(|&b| b == 0).unwrap_or(32);
-        if let Ok(name) = core::str::from_utf8(&name[..len]) {
-            f(name, read_u32(&area, 0)?, read_u32(&area, 4)?);
-        }
+        f(&name[..len], read_u32(&area, 0)?, read_u32(&area, 4)?);
     }
     Some(())
 }
 
+/// Visit every FMAP area (name, offset, size) in the memory-mapped flash.
+pub fn for_each_fmap_area(
+    boot_media: BootMediaInfo,
+    mut f: impl FnMut(&str, u32, u32),
+) -> Option<()> {
+    let base = match MAPPED_BASE.load(core::sync::atomic::Ordering::Acquire) {
+        0 => flash_mapping(boot_media, None)?.0,
+        base => base,
+    };
+    walk_fmap((base + boot_media.fmap_offset) as *const u8, |name, offset, size| {
+        if let Ok(name) = core::str::from_utf8(name) {
+            f(name, offset, size);
+        }
+    })
+}
+
 /// Find an FMAP area (offset, size) in the memory-mapped flash.
 fn fmap_area(flash_base: u64, fmap_offset: u64, name: &[u8]) -> Option<(u64, u64)> {
-    let fmap = (flash_base + fmap_offset) as *const u8;
-    let read = |offset: usize, buf: &mut [u8]| {
-        for (i, byte) in buf.iter_mut().enumerate() {
-            // SAFETY: the FMAP lies in the memory-mapped flash coreboot described.
-            *byte = unsafe { read_volatile(fmap.add(offset + i)) };
+    let mut found = None;
+    walk_fmap((flash_base + fmap_offset) as *const u8, |area, offset, size| {
+        if found.is_none() && area == name {
+            found = Some((u64::from(offset), u64::from(size)));
         }
-    };
-    let mut header = [0u8; 56];
-    read(0, &mut header);
-    if &header[..8] != b"__FMAP__" {
-        return None;
-    }
-    let areas = u16::from_le_bytes([header[54], header[55]]) as usize;
-    for i in 0..areas.min(64) {
-        let mut area = [0u8; 42];
-        read(56 + i * 42, &mut area);
-        let area_name = &area[8..40];
-        let len = area_name.iter().position(|&b| b == 0).unwrap_or(32);
-        if &area_name[..len] == name {
-            return Some((read_u32(&area, 0)? as u64, read_u32(&area, 4)? as u64));
-        }
-    }
-    None
+    })?;
+    found
 }
 
 /// Load the MM image into SMRAM; it then owns the variable store. Returns an
@@ -264,6 +255,14 @@ pub fn load(
     MAPPED_BASE.store(flash_base, core::sync::atomic::Ordering::Release);
     let (store_offset, store_size) = fmap_area(flash_base, boot_media.fmap_offset, b"SMMSTORE")
         .ok_or("no SMMSTORE FMAP area")?;
+    if store_size < crabefi::efi::payload_mm::MIN_STORE_SIZE || (store_size / 2) % 4096 != 0 {
+        log::error!(
+            "payload MM: SMMSTORE is {:#x} bytes; the MM store needs at least {:#x}, in two halves of whole 4 KiB blocks",
+            store_size,
+            crabefi::efi::payload_mm::MIN_STORE_SIZE
+        );
+        return Err("SMMSTORE is too small for the payload MM store");
+    }
 
     // Blob: "CRABMMI\0", file size, memory size, entry, relocation count, relocations, image.
     let image = MM_IMAGE;

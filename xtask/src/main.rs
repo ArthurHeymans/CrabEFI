@@ -408,6 +408,7 @@ fn test_payload_features(app: &str) -> &'static [&'static str] {
     match app {
         "boot-policy-test" => &["usb-on-demand"],
         "fwui-test" => &["external-boot-setting"],
+        "mm-seal-test" => &["payload-mm-test-lose-ready-to-boot"],
         _ => &[],
     }
 }
@@ -494,6 +495,7 @@ fn cmd_build_payload(
             .last()
             .unwrap_or_default()
             .to_string();
+        runtime::audit_mm_image(Path::new(&elf))?;
         cmd.env("CRABEFI_MM_ELF", elf);
         features.push("payload-mm");
     }
@@ -929,10 +931,13 @@ fn cmd_test(
         }
     } else {
         // ── Normal UEFI test app ─────────────────────────────────────
-        println!("Building test app: {}", app);
-        cmd_build_test_app(app, arch)?;
+        // mm-seal-test boots hello on a payload whose MM never closes the
+        // firmware phase: hello must never run.
+        let efi_app = if app == "mm-seal-test" { "hello" } else { app };
+        println!("Building test app: {}", efi_app);
+        cmd_build_test_app(efi_app, arch)?;
 
-        let efi_path = find_test_app_efi(app, arch)?;
+        let efi_path = find_test_app_efi(efi_app, arch)?;
 
         if app == "directory-test" {
             disk::create_directory_test_disk(

@@ -907,6 +907,28 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
                 failed += 1;
             }
         }
+        "mm-seal-test" => {
+            if std::env::var_os("CRABEFI_PAYLOAD_MM").is_none() {
+                bail!("mm-seal-test needs CRABEFI_PAYLOAD_MM=1");
+            }
+            if result
+                .output
+                .contains("payload MM did not end the firmware phase")
+            {
+                println!("[PASS] mm_seal_refused: the boot stopped when MM did not confirm READY_TO_BOOT");
+                passed += 1;
+            } else {
+                println!("[FAIL] mm_seal_refused: no refusal logged");
+                failed += 1;
+            }
+            if result.output.contains("Hello from CrabEFI!") {
+                println!("[FAIL] mm_seal_no_app: the boot option ran with MM's firmware phase open");
+                failed += 1;
+            } else {
+                println!("[PASS] mm_seal_no_app: no boot option ran");
+                passed += 1;
+            }
+        }
         "hello" => {
             // Test 1: Check if "Hello from CrabEFI!" appears
             if result.output.contains("Hello from CrabEFI!") {

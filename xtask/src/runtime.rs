@@ -794,6 +794,32 @@ fn audit_indirect_calls(arch: Arch, text: &str) -> Result<CallAudit> {
     Ok(audit)
 }
 
+/// The panic checks of the runtime audit for the payload MM build: a panic
+/// in SMM stops the whole machine, so no service path may reach one.
+pub fn audit_mm_image(elf_path: &Path) -> Result<()> {
+    let elf_bytes = fs::read(elf_path)
+        .with_context(|| format!("read payload MM ELF {}", elf_path.display()))?;
+    object::File::parse(elf_bytes.as_slice()).context("parse payload MM ELF")?;
+    // The panic handler stays linked for the freestanding build; any call
+    // into it or the core panic helpers from other code fails the audit.
+    let disassembly = Command::new(llvm_tool("llvm-objdump")?)
+        .args(["--disassemble", "--no-show-raw-insn"])
+        .arg(elf_path)
+        .output()
+        .context("llvm-objdump is required for payload MM auditing")?;
+    if !disassembly.status.success() {
+        bail!("llvm-objdump failed for the payload MM image");
+    }
+    let panic_calls = audit_reachable_panic_calls(&String::from_utf8_lossy(&disassembly.stdout));
+    if !panic_calls.is_empty() {
+        bail!(
+            "payload MM disassembly contains reachable Rust panic calls:\n{}",
+            panic_calls.join("\n")
+        );
+    }
+    Ok(())
+}
+
 fn run_audit_tools(elf: &Path, output: &Path, arch: Arch, relocation_slots: usize) -> Result<()> {
     let disassembly = Command::new(llvm_tool("llvm-objdump")?)
         .args(["--disassemble", "--no-show-raw-insn"])
