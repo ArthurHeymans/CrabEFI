@@ -56,12 +56,30 @@ fn certificates(var: &str) -> Vec<String> {
                         path.display()
                     )
                 });
-            certificate.rsa_public_key().unwrap_or_else(|error| {
+            // The same limits the runtime verifier's parse_certificate()
+            // applies: sha256WithRSAEncryption, at most 4096-bit RSA.
+            let usable =
+                crabefi_pkcs7::x509::AlgorithmIdentifier::parse(certificate.signature_algorithm)
+                    .is_ok_and(|algorithm| {
+                        algorithm.is(crabefi_pkcs7::oid::SHA256_WITH_RSA_ENCRYPTION)
+                    });
+            assert!(
+                usable,
+                "{var}: {} is not signed with sha256WithRSAEncryption, which CrabEFI requires",
+                path.display()
+            );
+            let key = certificate.rsa_public_key().unwrap_or_else(|error| {
                 panic!(
                     "{var}: {} does not hold an RSA key CrabEFI can verify with: {error:?}",
                     path.display()
                 )
             });
+            assert!(
+                key.modulus.len() <= 512
+                    && key.exponent().is_some_and(|e| e <= u64::from(u32::MAX)),
+                "{var}: {} holds an RSA key larger than 4096 bits or with an unusable exponent",
+                path.display()
+            );
             println!("cargo:rerun-if-changed={}", path.display());
             format!("include_bytes!({:?})", path.display().to_string())
         })

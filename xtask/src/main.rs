@@ -742,6 +742,11 @@ fn cmd_test(
     windows_media_dir: Option<PathBuf>,
     windows_success_markers: Vec<String>,
 ) -> Result<()> {
+    // Payload MM persists runtime writes at once; there is no journal
+    // replay to interrupt. Refuse before building or booting anything.
+    if app == "runtime-replay-interrupt-test" && std::env::var_os("CRABEFI_PAYLOAD_MM").is_some() {
+        bail!("runtime-replay-interrupt-test needs the retained journal, not payload MM");
+    }
     let storage = if ahci {
         qemu::StorageType::Ahci
     } else if nvme {

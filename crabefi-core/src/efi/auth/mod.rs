@@ -156,6 +156,20 @@ pub fn is_secure_boot_enabled() -> bool {
     }
 }
 
+/// Whether SecureBoot reads back as 1. Unlike [`is_secure_boot_enabled`], a
+/// failed read counts as not enforcing: for checks that must see enforcement
+/// confirmed before they let anything run.
+#[cfg(feature = "secure-boot")]
+pub fn is_secure_boot_enforcing_confirmed() -> bool {
+    matches!(
+        crate::efi::runtime_image::client::variables::try_get(
+            &Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID),
+            SECURE_BOOT_NAME,
+        ),
+        Ok(Some((_, data))) if data.first() == Some(&1)
+    )
+}
+
 /// Saved user preference, independent of whether a PK is enrolled.
 #[cfg(feature = "secure-boot")]
 pub fn is_secure_boot_requested() -> bool {

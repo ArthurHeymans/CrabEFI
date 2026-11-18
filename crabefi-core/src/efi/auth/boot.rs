@@ -464,18 +464,50 @@ fn next_firmware_timestamp(
     guid: &Guid,
     name: &[u16],
 ) -> Result<EfiTime, AuthError> {
-    let persisted = match crate::efi::varstore::persistence::try_get_variable_timestamp(guid, name)
-    {
-        Ok(timestamp) => timestamp.map(|t| utc_seconds(&efi_time_from_timestamp(t))),
-        // No durable store exists in this profile, so there is no persisted
-        // floor a new record could undercut; session issuance stays monotonic.
-        Err(crate::efi::varstore::VarStoreError::NotInitialized) => None,
-        // A durable store exists but its history is unreadable or malformed.
-        // Issuing from the build-date floor could append an older record and
-        // lower the replay floor, so refuse the write instead.
-        Err(_) => {
-            log::error!("Cannot read persisted timestamp history; refusing authenticated write");
-            return Err(AuthError::AccessDenied);
+    #[cfg(target_arch = "x86_64")]
+    let mm_floor = crate::efi::payload_mm::active().then(|| {
+        crate::efi::payload_mm::auth_timestamp(guid, name).map_err(|status| {
+            log::error!(
+                "Cannot read the MM timestamp floor ({status:?}); refusing authenticated write"
+            );
+            AuthError::AccessDenied
+        })
+    });
+    #[cfg(not(target_arch = "x86_64"))]
+    let mm_floor: Option<Result<Option<[u8; 16]>, AuthError>> = None;
+    // Payload MM holds the store: its floor, tombstones included, is the
+    // one a new record has to exceed.
+    let persisted = if let Some(floor) = mm_floor {
+        floor?.map(|bytes| {
+            utc_seconds(&EfiTime {
+                year: u16::from_le_bytes([bytes[0], bytes[1]]),
+                month: bytes[2],
+                day: bytes[3],
+                hour: bytes[4],
+                minute: bytes[5],
+                second: bytes[6],
+                nanosecond: u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
+                timezone: i16::from_le_bytes([bytes[12], bytes[13]]),
+                daylight: bytes[14],
+                pad1: 0,
+                pad2: 0,
+            })
+        })
+    } else {
+        match crate::efi::varstore::persistence::try_get_variable_timestamp(guid, name) {
+            Ok(timestamp) => timestamp.map(|t| utc_seconds(&efi_time_from_timestamp(t))),
+            // No durable store exists in this profile, so there is no persisted
+            // floor a new record could undercut; session issuance stays monotonic.
+            Err(crate::efi::varstore::VarStoreError::NotInitialized) => None,
+            // A durable store exists but its history is unreadable or malformed.
+            // Issuing from the build-date floor could append an older record and
+            // lower the replay floor, so refuse the write instead.
+            Err(_) => {
+                log::error!(
+                    "Cannot read persisted timestamp history; refusing authenticated write"
+                );
+                return Err(AuthError::AccessDenied);
+            }
         }
     };
     let mut issued = ISSUED_TIMESTAMPS.lock();

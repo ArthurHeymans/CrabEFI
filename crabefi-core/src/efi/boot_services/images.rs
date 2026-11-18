@@ -177,26 +177,32 @@ pub(super) extern "efiapi" fn load_image(
     // Secure Boot verification (if enabled). As UEFI requires for
     // SECURITY_VIOLATION, a rejected image is still loaded and gets a handle,
     // but StartImage refuses it.
+    // An enforced build verifies every image, so StartImage never sees one
+    // that was loaded unverified while enforcement happened to be off.
     #[cfg(feature = "secure-boot")]
-    let security_violation = super::super::auth::is_secure_boot_enabled() && {
-        log::debug!("BS.LoadImage: Secure Boot verification required");
-        match super::super::auth::verify_pe_image_secure_boot(data) {
-            Ok(true) => {
-                log::info!("BS.LoadImage: Secure Boot verification passed");
-                false
+    let security_violation = (cfg!(feature = "secure-boot-enforced")
+        || super::super::auth::is_secure_boot_enabled())
+        && {
+            log::debug!("BS.LoadImage: Secure Boot verification required");
+            match super::super::auth::verify_pe_image_secure_boot(data) {
+                Ok(true) => {
+                    log::info!("BS.LoadImage: Secure Boot verification passed");
+                    false
+                }
+                Ok(false) => {
+                    log::error!(
+                        "BS.LoadImage: Secure Boot verification FAILED - image not authorized"
+                    );
+                    crate::display_secure_boot_error();
+                    true
+                }
+                Err(e) => {
+                    log::error!("BS.LoadImage: Secure Boot verification error: {:?}", e);
+                    crate::display_secure_boot_error();
+                    true
+                }
             }
-            Ok(false) => {
-                log::error!("BS.LoadImage: Secure Boot verification FAILED - image not authorized");
-                crate::display_secure_boot_error();
-                true
-            }
-            Err(e) => {
-                log::error!("BS.LoadImage: Secure Boot verification error: {:?}", e);
-                crate::display_secure_boot_error();
-                true
-            }
-        }
-    };
+        };
     #[cfg(not(feature = "secure-boot"))]
     let security_violation = false;
 
@@ -463,7 +469,7 @@ pub(super) extern "efiapi" fn start_image(
     // An enforced build never runs an image without enforcement, whatever
     // left it off (no persistent store, a failed key enrollment).
     #[cfg(feature = "secure-boot-enforced")]
-    if !crate::efi::auth::is_secure_boot_enabled() {
+    if !crate::efi::auth::is_secure_boot_enforcing_confirmed() {
         log::error!("BS.StartImage: Secure Boot is not enforcing in an enforced build");
         return Status::SECURITY_VIOLATION;
     }

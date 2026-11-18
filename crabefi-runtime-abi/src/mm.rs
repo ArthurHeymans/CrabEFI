@@ -62,6 +62,29 @@ pub mod command {
     /// variables such as ESRT last-attempt and capsule results. Never for
     /// Secure Boot key databases.
     pub const SET_FIRMWARE_VARIABLE: u32 = 11;
+    /// Before ExitBootServices only, for PK, KEK, db and dbx: the timestamp an
+    /// authenticated write to `guid`/name must be newer than, i.e. its last
+    /// authenticated write, including the record an authenticated deletion
+    /// leaves. NOT_FOUND when there is none; else the 16-byte
+    /// timestamp is in `maximum_storage` and `remaining_storage`, see
+    /// [`super::unpack_timestamp`].
+    pub const AUTH_TIMESTAMP: u32 = 12;
+}
+
+/// Carry a 16-byte EFI timestamp in the `maximum_storage` and
+/// `remaining_storage` reply fields of [`command::AUTH_TIMESTAMP`].
+pub fn pack_timestamp(bytes: [u8; 16], reply: &mut Request) {
+    let (low, high) = bytes.split_at(8);
+    reply.maximum_storage = u64::from_le_bytes(low.try_into().unwrap_or_default());
+    reply.remaining_storage = u64::from_le_bytes(high.try_into().unwrap_or_default());
+}
+
+/// The timestamp [`pack_timestamp`] stored in `reply`.
+pub fn unpack_timestamp(reply: &Request) -> [u8; 16] {
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&reply.maximum_storage.to_le_bytes());
+    bytes[8..].copy_from_slice(&reply.remaining_storage.to_le_bytes());
+    bytes
 }
 
 /// Smallest variable store region (coreboot's SMMSTORE) the MM build serves.

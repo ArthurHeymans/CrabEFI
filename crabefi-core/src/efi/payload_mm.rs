@@ -42,12 +42,20 @@ fn data_capacity() -> usize {
 }
 
 fn call(request: Request, name: &[u16], data: &[u8]) -> Status {
+    match call_for_reply(request, name, data) {
+        Ok(reply) => Status::from_usize(reply.status as usize),
+        Err(status) => status,
+    }
+}
+
+/// Run `request` and return MM's reply header.
+fn call_for_reply(request: Request, name: &[u16], data: &[u8]) -> Result<Request, Status> {
     let base = COMM.load(Ordering::Acquire);
     if base == 0 {
-        return Status::NOT_READY;
+        return Err(Status::NOT_READY);
     }
     if name.len() * 2 > NAME_CAPACITY || data.len() > data_capacity() {
-        return Status::BAD_BUFFER_SIZE;
+        return Err(Status::BAD_BUFFER_SIZE);
     }
     let apm = APM_CMD.load(Ordering::Relaxed) as u8;
     let mut raise_smi = || {
@@ -75,11 +83,11 @@ fn call(request: Request, name: &[u16], data: &[u8]) -> Status {
                     polls * 10
                 );
             }
-            Status::from_usize(reply.status as usize)
+            Ok(reply)
         }
         mm::Outcome::Lost => {
             log::error!("payload MM: command {} not handled", request.command);
-            Status::DEVICE_ERROR
+            Err(Status::DEVICE_ERROR)
         }
     }
 }
@@ -193,6 +201,29 @@ pub fn firmware_write(offset: u64, data: &[u8]) -> Status {
         }
     }
     Status::SUCCESS
+}
+
+/// The newest authenticated timestamp MM recorded for `guid`/`name`, deletions
+/// included, as the 16 bytes of an EFI_TIME; `None` when it has none.
+pub fn auth_timestamp(guid: &Guid, name: &[u16]) -> Result<Option<[u8; 16]>, Status> {
+    let length = name
+        .iter()
+        .position(|&unit| unit == 0)
+        .unwrap_or(name.len());
+    let mut terminated = [0u16; NAME_CAPACITY / 2];
+    if length == 0 || length >= terminated.len() {
+        return Err(Status::INVALID_PARAMETER);
+    }
+    terminated[..length].copy_from_slice(&name[..length]);
+    let mut query = request(command::AUTH_TIMESTAMP);
+    query.guid = *guid.as_bytes();
+    query.name_size = ((length + 1) * 2) as u32;
+    let reply = call_for_reply(query, &terminated[..=length], &[])?;
+    match Status::from_usize(reply.status as usize) {
+        Status::SUCCESS => Ok(Some(mm::unpack_timestamp(&reply))),
+        Status::NOT_FOUND => Ok(None),
+        status => Err(status),
+    }
 }
 
 /// Write a protected firmware status variable (firmware phase only).

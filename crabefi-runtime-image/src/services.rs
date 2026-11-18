@@ -753,6 +753,33 @@ fn bind_signer(
     store.commit(transaction, prepared, name)
 }
 
+/// The newest authenticated timestamp recorded for `guid`/`name` (see
+/// `mm_protocol::command::AUTH_TIMESTAMP`), for boot firmware issuing its own
+/// authenticated writes while payload MM holds the store.
+#[cfg(feature = "mm")]
+pub fn auth_timestamp_floor(
+    guid: &[u8; 16],
+    name: &[u16],
+) -> Result<Option<VariableTimestamp>, efi::Status> {
+    // Only firmware key enrollment needs it, for the key databases.
+    let variable =
+        secure_boot::identify_key_database(guid, name).ok_or(efi::Status::INVALID_PARAMETER)?;
+    let lease = state::lease()?;
+    let store = lease.variables();
+    let secure = Some(store.auth_timestamp(variable))
+        .filter(|timestamp| *timestamp != VariableTimestamp::default());
+    Ok([secure, store.auth_history_timestamp(guid, name)]
+        .into_iter()
+        .flatten()
+        .reduce(|newest, floor| {
+            if timestamp_is_after(floor, newest) {
+                floor
+            } else {
+                newest
+            }
+        }))
+}
+
 /// Timestamp to record for an authenticated write: the envelope's own, unless
 /// an append carried an older one than the variable already has. An append
 /// must not lower the floor later replacements and deletions are held to.

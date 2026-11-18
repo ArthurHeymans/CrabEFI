@@ -580,6 +580,11 @@ fn dispatch(config: &InitConfig, request: &mut Request) -> efi::Status {
         {
             efi::Status::ACCESS_DENIED
         }
+        // Setup can still enroll keys after a boot option returned, so only
+        // ExitBootServices closes this read.
+        command::AUTH_TIMESTAMP if MM_RUNTIME_LATCH.load(Ordering::Acquire) => {
+            efi::Status::ACCESS_DENIED
+        }
         command::SETUP_AUTHORIZE => match (request.attributes, request.data_size) {
             (
                 bridge_operation::AUTHORIZE_SETUP_PK_DELETE
@@ -611,6 +616,36 @@ fn dispatch(config: &InitConfig, request: &mut Request) -> efi::Status {
             };
             copy_in(config.comm_base + DATA_OFFSET, data);
             set_firmware_variable(request, name, data)
+        }
+        command::AUTH_TIMESTAMP => {
+            if let Err(status) = load_name(config, request, name) {
+                return status;
+            }
+            let length = name
+                .iter()
+                .position(|&unit| unit == 0)
+                .unwrap_or(name.len());
+            match services::auth_timestamp_floor(&request.guid, &name[..length]) {
+                Ok(Some(timestamp)) => {
+                    let mut bytes = [0u8; 16];
+                    bytes[..2].copy_from_slice(&timestamp.year.to_le_bytes());
+                    bytes[2..8].copy_from_slice(&[
+                        timestamp.month,
+                        timestamp.day,
+                        timestamp.hour,
+                        timestamp.minute,
+                        timestamp.second,
+                        0,
+                    ]);
+                    bytes[8..12].copy_from_slice(&timestamp.nanosecond.to_le_bytes());
+                    bytes[12..14].copy_from_slice(&timestamp.timezone.to_le_bytes());
+                    bytes[14] = timestamp.daylight;
+                    crate::mm_protocol::pack_timestamp(bytes, request);
+                    efi::Status::SUCCESS
+                }
+                Ok(None) => efi::Status::NOT_FOUND,
+                Err(status) => status,
+            }
         }
         command::GET_VARIABLE => {
             if let Err(status) = load_name(config, request, name) {
