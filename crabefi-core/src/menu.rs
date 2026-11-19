@@ -22,6 +22,7 @@ use crate::drivers::storage::{self, StorageDevice, StorageId};
 use crate::framebuffer_console::{
     Color, DEFAULT_BG, DEFAULT_FG, FramebufferConsole, HIGHLIGHT_BG, HIGHLIGHT_FG, TITLE_COLOR,
 };
+use crate::fs::boot::{self as boot_fs, BootFilesystem, Kind as FilesystemKind};
 use crate::fs::{fat::FatFilesystem, gpt, iso9660};
 use crate::time::{Timeout, delay_ms};
 use core::fmt::Write;
@@ -77,6 +78,7 @@ pub struct BootEntry {
     pub pci: Option<PciAddress>,
     /// Partition information
     pub partition: gpt::Partition,
+    pub(crate) filesystem: FilesystemKind,
 }
 
 impl core::ops::Deref for BootEntry {
@@ -168,6 +170,7 @@ impl BootEntry {
             storage: device.id,
             pci: device.pci,
             partition,
+            filesystem: FilesystemKind::Fat,
         }
     }
 
@@ -242,14 +245,21 @@ pub fn discover_boot_entries() -> BootMenu {
         // Internal entries first, so the default entry is internal.
         devices.sort_by_key(crate::boot_policy::device_is_external);
     }
-    for device in devices {
+    for device in &devices {
         let partitions = storage::with_disk(device.id, |disk| gpt::read_partitions_auto(disk).ok())
             .ok()
             .flatten();
         match partitions {
-            Some(partitions) => discover_entries_on_disk(&device, &partitions, &mut menu),
-            None => try_el_torito_fallback(&device, &mut menu),
+            Some(partitions) => discover_entries_on_disk(device, &partitions, &mut menu),
+            None => try_el_torito_fallback(device, &mut menu),
         }
+    }
+
+    // Ext discovery only gets slots left over after scanning all FAT volumes
+    // and El Torito images, including recovery media on later devices.
+    #[cfg(all(feature = "ext4", target_arch = "x86_64"))]
+    if !crate::efi::auth::is_secure_boot_enabled() {
+        discover_ext_entries(&devices, &mut menu);
     }
 
     log::info!("Found {} boot entries", menu.entry_count());
@@ -259,9 +269,7 @@ pub fn discover_boot_entries() -> BootMenu {
 
 /// Discover boot entries on the partitions of one disk.
 ///
-/// For each ESP (or potential ESP) partition, mounts the FAT filesystem,
-/// checks for the arch-specific EFI bootloader, and scans for additional
-/// BLS/GRUB/payload entries.
+/// Check ESP candidates for FAT boot entries.
 ///
 /// # Arguments
 ///
@@ -276,37 +284,58 @@ fn discover_entries_on_disk(
     for partition in partitions {
         let partition_num = partition.number;
 
-        if !partition.is_esp && !is_potential_esp(partition) {
-            continue;
-        }
-
-        let _ = storage::with_disk(device.id, |disk| {
-            let mut fat = match FatFilesystem::new(disk, partition.first_lba) {
-                Ok(f) => f,
-                Err(_) => return,
-            };
-
-            // Check for UEFI bootloader
-            if fat.file_size(EFI_BOOT_PATH).is_ok() {
-                let mut name: String<64> = String::new();
-                let _ = write!(name, "Boot Entry ({})", device.label);
-
-                let entry = BootEntry::new(
-                    &name,
-                    EFI_BOOT_PATH,
+        if partition.is_esp || is_potential_esp(partition) {
+            boot_fs::with_filesystem(device.id, partition, FilesystemKind::Fat, |fs| {
+                if fs.file_size(EFI_BOOT_PATH).is_ok() {
+                    let mut name: String<64> = String::new();
+                    let _ = write!(name, "Boot Entry ({})", device.label);
+                    if !menu.add_entry(BootEntry::new(
+                        &name,
+                        EFI_BOOT_PATH,
+                        device,
+                        partition_num,
+                        partition.clone(),
+                    )) {
+                        return;
+                    }
+                }
+                scan_partition_for_entries(
+                    fs,
+                    FilesystemKind::Fat,
                     device,
                     partition_num,
-                    partition.clone(),
+                    partition,
+                    menu,
                 );
+            });
+        }
+    }
+}
 
-                if !menu.add_entry(entry) {
-                    return; // Menu full
-                }
+#[cfg(all(feature = "ext4", target_arch = "x86_64"))]
+fn discover_ext_entries(devices: &[StorageDevice], menu: &mut BootMenu) {
+    for device in devices.iter().filter(|device| !device.info.removable) {
+        if menu.entries.is_full() {
+            return;
+        }
+        let Ok(Ok(partitions)) = storage::with_disk(device.id, gpt::read_partitions_auto) else {
+            continue;
+        };
+        let kind = FilesystemKind::Ext {
+            media: device.info,
+            discovery: true,
+        };
+        for partition in partitions.iter().filter(|partition| !partition.is_esp) {
+            if menu.entries.is_full() {
+                return;
             }
-
-            // Scan for additional entries (BLS, GRUB, payloads)
-            scan_partition_for_entries(&mut fat, device, partition_num, partition, menu);
-        });
+            boot_fs::with_filesystem(device.id, partition, kind, |fs| {
+                if !scan_bls_from(fs, kind, device, partition, "", menu) {
+                    // On a root volume, BLS paths are relative to /boot.
+                    scan_bls_from(fs, kind, device, partition, "boot/", menu);
+                }
+            });
+        }
     }
 }
 
@@ -370,18 +399,19 @@ fn is_potential_esp(partition: &gpt::Partition) -> bool {
     size_mb > 0 && size_mb < 512 && partition.first_lba > 0
 }
 
-/// Convert a Linux-style path to FAT-style path
-///
-/// Wrapper around fs::linux_path_to_fat that returns an empty string on error
-/// for backward compatibility in menu scanning (errors are logged but not fatal).
-fn linux_path_to_fat(path: &str) -> String<128> {
-    match crate::fs::linux_path_to_fat(path) {
-        Ok(p) => p,
-        Err(e) => {
-            log::warn!("Invalid path '{}': {:?}", path, e);
-            String::new()
-        }
+/// Resolve a configured path relative to the boot directory without truncating it.
+fn boot_path(prefix: &str, path: &str) -> Option<String<128>> {
+    boot_fs::check_path(path).ok()?;
+    let relative = path.trim_start_matches(['/', '\\']);
+    if relative.is_empty() {
+        return None;
     }
+    let mut result = String::new();
+    result.push_str(prefix).ok()?;
+    for c in relative.chars() {
+        result.push(if c == '\\' { '/' } else { c }).ok()?;
+    }
+    Some(result)
 }
 
 /// Check if a bootloader exists on the given partition
@@ -409,137 +439,64 @@ fn check_bootloader_exists(disk: &mut dyn BlockDevice, partition_start: u64) -> 
     }
 }
 
-/// Scan a partition for additional boot entries (BLS, GRUB, payloads)
-///
-/// This function scans the given FAT filesystem for:
-/// - BLS (Boot Loader Specification) entries in /loader/entries/
-/// - GRUB configuration entries in grub.cfg
-/// - Coreboot payloads in common payload directories
-///
-/// Note: When Secure Boot is enabled, direct Linux boot entries (BLS Type #1
-/// and GRUB Linux entries) are not added because they bypass signature
-/// verification. Only UEFI boot entries are shown in that case.
-///
-/// # Arguments
-///
-/// * `fat` - Mounted FAT filesystem
-/// * `device` - Storage device for the boot entries
-/// * `partition_num` - 1-based partition number
-/// * `partition` - Partition info
-/// * `menu` - Boot menu to add entries to
+/// Scan a mounted volume for same-volume BLS and GRUB direct Linux entries.
 fn scan_partition_for_entries(
-    fat: &mut FatFilesystem<'_>,
+    fs: &mut dyn BootFilesystem,
+    filesystem: FilesystemKind,
     device: &StorageDevice,
     partition_num: u32,
     partition: &gpt::Partition,
     menu: &mut BootMenu,
 ) {
-    // Check if Secure Boot is active - if so, skip direct Linux boot entries
-    // because they bypass signature verification
-    let secure_boot_active = crate::efi::auth::is_secure_boot_enabled();
-    if secure_boot_active {
+    if crate::efi::auth::is_secure_boot_enabled() {
         log::debug!("Secure Boot active: skipping direct Linux boot entry discovery");
+        return;
     }
 
-    // 1. Scan for BLS entries - only if Secure Boot is off
-    // BLS entries should have kernels on the same partition (ESP or XBOOTLDR)
-    // Direct boot bypasses signature verification, so we disable it with Secure Boot
-    if !secure_boot_active && let Ok(bls_discovery) = crate::bls::discover_entries(fat) {
-        for bls_entry in bls_discovery.entries.iter() {
-            // Convert Linux path to FAT path and check if file exists
-            let fat_path = linux_path_to_fat(&bls_entry.linux);
-
-            // Only add the entry if the kernel file exists on this partition
-            if fat.file_size(&fat_path).is_ok() {
-                let mut name: String<64> = String::new();
-                let _ = name.push_str(bls_entry.display_title());
-
-                // Also convert initrd path
-                let initrd_fat_paths = bls_entry
-                    .initrds
-                    .iter()
-                    .map(|path| linux_path_to_fat(path))
-                    .collect();
-
-                let entry = BootEntry::new_with_kind(
-                    &name,
-                    &fat_path,
-                    device,
-                    partition_num,
-                    partition.clone(),
-                    BootEntryKind::BlsLinux {
-                        linux_path: fat_path.clone(),
-                        initrd_paths: initrd_fat_paths,
-                        cmdline: bls_entry.options.clone(),
-                    },
-                    BootCategory::Bls,
-                );
-
-                if !menu.add_entry(entry) {
-                    return; // Menu full
-                }
-                // Boot the first loader.conf default that made it into the
-                // menu, like systemd-boot, instead of the first entry (often
-                // the removable-media fallback).
-                if !menu.default_chosen && bls_discovery.is_default(bls_entry) {
-                    menu.selected = menu.entry_count() - 1;
-                    menu.default_chosen = true;
-                    log::info!("loader.conf default: '{}'", bls_entry.display_title());
-                }
-
-                log::debug!(
-                    "Added BLS entry '{}' (kernel exists on partition)",
-                    bls_entry.display_title()
-                );
-            } else {
-                log::debug!(
-                    "Skipping BLS entry '{}' (kernel '{}' not found on this partition)",
-                    bls_entry.display_title(),
-                    fat_path
-                );
-            }
-        }
-    }
+    scan_bls_from(fs, filesystem, device, partition, "", menu);
 
     // 2. Scan for GRUB config entries - only if Secure Boot is off
     // NOTE: GRUB entries from grub.cfg often reference kernels on the root partition,
     // not the ESP where grub.cfg lives. We only add entries if the kernel file
     // actually exists on this partition (for direct boot to work).
     // Direct boot bypasses signature verification, so we disable it with Secure Boot
-    if !secure_boot_active && let Ok(grub_config) = crate::grub::parse_config(fat) {
+    if let Ok(grub_config) = crate::grub::parse_config(fs) {
         // If GRUB has blscfg directive, BLS entries were already added above
         // Only add GRUB entries that have explicit linux/initrd paths AND
         // where the kernel file actually exists on this partition
         for grub_entry in grub_config.entries.iter() {
             if !grub_entry.linux.is_empty() {
-                // Convert Linux path to FAT path and check if file exists
-                let fat_path = linux_path_to_fat(&grub_entry.linux);
+                let Some(path) = boot_path("", &grub_entry.linux) else {
+                    continue;
+                };
 
-                // Only add the entry if the kernel file exists on this partition
-                if fat.file_size(&fat_path).is_ok() {
+                if fs.file_size(&path).is_ok() {
                     let mut name: String<64> = String::new();
                     let _ = name.push_str(&grub_entry.title);
 
-                    // Also convert the initrd paths
-                    let initrd_fat_paths = grub_entry
+                    let Some(initrd_paths) = grub_entry
                         .initrds
                         .iter()
-                        .map(|path| linux_path_to_fat(path))
-                        .collect();
+                        .map(|path| boot_path("", path))
+                        .collect::<Option<crate::bls::Initrds>>()
+                    else {
+                        continue;
+                    };
 
-                    let entry = BootEntry::new_with_kind(
+                    let mut entry = BootEntry::new_with_kind(
                         &name,
-                        &fat_path,
+                        &path,
                         device,
                         partition_num,
                         partition.clone(),
                         BootEntryKind::GrubLinux {
-                            linux_path: fat_path.clone(),
-                            initrd_paths: initrd_fat_paths,
+                            linux_path: path.clone(),
+                            initrd_paths,
                             cmdline: grub_entry.options.clone(),
                         },
                         BootCategory::Grub,
                     );
+                    entry.filesystem = filesystem;
 
                     if !menu.add_entry(entry) {
                         return; // Menu full
@@ -553,38 +510,72 @@ fn scan_partition_for_entries(
                     log::debug!(
                         "Skipping GRUB entry '{}' (kernel '{}' not found on this partition)",
                         grub_entry.title,
-                        fat_path
+                        path
                     );
                 }
             }
         }
     }
 
-    // 3. Scan for coreboot payloads
-    // NOTE: Payload discovery is disabled until boot_payload_entry() is fully
-    // implemented. Currently selecting a payload entry does nothing useful.
-    // See: src/lib.rs boot_payload_entry() and src/payload/mod.rs chainload_payload()
-    //
-    // TODO: Re-enable once payload chainloading is implemented:
-    // let payloads = crate::payload::discover_payloads(fat);
-    // for payload_entry in payloads.iter() {
-    //     let entry = BootEntry::new_with_kind(
-    //         &payload_entry.name,
-    //         &payload_entry.path,
-    //         device,
-    //         partition_num,
-    //         partition.clone(),
-    //         BootEntryKind::Payload {
-    //             path: payload_entry.path.clone(),
-    //             format: payload_entry.format,
-    //         },
-    //         BootCategory::Payload,
-    //     );
-    //
-    //     if !menu.add_entry(entry) {
-    //         return; // Menu full
-    //     }
-    // }
+    // Payload discovery stays disabled until payload chainloading works.
+}
+
+/// Add only usable BLS entries. Return whether this location yielded an entry.
+fn scan_bls_from(
+    fs: &mut dyn BootFilesystem,
+    filesystem: FilesystemKind,
+    device: &StorageDevice,
+    partition: &gpt::Partition,
+    prefix: &str,
+    menu: &mut BootMenu,
+) -> bool {
+    let Ok(discovery) = crate::bls::discover_entries_at(fs, prefix) else {
+        return false;
+    };
+    let mut added = false;
+    for config in &discovery.entries {
+        let Some(path) = boot_path(prefix, &config.linux) else {
+            continue;
+        };
+        let Some(initrd_paths) = config
+            .initrds
+            .iter()
+            .map(|path| boot_path(prefix, path))
+            .collect::<Option<crate::bls::Initrds>>()
+        else {
+            continue;
+        };
+        if core::iter::once(&path)
+            .chain(&initrd_paths)
+            .any(|path| !matches!(fs.file_size(path), Ok(1..)))
+        {
+            continue;
+        }
+        let mut entry = BootEntry::new_with_kind(
+            config.display_title(),
+            &path,
+            device,
+            partition.number,
+            partition.clone(),
+            BootEntryKind::BlsLinux {
+                linux_path: path.clone(),
+                initrd_paths,
+                cmdline: config.options.clone(),
+            },
+            BootCategory::Bls,
+        );
+        entry.filesystem = filesystem.for_boot();
+        if !menu.add_entry(entry) {
+            break;
+        }
+        added = true;
+        if !menu.default_chosen && discovery.is_default(config) {
+            menu.selected = menu.entry_count() - 1;
+            menu.default_chosen = true;
+            log::info!("loader.conf default: '{}'", config.display_title());
+        }
+    }
+    added
 }
 
 /// Show the boot menu and wait for user selection

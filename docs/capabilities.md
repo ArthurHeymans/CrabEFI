@@ -15,8 +15,9 @@ when measuring its dependency closure.
 | `secure-boot` | UEFI image/key verification and authenticated-variable runtime |
 | `capsule-update` | Signed firmware capsule application and bounded variable-store result persistence (no SPI dependency) |
 | `pkcs7` | Shared verifier dependencies, used by Secure Boot and capsules |
+| `ext4` | Experimental read-only ext2/3/4 BLS boot from trusted fixed disks on x86-64 |
 | `ui` | Graphical setup, mouse support and multi-size monospace bitmap fonts |
-| `full` | Existing standalone non-graphical capabilities (all above except `ui`) |
+| `full` | Standalone non-graphical capabilities (excludes `ui` and experimental `ext4`) |
 
 The coreboot binary explicitly selects `full`; its existing `ui` switch adds the
 GUI. Boot services, executable loading, FAT/simple filesystem, console, ordinary

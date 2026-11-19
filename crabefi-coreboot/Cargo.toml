@@ -10,6 +10,8 @@ description = "CrabEFI as a coreboot payload binary"
 default = ["bundled-runtime-image"]
 bundled-runtime-image = ["crabefi/bundled-runtime-image"]
 external-runtime-image = []
+# Experimental native Linux boot from ext2/3/4 on x86-64.
+ext4 = ["crabefi/ext4"]
 # Use the long-mode RDI entry for u-root/LinuxBoot instead of coreboot's
 # default 32-bit stack-argument entry. Only supported on x86-64.
 entry64 = []

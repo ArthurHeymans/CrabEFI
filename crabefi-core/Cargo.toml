@@ -37,8 +37,10 @@ capsule-update = ["pkcs7", "variable-store"]
 # CMS/X.509 views and RSA come from `crabefi-pkcs7`, shared with the runtime
 # image.
 pkcs7 = ["dep:sha1", "dep:crabefi-pkcs7"]
-# Preserve the standalone payload's existing non-graphical capabilities explicitly.
+# Capabilities bundled by the standalone payload.
 full = ["tpm", "xhci", "spi-flash", "secure-boot", "capsule-update", "cfr"]
+# Experimental read-only ext2/ext3/ext4 from trusted fixed disks.
+ext4 = ["dep:ext4-view"]
 # CFR (coreboot form representation) firmware settings: the parser and the
 # menu. Values are EFI variables under the CFR GUID, through the runtime image.
 cfr = ["crabefi-ui/cfr"]
@@ -95,6 +97,7 @@ sha1 = { optional = true, version = "0.11", default-features = false }
 sha2 = { version = "0.11", default-features = false }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
+ext4-view = { version = "1.0", default-features = false, optional = true }
 x86_64 = "0.15"
 
 # FDT parsing is needed on aarch64 (QEMU virt, SBSA) and riscv64 (OpenSBI

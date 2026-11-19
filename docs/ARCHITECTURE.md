@@ -28,6 +28,32 @@ not an unbounded or post-seal general-purpose heap.
 8. EBS cleans up boot state and seals the image last.
 9. Image-local SVAM validates and physically commits per-section virtual mappings.
 
+## Boot filesystems
+
+`BlockRange` gives the filesystem reader byte access bounded to its partition.
+Boot discovery, the BLS/GRUB readers, and direct Linux loading use the small
+read-only `BootFilesystem` interface: size, offset reads and bounded directory
+listings. FAT borrows a storage device for the operation. `ext4-view` owns its
+reader, so its adapter retains a storage ID and borrows the device per read.
+A future layer such as LUKS would supply decrypted bytes below the filesystem,
+not add operations to `BootFilesystem`.
+
+The experimental x86-64 `ext4` feature is opt-in and intended for trusted
+fixed disks. After FAT and El Torito discovery, it scans ext2/3/4 partitions
+for BLS entries. BLS can use `/loader/entries` on a separate boot partition
+or `/boot/loader/entries` on an ext root; the latter resolves kernel and
+initrd paths relative to `/boot`. GRUB config discovery remains FAT-only.
+Direct boot remains disabled under Secure Boot.
+
+Ext discovery caps I/O and directory iteration, and rejects volumes that
+need journal replay or exceed its block-size or block-group limits. These
+checks do not put a hard heap limit on every allocation in `ext4-view`.
+
+EFI Simple File System stays FAT-only. If ext volumes are later exposed to EFI
+applications, give each volume handle its own mount context and share the read
+operations without emulating writes. Keep FAT's allocation state, flush/error
+handling, and file-record identity out of the common read interface.
+
 ## Runtime ownership
 
 All 14 Runtime Services table slots point into the runtime image. Unsupported
