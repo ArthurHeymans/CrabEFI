@@ -15,7 +15,9 @@ pub mod arch;
 pub(crate) mod barrier;
 pub mod bls;
 pub mod boot;
+pub mod boot_event_log;
 mod boot_manager;
+pub mod boot_policy;
 pub mod boot_vars;
 #[cfg(feature = "bundled-runtime-image")]
 mod bundled_runtime;
@@ -70,19 +72,21 @@ pub fn reset_system() -> ! {
 }
 
 // Re-export the public platform API at the crate root for ergonomic access.
+pub use boot_policy::{BootPolicy, ExternalBoot, UsbInit};
 #[cfg(feature = "bundled-runtime-image")]
 pub use bundled_runtime::BUNDLED_RUNTIME_IMAGE;
 pub use crabefi_runtime_abi::{
-    RuntimeExternalRange, RuntimeResetConfig, RuntimeTimeConfig, reset_mechanism, time_mechanism,
+    MmProxyConfig, RuntimeExternalRange, RuntimeResetConfig, RuntimeTimeConfig, reset_mechanism,
+    time_mechanism,
 };
 pub use platform::{
     BlockDevice, BlockDeviceInfo, BlockError, BootResult, CapsuleBackend, CapsuleRegion,
-    ConsoleInput, CrbStart, DebugOutput, DeferredBufferConfig, FirmwareInfo, FmapRegion,
-    FramebufferConfig, Key, KeyState, MemoryRegion, MemoryType, PciEcamRegion, PlatformConfig,
-    PlatformConfigBuilder, PlatformEventLog, PlatformHooks, ResetHandler, ResetType, Rng, RngError,
-    RuntimeImageSource, RuntimePlatformConfig, StorageBackend, StorageError, Timer,
-    TimestampRecorder, Tpm2Device, Tpm2DeviceConfig, TpmDigest, TpmError, TpmEventLogConfig,
-    TpmLogFormat, TpmPcrBanks, VariableStorage,
+    ConsoleInput, CrbStart, DebugOutput, DeferredBufferConfig, FirmwareInfo, FirmwareSlots,
+    FmapRegion, FramebufferConfig, Key, KeyState, MemoryRegion, MemoryType, PciEcamRegion,
+    PlatformConfig, PlatformConfigBuilder, PlatformEventLog, PlatformHooks, ResetHandler,
+    ResetType, Rng, RngError, RuntimeImageSource, RuntimePlatformConfig, StorageBackend,
+    StorageError, Timer, TimestampRecorder, Tpm2Device, Tpm2DeviceConfig, TpmDigest, TpmError,
+    TpmEventLogConfig, TpmLogFormat, TpmPcrBanks, VariableStorage,
 };
 #[cfg(feature = "spi-flash")]
 pub use platform::{
@@ -195,6 +199,8 @@ fn init_persistence_and_boot(
     variable_storage: platform::VariableStorage<'_>,
     capsule_backend: Option<&mut dyn platform::CapsuleBackend>,
     retained_staging: bool,
+    mm_variables: bool,
+    capsule_on_disk_only: bool,
 ) -> ! {
     // ---- Variable persistence ----
     // SAFETY: init_platform and this tail never return, so the caller's borrowed
@@ -210,6 +216,7 @@ fn init_persistence_and_boot(
     // I/O errors) never halts the boot: log the failure and continue with
     // volatile variables.
     let persistence_available = match efi::varstore::init_persistence(variable_storage) {
+        Err(_) if mm_variables => false,
         Ok(()) => {
             log::info!("Variable store persistence initialized");
             true
@@ -224,6 +231,13 @@ fn init_persistence_and_boot(
     };
 
     let persistence_writable = persistence_available && efi::varstore::is_varstore_writable();
+    // Payload MM owns a writable store: everything below (retained capsule
+    // staging, Secure Boot, capsules) persists through it.
+    let (persistence_available, persistence_writable) = if mm_variables {
+        (true, true)
+    } else {
+        (persistence_available, persistence_writable)
+    };
     if persistence_available && !persistence_writable {
         log::warn!("Variable store is preserved read-only; capsule updates are disabled");
     }
@@ -233,36 +247,75 @@ fn init_persistence_and_boot(
     let capsule_backend_available = cfg!(feature = "capsule-update") && capsule_backend.is_some();
     let mut capsule_delivery_usable = false;
     let mut retained_staging_ready = false;
-    if persistence_available {
-        if persistence_writable && retained_staging {
-            match runtime.prepare_retained_staging() {
-                Ok(()) => {
-                    retained_staging_ready = true;
-                    let boot_consumer_ready = supports_capsule_delivery(
-                        persistence_writable,
-                        true,
-                        capsule_backend_available,
-                    );
-                    if boot_consumer_ready {
-                        match runtime.enable_capsule_delivery() {
-                            Ok(()) => capsule_delivery_usable = true,
-                            Err(status) => {
-                                log::warn!("Runtime capsule delivery setup failed: {:?}", status)
-                            }
+    // Runtime writes the OS made last session were replayed (or there were
+    // none to replay).
+    let mut journal_drained = true;
+    if persistence_available && persistence_writable && retained_staging {
+        match runtime.prepare_retained_staging() {
+            Ok(()) => {
+                retained_staging_ready = true;
+                let boot_consumer_ready = supports_capsule_delivery(
+                    persistence_writable,
+                    true,
+                    capsule_backend_available,
+                );
+                if boot_consumer_ready {
+                    match runtime.enable_capsule_delivery() {
+                        Ok(()) => capsule_delivery_usable = true,
+                        Err(status) => {
+                            log::warn!("Runtime capsule delivery setup failed: {:?}", status)
                         }
                     }
                 }
-                Err(status) => {
-                    log::warn!("Runtime image retained staging setup failed: {:?}", status)
-                }
             }
-            if let Err(status) = runtime.replay_deferred() {
-                retained_staging_ready = false;
-                log::warn!("Runtime image deferred replay failed: {:?}", status);
+            Err(status) => {
+                log::warn!("Runtime image retained staging setup failed: {:?}", status)
             }
         }
+        // With payload MM the local store never imported MM's variables, so
+        // replaying against it could acknowledge a record that did nothing:
+        // leave any journal untouched.
+        #[cfg(target_arch = "x86_64")]
+        let mm_owns_variables = efi::payload_mm::active();
+        #[cfg(not(target_arch = "x86_64"))]
+        let mm_owns_variables = false;
+        if mm_owns_variables {
+            log::info!("Payload MM owns the variables; the retained journal is not replayed");
+        } else if let Err(status) = runtime.replay_deferred() {
+            retained_staging_ready = false;
+            journal_drained = false;
+            log::warn!("Runtime image deferred replay failed: {:?}", status);
+        }
+    }
+    // Capsule-on-disk does not need retained staging.
+    let file_capsules_usable = if capsule_on_disk_only {
+        persistence_writable && capsule_backend_available
+    } else {
+        capsule_delivery_usable
+    };
+    if capsule_on_disk_only && persistence_writable {
+        efi::capsule::delete_capsule_update_data();
+    }
 
+    // Only capsule processing below waits for the journal.
+    #[cfg(not(feature = "capsule-update"))]
+    let _ = journal_drained;
+
+    if persistence_available {
         logger::apply_persisted_level();
+    }
+    // Also record boots that apply a capsule and reset below.
+    if cfg!(feature = "boot-event-log") && persistence_writable {
+        boot_event_log::record_boot();
+    }
+
+    // Bring up storage (and input devices, before any indefinite setup session)
+    // before Secure Boot init and capsule-on-disk look for files on the ESP.
+    boot_policy::apply_variable();
+    let usb_init = boot_policy::get().usb_init;
+    boot_manager::init_storage_subsystem(usb_init == boot_policy::UsbInit::Always);
+
+    if persistence_available {
         #[cfg(feature = "secure-boot")]
         match efi::auth::boot::init_secure_boot_default() {
             Ok(status) => log::info!(
@@ -274,12 +327,31 @@ fn init_persistence_and_boot(
         }
     }
 
+    // A firmware update must not run before the journal was replayed: the
+    // new firmware may not replay it (payload MM does not), and the OS was
+    // told those writes succeeded.
     #[cfg(feature = "capsule-update")]
-    if persistence_writable {
+    if persistence_writable && !journal_drained {
+        log::error!("Skipping pending capsules: the runtime variable journal was not replayed");
+    } else if persistence_writable {
         if let Some(backend) = capsule_backend {
+            efi::capsule::latch_update_boot();
+            // Before any capsule: a rollback boot must not re-apply one.
+            if efi::capsule::trial::check(backend) {
+                reset_system();
+            }
+            // A capsule file may sit on a USB ESP; scanning without USB would
+            // consume the request without finding it.
+            if !boot_manager::usb_ready()
+                && efi::capsule::disk::is_file_capsule_delivery_requested()
+            {
+                boot_manager::ensure_usb("capsule-on-disk request pending");
+            }
             let applied = efi::capsule::process_pending_capsules(backend);
             if applied != 0 {
                 log::info!("Applied {} pending firmware capsule(s)", applied);
+                // Run the new firmware; the OS must not boot on the old one.
+                reset_system();
             }
         }
     } else if capsule_backend_available {
@@ -309,9 +381,9 @@ fn init_persistence_and_boot(
     #[cfg(all(feature = "platform-entry", target_arch = "x86_64"))]
     log_stack_usage("before_boot_manager");
 
-    // Enumerate input devices before publishing or accepting an indefinite
-    // setup session. A framebuffer by itself is only an output device.
-    boot_manager::init_storage_subsystem();
+    if !boot_manager::usb_ready() && os_indications::firmware_ui_request_pending() {
+        boot_manager::ensure_usb("firmware UI requested");
+    }
     #[cfg(feature = "ui")]
     let graphical_pointer =
         drivers::mouse_cursor::is_initialized() && drivers::pointer::is_available();
@@ -319,14 +391,16 @@ fn init_persistence_and_boot(
     let graphical_pointer = false;
     let firmware_ui_supported = os_indications::firmware_ui_supported(
         persistence_writable,
-        retained_staging_ready,
+        // Payload MM persists OS runtime writes without the retained journal.
+        retained_staging_ready || mm_variables,
         handoff::framebuffer().is_some(),
-        drivers::keyboard_common::is_available(),
+        // Deferred USB comes up before a requested setup session.
+        drivers::keyboard_common::is_available() || boot_manager::usb_deferred(),
         graphical_pointer,
         drivers::serial::supports_console_input(),
     );
     efi::capsule::disk::install_os_indications_supported(
-        capsule_delivery_usable,
+        file_capsules_usable,
         firmware_ui_supported,
     );
     let boot_var_state = boot_vars::read_boot_var_state();
@@ -525,6 +599,12 @@ pub fn init_platform(mut config: PlatformConfig) -> ! {
         } else {
             log::warn!("Platform memory map exceeds direct-Linux handoff capacity");
         }
+        h.boot_events.clear();
+        if let Some(events) = config.boot_events {
+            let events = boot_event_log::platform_events(events);
+            // platform_events() stays within the capacity.
+            let _ = h.boot_events.extend_from_slice(&events);
+        }
         h.capsule_regions.clear();
         for region in config.capsule_regions {
             if h.capsule_regions.push(*region).is_err() {
@@ -550,6 +630,13 @@ pub fn init_platform(mut config: PlatformConfig) -> ! {
         .map(|r| r.size)
         .sum();
     log::info!("Total RAM: {} MB", total_ram / (1024 * 1024));
+
+    boot_policy::configure(config.boot_policy);
+
+    if config.capsule_on_disk_only {
+        // coreboot retains this buffer only as a capsule in CapsuleUpdateData.
+        config.runtime.deferred_buffer = DeferredBufferConfig::disabled();
+    }
 
     // ---- 8. Initialize keyboard subsystem ----
     drivers::keyboard_common::init();
@@ -648,9 +735,23 @@ pub fn init_platform(mut config: PlatformConfig) -> ! {
     }
 
     // ---- 16. Variable persistence, Secure Boot, and boot manager ----
+    // With payload MM the SMM image owns the flash store; boot code only
+    // forwards variable services to it.
+    let mm_variables = config.runtime.mm_proxy.enabled != 0;
+    if mm_variables {
+        log::info!("Variables are served by payload MM");
+        #[cfg(target_arch = "x86_64")]
+        efi::payload_mm::configure(config.runtime.mm_proxy);
+    }
     init_persistence_and_boot(
-        config.variable_storage,
+        if mm_variables {
+            platform::VariableStorage::None
+        } else {
+            config.variable_storage
+        },
         config.capsule_backend,
         config.runtime.deferred_buffer.size != 0,
+        mm_variables,
+        config.capsule_on_disk_only,
     );
 }

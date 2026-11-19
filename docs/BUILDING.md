@@ -143,6 +143,10 @@ wrapper with `--no-default-features` when embedding a freshly audited artifact.
 The `entry64` feature is off by default, applies only to x86-64, and changes
 only the payload entry contract for u-root/LinuxBoot.
 
+`CRABEFI_CAPSULE_TRUST_CERTS` names the DER certificates (`:`-separated paths)
+that firmware capsule signatures must chain to; the coreboot payload embeds them
+at build time. Without it the trust store is empty and every capsule is refused.
+
 ### Platform peripherals
 
 A platform hands CrabEFI the devices on buses it owns. It keeps the
@@ -293,6 +297,34 @@ interactive serial/text menu (also with `--ui`'s text fallback), not graphical
 rendering. Runtime requests use retained-memory warm-reset staging, not
 power-loss-safe runtime flash writes. See [capabilities](capabilities.md).
 
+### Secure Boot key hierarchy and image verification
+
+`secure-boot-auth-test` boots three times on file-backed SMMSTORE that starts
+with keys cleared and Secure Boot requested. It enrolls a test PKI, then checks
+time-based authenticated writes, the PK/KEK/db/dbx signer rules, persistence
+across cold boots and `LoadImage` against db/dbx. Every check prints
+`SBAUTH PASS|FAIL <id>`; logs are kept under `target/sb-auth-reports/`.
+
+```bash
+./crabefi test --app secure-boot-auth-test --timeout 300   # needs sbsign
+```
+
+The fixtures and the plan the app executes come from
+`test-apps/secure-boot-auth-test/gen_fixtures.py` (python3-cryptography,
+sbsign). Its keys under `fixtures/keys` are test-only.
+
+Ubuntu 24.04's signed shim is opt-in, as it is not redistributed here:
+
+```bash
+python3 -I test-apps/secure-boot-auth-test/fetch_ubuntu_shim.py /tmp/ubuntu-shim
+CRABEFI_SB_SHIM_DIR=/tmp/ubuntu-shim ./crabefi test --app secure-boot-auth-test
+```
+
+`CRABEFI_SB_POWER_LOSS_TRIALS=<n>` adds n opt-in trials that kill QEMU while
+the app rewrites a 2 KiB NV variable, then check on the next boot that
+PK/KEK/db/dbx are unchanged and the variable holds the old or the new value.
+SMMSTORE updates are not claimed to be power-fail safe, so CI does not run them.
+
 ### Interactive QEMU
 
 ```bash
@@ -418,6 +450,7 @@ Test apps live in `test-apps/` and target `x86_64-unknown-uefi` / `aarch64-unkno
 | `fwui-test` | x86-64 persistent reboot-to-setup and subsequent normal boot |
 | `storage-security-test` | Storage security command tests |
 | `secure-boot-test` | Secure Boot verification tests |
+| `secure-boot-auth-test` | Authenticated variables, PK/KEK/db/dbx hierarchy and LoadImage verification over three cold boots |
 | `fw-dump` | Firmware info dump utility |
 
 ```bash

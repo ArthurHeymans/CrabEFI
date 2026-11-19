@@ -18,6 +18,37 @@ ui = ["crabefi/ui", "crabefi/elan-i2c", "crabefi/hid-i2c"]
 # invalid, instead of failing startup with no memory map. Useful only for
 # table-less QEMU experiments; never enable for real hardware.
 fallback-memory-map = []
+# Bring up USB only when nothing boots without it, for the boot menu, or for a
+# firmware UI request. USB keyboards then do not work in GRUB or shim.
+usb-on-demand = []
+# Never boot USB or removable media automatically (BootNext, BootOrder, menu
+# timeout); a user may still select them in the boot menu.
+external-boot-menu-only = []
+# Never boot USB or removable media; takes precedence over menu-only.
+external-boot-deny = []
+# Count SATA ports the controller reports as hot-plug capable as internal, for
+# boards that mark every connector hot-plug capable.
+internal-hot-plug-sata = []
+# Offer the external-boot policy in the setup menu (stricter values only).
+external-boot-setting = ["crabefi/external-boot-setting"]
+# DRAM does not survive a warm reset: accept capsules only as files on the
+# ESP, no runtime UpdateCapsule (PlatformConfig::capsule_on_disk_only).
+capsule-on-disk-only = []
+# Load crabefi-mm into coreboot-owned SMRAM (coreboot PAYLOAD_MM_INTERFACE);
+# needs CRABEFI_MM_ELF at build time.
+payload-mm = []
+# Test only: emulated A/B slots and selector in the payload MM fixture's
+# spare flash (ab-update-test).
+ab-test-slots = ["payload-mm"]
+# Test only: reset during deferred replay before acknowledging a record.
+replay-test-reset-after-persist = ["crabefi/replay-test-reset-after-persist"]
+# Test only: payload MM never confirms READY_TO_BOOT, which must stop the boot.
+payload-mm-test-lose-ready-to-boot = ["crabefi/payload-mm-test-lose-ready-to-boot"]
+secure-boot-enforced = ["crabefi/secure-boot-enforced"]
+max-log-level-error = ["crabefi/max-log-level-error"]
+default-log-level-error = ["crabefi/default-log-level-error"]
+# CrabEFIEventLog with coreboot's boot events (ELOG_BOOT_EVENTS) when present.
+boot-event-log = ["crabefi/boot-event-log"]
 
 [dependencies]
 crabefi = { package = "crabefi-core", path = "../crabefi-core", features = [

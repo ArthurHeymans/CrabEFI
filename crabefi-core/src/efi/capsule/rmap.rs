@@ -115,10 +115,10 @@ pub fn parse_and_validate_rmap(
                 size: fmap_region.size,
             });
         } else {
-            log::warn!(
-                "RMAP: region '{}' not found in FMAP — skipping",
-                region_name
-            );
+            // The image is the concatenation of the listed regions: skipping
+            // one would shift every later region's bytes.
+            log::error!("RMAP: region '{}' not found in FMAP", region_name);
+            return Err(CapsuleError::InvalidRmap);
         }
     }
 
@@ -210,14 +210,17 @@ mod tests {
     }
 
     #[test]
-    fn rmap_skips_unknown_regions() {
+    fn rmap_rejects_unknown_regions() {
+        // The image concatenates the listed regions; dropping one would
+        // shift the bytes of every region after it.
         let firmware = [0xFFu8; 64];
-        let image = make_image_with_rmap(&firmware, &["COREBOOT", "DOES_NOT_EXIST"]);
+        let image = make_image_with_rmap(&firmware, &["DOES_NOT_EXIST", "COREBOOT"]);
         let fmap = make_fmap_regions(&[("COREBOOT", 0, 0x1000)]);
 
-        let approved = parse_and_validate_rmap(&image, &fmap).unwrap();
-        assert_eq!(approved.len(), 1);
-        assert_eq!(approved[0].name.as_str(), "COREBOOT");
+        assert_eq!(
+            parse_and_validate_rmap(&image, &fmap).unwrap_err(),
+            CapsuleError::InvalidRmap
+        );
     }
 
     #[test]

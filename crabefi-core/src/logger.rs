@@ -136,7 +136,8 @@ pub fn init() {
     if log::set_logger(&LOGGER).is_ok() {
         // Record the boot counter for relative timestamps.
         crate::time::set_boot_counter(read_counter());
-        log::set_max_level(DEFAULT_LEVEL);
+        // Through set_level, so max-log-level-error caps the start level too.
+        set_level(DEFAULT_LEVEL);
     }
 }
 
@@ -157,9 +158,17 @@ pub fn set_framebuffer(_fb: crate::platform::FramebufferConfig) {
     // Framebuffer logging disabled at compile time
 }
 
+/// Highest level the build allows; `max-log-level-error` (production builds)
+/// keeps the persisted variable and the menu from raising it.
+const MAX_LEVEL: LevelFilter = if cfg!(feature = "max-log-level-error") {
+    LevelFilter::Error
+} else {
+    LevelFilter::Trace
+};
+
 /// Set the maximum log level
 pub fn set_level(level: LevelFilter) {
-    log::set_max_level(level);
+    log::set_max_level(level.min(MAX_LEVEL));
 }
 
 /// Parse a persisted log-level variable payload.

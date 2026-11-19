@@ -128,12 +128,6 @@ pub const WIN_CERT_TYPE_EFI_GUID: u16 = 0x0EF1;
 // Secure Boot State
 // ============================================================================
 
-/// Variable attributes for the SecureBootEnable user preference variable
-/// This is non-volatile so it persists across resets
-#[cfg(feature = "secure-boot")]
-const SECURE_BOOT_ENABLE_ATTRS: u32 =
-    attributes::NON_VOLATILE | attributes::BOOTSERVICE_ACCESS | attributes::RUNTIME_ACCESS;
-
 /// Read the image-owned standard SetupMode variable.
 #[cfg(feature = "secure-boot")]
 pub fn is_setup_mode() -> bool {
@@ -145,15 +139,35 @@ pub fn is_setup_mode() -> bool {
         != Some(0)
 }
 
-/// Read the image-owned standard SecureBoot variable.
+/// Read the image-owned standard SecureBoot variable. A read that fails (for
+/// example because payload MM did not answer) counts as enforcing: callers
+/// must not boot unverified code because the policy could not be read.
 #[cfg(feature = "secure-boot")]
 pub fn is_secure_boot_enabled() -> bool {
-    crate::efi::runtime_image::client::variables::get(
+    match crate::efi::runtime_image::client::variables::try_get(
         &Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID),
         SECURE_BOOT_NAME,
+    ) {
+        Ok(value) => value.and_then(|(_, data)| data.first().copied()) == Some(1),
+        Err(status) => {
+            log::error!("Cannot read SecureBoot ({:?}); enforcing", status);
+            true
+        }
+    }
+}
+
+/// Whether SecureBoot reads back as 1. Unlike [`is_secure_boot_enabled`], a
+/// failed read counts as not enforcing: for checks that must see enforcement
+/// confirmed before they let anything run.
+#[cfg(feature = "secure-boot")]
+pub fn is_secure_boot_enforcing_confirmed() -> bool {
+    matches!(
+        crate::efi::runtime_image::client::variables::try_get(
+            &Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID),
+            SECURE_BOOT_NAME,
+        ),
+        Ok(Some((_, data))) if data.first() == Some(&1)
     )
-    .and_then(|(_, data)| data.first().copied())
-        == Some(1)
 }
 
 /// Saved user preference, independent of whether a PK is enrolled.
@@ -201,7 +215,11 @@ pub fn toggle_secure_boot() -> Result<SecureBootState, r_efi::efi::Status> {
 /// the standard Runtime Services GetVariable entry point.
 #[cfg(feature = "secure-boot")]
 pub fn verify_pe_image_secure_boot(pe_data: &[u8]) -> Result<bool, AuthError> {
-    boot::refresh_key_databases();
+    // db and dbx that could not be read must not pass for empty ones: an
+    // empty dbx revokes nothing.
+    if !boot::refresh_key_databases() {
+        return Err(AuthError::AccessDenied);
+    }
     authenticode::verify_pe_image_secure_boot(pe_data)
 }
 
@@ -246,16 +264,12 @@ pub fn disable_secure_boot() -> Result<(), r_efi::efi::Status> {
     Ok(())
 }
 
-/// Persist the SecureBootEnable preference to non-volatile storage
+/// Persist the SecureBootEnable preference to non-volatile storage. Only
+/// CrabEFI's own setup actions call this; outside Setup Mode the runtime
+/// image accepts the write only through the setup authorization scope.
 #[cfg(feature = "secure-boot")]
 fn persist_secure_boot_enable_preference(enabled: bool) -> r_efi::efi::Status {
-    let value: u8 = if enabled { 1 } else { 0 };
-    let status = crate::efi::runtime_image::client::variables::set(
-        &Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID),
-        SECURE_BOOT_ENABLE_NAME,
-        SECURE_BOOT_ENABLE_ATTRS,
-        &[value],
-    );
+    let status = crate::efi::runtime_image::bridge::set_secure_boot_enable_from_setup(enabled);
     if status == r_efi::efi::Status::SUCCESS {
         log::debug!("SecureBootEnable preference persisted: {}", enabled);
     } else {

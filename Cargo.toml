@@ -17,6 +17,7 @@ exclude = [
   "crabefi-runtime-abi",
   "crabefi-runtime-image",
   "test-apps/hello",
+  "test-apps/mm-gate-test",
   "test-apps/rng-test",
   "test-apps/secure-boot-test",
   "test-apps/storage-security-test",

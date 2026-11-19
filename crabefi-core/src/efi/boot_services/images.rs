@@ -174,28 +174,37 @@ pub(super) extern "efiapi" fn load_image(
         }
     };
 
-    // Secure Boot verification (if enabled)
+    // Secure Boot verification (if enabled). As UEFI requires for
+    // SECURITY_VIOLATION, a rejected image is still loaded and gets a handle,
+    // but StartImage refuses it.
+    // An enforced build verifies every image, so StartImage never sees one
+    // that was loaded unverified while enforcement happened to be off.
     #[cfg(feature = "secure-boot")]
-    if super::super::auth::is_secure_boot_enabled() {
-        log::debug!("BS.LoadImage: Secure Boot verification required");
-        match super::super::auth::verify_pe_image_secure_boot(data) {
-            Ok(true) => {
-                log::info!("BS.LoadImage: Secure Boot verification passed");
+    let security_violation = (cfg!(feature = "secure-boot-enforced")
+        || super::super::auth::is_secure_boot_enabled())
+        && {
+            log::debug!("BS.LoadImage: Secure Boot verification required");
+            match super::super::auth::verify_pe_image_secure_boot(data) {
+                Ok(true) => {
+                    log::info!("BS.LoadImage: Secure Boot verification passed");
+                    false
+                }
+                Ok(false) => {
+                    log::error!(
+                        "BS.LoadImage: Secure Boot verification FAILED - image not authorized"
+                    );
+                    crate::display_secure_boot_error();
+                    true
+                }
+                Err(e) => {
+                    log::error!("BS.LoadImage: Secure Boot verification error: {:?}", e);
+                    crate::display_secure_boot_error();
+                    true
+                }
             }
-            Ok(false) => {
-                log::error!("BS.LoadImage: Secure Boot verification FAILED - image not authorized");
-                crate::display_secure_boot_error();
-                free_if_owned(&source);
-                return Status::SECURITY_VIOLATION;
-            }
-            Err(e) => {
-                log::error!("BS.LoadImage: Secure Boot verification error: {:?}", e);
-                crate::display_secure_boot_error();
-                free_if_owned(&source);
-                return Status::SECURITY_VIOLATION;
-            }
-        }
-    }
+        };
+    #[cfg(not(feature = "secure-boot"))]
+    let security_violation = false;
 
     // Load the PE image using our PE loader
     let loaded_image = match pe::load_image(data) {
@@ -352,6 +361,7 @@ pub(super) extern "efiapi" fn load_image(
                 entry.num_pages = loaded_image.num_pages;
                 entry.parent_handle = parent_image_handle;
                 entry.subsystem = image_subsystem;
+                entry.security_violation = security_violation;
                 #[cfg(feature = "tpm")]
                 if let Some(measurement) = deferred_measurement {
                     entry.measurement_pcr = measurement.pcr_index;
@@ -396,6 +406,14 @@ pub(super) extern "efiapi" fn load_image(
         *image_handle = new_handle;
     }
 
+    if security_violation {
+        log::error!(
+            "BS.LoadImage: handle={:?} loaded but not startable",
+            new_handle
+        );
+        return Status::SECURITY_VIOLATION;
+    }
+
     log::info!(
         "BS.LoadImage: SUCCESS - handle={:?}, base={:#x}, entry={:#x}",
         new_handle,
@@ -419,14 +437,20 @@ pub(super) extern "efiapi" fn start_image(
     }
 
     // Find the loaded image entry
-    let (entry_point, image_base, image_subsystem) = {
+    let (entry_point, image_base, image_subsystem, security_violation) = {
         let efi_state = tables();
         match efi_state
             .loaded_images
             .iter()
             .find(|entry| entry.handle == image_handle)
-            .map(|entry| (entry.entry_point, entry.image_base, entry.subsystem))
-        {
+            .map(|entry| {
+                (
+                    entry.entry_point,
+                    entry.image_base,
+                    entry.subsystem,
+                    entry.security_violation,
+                )
+            }) {
             Some(info) => info,
             None => {
                 log::error!(
@@ -437,6 +461,18 @@ pub(super) extern "efiapi" fn start_image(
             }
         }
     };
+
+    if security_violation {
+        log::error!("BS.StartImage: image failed Secure Boot verification");
+        return Status::SECURITY_VIOLATION;
+    }
+    // An enforced build never runs an image without enforcement, whatever
+    // left it off (no persistent store, a failed key enrollment).
+    #[cfg(feature = "secure-boot-enforced")]
+    if !crate::efi::auth::is_secure_boot_enforcing_confirmed() {
+        log::error!("BS.StartImage: Secure Boot is not enforcing in an enforced build");
+        return Status::SECURITY_VIOLATION;
+    }
 
     let mark_status = STARTED.with_mut(|started| {
         if started.iter().any(|(handle, _)| *handle == image_handle) {
@@ -458,6 +494,11 @@ pub(super) extern "efiapi" fn start_image(
         entry_point,
         image_base
     );
+
+    // Every started image is third-party code: payload MM's firmware phase
+    // must be over before it runs, whichever path loaded it.
+    #[cfg(target_arch = "x86_64")]
+    crate::efi::payload_mm::ready_to_boot();
 
     // Signal EFI_EVENT_GROUP_READY_TO_BOOT before the first image is started
     // and measure boot-attempt action events without duplicating separators.
@@ -857,6 +898,7 @@ fn release_image(image_handle: Handle) -> Status {
 }
 
 pub(super) extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> Status {
+    crate::timestamp::record(crate::timestamp::TS_CRABEFI_EXIT_BOOT_SERVICES_ENTRY);
     log::info!(
         "BS.ExitBootServices(handle={:?}, map_key={:#x})",
         image_handle,
@@ -946,7 +988,6 @@ pub(super) extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: 
         );
 
         log::info!("ExitBootServices SUCCESS - transitioning to OS");
-        crate::timestamp::record(crate::timestamp::TS_CRABEFI_EXIT_BOOT_SERVICES);
 
         // Clean up hardware state for OS handoff.
         // Re-enable keyboard interrupts so Linux's i8042 driver works.
@@ -976,6 +1017,10 @@ pub(super) extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: 
         if let Some(hooks) = crate::handoff::callbacks().hooks {
             hooks.on_exit_boot_services();
         }
+
+        // The OS gets control right after this: everything above is part of
+        // ExitBootServices.
+        crate::timestamp::record(crate::timestamp::TS_CRABEFI_EXIT_BOOT_SERVICES);
 
         // CRITICAL: Disable logging only after the final fallible runtime-image
         // transition. The OS generally does not map firmware log devices as

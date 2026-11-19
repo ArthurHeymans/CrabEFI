@@ -400,6 +400,51 @@ fn cmd_build_with_entry(
     machine: Machine,
     entry64: bool,
 ) -> Result<()> {
+    cmd_build_payload(release, ui, arch, machine, entry64, &[])
+}
+
+/// Payload Cargo features a test app needs beyond the default build.
+fn test_payload_features(app: &str) -> Vec<&'static str> {
+    let mut features = match app {
+        "ab-update-test" => vec!["ab-test-slots"],
+        "boot-policy-test" => vec!["usb-on-demand"],
+        "fwui-test" => vec!["external-boot-setting"],
+        "mm-seal-test" => vec!["payload-mm-test-lose-ready-to-boot"],
+        "runtime-replay-interrupt-test" => vec!["replay-test-reset-after-persist"],
+        "boot-events-test" => vec!["boot-event-log"],
+        _ => Vec::new(),
+    };
+    if capsule_on_disk_only() {
+        features.push("capsule-on-disk-only");
+    }
+    features
+}
+
+/// CRABEFI_CAPSULE_ON_DISK_ONLY=1: test a payload that accepts capsules only
+/// from the ESP; capsule-test, built with the same variable, then checks it.
+pub(crate) fn capsule_on_disk_only() -> bool {
+    std::env::var_os("CRABEFI_CAPSULE_ON_DISK_ONLY").is_some()
+}
+
+/// Target directory of a payload build; variants never overwrite the default.
+fn payload_target_dir(entry64: bool, features: &[&str]) -> String {
+    if entry64 {
+        "target/entry64".to_string()
+    } else if features.is_empty() {
+        "target".to_string()
+    } else {
+        format!("target/{}", features.join("+"))
+    }
+}
+
+fn cmd_build_payload(
+    release: bool,
+    ui: bool,
+    arch: Arch,
+    machine: Machine,
+    entry64: bool,
+    extra_features: &[&str],
+) -> Result<()> {
     if entry64 && arch != Arch::X86_64 {
         bail!("--entry64 is only supported on x86-64");
     }
@@ -433,14 +478,39 @@ fn cmd_build_with_entry(
         cmd.arg("--release");
     }
     let mut features = vec!["external-runtime-image"];
+    features.extend_from_slice(extra_features);
     if ui {
         features.push("ui");
     }
     if entry64 {
         features.push("entry64");
-        // Do not overwrite the default coreboot payload with an incompatible
-        // entry: regular run/test commands must still find the 32-bit build.
-        cmd.arg("--target-dir").arg("target/entry64");
+    }
+    // Do not overwrite the default coreboot payload with an incompatible
+    // entry or feature set: regular run/test commands must still find it.
+    let target_dir = payload_target_dir(entry64, extra_features);
+    if target_dir != "target" {
+        cmd.arg("--target-dir").arg(&target_dir);
+    }
+    // CRABEFI_PAYLOAD_MM=1: also build the runtime image as payload MM and load it into coreboot's
+    // payload MM SMRAM (needs a coreboot base ROM with PAYLOAD_MM_INTERFACE,
+    // see CRABEFI_Q35_ROM).
+    if std::env::var_os("CRABEFI_PAYLOAD_MM").is_some() && matches!(arch, Arch::X86_64) {
+        let output =
+            std::process::Command::new(project_root.join("crabefi-runtime-image/mm-build.sh"))
+                .stderr(std::process::Stdio::inherit())
+                .output()
+                .context("Failed to run crabefi-runtime-image/mm-build.sh")?;
+        if !output.status.success() {
+            bail!("payload MM runtime image build failed");
+        }
+        let elf = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .last()
+            .unwrap_or_default()
+            .to_string();
+        runtime::audit_mm_image(Path::new(&elf))?;
+        cmd.env("CRABEFI_MM_ELF", elf);
+        features.push("payload-mm");
     }
     cmd.arg("--features").arg(features.join(","));
 
@@ -490,7 +560,6 @@ fn cmd_build_with_entry(
     }
 
     let mode = if release { "release" } else { "debug" };
-    let target_dir = if entry64 { "target/entry64" } else { "target" };
     println!("Built: {target_dir}/{target_triple}/{mode}/crabefi");
     Ok(())
 }
@@ -685,6 +754,11 @@ fn cmd_test(
     windows_media_dir: Option<PathBuf>,
     windows_success_markers: Vec<String>,
 ) -> Result<()> {
+    // Payload MM persists runtime writes at once; there is no journal
+    // replay to interrupt. Refuse before building or booting anything.
+    if app == "runtime-replay-interrupt-test" && std::env::var_os("CRABEFI_PAYLOAD_MM").is_some() {
+        bail!("runtime-replay-interrupt-test needs the retained journal, not payload MM");
+    }
     let storage = if ahci {
         qemu::StorageType::Ahci
     } else if nvme {
@@ -713,6 +787,11 @@ fn cmd_test(
     // Create temp dir for ROM and disk
     let temp_dir = tempfile::tempdir()?;
 
+    // The payload must trust the test capsule signer.
+    if app == "ab-update-test" {
+        qemu::ab_update::prepare_trust_root()?;
+    }
+
     // Prepare the ROM
     let firmware = if let Some(rom) = coreboot_rom {
         rom::PreparedFirmware {
@@ -721,10 +800,11 @@ fn cmd_test(
         }
     } else {
         // Build CrabEFI first
-        cmd_build(true, ui, arch, machine)?;
+        let features = test_payload_features(app);
+        cmd_build_payload(true, ui, arch, machine, false, &features)?;
 
         // Prepare ROM with CrabEFI payload
-        let crabefi_elf = rom::get_crabefi_elf(arch);
+        let crabefi_elf = rom::get_crabefi_elf_in(&payload_target_dir(false, &features), arch);
         rom::prepare_rom(&crabefi_elf, temp_dir.path(), arch, machine)?
     };
 
@@ -874,15 +954,38 @@ fn cmd_test(
         }
     } else {
         // ── Normal UEFI test app ─────────────────────────────────────
-        println!("Building test app: {}", app);
-        cmd_build_test_app(app, arch)?;
+        // mm-seal-test boots hello on a payload whose MM never closes the
+        // firmware phase: hello must never run.
+        let efi_app = match app {
+            "mm-seal-test" => "hello",
+            // runtime-image-test on a payload that resets in the middle of
+            // replaying its journal.
+            "runtime-replay-interrupt-test" => "runtime-image-test",
+            app => app,
+        };
+        println!("Building test app: {}", efi_app);
+        cmd_build_test_app(efi_app, arch)?;
 
-        let efi_path = find_test_app_efi(app, arch)?;
+        let efi_path = find_test_app_efi(efi_app, arch)?;
 
         if app == "directory-test" {
             disk::create_directory_test_disk(
                 disk_path.to_string_lossy().as_ref(),
                 &efi_path,
+                arch,
+            )?;
+        } else if app == "boot-policy-test" {
+            disk::create_boot_policy_disks(
+                &disk_path,
+                &qemu::boot_policy::usb_disk_path(&disk_path),
+                &efi_path,
+                arch,
+            )?;
+        } else if app == "secure-boot-auth-test" {
+            disk::create_secure_boot_auth_disk(
+                disk_path.to_string_lossy().as_ref(),
+                &efi_path,
+                &project_root().join("test-apps/secure-boot-auth-test/fixtures"),
                 arch,
             )?;
         } else {

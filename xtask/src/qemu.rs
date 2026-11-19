@@ -11,21 +11,32 @@ use std::process::{Child, Command, Stdio};
 
 use crate::{Arch, Machine};
 
+pub(crate) mod ab_update;
+mod boot_events;
+pub(crate) mod boot_policy;
 mod filesystem;
 mod fwui;
 pub(crate) mod sct;
+mod secure_boot_auth;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CaptureScenario {
     BootSmoke,
     Integration,
     RuntimeImageReplay,
+    /// capsule-test with capsule-on-disk-only: the firmware applies the
+    /// capsule and resets once.
+    CapsuleOnDiskReplay,
+    /// boot-events-test: 33 boots with resets in one QEMU process.
+    BootEventLog,
 }
 
 impl CaptureScenario {
     fn for_test_app(app: &str) -> Self {
-        if app == "runtime-image-test" {
+        if app == "runtime-image-test" || app == "runtime-replay-interrupt-test" {
             Self::RuntimeImageReplay
+        } else if app == "capsule-test" && crate::capsule_on_disk_only() {
+            Self::CapsuleOnDiskReplay
         } else {
             Self::Integration
         }
@@ -38,12 +49,22 @@ impl CaptureScenario {
     }
 
     fn allows_reboot(self) -> bool {
-        self == Self::RuntimeImageReplay
+        matches!(
+            self,
+            Self::RuntimeImageReplay | Self::CapsuleOnDiskReplay | Self::BootEventLog
+        )
     }
 }
 
 fn add_x86_boot_args(cmd: &mut Command, firmware: &str, scenario: CaptureScenario) {
-    if scenario.writable_flash() {
+    // Payload MM runs: like AMD ROM Armor 3, the flash only accepts writes from SMM.
+    if std::env::var_os("CRABEFI_PAYLOAD_MM").is_some() {
+        cmd.args(["-global", "driver=cfi.pflash01,property=secure,value=on"]);
+        cmd.args([
+            "-drive",
+            &format!("if=pflash,format=raw,file={firmware},snapshot=on"),
+        ]);
+    } else if scenario.writable_flash() {
         cmd.args([
             "-drive",
             &format!("if=pflash,format=raw,file={firmware},snapshot=on"),
@@ -58,15 +79,20 @@ fn add_x86_boot_args(cmd: &mut Command, firmware: &str, scenario: CaptureScenari
     }
 }
 
-fn prepare_runtime_test_flash(source: &Path) -> Result<tempfile::NamedTempFile> {
-    const FMAP_SIGNATURE: &[u8; 8] = b"__FMAP__";
-    const FMAP_HEADER_SIZE: usize = 56;
-    const FMAP_AREA_SIZE: usize = 42;
-    const SMMSTORE_SIZE: usize = 64 * 1024;
-    const SMMSTORE_TRAILING_GUARD: usize = 64 * 1024;
+const FMAP_HEADER_SIZE: usize = 56;
+const FMAP_AREA_SIZE: usize = 42;
 
-    let mut bytes = fs::read(source)
-        .with_context(|| format!("failed to read runtime test flash {}", source.display()))?;
+/// Location of the FMAP area table and of the SMMSTORE area, if any.
+struct FmapAreas {
+    count_offset: usize,
+    count: u16,
+    areas: usize,
+    smmstore: Option<(usize, usize)>,
+}
+
+fn fmap_smmstore(bytes: &[u8]) -> Result<FmapAreas> {
+    const FMAP_SIGNATURE: &[u8; 8] = b"__FMAP__";
+
     let fmap = bytes
         .windows(FMAP_SIGNATURE.len())
         .position(|window| window == FMAP_SIGNATURE)
@@ -82,7 +108,7 @@ fn prepare_runtime_test_flash(source: &Path) -> Result<tempfile::NamedTempFile> 
     let areas = fmap
         .checked_add(FMAP_HEADER_SIZE)
         .context("FMAP areas offset overflow")?;
-    let existing_smmstore = (0..usize::from(count)).find_map(|index| {
+    let smmstore = (0..usize::from(count)).find_map(|index| {
         let entry = areas.checked_add(index.checked_mul(FMAP_AREA_SIZE)?)?;
         let bytes = bytes.get(entry..entry + FMAP_AREA_SIZE)?;
         let name = &bytes[8..40];
@@ -97,7 +123,27 @@ fn prepare_runtime_test_flash(source: &Path) -> Result<tempfile::NamedTempFile> 
             )
         })
     });
-    if let Some((offset, size)) = existing_smmstore {
+    Ok(FmapAreas {
+        count_offset,
+        count,
+        areas,
+        smmstore,
+    })
+}
+
+fn prepare_runtime_test_flash(source: &Path) -> Result<tempfile::NamedTempFile> {
+    const SMMSTORE_SIZE: usize = 64 * 1024;
+    const SMMSTORE_TRAILING_GUARD: usize = 64 * 1024;
+
+    let mut bytes = fs::read(source)
+        .with_context(|| format!("failed to read runtime test flash {}", source.display()))?;
+    let FmapAreas {
+        count_offset,
+        count,
+        areas,
+        smmstore,
+    } = fmap_smmstore(&bytes)?;
+    if let Some((offset, size)) = smmstore {
         let end = offset
             .checked_add(size)
             .context("existing SMMSTORE range overflow")?;
@@ -846,6 +892,18 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
     if app_name == "fwui-test" {
         return fwui::run(config, disk_path);
     }
+    if app_name == "boot-policy-test" {
+        return boot_policy::run(config, disk_path);
+    }
+    if app_name == "ab-update-test" {
+        return ab_update::run(config, disk_path);
+    }
+    if app_name == "boot-events-test" {
+        return boot_events::run(config, disk_path);
+    }
+    if app_name == "secure-boot-auth-test" {
+        return secure_boot_auth::run(config, disk_path);
+    }
     let scenario = CaptureScenario::for_test_app(app_name);
     println!(
         "=== CrabEFI Integration Tests ({}, {:?}) ===\n",
@@ -874,6 +932,80 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
     let mut failed = 0;
 
     match app_name {
+        "mm-gate-test" => {
+            let fails = result
+                .output
+                .lines()
+                .filter(|l| l.contains("MMGATE FAIL"))
+                .count();
+            let passes = result
+                .output
+                .lines()
+                .filter(|l| l.contains("MMGATE PASS"))
+                .count();
+            for line in result.output.lines().filter(|l| l.contains("MMGATE ")) {
+                println!("  {}", line.trim());
+            }
+            // Every gate must have been checked; a skipped run proves nothing.
+            const GATES: [&str; 7] = [
+                "ping",
+                "ring0-flash-write-blocked",
+                "firmware-write-denied",
+                "firmware-variable-denied",
+                "setup-authorize-denied",
+                "second-load-refused",
+                "mm-still-answers",
+            ];
+            let missing: Vec<_> = GATES
+                .iter()
+                .filter(|gate| {
+                    !result
+                        .output
+                        .lines()
+                        .any(|line| line.trim_end().ends_with(&format!("MMGATE PASS {gate}")))
+                })
+                .collect();
+            for gate in &missing {
+                println!("  missing MMGATE PASS {gate}");
+            }
+            if result.output.contains("MMGATE DONE")
+                && fails == 0
+                && missing.is_empty()
+                && !result.output.contains("MMGATE SKIP")
+            {
+                println!("[PASS] mm_gate: {passes} checks passed");
+                passed += 1;
+            } else {
+                println!("[FAIL] mm_gate: {fails} failed checks or no MMGATE DONE");
+                failed += 1;
+            }
+        }
+        "mm-seal-test" => {
+            if std::env::var_os("CRABEFI_PAYLOAD_MM").is_none() {
+                bail!("mm-seal-test needs CRABEFI_PAYLOAD_MM=1");
+            }
+            if result
+                .output
+                .contains("payload MM did not end the firmware phase")
+            {
+                println!(
+                    "[PASS] mm_seal_refused: the boot stopped when MM did not confirm READY_TO_BOOT"
+                );
+                passed += 1;
+            } else {
+                println!("[FAIL] mm_seal_refused: no refusal logged");
+                failed += 1;
+            }
+            if result.output.contains("Hello from CrabEFI!") {
+                println!(
+                    "[FAIL] mm_seal_no_app: the boot option ran with MM's firmware phase open"
+                );
+                failed += 1;
+            } else {
+                println!("[PASS] mm_seal_no_app: no boot option ran");
+                passed += 1;
+            }
+        }
         "hello" => {
             // Test 1: Check if "Hello from CrabEFI!" appears
             if result.output.contains("Hello from CrabEFI!") {
@@ -1331,8 +1463,9 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
                 failed += 1;
             }
 
-            // Check OsIndicationsSupported was set by firmware
-            if result.output.contains("OsIndicationsSupported set:") {
+            // Check OsIndicationsSupported was set by firmware (as read by
+            // the app; the firmware's own Info message is off by default)
+            if result.output.contains("OsIndicationsSupported = ") {
                 println!("[PASS] firmware_os_ind: Firmware set OsIndicationsSupported");
                 passed += 1;
             } else {
@@ -1341,14 +1474,28 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
             }
 
             // Check individual test results from the EFI app
-            for test_name in [
-                "os_ind_supported_read",
-                "os_ind_fmp_capsule_bit",
-                "os_ind_file_capsule_bit",
-                "query_caps_call",
-                "query_caps_max_size",
-                "update_capsule_null_rejected",
-            ] {
+            let test_names: &[&str] = if crate::capsule_on_disk_only() {
+                &[
+                    "os_ind_supported_read",
+                    "os_ind_fmp_capsule_bit",
+                    "os_ind_file_capsule_bit",
+                    "query_caps_persist_unsupported",
+                    "update_capsule_null_rejected",
+                    "update_capsule_runtime_unsupported",
+                    "query_caps_runtime_unsupported",
+                    "capsule_update_data_deleted",
+                ]
+            } else {
+                &[
+                    "os_ind_supported_read",
+                    "os_ind_fmp_capsule_bit",
+                    "os_ind_file_capsule_bit",
+                    "query_caps_call",
+                    "query_caps_max_size",
+                    "update_capsule_null_rejected",
+                ]
+            };
+            for test_name in test_names {
                 let pass_marker = format!("[PASS] {}", test_name);
                 let fail_marker = format!("[FAIL] {}", test_name);
                 if result.output.contains(&pass_marker) {
@@ -1378,7 +1525,19 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
                 failed += 1;
             }
         }
-        "runtime-image-test" => {
+        "runtime-image-test" | "runtime-replay-interrupt-test" => {
+            if app_name == "runtime-replay-interrupt-test" {
+                if result
+                    .output
+                    .contains("replay fault injection: reset before the journal acknowledgement")
+                {
+                    println!("[PASS] replay_interrupted: replay reset after persisting a record");
+                    passed += 1;
+                } else {
+                    println!("[FAIL] replay_interrupted: the fault was not injected");
+                    failed += 1;
+                }
+            }
             if result.output.contains("RUNTIME IMAGE TEST PASSED") {
                 println!(
                     "[PASS] runtime_image_boundary: all Runtime Services entries are image code"
@@ -1399,11 +1558,14 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
                 println!("[FAIL] runtime_post_svam: post-SVAM marker missing");
                 failed += 1;
             }
+            // A reset in the middle of the boot loses the capsule staged at
+            // runtime, so the interrupted run only checks the variables.
             if !matches!(config.arch, Arch::X86_64)
                 || (result
                     .output
                     .contains("RUNTIME DEFERRED VARIABLE REPLAY PASSED")
-                    && result.output.contains("RUNTIME CAPSULE CONSUMPTION PASSED"))
+                    && (app_name == "runtime-replay-interrupt-test"
+                        || result.output.contains("RUNTIME CAPSULE CONSUMPTION PASSED")))
             {
                 println!(
                     "[PASS] runtime_two_boot_replay: deferred variable replayed and capsule consumed"

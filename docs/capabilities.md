@@ -170,10 +170,11 @@ not implied by selecting Secure Boot or a basic feature profile.
 
 `OsIndicationsSupported` advertises `EFI_OS_INDICATIONS_BOOT_TO_FW_UI` (`0x1`)
 only with writable variable persistence, a successfully prepared/replayed
-retained runtime NV journal, and either a live native bidirectional serial
-console or a framebuffer with a ready keyboard (or a ready pointer with the
-`ui` feature). USB input is enumerated before the capability check. A framebuffer
-alone and a failed or still-initializing PS/2 device are not usable input paths.
+retained runtime NV journal (not needed when payload MM serves variables),
+and either a live native bidirectional serial console or a framebuffer with a
+ready keyboard (or a ready pointer with the `ui` feature). USB input is
+enumerated before the capability check. A framebuffer alone and a failed or
+still-initializing PS/2 device are not usable input paths.
 The text setup menu is always built; `ui` is not required. An arbitrary platform
 `DebugOutput` alone is not assumed to accept input. Capsule capability bits are
 independent and retain their existing gates.
@@ -192,6 +193,7 @@ boot-time persistent backend. OS runtime requests use the existing retained RAM
 journal and warm-reset replay; this does **not** add power-loss-safe runtime
 flash persistence. Embedders without retained staging intentionally do not
 advertise this feature, even if pre-ExitBootServices NV writes would work.
+With payload MM, OS runtime requests go to the MM variable store in flash.
 The dedicated QEMU regression is documented in [Building](BUILDING.md).
 
 ## Toolchain and validation scope

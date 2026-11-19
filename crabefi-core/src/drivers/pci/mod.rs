@@ -515,17 +515,21 @@ fn enumerate_region(
     Ok(())
 }
 
-/// Bind drivers to all enumerated PCI devices
+/// Bind drivers to the enumerated PCI devices selected by `filter`
 ///
-/// This iterates all discovered PCI devices and uses the driver registry
+/// This iterates the selected PCI devices and uses the driver registry
 /// to find and initialize appropriate drivers.
 ///
 /// Called from `init_storage()` after SPI controller detection, because
 /// SPI needs PCI enumeration but storage drivers need SPI to be done first.
-pub fn bind_drivers() {
+pub fn bind_drivers(filter: impl Fn(&PciDevice) -> bool) {
     log::info!("Binding PCI drivers to devices...");
 
-    let bound_count = with_devices(driver::bind_all);
+    let bound_count = with_devices(|devices| {
+        let selected: alloc::vec::Vec<&PciDevice> =
+            devices.iter().filter(|device| filter(device)).collect();
+        driver::bind_all(&selected)
+    });
 
     log::info!("PCI driver binding complete: {} devices bound", bound_count);
 }

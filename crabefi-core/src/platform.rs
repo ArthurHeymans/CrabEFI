@@ -454,6 +454,22 @@ pub struct FmapRegion {
     pub size: u32,
 }
 
+/// Firmware slots of a platform that boots one of two copies (A/B).
+///
+/// Each slot is a flash range. In A/B mode a capsule may only write regions
+/// that lie entirely inside the inactive slot; regions inside the running
+/// slot are skipped and anything else is rejected, so the running copy and
+/// shared regions are never touched. The regions need not come from an
+/// on-flash FMAP: a platform without one describes its layout through
+/// [`CapsuleBackend::fmap_regions`] and these slots.
+#[derive(Debug, Clone)]
+pub struct FirmwareSlots {
+    /// The copy that booted; a capsule never writes it.
+    pub running: FmapRegion,
+    /// The copy a capsule writes and then activates.
+    pub inactive: FmapRegion,
+}
+
 /// Capsule update backend.
 ///
 /// Implemented by platform firmware to provide the low-level operations
@@ -495,6 +511,57 @@ pub trait CapsuleBackend {
 
     /// Get all FMAP regions for RMAP manifest validation.
     fn fmap_regions(&mut self) -> &[FmapRegion];
+
+    /// Flash offset of the running firmware, if known. The capsule region
+    /// holding it is written last, so with A/B copies a power loss during the
+    /// update leaves the running copy intact.
+    fn running_firmware_offset(&self) -> Option<u32> {
+        None
+    }
+
+    /// A/B firmware slots, if the platform boots by slot. A capsule then
+    /// writes only the inactive slot, reads it back, records a trial and
+    /// activates the slot; the running copy stays as the fallback.
+    ///
+    /// CrabEFI counts the trial boots of the new slot and rolls back when the
+    /// OS does not confirm it. It can only do that when the new firmware
+    /// reaches CrabEFI: a slot that hangs earlier needs the platform's own
+    /// fallback (its slot selector or a watchdog) to boot the other copy.
+    fn firmware_slots(&mut self) -> Option<FirmwareSlots> {
+        None
+    }
+
+    /// Whether the flash is laid out for A/B slots, even when
+    /// [`firmware_slots`](Self::firmware_slots) cannot resolve them (a slot
+    /// header lost to a power cut). Updates are then refused rather than
+    /// written as one image over the running copy.
+    fn firmware_slots_expected(&mut self) -> bool {
+        false
+    }
+
+    /// Read back `buffer.len()` bytes at `offset` within the named region.
+    /// Required in A/B mode: a slot is only activated once its contents match
+    /// the authenticated image.
+    fn read_firmware_region(
+        &mut self,
+        _region_name: &str,
+        _offset: u32,
+        _buffer: &mut [u8],
+    ) -> Result<(), StorageError> {
+        Err(StorageError::NotSupported)
+    }
+
+    /// Boot `slot` from the next reset on. CrabEFI calls this only after the
+    /// slot was written and verified and its trial record is stored, or to
+    /// roll back to the previous slot.
+    ///
+    /// Return [`StorageError::WriteProtected`] when slot selection can only
+    /// change in a capsule-update boot; CrabEFI then requests one and resets.
+    /// After any other error either slot may boot next: CrabEFI keeps the
+    /// trial record, and the next boot compares it with the slot that runs.
+    fn activate_slot(&mut self, _slot: &FmapRegion) -> Result<(), StorageError> {
+        Err(StorageError::NotSupported)
+    }
 }
 
 // ============================================================================
@@ -1060,6 +1127,9 @@ pub struct RuntimePlatformConfig<'a> {
     pub external_ranges: &'a [crabefi_runtime_abi::RuntimeExternalRange],
     /// Optional, exclusively owned warm-reset-preserved deferred storage.
     pub deferred_buffer: DeferredBufferConfig,
+    /// Variables served by a payload MM image in SMM (disabled by default). Its
+    /// buffer must be RuntimeServicesData.
+    pub mm_proxy: crabefi_runtime_abi::MmProxyConfig,
 }
 
 /// Result of the UEFI boot manager.
@@ -1199,6 +1269,17 @@ pub struct PlatformConfig<'a> {
     /// Backend used to validate and apply pending firmware capsules.
     pub capsule_backend: Option<&'a mut dyn CapsuleBackend>,
 
+    /// Accept capsules only as files on the ESP, for platforms whose DRAM
+    /// does not survive a warm reset. The retained deferred buffer is not
+    /// used: `UpdateCapsule()` returns `UNSUPPORTED`, so do NV writes after
+    /// ExitBootServices unless payload MM serves variables. No
+    /// `CapsuleUpdateData*` variable is written; stale ones are deleted.
+    pub capsule_on_disk_only: bool,
+    /// Events of this boot from the platform firmware, as a coreboot event
+    /// log image (`commonlib/bsd/elog.h`), appended to the boot event log;
+    /// see [`crate::boot_event_log`].
+    pub boot_events: Option<&'a [u8]>,
+
     /// Optional platform lifecycle callbacks.
     pub hooks: Option<&'a dyn PlatformHooks>,
 
@@ -1235,6 +1316,10 @@ pub struct PlatformConfig<'a> {
     /// "protocol not found" and skip measured boot).
     #[cfg(feature = "tpm")]
     pub tpm_event_log: Option<TpmEventLogConfig<'a>>,
+
+    // ---- Boot ----
+    /// When USB comes up and which media may boot; see [`crate::boot_policy`].
+    pub boot_policy: crate::boot_policy::BootPolicy,
 
     // ---- Pre-initialization ----
     /// Whether the page allocator and heap were initialized before entry.
@@ -1290,11 +1375,14 @@ pub struct PlatformConfigBuilder<'a> {
     firmware_info: Option<FirmwareInfo>,
     capsule_regions: &'a [CapsuleRegion],
     capsule_backend: Option<&'a mut dyn CapsuleBackend>,
+    capsule_on_disk_only: bool,
+    boot_events: Option<&'a [u8]>,
     hooks: Option<&'a dyn PlatformHooks>,
     rng: Option<&'a dyn Rng>,
     ecam_regions: &'a [PciEcamRegion],
     #[cfg(feature = "tpm")]
     tpm_event_log: Option<TpmEventLogConfig<'a>>,
+    boot_policy: crate::boot_policy::BootPolicy,
     heap_pre_initialized: bool,
 }
 
@@ -1329,11 +1417,14 @@ impl<'a> PlatformConfigBuilder<'a> {
             firmware_info: None,
             capsule_regions: &[],
             capsule_backend: None,
+            capsule_on_disk_only: false,
+            boot_events: None,
             hooks: None,
             rng: None,
             ecam_regions: &[],
             #[cfg(feature = "tpm")]
             tpm_event_log: None,
+            boot_policy: crate::boot_policy::BootPolicy::default(),
             heap_pre_initialized: false,
         }
     }
@@ -1430,6 +1521,18 @@ impl<'a> PlatformConfigBuilder<'a> {
         self
     }
 
+    /// Accept capsules only from the ESP; see [`PlatformConfig::capsule_on_disk_only`].
+    pub fn capsule_on_disk_only(mut self, value: bool) -> Self {
+        self.capsule_on_disk_only = value;
+        self
+    }
+
+    /// See [`PlatformConfig::boot_events`].
+    pub fn boot_events(mut self, value: &'a [u8]) -> Self {
+        self.boot_events = Some(value);
+        self
+    }
+
     /// Platform lifecycle callbacks.
     pub fn hooks(mut self, value: &'a dyn PlatformHooks) -> Self {
         self.hooks = Some(value);
@@ -1452,6 +1555,12 @@ impl<'a> PlatformConfigBuilder<'a> {
     #[cfg(feature = "tpm")]
     pub fn tpm_event_log(mut self, value: TpmEventLogConfig<'a>) -> Self {
         self.tpm_event_log = Some(value);
+        self
+    }
+
+    /// Boot device policy.
+    pub fn boot_policy(mut self, value: crate::boot_policy::BootPolicy) -> Self {
+        self.boot_policy = value;
         self
     }
 
@@ -1484,6 +1593,8 @@ impl<'a> PlatformConfigBuilder<'a> {
             firmware_info: self.firmware_info,
             capsule_regions: self.capsule_regions,
             capsule_backend: self.capsule_backend,
+            capsule_on_disk_only: self.capsule_on_disk_only,
+            boot_events: self.boot_events,
             hooks: self.hooks,
             rng: self.rng,
             ecam_regions: self.ecam_regions,
@@ -1491,6 +1602,7 @@ impl<'a> PlatformConfigBuilder<'a> {
             runtime: self.runtime,
             #[cfg(feature = "tpm")]
             tpm_event_log: self.tpm_event_log,
+            boot_policy: self.boot_policy,
             heap_pre_initialized: self.heap_pre_initialized,
         }
     }

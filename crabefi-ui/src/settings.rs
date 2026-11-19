@@ -1,5 +1,5 @@
 //! Shared CFR draft/dependency/save policy for the graphical settings UI.
-use crate::cfr::{CfrOption, CfrOptionType, CfrValue, SettingsModel};
+use crate::cfr::{CfrOption, CfrOptionType, CfrValue, EXTERNAL_BOOT_CHOICES, SettingsModel};
 use crate::log_level::LevelFilter;
 use alloc::{string::String, vec::Vec};
 use core::cell::RefCell;
@@ -42,6 +42,13 @@ impl SettingsModel for Session<'_> {
         self.stored.borrow_mut().clear();
         self.model.set_configured_level(level)
     }
+    fn external_boot(&self) -> Option<(usize, usize)> {
+        self.model.external_boot()
+    }
+    fn set_external_boot(&self, choice: usize) -> Result<(), &'static str> {
+        self.stored.borrow_mut().clear();
+        self.model.set_external_boot(choice)
+    }
     fn find_numeric_value(&self, object_id: u64) -> Option<u32> {
         let mut stored = self.stored.borrow_mut();
         if let Some((_, value)) = stored.iter().find(|(id, _)| *id == object_id) {
@@ -65,6 +72,13 @@ pub enum MenuItem {
         current_level: log::LevelFilter,
         /// Snapshot of the value when the menu was opened, used to detect changes.
         original_level: log::LevelFilter,
+    },
+    /// CrabEFI-owned external-boot policy, as [`EXTERNAL_BOOT_CHOICES`]
+    /// indices. Only `floor` (the build policy) and stricter are offered.
+    CrabExternalBoot {
+        current: usize,
+        original: usize,
+        floor: usize,
     },
     /// Editable option
     Option {
@@ -95,8 +109,35 @@ pub fn has_changes(items: &[MenuItem]) -> bool {
                 current_level,
                 original_level,
             } if current_level != original_level
+        ) || matches!(
+            item,
+            MenuItem::CrabExternalBoot {
+                current,
+                original,
+                ..
+            } if current != original
         )
     })
+}
+
+/// External-boot choices offered: the build policy and stricter ones.
+pub fn external_boot_choices(floor: usize) -> core::ops::Range<usize> {
+    floor..EXTERNAL_BOOT_CHOICES.len()
+}
+
+pub fn external_boot_name(choice: usize) -> &'static str {
+    EXTERNAL_BOOT_CHOICES.get(choice).copied().unwrap_or("?")
+}
+
+/// Cycle through the offered external-boot choices.
+pub fn step_external_boot(current: usize, floor: usize, forward: bool) -> usize {
+    let choices = external_boot_choices(floor);
+    match forward {
+        true if current + 1 < choices.end => current + 1,
+        true => choices.start,
+        false if current > choices.start => current - 1,
+        false => choices.end - 1,
+    }
 }
 
 pub fn build_menu_items(cfr: &CfrInfo<'_>) -> Vec<MenuItem> {
@@ -111,6 +152,13 @@ pub fn build_menu_items(cfr: &CfrInfo<'_>) -> Vec<MenuItem> {
         current_level,
         original_level: current_level,
     });
+    if let Some((floor, current)) = cfr.external_boot() {
+        items.push(MenuItem::CrabExternalBoot {
+            current,
+            original: current,
+            floor,
+        });
+    }
 
     for (form_idx, form) in cfr.forms().iter().enumerate() {
         if !form.is_visible() {
@@ -225,7 +273,7 @@ pub fn is_item_visible(cfr: &CfrInfo<'_>, items: &[MenuItem], item: &MenuItem) -
                 .is_none_or(|opt| is_dep_met_live(cfr, items, opt.dependency_id, &opt.dep_values));
             form_ok && opt_ok
         }
-        MenuItem::CrabLogLevel { .. } => true,
+        MenuItem::CrabLogLevel { .. } | MenuItem::CrabExternalBoot { .. } => true,
         // Comments and subform headers don't carry their own indices, so
         // they stay visible (their parent form header hides the section).
         MenuItem::Comment { .. } | MenuItem::SubformHeader { .. } => true,
@@ -259,12 +307,15 @@ pub fn find_first_selectable(cfr: &CfrInfo<'_>, items: &[MenuItem], start: usize
 pub fn is_selectable(item: &MenuItem) -> bool {
     matches!(
         item,
-        MenuItem::Option { .. } | MenuItem::CrabLogLevel { .. }
+        MenuItem::Option { .. } | MenuItem::CrabLogLevel { .. } | MenuItem::CrabExternalBoot { .. }
     )
 }
 
 pub fn can_edit_item(cfr: &CfrInfo<'_>, items: &[MenuItem], index: usize) -> bool {
-    if matches!(items.get(index), Some(MenuItem::CrabLogLevel { .. })) {
+    if matches!(
+        items.get(index),
+        Some(MenuItem::CrabLogLevel { .. } | MenuItem::CrabExternalBoot { .. })
+    ) {
         return true;
     }
 
@@ -329,6 +380,8 @@ pub enum SettingEdit {
     Cycle,
     Set(CfrValue),
     SetLogLevel(LevelFilter),
+    /// Select an [`EXTERNAL_BOOT_CHOICES`] index.
+    SetExternalBoot(usize),
     RestoreDefault,
 }
 
@@ -365,6 +418,24 @@ pub fn apply_edit(
                 _ => return None,
             };
             Some(replace(current_level, next))
+        }
+        MenuItem::CrabExternalBoot { current, floor, .. } => {
+            let next = match edit {
+                SettingEdit::RestoreDefault => *floor,
+                SettingEdit::SetExternalBoot(choice)
+                    if external_boot_choices(*floor).contains(&choice) =>
+                {
+                    choice
+                }
+                SettingEdit::Step(direction) => step_external_boot(
+                    *current,
+                    *floor,
+                    matches!(direction, StepDirection::Forward),
+                ),
+                SettingEdit::Cycle => step_external_boot(*current, *floor, true),
+                _ => return None,
+            };
+            Some(replace(current, next))
         }
         MenuItem::Option {
             form_idx,
@@ -483,6 +554,18 @@ pub fn save_all_changes(cfr: &CfrInfo<'_>, items: &mut [MenuItem]) -> (usize, us
                     }
                 }
             }
+            MenuItem::CrabExternalBoot {
+                current, original, ..
+            } if current != original => match cfr.set_external_boot(*current) {
+                Ok(()) => {
+                    *original = *current;
+                    saved += 1;
+                }
+                Err(e) => {
+                    log::warn!("Failed to save external boot policy: {}", e);
+                    failed += 1;
+                }
+            },
             MenuItem::Option {
                 form_idx,
                 option_idx,
@@ -737,6 +820,73 @@ mod tests {
         );
         session.find_numeric_value(900);
         assert_eq!(model.0.get(), 2);
+    }
+
+    #[test]
+    fn external_boot_offers_only_the_build_policy_and_stricter() {
+        assert_eq!(external_boot_choices(0), 0..3);
+        assert_eq!(external_boot_choices(1), 1..3);
+        assert_eq!(external_boot_choices(2), 2..3);
+        for floor in 0..3 {
+            for current in external_boot_choices(floor) {
+                for forward in [true, false] {
+                    let next = step_external_boot(current, floor, forward);
+                    assert!(external_boot_choices(floor).contains(&next));
+                }
+            }
+        }
+        assert_eq!(step_external_boot(2, 1, true), 1);
+        assert_eq!(step_external_boot(1, 1, false), 2);
+        assert_eq!(step_external_boot(2, 2, true), 2);
+    }
+
+    #[test]
+    fn external_boot_is_saved_through_the_session() {
+        struct Model(core::cell::Cell<Option<usize>>);
+        impl SettingsModel for Model {
+            fn forms(&self) -> &[CfrForm] {
+                &[]
+            }
+            fn read_option_value(&self, _: &CfrOption) -> CfrValue {
+                CfrValue::Bool(false)
+            }
+            fn write_option_value(&self, _: &CfrOption, _: &CfrValue) -> Result<(), &'static str> {
+                Ok(())
+            }
+            fn external_boot(&self) -> Option<(usize, usize)> {
+                Some((1, 1))
+            }
+            fn set_external_boot(&self, choice: usize) -> Result<(), &'static str> {
+                self.0.set(Some(choice));
+                Ok(())
+            }
+        }
+        let model = Model(core::cell::Cell::new(None));
+        let session = Session::new(&model);
+        let mut items = build_menu_items(&session);
+        let index = items
+            .iter()
+            .position(|item| matches!(item, MenuItem::CrabExternalBoot { .. }))
+            .unwrap();
+        assert!(matches!(
+            items[index],
+            MenuItem::CrabExternalBoot {
+                current: 1,
+                original: 1,
+                floor: 1
+            }
+        ));
+        assert!(increment_option(&session, &mut items, index));
+        assert!(has_changes(&items));
+        assert_eq!(save_all_changes(&session, &mut items), (1, 0));
+        assert_eq!(model.0.get(), Some(2));
+        assert!(!has_changes(&items));
+        // Without a model that stores it, the setting is not offered.
+        assert!(
+            !build_menu_items(&CfrInfo::new())
+                .iter()
+                .any(|item| matches!(item, MenuItem::CrabExternalBoot { .. }))
+        );
     }
 
     #[test]

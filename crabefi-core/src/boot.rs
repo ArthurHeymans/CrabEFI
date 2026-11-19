@@ -112,8 +112,8 @@ pub fn install_block_io_protocols(
     };
 
     // Create BlockIO for each partition
-    for (i, partition) in partitions.iter().enumerate() {
-        let partition_num = (i + 1) as u32;
+    for partition in &partitions {
+        let partition_num = partition.number;
         let partition_blocks = partition.size_sectors();
 
         let partition_block_io = block_io::create_partition_block_io(
@@ -154,7 +154,7 @@ pub fn install_block_io_protocols(
             partition_num,
             partition.first_lba,
             partition_blocks,
-            &partition.partition_guid,
+            partition.signature(),
         );
 
         if !part_device_path.is_null() {
@@ -260,7 +260,7 @@ pub(crate) fn try_boot_path_from_esp(
         partition_num,
         esp.first_lba,
         partition_size,
-        &esp.partition_guid,
+        esp.signature(),
     );
 
     if !dp.is_null() {
@@ -389,6 +389,7 @@ fn execute_bootloader(
     path: &str,
     device_handle: r_efi::efi::Handle,
 ) -> Result<(), Status> {
+    // StartImage ends payload MM's firmware phase right before the image runs.
     use core::ptr;
     use efi::allocator::free_pool;
     use efi::protocols::loaded_image::LOADED_IMAGE_PROTOCOL_GUID;
@@ -405,6 +406,7 @@ fn execute_bootloader(
     // lifecycle as subsequently loaded children. LoadImage copies both buffers.
     let bs = unsafe { &*boot_services::get_boot_services() };
     let mut image_handle = ptr::null_mut();
+    crate::timestamp::record(crate::timestamp::TS_CRABEFI_OS_LOADER_LOAD);
     // SAFETY: both buffers are live for this call; LoadImage receives a valid
     // firmware handle and writes the new handle to image_handle.
     let status = unsafe {
@@ -420,6 +422,11 @@ fn execute_bootloader(
     let _ = free_pool(image.buffer);
     let _ = free_pool(full_path.cast());
     if status != Status::SUCCESS {
+        // SECURITY_VIOLATION still returns a loaded, never-startable image.
+        if !image_handle.is_null() {
+            // SAFETY: LoadImage wrote this handle for the rejected image.
+            let _ = unsafe { (bs.unload_image)(image_handle) };
+        }
         return Err(status);
     }
 
@@ -439,6 +446,7 @@ fn execute_bootloader(
     }
 
     log::info!("Executing bootloader...");
+    crate::timestamp::record(crate::timestamp::TS_CRABEFI_OS_LOADER_START);
     // No exit-data consumer at this level; StartImage frees any returned data.
     // SAFETY: image_handle came from a successful LoadImage; no exit data is requested.
     let status = unsafe { (bs.start_image)(image_handle, ptr::null_mut(), ptr::null_mut()) };

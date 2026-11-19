@@ -1,0 +1,44 @@
+From 86eff01ab3ba5d85363c4553c0a676331b28dd9e Mon Sep 17 00:00:00 2001
+From: Arthur Heymans <arthur@aheymans.xyz>
+Date: Wed, 18 Nov 2026 17:53:22 +0100
+Subject: [PATCH 3/3] configs: Add QEMU q35 payload MM defconfig for CrabEFI
+ (local)
+
+Matches CrabEFI's firmware/coreboot-qemu-q35.rom.zst config, plus
+payload MM: 64-bit coreboot (CrabEFI needs 64-bit SMM), SMM in TSEG
+(the payload MM area needs 2 MiB of SMRAM) and a 256 KiB SMMSTORE
+(crabefi-mm's store needs two halves larger than one 32 KiB variable).
+OPTION_BACKEND_NONE is explicit since PAYLOAD_MM_INTERFACE otherwise
+defaults to the UEFI variable store backend, which breaks the romstage
+link on q35.
+
+Signed-off-by: Arthur Heymans <arthur@aheymans.xyz>
+---
+ configs/defconfig.crabefi-mm | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+ create mode 100644 configs/defconfig.crabefi-mm
+
+diff --git a/configs/defconfig.crabefi-mm b/configs/defconfig.crabefi-mm
+new file mode 100644
+index 0000000000..8419c9f6e9
+--- /dev/null
++++ b/configs/defconfig.crabefi-mm
+@@ -0,0 +1,15 @@
++CONFIG_OPTION_BACKEND_NONE=y
++CONFIG_CBFS_SIZE=0x00400000
++CONFIG_BOARD_EMULATION_QEMU_X86_Q35=y
++CONFIG_DRIVERS_EFI_FW_INFO=y
++CONFIG_USE_X86_64_SUPPORT=y
++CONFIG_CPU_QEMU_X86_TSEG_SMM=y
++CONFIG_DRIVERS_EFI_VARIABLE_STORE=y
++CONFIG_DRIVERS_EFI_MAIN_FW_VERSION=0x00010000
++CONFIG_DRIVERS_EFI_MAIN_FW_LSV=0x00010000
++CONFIG_DRIVERS_EFI_UPDATE_CAPSULES=y
++CONFIG_PAYLOAD_MM_INTERFACE=y
++CONFIG_SMMSTORE_SIZE=0x40000
++# CONFIG_SMMSTORE is not set
++CONFIG_DEFAULT_CONSOLE_LOGLEVEL_8=y
++CONFIG_PAYLOAD_NONE=y
+-- 
+2.56.0
+

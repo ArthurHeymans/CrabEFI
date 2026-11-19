@@ -1061,12 +1061,63 @@ pub fn get_varstore_stats() -> Option<(u32, u32, u32)> {
 
 /// Durably write a firmware-private value, then import it through the
 /// privileged pre-boot runtime-image interface.
+/// Like [`persist_firmware_variable`], for data that may be dropped: the
+/// write fails with `StoreFull` instead of compacting. Compaction erases the
+/// only bank of this store, which a routine write every boot must not risk.
+pub(crate) fn persist_firmware_variable_if_room(
+    guid: &r_efi::efi::Guid,
+    name: &[u16],
+    attributes: u32,
+    data: &[u8],
+) -> Result<(), VarStoreError> {
+    #[cfg(target_arch = "x86_64")]
+    if crate::efi::payload_mm::active() {
+        // Payload MM compacts into a spare half, keeping a durable copy.
+        return persist_firmware_variable(guid, name, attributes, data);
+    }
+    let name_len = name
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(name.len());
+    let mut terminated_name = [0u16; crabefi_runtime_abi::MAX_VARIABLE_NAME_LEN + 1];
+    terminated_name
+        .get_mut(..name_len)
+        .ok_or(VarStoreError::InvalidArgument)?
+        .copy_from_slice(&name[..name_len]);
+    let record = edk2::build_variable_record(
+        &edk2::guid_to_bytes(guid),
+        &terminated_name[..=name_len],
+        attributes,
+        data,
+        None,
+    )
+    .ok_or(VarStoreError::InvalidArgument)?;
+    let storage_size = with_storage_mut(|s| s.size()).ok_or(VarStoreError::NotInitialized)?;
+    if !write_slot_available(
+        VARSTORE.get().write_offset,
+        record.len() as u32,
+        storage_size,
+    )? {
+        return Err(VarStoreError::StoreFull);
+    }
+    persist_firmware_variable(guid, name, attributes, data)
+}
+
 pub(crate) fn persist_firmware_variable(
     guid: &r_efi::efi::Guid,
     name: &[u16],
     attributes: u32,
     data: &[u8],
 ) -> Result<(), VarStoreError> {
+    #[cfg(target_arch = "x86_64")]
+    if crate::efi::payload_mm::active() {
+        return match crate::efi::payload_mm::set_firmware_variable(guid, name, attributes, data) {
+            r_efi::efi::Status::SUCCESS => Ok(()),
+            r_efi::efi::Status::OUT_OF_RESOURCES => Err(VarStoreError::StoreFull),
+            r_efi::efi::Status::ACCESS_DENIED => Err(VarStoreError::WriteProtected),
+            _ => Err(VarStoreError::StorageFailure),
+        };
+    }
     let name_len = name
         .iter()
         .position(|unit| *unit == 0)

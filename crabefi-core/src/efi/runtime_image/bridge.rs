@@ -34,13 +34,89 @@ pub(crate) fn delete_pk_from_setup() -> Status {
         }
         SETUP_PK_DELETE_ACTIVE.set(true);
         let _scope = ResetAuthorization;
-        super::client::variables::set(
-            &Guid::from_bytes(&crabefi_efi_types::secure_boot::EFI_GLOBAL_VARIABLE_GUID),
-            crabefi_efi_types::secure_boot::PK_NAME,
-            0,
-            &[],
-        )
+        let delete = || {
+            super::client::variables::set(
+                &Guid::from_bytes(&crabefi_efi_types::secure_boot::EFI_GLOBAL_VARIABLE_GUID),
+                crabefi_efi_types::secure_boot::PK_NAME,
+                0,
+                &[],
+            )
+        };
+        // With payload MM the MM bridge decides, from this firmware-phase grant.
+        #[cfg(target_arch = "x86_64")]
+        return crate::efi::payload_mm::with_setup_authorization(
+            crabefi_runtime_abi::bridge_operation::AUTHORIZE_SETUP_PK_DELETE,
+            delete,
+        );
+        #[cfg(not(target_arch = "x86_64"))]
+        delete()
     }
+}
+
+/// SecureBootEnable value the physical-presence setup action is writing.
+#[cfg(feature = "variable-store")]
+static SETUP_SECURE_BOOT_ENABLE: crate::cell::LocalCell<Option<u8>> =
+    crate::cell::LocalCell::new(None);
+
+#[cfg(feature = "variable-store")]
+const SECURE_BOOT_ENABLE_ATTRIBUTES: u32 = r_efi::efi::VARIABLE_NON_VOLATILE
+    | r_efi::efi::VARIABLE_BOOTSERVICE_ACCESS
+    | r_efi::efi::VARIABLE_RUNTIME_ACCESS;
+
+/// Write the SecureBootEnable preference chosen by the physical-presence
+/// setup action. Outside Setup Mode the runtime image accepts it only while
+/// this synchronous scope names the same value; it is never retained.
+#[cfg(feature = "secure-boot")]
+#[cfg_attr(not(feature = "variable-store"), allow(unused_variables))]
+pub(crate) fn set_secure_boot_enable_from_setup(enabled: bool) -> Status {
+    #[cfg(not(feature = "variable-store"))]
+    return Status::UNSUPPORTED;
+
+    #[cfg(feature = "variable-store")]
+    {
+        if SETUP_SECURE_BOOT_ENABLE.get().is_some() {
+            return Status::ACCESS_DENIED;
+        }
+        struct ResetAuthorization;
+        impl Drop for ResetAuthorization {
+            fn drop(&mut self) {
+                SETUP_SECURE_BOOT_ENABLE.set(None);
+            }
+        }
+        let value = u8::from(enabled);
+        SETUP_SECURE_BOOT_ENABLE.set(Some(value));
+        let _scope = ResetAuthorization;
+        let write = || {
+            super::client::variables::set(
+                &Guid::from_bytes(&crabefi_efi_types::secure_boot::EFI_GLOBAL_VARIABLE_GUID),
+                crabefi_efi_types::secure_boot::SECURE_BOOT_ENABLE_NAME,
+                SECURE_BOOT_ENABLE_ATTRIBUTES,
+                &[value],
+            )
+        };
+        // With payload MM the MM bridge decides, from this firmware-phase grant.
+        #[cfg(target_arch = "x86_64")]
+        return crate::efi::payload_mm::with_setup_authorization(
+            crabefi_runtime_abi::bridge_operation::AUTHORIZE_SETUP_SECURE_BOOT_ENABLE,
+            write,
+        );
+        #[cfg(not(target_arch = "x86_64"))]
+        write()
+    }
+}
+
+#[cfg(feature = "variable-store")]
+fn setup_secure_boot_enable_authorized(
+    request: &BridgeRequest,
+    name: &[u16],
+    data: &[u8],
+    active: Option<u8>,
+) -> bool {
+    active.is_some_and(|value| data == [value])
+        && crabefi_efi_types::secure_boot::is_secure_boot_enable(&request.guid, name)
+        && request.attributes == SECURE_BOOT_ENABLE_ATTRIBUTES
+        && request.timestamp_valid == 0
+        && request.reserved == 0
 }
 
 #[cfg(feature = "variable-store")]
@@ -74,9 +150,57 @@ pub unsafe extern "C" fn dispatch(request: *const BridgeRequest) -> usize {
     let result = unsafe { request.as_ref() }
         .ok_or(Status::INVALID_PARAMETER)
         .and_then(|request| unsafe { persist(request) });
+    #[cfg(all(feature = "replay-test-reset-after-persist", target_arch = "x86_64"))]
+    if result.is_ok()
+        && let Some(request) = unsafe { request.as_ref() }
+    {
+        replay_fault::after_persist(request);
+    }
     match result {
         Ok(()) => Status::SUCCESS.as_usize(),
         Err(status) => status.as_usize(),
+    }
+}
+
+/// Test only (runtime-replay-interrupt-test): reset right after the first
+/// persisted write of runtime-image-test's private variable, before replay
+/// can acknowledge its journal record, as a power cut or watchdog would.
+/// Armed once through CMOS byte 0x7e, which survives the reset.
+#[cfg(all(feature = "replay-test-reset-after-persist", target_arch = "x86_64"))]
+mod replay_fault {
+    const CMOS_INDEX: u8 = 0x7e;
+    const ARMED: u8 = 0xa5;
+    /// GUID of runtime-image-test's private authenticated variable.
+    const GUID: [u8; 16] = [
+        0x5e, 0x7c, 0x7c, 0x2b, 0x0a, 0x0d, 0x8e, 0x4b, 0x9a, 0x59, 0x5c, 0xe0, 0xc3, 0xa0, 0xe7,
+        0xd1,
+    ];
+
+    fn cmos(value: Option<u8>) -> u8 {
+        // SAFETY: the RTC/CMOS index and data ports.
+        unsafe {
+            core::arch::asm!("out 0x70, al", in("al") CMOS_INDEX, options(nomem, nostack));
+            match value {
+                Some(value) => {
+                    core::arch::asm!("out 0x71, al", in("al") value, options(nomem, nostack));
+                    value
+                }
+                None => {
+                    let read: u8;
+                    core::arch::asm!("in al, 0x71", out("al") read, options(nomem, nostack));
+                    read
+                }
+            }
+        }
+    }
+
+    pub(super) fn after_persist(request: &crabefi_runtime_abi::BridgeRequest) {
+        if request.guid != GUID || cmos(None) != ARMED {
+            return;
+        }
+        cmos(Some(0));
+        log::warn!("replay fault injection: reset before the journal acknowledgement");
+        crate::reset_system();
     }
 }
 
@@ -116,9 +240,42 @@ unsafe fn persist(request: &BridgeRequest) -> Result<(), Status> {
     }
     let timestamp = (request.timestamp_valid != 0).then_some(request.timestamp);
     let guid = Guid::from_bytes(&request.guid);
+    // Payload MM owns the store: the ring-0 image only persists boot-time
+    // bookkeeping such as the capsule staging reservation, through MM's
+    // firmware-phase variable command.
+    #[cfg(target_arch = "x86_64")]
+    if crate::efi::payload_mm::active()
+        && matches!(
+            request.operation,
+            bridge_operation::PERSIST_WRITE | bridge_operation::PERSIST_DELETE
+        )
+    {
+        return match (request.operation, timestamp) {
+            (bridge_operation::PERSIST_WRITE, None) => {
+                match crate::efi::payload_mm::set_firmware_variable(
+                    &guid,
+                    name,
+                    request.attributes,
+                    data,
+                ) {
+                    Status::SUCCESS => Ok(()),
+                    status => Err(status),
+                }
+            }
+            _ => Err(Status::UNSUPPORTED),
+        };
+    }
     match request.operation {
         bridge_operation::AUTHORIZE_SETUP_PK_DELETE => {
             return if setup_pk_delete_authorized(request, name, SETUP_PK_DELETE_ACTIVE.get()) {
+                Ok(())
+            } else {
+                Err(Status::ACCESS_DENIED)
+            };
+        }
+        bridge_operation::AUTHORIZE_SETUP_SECURE_BOOT_ENABLE => {
+            let active = SETUP_SECURE_BOOT_ENABLE.get();
+            return if setup_secure_boot_enable_authorized(request, name, data, active) {
                 Ok(())
             } else {
                 Err(Status::ACCESS_DENIED)
@@ -197,6 +354,64 @@ mod tests {
             },
         ] {
             assert!(!setup_pk_delete_authorized(&invalid, PK_NAME, true));
+        }
+        // An ordinary bridge caller cannot grant itself setup authorization.
+        assert_eq!(
+            unsafe { dispatch(&request) },
+            Status::ACCESS_DENIED.as_usize()
+        );
+    }
+
+    #[test]
+    fn setup_authorization_only_accepts_the_active_secure_boot_enable_value() {
+        use crabefi_efi_types::secure_boot::{
+            EFI_GLOBAL_VARIABLE_GUID, SECURE_BOOT_ENABLE_NAME, SECURE_BOOT_NAME,
+        };
+        let value = [0u8];
+        let request = BridgeRequest {
+            operation: bridge_operation::AUTHORIZE_SETUP_SECURE_BOOT_ENABLE,
+            attributes: SECURE_BOOT_ENABLE_ATTRIBUTES,
+            guid: EFI_GLOBAL_VARIABLE_GUID,
+            name_address: SECURE_BOOT_ENABLE_NAME.as_ptr() as u64,
+            name_len: SECURE_BOOT_ENABLE_NAME.len() as u32,
+            data_address: value.as_ptr() as u64,
+            data_len: 1,
+            ..BridgeRequest::default()
+        };
+        let name = SECURE_BOOT_ENABLE_NAME;
+        let authorized = |name, data: &[u8], active| {
+            setup_secure_boot_enable_authorized(&request, name, data, active)
+        };
+        assert!(!authorized(name, &value, None));
+        assert!(authorized(name, &value, Some(0)));
+        assert!(!authorized(name, &value, Some(1)));
+        assert!(!authorized(name, &[0, 0], Some(0)));
+        assert!(!authorized(name, &[], Some(0)));
+        assert!(!authorized(SECURE_BOOT_NAME, &value, Some(0)));
+        for invalid in [
+            BridgeRequest {
+                guid: [0x42; 16],
+                ..request
+            },
+            BridgeRequest {
+                attributes: SECURE_BOOT_ENABLE_ATTRIBUTES | 0x20,
+                ..request
+            },
+            BridgeRequest {
+                timestamp_valid: 1,
+                ..request
+            },
+            BridgeRequest {
+                reserved: 1,
+                ..request
+            },
+        ] {
+            assert!(!setup_secure_boot_enable_authorized(
+                &invalid,
+                name,
+                &value,
+                Some(0)
+            ));
         }
         // An ordinary bridge caller cannot grant itself setup authorization.
         assert_eq!(

@@ -136,8 +136,10 @@ fn dispatched_instances(serial: &str, sequence: &Sequence) -> Result<BTreeMap<St
         ]
         .iter()
         .find_map(|prefix| {
-            line.strip_prefix(prefix)
-                .map(|name| (name.trim(), *prefix == "Protocol test:"))
+            // A test's output without a trailing newline (BlockIo Reset_Func)
+            // can precede the record on the same line.
+            line.split_once(prefix)
+                .map(|(_, name)| (name.trim(), *prefix == "Protocol test:"))
         });
         if let Some((name, protocol)) = dispatch {
             ensure!(pending.is_none(), "incomplete SCT dispatch record");

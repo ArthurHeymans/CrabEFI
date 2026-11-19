@@ -249,9 +249,21 @@ pub struct AhciPort {
     pub sector_size: u32,
     /// ATA address encoding selected from IDENTIFY DEVICE.
     addressing: Option<AtaAddressing>,
+    /// An external SATA (eSATA) port: PxCMD.ESP on an HBA with CAP.SXS, as
+    /// Linux decides.
+    pub esata: bool,
+    /// A hot-plug capable port (PxCMD.HPCP), such as a drive bay. Linux also
+    /// treats these as external, but some desktop boards set it on internal
+    /// connectors (see [`crate::BootPolicy::internal_hot_plug_sata`]).
+    pub hot_plug: bool,
 }
 
 impl AhciPort {
+    /// The medium can change: optical and other ATAPI packet devices.
+    pub fn removable_media(&self) -> bool {
+        self.device_type == DeviceType::Satapi
+    }
+
     fn command_header_ptr(&self, slot: u8) -> *mut CommandHeader {
         (self.cmd_list_dma.cpu_address() as *mut CommandHeader).wrapping_add(slot as usize)
     }
@@ -682,6 +694,12 @@ impl AhciController {
             sector_count: 0,
             sector_size: 512,
             addressing: None,
+            esata: {
+                // SAFETY: the HBA registers mapped at probe time.
+                let hba = unsafe { &*(self.mmio_base as *const AhciHbaRegisters) };
+                hba.cap.is_set(CAP::SXS) && self.port_regs(port_num).cmd.is_set(PORT_CMD::ESP)
+            },
+            hot_plug: self.port_regs(port_num).cmd.is_set(PORT_CMD::HPCP),
         };
 
         // Start command processing. Once the DMA addresses have been programmed,

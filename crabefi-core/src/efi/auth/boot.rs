@@ -82,7 +82,7 @@ impl Default for SecureBootConfig {
     fn default() -> Self {
         Self {
             auto_enroll_defaults: true,
-            enable_secure_boot: false, // Don't enable by default, let user decide
+            enable_secure_boot: cfg!(feature = "secure-boot-enforced"),
         }
     }
 }
@@ -119,12 +119,15 @@ pub fn init_secure_boot(config: &SecureBootConfig) -> Result<EnrollmentStatus, A
         // A saved preference also records an explicit setup choice. In
         // particular, clear-all persists false so a later boot must not
         // silently re-enroll the keys the user deliberately removed.
+        // An enforced build has no "keys deliberately removed" choice: it
+        // always enrolls its keys again.
         if config.auto_enroll_defaults
-            && get_variable_data(
-                &Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID),
-                SECURE_BOOT_ENABLE_NAME,
-            )
-            .is_none()
+            && (cfg!(feature = "secure-boot-enforced")
+                || get_variable_data(
+                    &Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID),
+                    SECURE_BOOT_ENABLE_NAME,
+                )
+                .is_none())
         {
             log::info!("Auto-enrolling Microsoft default keys...");
             match enroll_and_persist_default_keys() {
@@ -203,15 +206,25 @@ fn key_database(variable: SecureBootVariable) -> spin::MutexGuard<'static, KeyDa
     }
 }
 
+/// Returns `false` when the variable could not be read; the cache is then
+/// emptied and marked uninitialized rather than taken for an absent database.
 fn refresh_key_database(
     variable: SecureBootVariable,
     restore_persistent_timestamp: bool,
     force: bool,
-) {
+) -> bool {
     let guid = Guid::from_bytes(variable.guid());
-    let data = get_variable_data(&guid, variable.name());
+    let data = match crate::efi::runtime_image::client::variables::try_get(&guid, variable.name()) {
+        Ok(value) => value.map(|(_, data)| data),
+        Err(status) => {
+            log::error!("Cannot read {:?} ({:?})", variable, status);
+            key_database(variable).clear();
+            KEY_DATABASE_SNAPSHOTS.lock()[variable.index()] = DatabaseSnapshot::new();
+            return false;
+        }
+    };
     if !force && KEY_DATABASE_SNAPSHOTS.lock()[variable.index()].matches(data.as_deref()) {
-        return;
+        return true;
     }
 
     let mut database = key_database(variable);
@@ -252,28 +265,33 @@ fn refresh_key_database(
         complete,
         data,
     };
+    true
 }
 
 /// Refresh boot-only Authenticode key caches from authoritative runtime-store
 /// snapshots. Unchanged values are not reparsed, and this verification-only
-/// path deliberately avoids persistent-store timestamp walks.
-pub(crate) fn refresh_key_databases() {
-    refresh_key_databases_with_force(false);
+/// path deliberately avoids persistent-store timestamp walks. Returns `false`
+/// when a database could not be read.
+pub(crate) fn refresh_key_databases() -> bool {
+    refresh_key_databases_with_force(false)
 }
 
-pub(crate) fn force_refresh_key_databases() {
-    refresh_key_databases_with_force(true);
+pub(crate) fn force_refresh_key_databases() -> bool {
+    refresh_key_databases_with_force(true)
 }
 
-fn refresh_key_databases_with_force(force: bool) {
+fn refresh_key_databases_with_force(force: bool) -> bool {
+    // Refresh every database even after a failed read.
+    let mut read = true;
     for variable in [
         SecureBootVariable::PK,
         SecureBootVariable::Kek,
         SecureBootVariable::Db,
         SecureBootVariable::Dbx,
     ] {
-        refresh_key_database(variable, false, force);
+        read &= refresh_key_database(variable, false, force);
     }
+    read
 }
 
 /// Counts and identities must not imply a complete inventory after a
@@ -446,18 +464,50 @@ fn next_firmware_timestamp(
     guid: &Guid,
     name: &[u16],
 ) -> Result<EfiTime, AuthError> {
-    let persisted = match crate::efi::varstore::persistence::try_get_variable_timestamp(guid, name)
-    {
-        Ok(timestamp) => timestamp.map(|t| utc_seconds(&efi_time_from_timestamp(t))),
-        // No durable store exists in this profile, so there is no persisted
-        // floor a new record could undercut; session issuance stays monotonic.
-        Err(crate::efi::varstore::VarStoreError::NotInitialized) => None,
-        // A durable store exists but its history is unreadable or malformed.
-        // Issuing from the build-date floor could append an older record and
-        // lower the replay floor, so refuse the write instead.
-        Err(_) => {
-            log::error!("Cannot read persisted timestamp history; refusing authenticated write");
-            return Err(AuthError::AccessDenied);
+    #[cfg(target_arch = "x86_64")]
+    let mm_floor = crate::efi::payload_mm::active().then(|| {
+        crate::efi::payload_mm::auth_timestamp(guid, name).map_err(|status| {
+            log::error!(
+                "Cannot read the MM timestamp floor ({status:?}); refusing authenticated write"
+            );
+            AuthError::AccessDenied
+        })
+    });
+    #[cfg(not(target_arch = "x86_64"))]
+    let mm_floor: Option<Result<Option<[u8; 16]>, AuthError>> = None;
+    // Payload MM holds the store: its floor, tombstones included, is the
+    // one a new record has to exceed.
+    let persisted = if let Some(floor) = mm_floor {
+        floor?.map(|bytes| {
+            utc_seconds(&EfiTime {
+                year: u16::from_le_bytes([bytes[0], bytes[1]]),
+                month: bytes[2],
+                day: bytes[3],
+                hour: bytes[4],
+                minute: bytes[5],
+                second: bytes[6],
+                nanosecond: u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
+                timezone: i16::from_le_bytes([bytes[12], bytes[13]]),
+                daylight: bytes[14],
+                pad1: 0,
+                pad2: 0,
+            })
+        })
+    } else {
+        match crate::efi::varstore::persistence::try_get_variable_timestamp(guid, name) {
+            Ok(timestamp) => timestamp.map(|t| utc_seconds(&efi_time_from_timestamp(t))),
+            // No durable store exists in this profile, so there is no persisted
+            // floor a new record could undercut; session issuance stays monotonic.
+            Err(crate::efi::varstore::VarStoreError::NotInitialized) => None,
+            // A durable store exists but its history is unreadable or malformed.
+            // Issuing from the build-date floor could append an older record and
+            // lower the replay floor, so refuse the write instead.
+            Err(_) => {
+                log::error!(
+                    "Cannot read persisted timestamp history; refusing authenticated write"
+                );
+                return Err(AuthError::AccessDenied);
+            }
         }
     };
     let mut issued = ISSUED_TIMESTAMPS.lock();
@@ -498,7 +548,8 @@ fn utc_seconds(time: &EfiTime) -> i64 {
     }
 }
 
-/// UTC `EfiTime` for Unix seconds (civil-from-days, Howard Hinnant).
+/// UTC `EfiTime` for Unix seconds (civil-from-days, Howard Hinnant), with
+/// TimeZone 0 like every EFI_VARIABLE_AUTHENTICATION_2 TimeStamp.
 fn efi_time_from_unix(seconds: i64) -> EfiTime {
     let days = seconds.div_euclid(86_400);
     let second_of_day = seconds.rem_euclid(86_400);
@@ -523,7 +574,6 @@ fn efi_time_from_unix(seconds: i64) -> EfiTime {
         hour: (second_of_day / 3_600) as u8,
         minute: (second_of_day / 60 % 60) as u8,
         second: (second_of_day % 60) as u8,
-        timezone: EFI_UNSPECIFIED_TIMEZONE,
         ..EfiTime::zero()
     }
 }
@@ -775,6 +825,7 @@ mod tests {
             let time = efi_time_from_unix(seconds);
             assert_eq!(date(&time), expected);
             assert!(time.is_valid());
+            assert!(time.has_zero_authentication_fields());
             assert_eq!(utc_seconds(&time), seconds);
         }
     }

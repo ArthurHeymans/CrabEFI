@@ -21,6 +21,8 @@ pub mod fmp;
 pub mod header;
 pub mod result;
 pub mod rmap;
+#[cfg(feature = "capsule-update")]
+pub mod trial;
 
 #[cfg(any(feature = "capsule-update", test))]
 use crabefi_runtime_abi::capsule::{
@@ -55,6 +57,26 @@ pub use result::{CapsuleResult, CapsuleResultStatus};
 ///
 /// The number of capsules successfully applied. If any capsule was applied,
 /// the caller should trigger a system reset.
+/// Whether this boot started with a capsule-on-disk request, before capsule
+/// processing cleared it. Backends whose slots may only change in a
+/// capsule-update boot can ask this. Set by [`latch_update_boot`].
+static UPDATE_BOOT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Record whether this is a capsule-update boot; call once before
+/// [`trial::check`] and [`process_pending_capsules`].
+#[cfg(feature = "capsule-update")]
+pub fn latch_update_boot() {
+    UPDATE_BOOT.store(
+        disk::is_file_capsule_delivery_requested(),
+        core::sync::atomic::Ordering::Release,
+    );
+}
+
+/// See [`latch_update_boot`].
+pub fn update_boot() -> bool {
+    UPDATE_BOOT.load(core::sync::atomic::Ordering::Acquire)
+}
+
 #[cfg(feature = "capsule-update")]
 pub fn process_pending_capsules(backend: &mut dyn CapsuleBackend) -> usize {
     let mut applied_count = 0;
@@ -105,8 +127,15 @@ pub fn process_pending_capsules(backend: &mut dyn CapsuleBackend) -> usize {
         // Clear the OsIndications bits *before* applying anything: if
         // processing crashes or power is lost part-way, the next boot must
         // not re-enter capsule processing for the same request. The OS
-        // re-requests delivery if no capsule result reports success.
-        disk::clear_os_indications_capsule_bits();
+        // re-requests delivery if no capsule result reports success. If the
+        // request cannot be cleared, applying would repeat on every boot,
+        // since a successful update resets: apply nothing.
+        let disk_capsules = if disk::clear_os_indications_capsule_bits() {
+            disk_capsules
+        } else {
+            log::error!("Not applying ESP capsules: the request could not be cleared");
+            alloc::vec::Vec::new()
+        };
 
         for (i, capsule) in disk_capsules.iter().enumerate() {
             log::info!(
@@ -134,6 +163,40 @@ pub fn process_pending_capsules(backend: &mut dyn CapsuleBackend) -> usize {
     }
 
     applied_count
+}
+
+/// `EFI_CAPSULE_VENDOR_GUID`, the GUID of the `CapsuleUpdateData*` variables.
+const CAPSULE_VENDOR_GUID: r_efi::efi::Guid = r_efi::efi::Guid::from_fields(
+    0x711c703f,
+    0xc285,
+    0x4b10,
+    0xa3,
+    0xb0,
+    &[0x36, 0xec, 0xbd, 0x3c, 0x8b, 0xe2],
+);
+
+/// Delete `CapsuleUpdateData`, `CapsuleUpdateData1`, ... up to the first
+/// missing one, where coreboot stops collecting capsules to coalesce.
+pub fn delete_capsule_update_data() {
+    use crate::efi::runtime_image::client::variables;
+
+    for index in 0u32.. {
+        let name = if index == 0 {
+            alloc::string::String::from("CapsuleUpdateData")
+        } else {
+            alloc::format!("CapsuleUpdateData{index}")
+        };
+        let name16: alloc::vec::Vec<u16> = name.encode_utf16().chain([0]).collect();
+        if variables::get(&CAPSULE_VENDOR_GUID, &name16).is_none() {
+            return;
+        }
+        let status = variables::delete(&CAPSULE_VENDOR_GUID, &name16);
+        if status != r_efi::efi::Status::SUCCESS {
+            log::warn!("Failed to delete stale {}: {:?}", name, status);
+            return;
+        }
+        log::info!("Deleted stale {}", name);
+    }
 }
 
 #[cfg(any(feature = "capsule-update", test))]

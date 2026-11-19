@@ -15,6 +15,8 @@ pub(crate) mod dma_range;
 pub mod esrt;
 pub mod guid_fmt;
 pub mod image_loader;
+#[cfg(target_arch = "x86_64")]
+pub mod payload_mm;
 pub mod protocols;
 pub mod runtime_image;
 pub mod system_table;

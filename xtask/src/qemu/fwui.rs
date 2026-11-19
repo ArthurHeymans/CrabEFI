@@ -238,7 +238,14 @@ pub(super) fn run(config: &QemuConfig, disk: &Path) -> Result<()> {
     let menus = output.matches("CrabEFI Boot Menu").count();
     setup.key("f")?;
     setup.wait_for("Firmware Settings")?;
+    // CrabEFI section: the item after the log level, Allow -> Menu only.
+    setup.key("down")?;
+    setup.key("ret")?;
+    setup.wait_for("[Menu only]")?;
     setup.key("esc")?;
+    setup.wait_for("Save changes?")?;
+    setup.key("y")?;
+    setup.wait_for("Saved 1 option(s).")?;
     setup.wait_for_n("CrabEFI Boot Menu", menus + 1)?;
     println!("[PASS] firmware settings accessible without boot media");
     setup.key("r")?;
@@ -249,8 +256,12 @@ pub(super) fn run(config: &QemuConfig, disk: &Path) -> Result<()> {
     if text.contains(REQUEST) || text.contains(MENU) {
         bail!("no-media request was not cleared persistently");
     }
+    if !text.contains("external boot MenuOnly") || text.contains("Ignoring malformed") {
+        bail!("external boot policy saved in setup was not applied");
+    }
     println!(
         "[PASS] no-media setup, empty-menu Enter, persistent clear, and normal subsequent reboot"
     );
+    println!("[PASS] external boot policy saved in setup applies on the next boot");
     Ok(())
 }

@@ -20,6 +20,10 @@ pub const EFI_CERT_RSA2048_GUID: [u8; 16] = [
 pub const EFI_CERT_SHA256_GUID: [u8; 16] = [
     0x26, 0x16, 0xc4, 0xc1, 0x4c, 0x50, 0x92, 0x40, 0xac, 0xa9, 0x41, 0xf9, 0x36, 0x93, 0x43, 0x28,
 ];
+/// EFI X.509 TBSCertificate SHA-256 type GUID in UEFI byte order.
+pub const EFI_CERT_X509_SHA256_GUID: [u8; 16] = [
+    0x92, 0xa4, 0xd2, 0x3b, 0xc0, 0x96, 0x79, 0x40, 0xb4, 0x20, 0xfc, 0xf9, 0x8e, 0xf1, 0x03, 0xed,
+];
 /// EFI PKCS#7 certificate type GUID in UEFI byte order.
 pub const EFI_CERT_TYPE_PKCS7_GUID: [u8; 16] = [
     0x9d, 0xd2, 0xaf, 0x4a, 0xdf, 0x68, 0xee, 0x49, 0x8a, 0xa9, 0x34, 0x7d, 0x37, 0x56, 0x65, 0xa7,
@@ -152,6 +156,11 @@ pub fn identify_key_database(guid: &[u8; 16], name: &[u16]) -> Option<SecureBoot
         }
     }
     None
+}
+
+/// Return whether a variable is CrabEFI's SecureBootEnable preference.
+pub fn is_secure_boot_enable(guid: &[u8; 16], name: &[u16]) -> bool {
+    guid == &EFI_GLOBAL_VARIABLE_GUID && name_matches(name, SECURE_BOOT_ENABLE_NAME)
 }
 
 /// Return whether a variable is an image-synthesized Secure Boot status value.

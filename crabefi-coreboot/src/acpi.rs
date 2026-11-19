@@ -535,6 +535,124 @@ unsafe fn find_table(rsdp_addr: u64, signature: &[u8; 4]) -> Option<(u64, usize)
     }
 }
 
+/// ACPI FPDT performance record header (ACPI 6.5, 5.2.24.1).
+#[cfg(target_arch = "x86_64")]
+#[repr(C)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
+struct PerformanceRecordHeader {
+    kind: U16,
+    length: u8,
+    revision: u8,
+}
+
+/// Firmware Basic Boot Performance Pointer Record (FPDT record type 0).
+#[cfg(target_arch = "x86_64")]
+#[repr(C)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
+struct FbptPointerRecord {
+    header: PerformanceRecordHeader,
+    reserved: U32,
+    fbpt_address: U64,
+}
+
+/// Header of the Firmware Basic Boot Performance Table.
+#[cfg(target_arch = "x86_64")]
+#[repr(C)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
+struct FbptHeader {
+    signature: [u8; 4],
+    length: U32,
+}
+
+/// Firmware Basic Boot Performance Data Record (ACPI 6.5, 5.2.24.7), right
+/// after the FBPT header.
+#[cfg(target_arch = "x86_64")]
+#[repr(C)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
+struct BasicBootRecord {
+    header: PerformanceRecordHeader,
+    reserved: U32,
+    reset_end: U64,
+    os_loader_load_image_start: U64,
+    os_loader_start_image_start: U64,
+    exit_boot_services_entry: U64,
+    exit_boot_services_exit: U64,
+}
+
+#[cfg(target_arch = "x86_64")]
+const BASIC_BOOT_RECORD_TYPE: u16 = 2;
+
+/// The Firmware Basic Boot Performance Table that the FPDT points to, with
+/// the bytes it spans. Its basic boot record is checked, so its fields lie at
+/// the offsets the timestamp recorder writes.
+///
+/// `owned(start, length)` must say whether a span lies in memory the
+/// producer reserved for tables; the FBPT is only read and returned if so.
+///
+/// # Safety
+/// `rsdp_addr` and the tables it references must be identity mapped.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn find_fbpt(rsdp_addr: u64, owned: impl Fn(u64, u64) -> bool) -> Option<u64> {
+    let (fpdt, length) = unsafe { find_table(rsdp_addr, b"FPDT") }?;
+    let table = unsafe { core::slice::from_raw_parts(fpdt as *const u8, length) };
+    let mut records = table.get(size_of::<SdtHeader>()..)?;
+    while let Ok((header, _)) = PerformanceRecordHeader::ref_from_prefix(records) {
+        let length = usize::from(header.length);
+        if length < size_of::<PerformanceRecordHeader>() || length > records.len() {
+            return None;
+        }
+        if header.kind.get() == 0 {
+            let (pointer, _) = FbptPointerRecord::ref_from_prefix(&records[..length]).ok()?;
+            let fbpt = pointer.fbpt_address.get();
+            if fbpt == 0 {
+                return None;
+            }
+            let span = size_of::<FbptHeader>() + size_of::<BasicBootRecord>();
+            if !owned(fbpt, span as u64) {
+                return None;
+            }
+            let bytes = unsafe { core::slice::from_raw_parts(fbpt as *const u8, span) };
+            let (fbpt_header, rest) = FbptHeader::ref_from_prefix(bytes).ok()?;
+            let (record, _) = BasicBootRecord::ref_from_prefix(rest).ok()?;
+            let table_length = fbpt_header.length.get() as usize;
+            let record_length = usize::from(record.header.length);
+            let valid = &fbpt_header.signature == b"FBPT"
+                && table_length >= span
+                && record.header.kind.get() == BASIC_BOOT_RECORD_TYPE
+                && record_length >= size_of::<BasicBootRecord>()
+                && size_of::<FbptHeader>() + record_length <= table_length
+                && owned(fbpt, table_length as u64);
+            return valid.then_some(fbpt);
+        }
+        records = &records[length..];
+    }
+    None
+}
+
+/// Byte offsets of the basic boot record fields in the FBPT.
+#[cfg(target_arch = "x86_64")]
+pub mod fbpt_offsets {
+    use super::{BasicBootRecord, FbptHeader};
+    use core::mem::{offset_of, size_of};
+
+    const RECORD: usize = size_of::<FbptHeader>();
+    pub const OS_LOADER_LOAD_IMAGE_START: usize =
+        RECORD + offset_of!(BasicBootRecord, os_loader_load_image_start);
+    pub const OS_LOADER_START_IMAGE_START: usize =
+        RECORD + offset_of!(BasicBootRecord, os_loader_start_image_start);
+    pub const EXIT_BOOT_SERVICES_ENTRY: usize =
+        RECORD + offset_of!(BasicBootRecord, exit_boot_services_entry);
+    pub const EXIT_BOOT_SERVICES_EXIT: usize =
+        RECORD + offset_of!(BasicBootRecord, exit_boot_services_exit);
+    // timestamps.rs is also compiled alone, so it repeats these offsets.
+    const _: () = assert!(
+        OS_LOADER_LOAD_IMAGE_START == 24
+            && OS_LOADER_START_IMAGE_START == 32
+            && EXIT_BOOT_SERVICES_ENTRY == 40
+            && EXIT_BOOT_SERVICES_EXIT == 48
+    );
+}
+
 /// Locate a TPM 1.2 event log described by the ACPI TCPA table.
 ///
 /// Some coreboot platforms publish the log through ACPI but do not export the

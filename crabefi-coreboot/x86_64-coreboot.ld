@@ -65,5 +65,13 @@ SECTIONS {
         _deferred_buffer_end = .;
     } :defer
 
+    /* Payload MM request buffer; carved out as RuntimeServicesData so the OS
+       keeps it, and registered with the MM image once at load. */
+    .mm_comm ALIGN(4096) (NOLOAD) : {
+        _mm_comm_start = .;
+        . += 68K;
+        _mm_comm_end = .;
+    } :defer
+
     /DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) *(.debug*) }
 }

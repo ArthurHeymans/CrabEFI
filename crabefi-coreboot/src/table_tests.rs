@@ -7,6 +7,7 @@ extern crate alloc;
 extern crate std;
 
 mod acpi;
+mod amd_ab;
 mod framebuffer;
 mod memory;
 mod tables;

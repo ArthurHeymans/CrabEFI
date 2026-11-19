@@ -40,7 +40,61 @@ pub struct DiskCapsule {
     /// File name (for logging).
     pub filename: heapless::String<256>,
     /// Raw capsule file contents.
-    pub data: Vec<u8>,
+    pub data: PageBuffer,
+}
+
+/// Boot-services pages holding a capsule file. Firmware images are larger
+/// than the global heap, so they get their own pages, freed on drop.
+pub struct PageBuffer {
+    address: u64,
+    pages: u64,
+    len: usize,
+}
+
+impl PageBuffer {
+    fn new(len: usize) -> Option<Self> {
+        use crate::efi::allocator::{AllocateType, MemoryType, allocate_pages};
+        let pages = (len as u64).div_ceil(4096).max(1);
+        let mut address = 0;
+        let status = allocate_pages(
+            AllocateType::AllocateAnyPages,
+            MemoryType::BootServicesData,
+            pages,
+            &mut address,
+        );
+        // Lazily: a buffer built for a failed allocation would free pages
+        // it never owned when dropped.
+        (status == r_efi::efi::Status::SUCCESS).then(|| Self {
+            address,
+            pages,
+            len,
+        })
+    }
+
+    fn truncate(&mut self, len: usize) {
+        self.len = self.len.min(len);
+    }
+}
+
+impl core::ops::Deref for PageBuffer {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        // SAFETY: `pages` pages at `address` belong to this buffer until drop.
+        unsafe { core::slice::from_raw_parts(self.address as *const u8, self.len) }
+    }
+}
+
+impl core::ops::DerefMut for PageBuffer {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as above, and `&mut self` makes the access exclusive.
+        unsafe { core::slice::from_raw_parts_mut(self.address as *mut u8, self.len) }
+    }
+}
+
+impl Drop for PageBuffer {
+    fn drop(&mut self) {
+        let _ = crate::efi::allocator::free_pages(self.address, self.pages);
+    }
 }
 
 /// Check if file-based capsule delivery was requested via `OsIndications`.
@@ -170,13 +224,11 @@ fn scan_device_for_capsules(
             }
 
             // Read the file
-            let mut buffer = Vec::new();
-            if buffer.try_reserve_exact(file_size as usize).is_err() {
+            let Some(mut buffer) = PageBuffer::new(file_size as usize) else {
                 log::error!("Out of memory loading capsule file {}", path);
                 continue;
-            }
-            buffer.resize(file_size as usize, 0);
-            match fat_fs.read_file_all(&path, buffer.as_mut_slice()) {
+            };
+            match fat_fs.read_file_all(&path, &mut buffer) {
                 Ok(bytes_read) => {
                     buffer.truncate(bytes_read);
                     log::info!("Loaded capsule file: {} ({} bytes)", name, bytes_read);
@@ -248,7 +300,8 @@ pub fn install_os_indications_supported(capsule_delivery_usable: bool, firmware_
 /// Clear the capsule-related bits in `OsIndications` after processing.
 ///
 /// This prevents re-processing on subsequent boots.
-pub fn clear_os_indications_capsule_bits() {
+/// Returns whether no capsule bit is left set (also when there was none).
+pub fn clear_os_indications_capsule_bits() -> bool {
     let os_ind_name: &[u16] = &[
         'O' as u16, 's' as u16, 'I' as u16, 'n' as u16, 'd' as u16, 'i' as u16, 'c' as u16,
         'a' as u16, 't' as u16, 'i' as u16, 'o' as u16, 'n' as u16, 's' as u16, 0,
@@ -267,12 +320,33 @@ pub fn clear_os_indications_capsule_bits() {
             attributes,
             &bytes,
         );
-        if status == r_efi::efi::Status::SUCCESS {
-            log::info!("Cleared capsule bits in OsIndications");
-        } else {
-            log::warn!("Failed to clear OsIndications: {:?}", status);
+        if status != r_efi::efi::Status::SUCCESS {
+            log::error!("Failed to clear OsIndications: {:?}", status);
+            return false;
         }
+        log::info!("Cleared capsule bits in OsIndications");
     }
+    true
+}
+
+/// Request a capsule-update boot (file capsule delivery) for the next boot.
+#[cfg(feature = "capsule-update")]
+pub fn request_file_capsule_delivery() -> bool {
+    let os_ind_name: &[u16] = &[
+        'O' as u16, 's' as u16, 'I' as u16, 'n' as u16, 'd' as u16, 'i' as u16, 'c' as u16,
+        'a' as u16, 't' as u16, 'i' as u16, 'o' as u16, 'n' as u16, 's' as u16, 0,
+    ];
+    let guid = Guid::from_bytes(&EFI_GLOBAL_VARIABLE_GUID);
+    let value = crate::efi::runtime_image::client::variables::get(&guid, os_ind_name)
+        .and_then(|(_, data)| data.get(..8).and_then(|bytes| bytes.try_into().ok()))
+        .map_or(0, u64::from_le_bytes);
+    let value = value | EFI_OS_INDICATIONS_FILE_CAPSULE_DELIVERY_SUPPORTED;
+    crate::efi::runtime_image::client::variables::set(
+        &guid,
+        os_ind_name,
+        0x07, // NV | BS | RT
+        &value.to_le_bytes(),
+    ) == r_efi::efi::Status::SUCCESS
 }
 
 fn clear_capsule_bits(value: u64) -> u64 {

@@ -20,8 +20,12 @@ extern crate alloc;
 static HOST_CHECK_ALLOCATOR: linked_list_allocator::LockedHeap =
     linked_list_allocator::LockedHeap::empty();
 
+#[cfg(feature = "ab-test-slots")]
+mod ab_test;
 #[cfg(not(target_arch = "riscv64"))]
 mod acpi;
+#[cfg(all(feature = "payload-mm", not(feature = "ab-test-slots")))]
+mod amd_ab;
 #[cfg(target_arch = "aarch64")]
 #[path = "arch/aarch64/entry.rs"]
 mod arch_entry;
@@ -36,6 +40,8 @@ mod fmap;
 mod framebuffer;
 mod memory;
 mod memory_map;
+#[cfg(feature = "payload-mm")]
+mod payload_mm;
 #[cfg(feature = "external-runtime-image")]
 mod runtime_blob;
 mod tables;
@@ -77,6 +83,21 @@ impl memory_map::Region for crabefi::MemoryRegion {
     }
 }
 
+/// Whether `start..start + length` lies in one region coreboot reserved
+/// (CBMEM tables or reserved memory).
+fn in_table_memory(map: &[memory::MemoryRegion], start: u64, length: u64) -> bool {
+    let Some(end) = start.checked_add(length) else {
+        return false;
+    };
+    map.iter().any(|region| {
+        matches!(
+            region.region_type,
+            memory::MemoryType::Reserved | memory::MemoryType::Table
+        ) && start >= region.start
+            && end <= region.start.saturating_add(region.size)
+    })
+}
+
 fn runtime_image_source() -> crabefi::RuntimeImageSource<'static> {
     #[cfg(feature = "bundled-runtime-image")]
     {
@@ -89,6 +110,25 @@ fn runtime_image_source() -> crabefi::RuntimeImageSource<'static> {
             bytes: runtime_blob::RUNTIME_IMAGE,
             expected_sha256: runtime_blob::RUNTIME_IMAGE_SHA256,
         }
+    }
+}
+
+/// Boot device policy selected by Cargo features.
+fn boot_policy() -> crabefi::BootPolicy {
+    crabefi::BootPolicy {
+        usb_init: if cfg!(feature = "usb-on-demand") {
+            crabefi::UsbInit::OnDemand
+        } else {
+            crabefi::UsbInit::Always
+        },
+        external_boot: if cfg!(feature = "external-boot-deny") {
+            crabefi::ExternalBoot::Deny
+        } else if cfg!(feature = "external-boot-menu-only") {
+            crabefi::ExternalBoot::MenuOnly
+        } else {
+            crabefi::ExternalBoot::Allow
+        },
+        internal_hot_plug_sata: cfg!(feature = "internal-hot-plug-sata"),
     }
 }
 
@@ -153,11 +193,16 @@ fn runtime_platform_config() -> crabefi::RuntimePlatformConfig<'static> {
             io_or_mmio_base: 0,
         },
     );
+    #[cfg(feature = "payload-mm")]
+    let mm_proxy = payload_mm::runtime_config();
+    #[cfg(not(feature = "payload-mm"))]
+    let mm_proxy = Default::default();
     crabefi::RuntimePlatformConfig {
         time,
         reset,
         external_ranges: &[],
         deferred_buffer,
+        mm_proxy,
     }
 }
 
@@ -388,6 +433,7 @@ impl crabefi::VariableStoreLocator for CorebootVariableStoreLocator {
 struct CorebootCapsuleBackend {
     firmware_info: Option<crabefi::FirmwareInfo>,
     fmap_offset: Option<u64>,
+    boot_media: Option<tables::BootMediaInfo>,
     fmap_loaded: bool,
     fmap_regions: alloc::vec::Vec<crabefi::FmapRegion>,
 }
@@ -400,6 +446,7 @@ impl CorebootCapsuleBackend {
         Self {
             firmware_info,
             fmap_offset: boot_media.map(|media| media.fmap_offset),
+            boot_media,
             fmap_loaded: false,
             fmap_regions: alloc::vec::Vec::new(),
         }
@@ -410,6 +457,30 @@ impl CorebootCapsuleBackend {
             return;
         }
         self.fmap_loaded = true;
+        #[cfg(feature = "ab-test-slots")]
+        self.fmap_regions.extend(ab_test::regions());
+        // Payload MM owns the flash; the FMAP is read from the mapped flash.
+        #[cfg(feature = "payload-mm")]
+        if crabefi::efi::payload_mm::active()
+            && let Some(boot_media) = self.boot_media
+        {
+            let regions = &mut self.fmap_regions;
+            if payload_mm::for_each_fmap_area(boot_media, |name, offset, size| {
+                let mut region_name = heapless::String::new();
+                if region_name.push_str(name).is_ok() {
+                    regions.push(crabefi::FmapRegion {
+                        name: region_name,
+                        offset,
+                        size,
+                    });
+                }
+            })
+            .is_none()
+            {
+                log::warn!("Capsule backend could not load FMAP");
+            }
+            return;
+        }
         let parsed = crabefi::efi::varstore::with_spi_storage_mut(|storage| {
             fmap::read_fmap(storage.controller_mut(), self.fmap_offset)
         })
@@ -428,13 +499,203 @@ impl CorebootCapsuleBackend {
     }
 }
 
+#[cfg(feature = "payload-mm")]
+impl CorebootCapsuleBackend {
+    /// AMD PSP A/B slot headers and the FMAP region of each slot: the largest
+    /// area holding that slot's PSP L2 directory but not the other's.
+    #[cfg(not(feature = "ab-test-slots"))]
+    fn slot_regions(&mut self) -> Option<([amd_ab::Ish; 2], [crabefi::FmapRegion; 2])> {
+        if !crabefi::efi::payload_mm::active() {
+            return None;
+        }
+        let boot_media = self.boot_media?;
+        let ishes = amd_ab::read_ishes(&mut |offset, buf: &mut [u8]| {
+            payload_mm::read_flash(boot_media, offset, buf)
+        })?;
+        self.load_fmap();
+        let holds = |region: &crabefi::FmapRegion, at: u32| {
+            (region.offset..region.offset.saturating_add(region.size)).contains(&at)
+        };
+        let region_of = |mine: u32, other: u32| {
+            self.fmap_regions
+                .iter()
+                .filter(|region| holds(region, mine) && !holds(region, other))
+                .max_by_key(|region| region.size)
+                .cloned()
+        };
+        let a = region_of(ishes[0].pl2, ishes[1].pl2)?;
+        let b = region_of(ishes[1].pl2, ishes[0].pl2)?;
+        Some((ishes, [a, b]))
+    }
+
+    /// AMD PSP A/B: the running slot holds the CBFS coreboot booted from.
+    #[cfg(not(feature = "ab-test-slots"))]
+    fn psp_firmware_slots(&mut self) -> Option<crabefi::FirmwareSlots> {
+        let (ishes, regions) = self.slot_regions()?;
+        let running = crabefi::CapsuleBackend::running_firmware_offset(self)?;
+        let index = regions
+            .iter()
+            .position(|region| (region.offset..region.offset + region.size).contains(&running))?;
+        log::info!(
+            "A/B slots: running '{}' (priority {:#x}), inactive '{}' (priority {:#x})",
+            regions[index].name,
+            ishes[index].priority,
+            regions[1 - index].name,
+            ishes[1 - index].priority
+        );
+        Some(crabefi::FirmwareSlots {
+            running: regions[index].clone(),
+            inactive: regions[1 - index].clone(),
+        })
+    }
+
+    /// AMD PSP A/B: raise the slot's directory priority over the other's.
+    /// Only a capsule-update boot may write the slot headers
+    /// (`WriteProtected` otherwise).
+    #[cfg(not(feature = "ab-test-slots"))]
+    fn psp_activate_slot(
+        &mut self,
+        slot: &crabefi::FmapRegion,
+    ) -> Result<(), crabefi::StorageError> {
+        let (ishes, regions) = self
+            .slot_regions()
+            .ok_or(crabefi::StorageError::NotSupported)?;
+        let target = regions
+            .iter()
+            .position(|region| region.name == slot.name && region.offset == slot.offset)
+            .ok_or(crabefi::StorageError::InvalidArgument)?;
+        let boot_media = self
+            .boot_media
+            .ok_or(crabefi::StorageError::NotInitialized)?;
+        let writes = amd_ab::activation(&ishes[target], &ishes[1 - target]);
+        // Both slots share the memory training cache, and the ABL reuses it even
+        // when the other slot's APCB differs (e.g. the UMA size): the next boot
+        // must train again. Erased first, so a power loss before the header
+        // write only costs the old slot one training boot.
+        if let Some(cache) = self
+            .fmap_regions
+            .iter()
+            .find(|region| region.name.as_str() == "RW_MRC_CACHE")
+            .filter(|_| !writes.is_empty())
+        {
+            let status = crabefi::efi::payload_mm::firmware_erase(
+                u64::from(cache.offset),
+                u64::from(cache.size),
+            );
+            if status == r_efi::efi::Status::WRITE_PROTECTED {
+                return Err(crabefi::StorageError::WriteProtected);
+            }
+            if status != r_efi::efi::Status::SUCCESS {
+                log::error!("Erasing RW_MRC_CACHE failed: {:?}", status);
+                return Err(crabefi::StorageError::IoError);
+            }
+        }
+        for (offset, header) in writes {
+            // The header has its own sector: rewrite the sector with it.
+            let sector = offset & !0xFFF;
+            let mut data = alloc::vec![0u8; 0x1000];
+            if !payload_mm::read_flash(boot_media, sector, &mut data) {
+                return Err(crabefi::StorageError::IoError);
+            }
+            let at = (offset - sector) as usize;
+            data[at..at + header.len()].copy_from_slice(&header);
+            let status = match crabefi::efi::payload_mm::firmware_erase(u64::from(sector), 0x1000) {
+                r_efi::efi::Status::SUCCESS => {
+                    crabefi::efi::payload_mm::firmware_write(u64::from(sector), &data)
+                }
+                status => status,
+            };
+            if status == r_efi::efi::Status::WRITE_PROTECTED {
+                // Not a capsule-update boot.
+                return Err(crabefi::StorageError::WriteProtected);
+            }
+            if status != r_efi::efi::Status::SUCCESS {
+                log::error!(
+                    "Writing the slot header at {:#x} failed: {:?}",
+                    offset,
+                    status
+                );
+                return Err(crabefi::StorageError::IoError);
+            }
+        }
+        Ok(())
+    }
+}
+
+// Capsule signing roots from CRABEFI_CAPSULE_TRUST_CERTS (build.rs).
+include!(concat!(env!("OUT_DIR"), "/capsule_trust.rs"));
+
 impl crabefi::CapsuleBackend for CorebootCapsuleBackend {
     fn firmware_info(&self) -> Option<&crabefi::FirmwareInfo> {
         self.firmware_info.as_ref()
     }
 
     fn capsule_trust_store(&self) -> &[&[u8]] {
-        &[]
+        CAPSULE_TRUST_STORE
+    }
+
+    #[cfg(feature = "payload-mm")]
+    fn firmware_slots(&mut self) -> Option<crabefi::FirmwareSlots> {
+        #[cfg(feature = "ab-test-slots")]
+        return ab_test::firmware_slots(self);
+        #[cfg(not(feature = "ab-test-slots"))]
+        self.psp_firmware_slots()
+    }
+
+    #[cfg(feature = "payload-mm")]
+    fn firmware_slots_expected(&mut self) -> bool {
+        #[cfg(feature = "ab-test-slots")]
+        return true;
+        #[cfg(not(feature = "ab-test-slots"))]
+        self.boot_media.is_some_and(|boot_media| {
+            amd_ab::lists_slots(&mut |offset, buf: &mut [u8]| {
+                payload_mm::read_flash(boot_media, offset, buf)
+            })
+        })
+    }
+
+    #[cfg(feature = "payload-mm")]
+    fn activate_slot(&mut self, slot: &crabefi::FmapRegion) -> Result<(), crabefi::StorageError> {
+        #[cfg(feature = "ab-test-slots")]
+        return ab_test::activate_slot(self, slot);
+        #[cfg(not(feature = "ab-test-slots"))]
+        self.psp_activate_slot(slot)
+    }
+
+    fn read_firmware_region(
+        &mut self,
+        region_name: &str,
+        offset: u32,
+        buffer: &mut [u8],
+    ) -> Result<(), crabefi::StorageError> {
+        self.load_fmap();
+        let region = self
+            .fmap_regions
+            .iter()
+            .find(|region| region.name.as_str() == region_name)
+            .ok_or(crabefi::StorageError::InvalidArgument)?;
+        if u64::from(offset) + buffer.len() as u64 > u64::from(region.size) {
+            return Err(crabefi::StorageError::InvalidArgument);
+        }
+        let at = region.offset + offset;
+        // Through MM, which reaches all of the flash the writes reach (the
+        // window mapped below 4 GiB holds at most 16 MiB).
+        #[cfg(feature = "payload-mm")]
+        if crabefi::efi::payload_mm::active() {
+            return match crabefi::efi::payload_mm::firmware_read(u64::from(at), buffer) {
+                r_efi::efi::Status::SUCCESS => Ok(()),
+                _ => Err(crabefi::StorageError::IoError),
+            };
+        }
+        crabefi::efi::varstore::with_spi_storage_mut(|storage| {
+            crabefi::FirmwareStorage::read(storage.controller_mut(), u64::from(at), buffer)
+        })
+        .ok_or(crabefi::StorageError::NotInitialized)?
+    }
+
+    fn running_firmware_offset(&self) -> Option<u32> {
+        // coreboot reports the CBFS it booted from (COREBOOT or COREBOOT_B with PSP A/B).
+        u32::try_from(self.boot_media?.cbfs_offset).ok()
     }
 
     fn write_firmware_region(
@@ -455,6 +716,24 @@ impl crabefi::CapsuleBackend for CorebootCapsuleBackend {
             .ok_or(crabefi::StorageError::InvalidArgument)?;
         if offset as u64 + data.len() as u64 > u64::from(region.size) {
             return Err(crabefi::StorageError::InvalidArgument);
+        }
+        // With payload MM only SMM may write the flash (firmware phase only).
+        #[cfg(feature = "payload-mm")]
+        if crabefi::efi::payload_mm::active() {
+            let erased = crabefi::efi::payload_mm::firmware_erase(
+                u64::from(region.offset),
+                u64::from(region.size),
+            );
+            let status = if erased == r_efi::efi::Status::SUCCESS {
+                crabefi::efi::payload_mm::firmware_write(u64::from(write_offset), data)
+            } else {
+                erased
+            };
+            return match status {
+                r_efi::efi::Status::SUCCESS => Ok(()),
+                r_efi::efi::Status::ACCESS_DENIED => Err(crabefi::StorageError::AccessDenied),
+                _ => Err(crabefi::StorageError::IoError),
+            };
         }
         crabefi::efi::varstore::with_spi_storage_mut(|storage| {
             let controller = storage.controller_mut();
@@ -737,12 +1016,15 @@ fn riscv_fdt_only_boot(fdt_ptr: u64, fdt_size: u32) -> ! {
         firmware_info: None,
         capsule_regions: &[],
         capsule_backend: None,
+        capsule_on_disk_only: cfg!(feature = "capsule-on-disk-only"),
+        boot_events: None,
         hooks: Some(&hooks),
         rng: None,
         ecam_regions: &[],
         runtime_image: runtime_image_source(),
         runtime: runtime_platform_config(),
         tpm_event_log: None,
+        boot_policy: boot_policy(),
         heap_pre_initialized: false,
     };
 
@@ -850,7 +1132,18 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
 
     #[cfg(target_arch = "x86_64")]
     let timestamp_recorder = cb_info.timestamps.and_then(|table_addr| {
-        let recorder = timestamps::CorebootTimestampRecorder::new(table_addr)?;
+        // Only touch memory coreboot reserved for tables, never RAM the
+        // allocator hands out or ranges outside the map.
+        let fbpt = cb_info
+            .acpi_rsdp
+            // SAFETY: coreboot's ACPI tables are identity mapped.
+            .and_then(|rsdp| unsafe {
+                acpi::find_fbpt(rsdp, |start, length| {
+                    in_table_memory(&cb_info.memory_map, start, length)
+                })
+            });
+        let recorder = timestamps::CorebootTimestampRecorder::new(table_addr)?
+            .with_fbpt(fbpt, crabefi::time::counter_frequency);
         recorder.record_counter(crabefi::timestamp::TS_CRABEFI_START, entry_counter);
         recorder.record_now(crabefi::timestamp::TS_CRABEFI_TABLES_PARSED);
         Some(recorder)
@@ -937,7 +1230,39 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     // ================================================================
     // Phase 4: Calibrate timer (needs serial for logging)
     // ================================================================
-    crabefi::time::init(cb_info.acpi_rsdp);
+    // coreboot advertises the TSC rate only when it is constant; using it skips
+    // the 50 ms ACPI PM timer calibration window.
+    #[cfg(target_arch = "x86_64")]
+    let tsc_from_coreboot = cb_info.tsc_freq_khz;
+    #[cfg(not(target_arch = "x86_64"))]
+    let tsc_from_coreboot: Option<u32> = None;
+    if let Some(freq_khz) = tsc_from_coreboot {
+        crabefi::time::set_counter_frequency(u64::from(freq_khz) * 1000);
+        log::info!("TSC frequency from coreboot: {} kHz", freq_khz);
+    } else {
+        crabefi::time::init(cb_info.acpi_rsdp);
+    }
+
+    // Before any flash access: from here on the flash may only be writable from SMM.
+    // Fail closed: without the MM variable authority (or with a corrupt store)
+    // Secure Boot keys are missing or unprotected, so nothing may be booted.
+    // coreboot's SMMSTORE handler writes the same flash region raw, so it
+    // would let the OS change variables around payload MM's verification.
+    #[cfg(feature = "payload-mm")]
+    if let Err(error) = if cb_info.smmstorev2_offered {
+        Err("coreboot also offers SMMSTORE, which writes the variable store around payload MM")
+    } else {
+        payload_mm::load(
+            &cb_info.payload_mm,
+            cb_info.boot_media,
+            cb_info.spi_flash.as_ref(),
+        )
+    } {
+        log::error!("payload MM unavailable ({error}): refusing to boot");
+        loop {
+            crabefi::arch::halt();
+        }
+    }
 
     // ================================================================
     // Phase 5: Build PlatformConfig
@@ -1059,6 +1384,18 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         firmware_info,
         capsule_regions: &capsule_regions[..capsule_count],
         capsule_backend: Some(&mut capsule_backend),
+        capsule_on_disk_only: cfg!(feature = "capsule-on-disk-only"),
+        // SAFETY: the record lies in coreboot-reserved memory, which persists
+        // for the entire boot (checked against the memory map).
+        boot_events: cb_info
+            .boot_events
+            .filter(|_| cfg!(feature = "boot-event-log"))
+            .filter(|&(address, size)| {
+                address != 0 && in_table_memory(&cb_info.memory_map, address, u64::from(size))
+            })
+            .map(|(address, size)| unsafe {
+                core::slice::from_raw_parts(address as *const u8, size as usize)
+            }),
         hooks: Some(&hooks),
         rng: None,
         ecam_regions: &[], // ACPI/FDT discovery is selected by the library below.
@@ -1112,6 +1449,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
                 tpm1_tis_base: None,
             }
         }),
+        boot_policy: boot_policy(),
         heap_pre_initialized: false, // Set to true after Phase 6
     };
 
@@ -1125,6 +1463,8 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     // call is a no-op.
     // ================================================================
     crabefi::efi::allocator::init_from_platform(config.memory_map);
+    #[cfg(feature = "payload-mm")]
+    payload_mm::reserve_buffer();
     match crabefi::heap::init() {
         Ok(()) | Err(crabefi::heap::HeapInitError::AlreadyInitialized) => {
             config.heap_pre_initialized = true;

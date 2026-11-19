@@ -36,6 +36,23 @@ struct TimestampEntry {
 #[derive(Clone, Copy)]
 pub(crate) struct CorebootTimestampRecorder {
     table_addr: u64,
+    /// ACPI Firmware Basic Boot Performance Table to fill (coreboot ACPI_FPDT).
+    fbpt: Option<u64>,
+    /// Counter frequency in Hz when the timestamp table gives none.
+    counter_hz: fn() -> u64,
+}
+
+/// FBPT field (byte offset) for a CrabEFI milestone: OS loader LoadImage
+/// (1509), StartImage (1511), ExitBootServices entry (1510) and exit (1508).
+/// Literal IDs: ci/run-coreboot-feature-tests.sh compiles this file alone.
+fn fbpt_field(id: u32) -> Option<usize> {
+    match id {
+        1509 => Some(24),
+        1511 => Some(32),
+        1510 => Some(40),
+        1508 => Some(48),
+        _ => None,
+    }
 }
 
 impl CorebootTimestampRecorder {
@@ -68,13 +85,56 @@ impl CorebootTimestampRecorder {
             return None;
         }
 
-        Some(Self { table_addr })
+        Some(Self {
+            table_addr,
+            fbpt: None,
+            counter_hz: || 0,
+        })
+    }
+
+    /// Also fill the FBPT basic boot record at `fbpt` (checked by
+    /// `acpi::find_fbpt`), converting counter values with the timestamp
+    /// table's rate or, without one, `counter_hz`.
+    pub(crate) fn with_fbpt(self, fbpt: Option<u64>, counter_hz: fn() -> u64) -> Self {
+        Self {
+            fbpt,
+            counter_hz,
+            ..self
+        }
+    }
+
+    /// Store milestone `id` in the FBPT in ns since reset (the counter is the
+    /// TSC, which starts at reset like coreboot's timestamp base).
+    fn record_fbpt(&self, id: u32, counter: u64) {
+        let (Some(fbpt), Some(field)) = (self.fbpt, fbpt_field(id)) else {
+            return;
+        };
+        // SAFETY: `table_addr` was accepted by `new()`; the FBPT was found
+        // through the FPDT and lives in reserved coreboot memory.
+        let table = self.table_addr as *const TimestampTable;
+        // SAFETY: `table_addr` was accepted by `new()`.
+        let mhz =
+            u64::from(unsafe { core::ptr::addr_of!((*table).tick_freq_mhz).read_unaligned() });
+        let hz = if mhz != 0 {
+            mhz * 1_000_000
+        } else {
+            (self.counter_hz)()
+        };
+        if hz == 0 {
+            return;
+        }
+        let ns = (u128::from(counter) * 1_000_000_000 / u128::from(hz)).min(u128::from(u64::MAX));
+        // SAFETY: `acpi::find_fbpt` checked the basic boot record, and the
+        // caller checked the table lies in reserved memory.
+        unsafe { ((fbpt + field as u64) as *mut u64).write_unaligned(ns as u64) };
     }
 
     /// Append a milestone using the current architecture counter.
     #[cfg(not(test))]
     pub(crate) fn record_now(&self, id: u32) {
-        self.record_counter(id, crabefi::time::read_counter());
+        let counter = crabefi::time::read_counter();
+        self.record_counter(id, counter);
+        self.record_fbpt(id, counter);
     }
 
     /// Append a milestone using an explicit architecture counter value.

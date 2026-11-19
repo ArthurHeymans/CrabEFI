@@ -40,6 +40,10 @@ pub mod tags {
     pub const CB_TAG_CBMEM_CONSOLE: u32 = 0x0017;
     pub const CB_TAG_SPI_FLASH: u32 = 0x0029;
     pub const CB_TAG_BOOT_MEDIA_PARAMS: u32 = 0x0030;
+    pub const CB_TAG_TSC_INFO: u32 = 0x0032;
+    pub const CB_TAG_PAYLOAD_MM_INTERFACE_INFO: u32 = 0x003b;
+    pub const CB_TAG_PAYLOAD_MM_SMRAM_REGION: u32 = 0x003c;
+    pub const CB_TAG_PAYLOAD_MM_SHARED_MEM: u32 = 0x003d;
     pub const CB_TAG_CBMEM_ENTRY: u32 = 0x0031;
     pub const CB_TAG_SMMSTOREV2: u32 = 0x0039;
     pub const CB_TAG_FMAP: u32 = 0x0037;
@@ -60,6 +64,8 @@ pub(crate) mod cbmem_ids {
     pub const CBMEM_ID_TCPA_TCG_LOG: u32 = 0x54445041;
     /// TPM log per TPM 2.0 specification (ASCII "TPM2")
     pub const CBMEM_ID_TPM2_TCG_LOG: u32 = 0x54504d32;
+    /// Events of this boot in the event log format (ASCII "ELGB")
+    pub const CBMEM_ID_ELOG_BOOT: u32 = 0x454c4742;
 }
 
 /// LB_TAG for TPM CB log (only the coreboot-specific format is exported via CB tables)
@@ -158,6 +164,37 @@ struct CbAcpiRsdp {
     tag: u32,
     size: u32,
     rsdp_pointer: u64,
+}
+
+/// Constant TSC rate (coreboot's `struct lb_tsc_info`)
+#[repr(C, packed)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
+struct CbTscInfo {
+    tag: u32,
+    size: u32,
+    freq_khz: u32,
+}
+
+/// coreboot `struct lb_payload_mm_interface_info`
+#[repr(C, packed)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
+struct CbPayloadMmInterfaceInfo {
+    tag: u32,
+    size: u32,
+    revision: u8,
+    bootloader_smm_is_64bit: u8,
+    apm_cmd: u8,
+    pad: u8,
+}
+
+/// coreboot `struct lb_payload_mm_smram_region` / `struct lb_payload_mm_shared_mem`
+#[repr(C, packed)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
+struct CbPayloadMmRange {
+    tag: u32,
+    size: u32,
+    physical_start: u64,
+    physical_size: u64,
 }
 
 /// Devicetree (FDT) pointer
@@ -371,8 +408,8 @@ pub struct SpiFlashInfo {
 /// Boot media parameters
 ///
 /// Contains information about the boot media layout from coreboot tables.
-// CBFS fields are parsed for handoff completeness; only FMAP offset is
-// consumed so far.
+// CBFS fields are parsed for handoff completeness; only the FMAP and CBFS
+// offsets are consumed so far.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct BootMediaInfo {
@@ -419,6 +456,16 @@ pub struct CapsuleRegion {
     pub size: u32,
 }
 
+/// coreboot payload MM interface: SMI command, SMRAM area for the MM image and
+/// the shared page (start of the payload MM area) where it registers its entry.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PayloadMmInfo {
+    pub apm_cmd: Option<u8>,
+    pub smm_is_64bit: bool,
+    pub smram: Option<(u64, u64)>,
+    pub shared_mem: Option<(u64, u64)>,
+}
+
 /// Information extracted from coreboot tables
 pub struct CorebootInfo {
     /// Memory map
@@ -439,10 +486,17 @@ pub struct CorebootInfo {
     pub cbmem_console: Option<u64>,
     /// Timestamp table address (from CB_TAG_TIMESTAMPS)
     pub timestamps: Option<u64>,
+    /// Constant TSC frequency in kHz (from CB_TAG_TSC_INFO)
+    pub tsc_freq_khz: Option<u32>,
+    /// coreboot-mediated payload MM interface (CB_TAG_PAYLOAD_MM_*)
+    pub payload_mm: PayloadMmInfo,
     /// SMBIOS tables address (from CBMEM entry)
     pub smbios: Option<u64>,
     /// SMMSTORE v2 information for UEFI variable storage
     pub smmstorev2: Option<Smmstorev2Info>,
+    /// coreboot published an SMMSTORE v2 record, whether or not it parsed:
+    /// its SMI handler then writes the store.
+    pub smmstorev2_offered: bool,
     /// SPI flash information
     pub spi_flash: Option<SpiFlashInfo>,
     /// Boot media parameters (includes FMAP location)
@@ -464,6 +518,8 @@ pub struct CorebootInfo {
     /// - `CBMEM_ID_TCPA_TCG_LOG` (0x54445041): TCG 1.2 SHA1-only format
     /// - `CBMEM_ID_TPM2_TCG_LOG` (0x54504d32): TCG 2.0 crypto-agile format
     pub tpm_log: Option<TpmLogInfo>,
+    /// Events of this boot from CBMEM (address, size), ELOG format
+    pub boot_events: Option<(u64, u32)>,
 }
 
 /// Information about a TPM event log found in CBMEM.
@@ -488,8 +544,11 @@ impl CorebootInfo {
             version: None,
             cbmem_console: None,
             timestamps: None,
+            tsc_freq_khz: None,
+            payload_mm: PayloadMmInfo::default(),
             smbios: None,
             smmstorev2: None,
+            smmstorev2_offered: false,
             spi_flash: None,
             boot_media: None,
             cfr_raw: None,
@@ -497,6 +556,7 @@ impl CorebootInfo {
             efi_fw_info: None,
             capsules: heapless::Vec::new(),
             tpm_log: None,
+            boot_events: None,
         }
     }
 }
@@ -800,6 +860,25 @@ fn parse_record(record_bytes: &[u8], info: &mut CorebootInfo, depth: usize) {
         tags::CB_TAG_TIMESTAMPS => {
             parse_timestamps(record_bytes, info);
         }
+        tags::CB_TAG_TSC_INFO => {
+            parse_tsc_info(record_bytes, info);
+        }
+        tags::CB_TAG_PAYLOAD_MM_INTERFACE_INFO => {
+            if let Ok((mm, _)) = CbPayloadMmInterfaceInfo::read_from_prefix(record_bytes) {
+                info.payload_mm.apm_cmd = Some(mm.apm_cmd);
+                info.payload_mm.smm_is_64bit = mm.bootloader_smm_is_64bit != 0;
+            }
+        }
+        tags::CB_TAG_PAYLOAD_MM_SMRAM_REGION | tags::CB_TAG_PAYLOAD_MM_SHARED_MEM => {
+            if let Ok((range, _)) = CbPayloadMmRange::read_from_prefix(record_bytes) {
+                let value = Some((range.physical_start, range.physical_size));
+                if tag == tags::CB_TAG_PAYLOAD_MM_SMRAM_REGION {
+                    info.payload_mm.smram = value;
+                } else {
+                    info.payload_mm.shared_mem = value;
+                }
+            }
+        }
         tags::CB_TAG_CBMEM_CONSOLE => {
             parse_cbmem_console(record_bytes, info);
         }
@@ -810,6 +889,7 @@ fn parse_record(record_bytes: &[u8], info: &mut CorebootInfo, depth: usize) {
             parse_tpm_cb_log_ref(record_bytes, info);
         }
         tags::CB_TAG_SMMSTOREV2 => {
+            info.smmstorev2_offered = true;
             parse_smmstorev2(record_bytes, info);
         }
         tags::CB_TAG_SPI_FLASH => {
@@ -1084,6 +1164,18 @@ fn parse_acpi_rsdp(record_bytes: &[u8], info: &mut CorebootInfo) {
     log::debug!("ACPI RSDP: {:#x}", rsdp_pointer);
 }
 
+/// Parse the constant TSC frequency
+fn parse_tsc_info(record_bytes: &[u8], info: &mut CorebootInfo) {
+    let Ok((tsc, _)) = CbTscInfo::read_from_prefix(record_bytes) else {
+        log::warn!("Failed to parse TSC info record");
+        return;
+    };
+    let freq_khz = tsc.freq_khz;
+    if freq_khz != 0 {
+        info.tsc_freq_khz = Some(freq_khz);
+    }
+}
+
 /// Parse devicetree (FDT) pointer
 fn parse_devicetree(record_bytes: &[u8], info: &mut CorebootInfo) {
     let Ok((dt, _)) = CbDevicetree::read_from_prefix(record_bytes) else {
@@ -1326,6 +1418,10 @@ fn parse_cbmem_entry(record_bytes: &[u8], info: &mut CorebootInfo) {
                 address,
                 entry_size
             );
+        }
+        cbmem_ids::CBMEM_ID_ELOG_BOOT => {
+            info.boot_events = Some((address, entry_size));
+            log::info!("Boot events found at {:#x} ({} bytes)", address, entry_size);
         }
         cbmem_ids::CBMEM_ID_TPM_CB_LOG
         | cbmem_ids::CBMEM_ID_TCPA_TCG_LOG

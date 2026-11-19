@@ -85,6 +85,9 @@ pub struct StorageDevice {
     pub pci: Option<PciAddress>,
     /// Geometry and media properties.
     pub info: BlockDeviceInfo,
+    /// Attached as external storage: USB, removable media, or a SATA
+    /// device on an external or hot-plug capable port.
+    pub external: bool,
     /// Short display name for boot menu entries (e.g. "NVMe ns1").
     pub label: String<32>,
 }
@@ -109,6 +112,7 @@ pub fn devices() -> Vec<StorageDevice> {
                     },
                     pci: Some(pci),
                     info: fixed_disk_info(namespace.num_blocks, namespace.block_size),
+                    external: false,
                     label: label(format_args!("NVMe ns{}", namespace.nsid)),
                 });
             }
@@ -128,7 +132,8 @@ pub fn devices() -> Vec<StorageDevice> {
                         port,
                     },
                     pci: Some(pci),
-                    info: fixed_disk_info(port_info.sector_count, port_info.sector_size),
+                    info: ahci_disk_info(port_info),
+                    external: ahci_external(port_info),
                     label: label(format_args!("SATA port {}", port)),
                 });
             }
@@ -147,6 +152,7 @@ pub fn devices() -> Vec<StorageDevice> {
                 },
                 pci: None,
                 info: usb_disk_info(device),
+                external: true,
                 label: label(format_args!("{} USB", controller.controller_type())),
             });
         });
@@ -162,6 +168,7 @@ pub fn devices() -> Vec<StorageDevice> {
                 id: StorageId::Sdhci { controller_id },
                 pci,
                 info: sdhci_disk_info(controller),
+                external: controller.removable(),
                 label: label(format_args!(
                     "{}",
                     if pci.is_some() { "SD card" } else { "eMMC" }
@@ -179,6 +186,7 @@ pub fn devices() -> Vec<StorageDevice> {
                 id: StorageId::Platform { index },
                 pci: None,
                 info: device.info(),
+                external: device.info().removable,
                 label: label(format_args!("{}", device.name())),
             });
         }
@@ -220,7 +228,7 @@ pub fn with_disk<R>(
             port,
         } => ahci::with_controller(controller_id, |controller| {
             let port_info = controller.get_port(port)?;
-            let info = fixed_disk_info(port_info.sector_count, port_info.sector_size);
+            let info = ahci_disk_info(port_info);
             Some(f(&mut Disk::new(
                 info,
                 ReadOnly(|lba, count, buffer: &mut [u8]| {
@@ -388,6 +396,39 @@ fn fixed_disk_info(num_blocks: u64, block_size: u32) -> BlockDeviceInfo {
         media_id: 0,
         removable: false,
         read_only: true,
+    }
+}
+
+fn ahci_disk_info(port: &ahci::AhciPort) -> BlockDeviceInfo {
+    BlockDeviceInfo {
+        removable: port.removable_media(),
+        ..fixed_disk_info(port.sector_count, port.sector_size)
+    }
+}
+
+/// Media or a drive a user can attach or swap without opening the machine:
+/// removable media, an eSATA port, or a hot-plug capable port unless the
+/// board says those are internal.
+fn ahci_external(port: &ahci::AhciPort) -> bool {
+    port.removable_media()
+        || port.esata
+        || (port.hot_plug && !crate::boot_policy::get().internal_hot_plug_sata)
+}
+
+/// Whether `id` is external storage, as [`StorageDevice::external`];
+/// `None` if it is not present.
+pub fn is_external(id: StorageId) -> Option<bool> {
+    match id {
+        StorageId::Nvme { .. } => Some(false),
+        StorageId::Ahci {
+            controller_id,
+            port,
+        } => ahci::with_controller(controller_id, |controller| {
+            controller.get_port(port).map(ahci_external)
+        })
+        .flatten(),
+        StorageId::Usb { .. } => Some(true),
+        _ => with_disk(id, |disk| disk.info().removable).ok(),
     }
 }
 

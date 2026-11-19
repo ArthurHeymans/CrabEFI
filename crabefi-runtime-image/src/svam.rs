@@ -90,12 +90,32 @@ pub fn set_virtual_address_map(
                 descriptor_size,
                 descriptor_count,
             )?;
+            #[cfg(all(target_arch = "x86_64", not(feature = "mm")))]
+            let proxy_virtual = crate::proxy::physical()
+                .map(|(base, size)| {
+                    let end = base
+                        .checked_add(size)
+                        .ok_or(efi::Status::INVALID_PARAMETER)?;
+                    let mapping = unique_mapping(
+                        virtual_map.cast(),
+                        descriptor_size,
+                        descriptor_count,
+                        |candidate| {
+                            covers_runtime(candidate, efi::RUNTIME_SERVICES_DATA, base, end)
+                        },
+                    )?;
+                    virtual_base(base, &mapping)
+                })
+                .transpose()?;
+            #[cfg(not(all(target_arch = "x86_64", not(feature = "mm"))))]
+            let proxy_virtual: Option<u64> = None;
             validate_and_commit(
                 state_pointer,
                 runtime,
                 &section_mappings,
                 &range_mappings,
                 deferred_mapping,
+                proxy_virtual,
             )
         })
         .inspect_err(|_| state::abort_virtual_transition())
@@ -325,6 +345,7 @@ fn validate_and_commit(
     section_mappings: &[Mapping],
     range_mappings: &[Mapping],
     deferred_mapping: Option<Mapping>,
+    proxy_virtual: Option<u64>,
 ) -> Result<(), efi::Status> {
     let section_virtual_bases: Vec<u64, MAX_SECTIONS> = virtual_bases(
         runtime.sections.iter().map(|section| section.physical_base),
@@ -357,6 +378,12 @@ fn validate_and_commit(
         range.virtual_base = *virtual_base;
     }
     runtime.time = virtual_time;
+    #[cfg(all(target_arch = "x86_64", not(feature = "mm")))]
+    if let Some(base) = proxy_virtual {
+        crate::proxy::set_virtual(base);
+    }
+    #[cfg(not(all(target_arch = "x86_64", not(feature = "mm"))))]
+    let _ = proxy_virtual;
     if let (Some(retained), Some(base)) = (&mut runtime.retained, retained_virtual_base) {
         retained.virtual_base = base;
     }

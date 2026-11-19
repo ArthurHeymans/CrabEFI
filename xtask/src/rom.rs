@@ -48,17 +48,27 @@ pub fn prepare_rom(
 
 /// Prepare x86_64 (Q35) firmware
 fn prepare_rom_x86_64(crabefi_elf: &Path, output_dir: &Path) -> Result<PreparedFirmware> {
-    let compressed_rom = project_root().join("firmware/coreboot-qemu-q35.rom.zst");
+    let output_rom = output_dir.join("coreboot.rom");
+    // A payload-less q35 ROM built elsewhere, e.g. coreboot with PAYLOAD_MM_INTERFACE.
+    if let Some(base) = std::env::var_os("CRABEFI_Q35_ROM") {
+        println!("Using base ROM {}", Path::new(&base).display());
+        std::fs::copy(&base, &output_rom).context("Failed to copy CRABEFI_Q35_ROM")?;
+        inject_crabefi_payload(&output_rom, crabefi_elf)?;
+        return Ok(PreparedFirmware {
+            coreboot_rom: output_rom,
+            tfa_flash: None,
+        });
+    }
+    // Payload MM runs need coreboot's payload MM interface (see firmware/README.md).
+    let compressed_rom = project_root().join(if std::env::var_os("CRABEFI_PAYLOAD_MM").is_some() {
+        "firmware/coreboot-qemu-q35-payload-mm.rom.zst"
+    } else {
+        "firmware/coreboot-qemu-q35.rom.zst"
+    });
 
     if !compressed_rom.exists() {
-        bail!(
-            "Base coreboot ROM not found: {}\n\
-            Please ensure firmware/coreboot-qemu-q35.rom.zst exists",
-            compressed_rom.display()
-        );
+        bail!("Base coreboot ROM not found: {}", compressed_rom.display());
     }
-
-    let output_rom = output_dir.join("coreboot.rom");
 
     // Decompress the ROM
     println!("Decompressing base ROM...");
@@ -303,10 +313,15 @@ fn prepare_rom_riscv64(crabefi_elf: &Path, output_dir: &Path) -> Result<Prepared
 
 /// Get the path to the CrabEFI ELF
 pub fn get_crabefi_elf(arch: Arch) -> PathBuf {
+    get_crabefi_elf_in("target", arch)
+}
+
+/// Release payload ELF built into `target_dir` (relative to the project root).
+pub fn get_crabefi_elf_in(target_dir: &str, arch: Arch) -> PathBuf {
     let target_triple = match arch {
         Arch::X86_64 => "x86_64-unknown-none",
         Arch::Aarch64 => "aarch64-unknown-none",
         Arch::Riscv64 => "riscv64gc-unknown-none-elf",
     };
-    project_root().join(format!("target/{}/release/crabefi", target_triple))
+    project_root().join(format!("{}/{}/release/crabefi", target_dir, target_triple))
 }

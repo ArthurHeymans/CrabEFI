@@ -78,6 +78,7 @@ pub extern "C" fn _start() -> ! {
                     base: deferred_base,
                     size: 4096,
                 },
+                mm_proxy: Default::default(),
             },
         )
         .build(),
