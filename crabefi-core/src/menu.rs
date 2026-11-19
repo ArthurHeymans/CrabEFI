@@ -286,7 +286,8 @@ fn discover_entries_on_disk(
 
         if partition.is_esp || is_potential_esp(partition) {
             boot_fs::with_filesystem(device.id, partition, FilesystemKind::Fat, |fs| {
-                if fs.file_size(EFI_BOOT_PATH).is_ok() {
+                // An empty file cannot be a bootloader.
+                if matches!(fs.file_size(EFI_BOOT_PATH), Ok(1..)) {
                     let mut name: String<64> = String::new();
                     let _ = write!(name, "Boot Entry ({})", device.label);
                     if !menu.add_entry(BootEntry::new(
