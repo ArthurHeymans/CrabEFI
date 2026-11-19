@@ -63,7 +63,7 @@ pub enum UsbControllerHandle {
 // SAFETY: UsbControllerHandle wraps raw pointers to USB controller structs (xHCI, EHCI, etc.)
 // allocated via the EFI page allocator. These pointers:
 // 1. Remain valid for the firmware's lifetime
-// 2. Are only accessed through ALL_CONTROLLERS mutex-protected array
+// 2. Are only accessed through the ALL_CONTROLLERS mutex-protected list
 // 3. Point to structs that themselves have MMIO and DMA buffer pointers, but
 //    all hardware access is serialized through this handle abstraction
 // The firmware is single-threaded; no concurrent USB operations are possible.
@@ -122,12 +122,11 @@ macro_rules! with_usb_controller {
     };
 }
 
-/// Maximum number of USB host controllers
-const MAX_CONTROLLERS: usize = 8;
-
-/// Global list of all USB controllers
-static ALL_CONTROLLERS: Mutex<heapless::Vec<UsbControllerHandle, MAX_CONTROLLERS>> =
-    Mutex::new(heapless::Vec::new());
+/// Global list of all USB controllers, grown from the boot-services heap.
+///
+/// Controllers are never removed, so a controller's index is stable.
+static ALL_CONTROLLERS: Mutex<alloc::vec::Vec<UsbControllerHandle>> =
+    Mutex::new(alloc::vec::Vec::new());
 
 /// Set once [`cleanup()`] has stopped every controller for OS handoff.
 static STOPPED: crate::cell::LocalCell<bool> = crate::cell::LocalCell::new(false);
@@ -142,37 +141,44 @@ static STOPPED: crate::cell::LocalCell<bool> = crate::cell::LocalCell::new(false
 /// writing it into the allocation, and pushing it into the controller list.
 ///
 /// # Arguments
-/// * `controllers` - Locked controller list
 /// * `controller` - The initialized controller to store
 /// * `wrap` - Closure to wrap the raw pointer into the appropriate `UsbControllerHandle` variant
+/// * `discard` - Stops the controller if publication fails
 /// * `name` - Controller type name for logging
 /// * `address` - PCI address for logging
 fn store_controller<T>(
-    controllers: &mut heapless::Vec<UsbControllerHandle, MAX_CONTROLLERS>,
     controller: T,
     wrap: fn(*mut T) -> UsbControllerHandle,
+    discard: impl FnOnce(T),
     name: &str,
     address: pci::PciAddress,
 ) -> Result<(), ()> {
+    // Grow the list first, so a full heap never strands controller pages.
+    let mut controllers = ALL_CONTROLLERS.lock();
+    if controllers.try_reserve(1).is_err() {
+        drop(controllers);
+        log::error!(
+            "USB: out of heap registering {} controller at {}",
+            name,
+            address
+        );
+        discard(controller);
+        return Err(());
+    }
     let pages = mem::size_of::<T>().div_ceil(4096);
     let Some(alloc) = efi::allocate_pages(pages as u64) else {
-        log::error!("  Failed to allocate memory for {} controller", name);
+        drop(controllers);
+        log::error!(
+            "USB: out of pages registering {} controller at {}",
+            name,
+            address
+        );
+        discard(controller);
         return Err(());
     };
     let controller_ptr = alloc.as_mut_ptr() as *mut T;
     unsafe { ptr::write(controller_ptr, controller) };
-    if controllers.push(wrap(controller_ptr)).is_err() {
-        log::warn!(
-            "USB: Failed to register {} controller at {} - controller list full",
-            name,
-            address
-        );
-        // SAFETY: registration failed, so the initialized controller is still
-        // exclusively owned by this allocation and must be dropped before free.
-        unsafe { ptr::drop_in_place(controller_ptr) };
-        efi::free_pages(alloc, pages as u64);
-        return Err(());
-    }
+    controllers.push(wrap(controller_ptr));
     log::info!("  {} controller initialized", name);
     Ok(())
 }
@@ -299,35 +305,34 @@ pub fn register_controller(
     address: pci::PciAddress,
     controller: InitializedController,
 ) -> Result<(), ()> {
-    let mut controllers = ALL_CONTROLLERS.lock();
     match controller {
         #[cfg(feature = "xhci")]
         InitializedController::Xhci(c) => store_controller(
-            &mut controllers,
             *c,
             UsbControllerHandle::Xhci,
+            XhciController::discard_unregistered,
             "xHCI",
             address,
         ),
         InitializedController::Ehci(c) => store_controller(
-            &mut controllers,
             *c,
             UsbControllerHandle::Ehci,
+            |mut controller| controller.cleanup(),
             "EHCI",
             address,
         ),
         InitializedController::Ohci(c) => store_controller(
-            &mut controllers,
             *c,
             UsbControllerHandle::Ohci,
+            |mut controller| controller.cleanup(),
             "OHCI",
             address,
         ),
         #[cfg(target_arch = "x86_64")]
         InitializedController::Uhci(c) => store_controller(
-            &mut controllers,
             *c,
             UsbControllerHandle::Uhci,
+            |mut controller| controller.cleanup(),
             "UHCI",
             address,
         ),

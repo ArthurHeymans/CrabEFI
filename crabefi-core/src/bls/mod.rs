@@ -30,10 +30,8 @@ pub mod entry;
 pub use entry::{BlsEntry, BlsParseError, Initrds, LoaderConf, MAX_INITRDS};
 
 use crate::fs::boot::BootFilesystem;
-use heapless::{String, Vec};
-
-/// Maximum number of BLS entries we can discover
-const MAX_BLS_ENTRIES: usize = 16;
+use alloc::vec::Vec;
+use heapless::String;
 
 /// Maximum size of a .conf file we'll read
 const MAX_CONF_SIZE: usize = 4096;
@@ -59,7 +57,7 @@ pub enum BlsError {
 #[derive(Debug)]
 pub struct BlsDiscovery {
     /// Parsed boot entries
-    pub entries: Vec<BlsEntry, MAX_BLS_ENTRIES>,
+    pub entries: Vec<BlsEntry>,
     /// Loader configuration (if loader.conf exists)
     pub loader_conf: Option<LoaderConf>,
 }
@@ -157,19 +155,25 @@ pub(crate) fn discover_entries_at(
             if core::fmt::write(&mut path, format_args!("{entries_dir}/{filename}")).is_err() {
                 continue;
             }
-            if let Some(entry) = try_load_entry(fs, path.as_str()) {
-                let _ = discovery.entries.push(entry);
+            if let Some(mut entry) = try_load_entry(fs, path.as_str()) {
+                if discovery.entries.try_reserve(1).is_err() {
+                    log::error!("BLS: out of heap; stopping discovery at {}", path);
+                    break;
+                }
+                entry.scan_order = discovery.entries.len();
+                discovery.entries.push(entry);
             }
         }
     }
 
-    // Sort entries: by sort-key ascending, then by version descending (newer first)
-    discovery.entries.as_mut_slice().sort_by(|a, b| {
-        if !a.sort_key.is_empty() || !b.sort_key.is_empty() {
+    // Preserve the directory order of ties without stable sort's heap scratch.
+    discovery.entries.sort_unstable_by(|a, b| {
+        let order = if !a.sort_key.is_empty() || !b.sort_key.is_empty() {
             a.sort_key.cmp(&b.sort_key)
         } else {
             b.version.cmp(&a.version)
-        }
+        };
+        order.then_with(|| a.scan_order.cmp(&b.scan_order))
     });
 
     if discovery.is_empty() {
@@ -268,7 +272,7 @@ mod tests {
         for id in ids {
             let mut entry = BlsEntry::new();
             let _ = entry.id.push_str(id);
-            let _ = discovery.entries.push(entry);
+            discovery.entries.push(entry);
         }
         discovery
     }

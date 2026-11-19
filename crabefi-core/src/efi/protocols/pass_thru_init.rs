@@ -29,9 +29,9 @@ pub fn init() {
     log::info!("Pass-through protocol initialization complete");
 }
 
-fn publish<P>(handle: Handle, guid: &Guid, protocol: *mut P, discard: impl FnOnce(*mut P)) {
+fn publish<P>(handle: Handle, guid: &Guid, protocol: *mut P, discard: impl FnOnce(*mut P)) -> bool {
     if protocol.is_null() {
-        return;
+        return false;
     }
     let status = boot_services::install_protocol(handle, guid, protocol.cast());
     if status == Status::SUCCESS {
@@ -40,6 +40,7 @@ fn publish<P>(handle: Handle, guid: &Guid, protocol: *mut P, discard: impl FnOnc
             crate::efi::guid_fmt::GuidFmt(*guid),
             handle
         );
+        true
     } else {
         discard(protocol);
         log::warn!(
@@ -48,6 +49,7 @@ fn publish<P>(handle: Handle, guid: &Guid, protocol: *mut P, discard: impl FnOnc
             handle,
             status
         );
+        false
     }
 }
 
@@ -55,17 +57,15 @@ fn publish<P>(handle: Handle, guid: &Guid, protocol: *mut P, discard: impl FnOnc
 fn init_nvme_pass_thru() {
     // Iterate over all NVMe controllers
     for controller_index in 0..nvme::controller_count() {
-        let Some((pci_addr, namespaces)) = nvme::with_controller(controller_index, |controller| {
-            let mut namespaces = heapless::Vec::<_, 8>::new();
-            namespaces
-                .extend_from_slice(controller.namespaces())
-                .expect("NVMe namespace registry capacity must match protocol capacity");
-            (controller.pci_address(), namespaces)
-        }) else {
+        let Some((pci_addr, namespace_count)) =
+            nvme::with_controller(controller_index, |controller| {
+                (controller.pci_address(), controller.namespaces().len())
+            })
+        else {
             continue;
         };
 
-        if namespaces.is_empty() {
+        if namespace_count == 0 {
             continue;
         }
 
@@ -116,22 +116,27 @@ fn init_nvme_pass_thru() {
         );
 
         // Install Storage Security Command Protocol on each namespace
-        for ns in namespaces.iter() {
+        for index in 0..namespace_count {
+            // Copy just the ID. Release the controller lock before installing
+            // protocols, which can call notification callbacks synchronously.
+            let Some(nsid) = nvme::with_controller(controller_index, |controller| {
+                controller.namespaces().get(index).map(|ns| ns.nsid)
+            })
+            .flatten() else {
+                continue;
+            };
             // Create a handle for the namespace
             let ns_handle = match boot_services::create_handle() {
                 Some(h) => h,
                 None => {
-                    log::error!("Failed to create handle for NVMe namespace {}", ns.nsid);
+                    log::error!("Failed to create handle for NVMe namespace {nsid}");
                     continue;
                 }
             };
 
             // Install device path on namespace handle
-            let ns_device_path = device_path::create_nvme_device_path(
-                pci_addr.device(),
-                pci_addr.function(),
-                ns.nsid,
-            );
+            let ns_device_path =
+                device_path::create_nvme_device_path(pci_addr.device(), pci_addr.function(), nsid);
             if !ns_device_path.is_null() {
                 boot_services::install_protocol(
                     ns_handle,
@@ -142,18 +147,22 @@ fn init_nvme_pass_thru() {
 
             // Install Storage Security Command Protocol
             let storage_security = storage_security::create_storage_security_protocol(
-                ns.nsid, // Use nsid as media_id
+                nsid, // Use nsid as media_id
                 StorageId::Nvme {
                     controller_id: controller_index,
-                    nsid: ns.nsid,
+                    nsid,
                 },
             );
-            publish(
+            if publish(
                 ns_handle,
                 &STORAGE_SECURITY_COMMAND_GUID,
                 storage_security,
                 storage_security::discard_unpublished,
-            );
+            ) {
+                log::info!(
+                    "NVMe StorageSecurity installed: controller {controller_index}, namespace {nsid}"
+                );
+            }
         }
     }
 }

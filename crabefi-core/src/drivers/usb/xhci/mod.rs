@@ -18,6 +18,8 @@ pub mod transfers;
 pub use ring::TrbRing;
 pub use slots::UsbSlot;
 
+use alloc::boxed::Box;
+
 use crate::barrier;
 use crate::drivers::mmio::MmioRegion;
 use crate::drivers::pci::PciAddress;
@@ -86,14 +88,6 @@ pub(super) fn read_event_control(addr: u64) -> u32 {
 /// xHCI MMIO region size (64KB should cover all controllers)
 const XHCI_MMIO_SIZE: usize = 0x10000;
 
-/// Maximum number of device slots supported.
-///
-/// The xHCI spec allows up to 255 slots. We use a heapless Vec with this
-/// capacity and tell the controller to limit itself accordingly via the
-/// CONFIG register. This avoids a separate `max_slots` bookkeeping field
-/// and ensures all slot accesses go through bounds-checked `.get()`.
-pub const MAX_SLOTS: usize = 16;
-
 /// xHCI Controller
 pub struct XhciController {
     /// PCI address (bus:device.function)
@@ -124,11 +118,12 @@ pub struct XhciController {
     event_ring: TrbRing,
     /// Active device slots, indexed by slot ID.
     ///
-    /// Slot IDs are assigned by the controller (1-based). We pre-fill the Vec
-    /// to `max_slots + 1` entries (all `None`), reserving index zero.
-    /// All accesses use `.get()` / `.get_mut()` to safely handle out-of-range
-    /// slot IDs without panicking.
-    slots: heapless::Vec<Option<UsbSlot>, { MAX_SLOTS + 1 }>,
+    /// Slot IDs are assigned by the controller (1-based). The table has one
+    /// entry per slot the controller reports in HCSPARAMS1.MaxSlots (at most
+    /// 255), plus the reserved index zero; each device's state is boxed so an
+    /// empty slot costs one pointer. All accesses use `.get()` / `.get_mut()`
+    /// to safely handle out-of-range slot IDs without panicking.
+    slots: alloc::vec::Vec<Option<Box<UsbSlot>>>,
     /// Persistent interrupt TDs; their DMA buffers remain alive between polls.
     interrupt_polls: alloc::vec::Vec<bulk::InterruptPoll>,
 }
@@ -171,21 +166,24 @@ unsafe impl Send for XhciController {}
 // through the parent XhciController. Single-threaded firmware ensures no races.
 unsafe impl Send for UsbSlot {}
 
-fn find_device_slot<T>(slots: &[Option<T>], mut matches: impl FnMut(&T) -> bool) -> Option<u8> {
+fn find_device_slot<T: ?Sized>(
+    slots: &[Option<impl core::ops::Deref<Target = T>>],
+    mut matches: impl FnMut(&T) -> bool,
+) -> Option<u8> {
     slots.iter().enumerate().skip(1).find_map(|(id, slot)| {
-        slot.as_ref()
+        slot.as_deref()
             .filter(|slot| matches(slot))
             .and_then(|_| u8::try_from(id).ok())
     })
 }
 
-fn for_each_device_slot<T>(
-    slots: &[Option<T>],
+fn for_each_device_slot<T: ?Sized>(
+    slots: &[Option<impl core::ops::Deref<Target = T>>],
     mut matches: impl FnMut(&T) -> bool,
     f: &mut dyn FnMut(u8),
 ) {
     for (id, slot) in slots.iter().enumerate().skip(1) {
-        if slot.as_ref().is_some_and(&mut matches)
+        if slot.as_deref().is_some_and(&mut matches)
             && let Ok(id) = u8::try_from(id)
         {
             f(id);
@@ -220,14 +218,14 @@ impl XhciController {
 
     /// Get slot info
     pub fn get_slot(&self, slot_id: u8) -> Option<&UsbSlot> {
-        self.slots.get(slot_id as usize).and_then(|s| s.as_ref())
+        self.slots.get(slot_id as usize).and_then(|s| s.as_deref())
     }
 
     /// Get mutable slot info
     pub fn get_slot_mut(&mut self, slot_id: u8) -> Option<&mut UsbSlot> {
         self.slots
             .get_mut(slot_id as usize)
-            .and_then(|s| s.as_mut())
+            .and_then(|s| s.as_deref_mut())
     }
 
     /// Get the PCI address of this controller
@@ -235,13 +233,14 @@ impl XhciController {
         self.pci_address
     }
 
-    /// Clean up the controller before handing off to the OS
-    ///
-    /// This must be called before ExitBootServices to ensure Linux's xHCI
-    /// driver can properly initialize the controller.
-    pub fn cleanup(&mut self) {
-        log::debug!("xHCI cleanup: stopping controller");
+    pub(super) fn discard_unregistered(mut self) {
+        if !self.halt() {
+            log::error!("xHCI: halt failed; retaining DMA allocations for unregistered controller");
+            core::mem::forget(self);
+        }
+    }
 
+    fn halt(&mut self) -> bool {
         self.registers
             .operational
             .usbcmd
@@ -254,7 +253,19 @@ impl XhciController {
                 .usbsts
                 .read_volatile()
                 .hc_halted()
-        });
+        })
+    }
+
+    /// Clean up the controller before handing off to the OS
+    ///
+    /// This must be called before ExitBootServices to ensure Linux's xHCI
+    /// driver can properly initialize the controller.
+    pub fn cleanup(&mut self) {
+        log::debug!("xHCI cleanup: stopping controller");
+        if !self.halt() {
+            log::error!("xHCI cleanup: halt timed out; cannot reset controller");
+            return;
+        }
 
         self.registers
             .operational
@@ -332,32 +343,32 @@ mod tests {
 
     #[test]
     fn discovery_includes_highest_slot_and_ignores_reserved_zero() {
-        let mut slots = [None; MAX_SLOTS + 1];
+        const MAX_SLOTS: usize = 255;
+        let mut slots: [Option<&str>; MAX_SLOTS + 1] = [None; MAX_SLOTS + 1];
         slots[0] = Some("keyboard");
-        assert_eq!(find_device_slot(&slots, |class| *class == "keyboard"), None);
+        assert_eq!(find_device_slot(&slots, |class| class == "keyboard"), None);
         for class in ["keyboard", "mouse", "storage"] {
             slots[MAX_SLOTS] = Some(class);
             assert_eq!(
-                find_device_slot(&slots, |value| *value == class),
+                find_device_slot(&slots, |value| value == class),
                 Some(MAX_SLOTS as u8)
             );
         }
         assert_eq!(find_device_slot(&slots[..MAX_SLOTS], |_| true), None);
         slots[2] = Some("mouse");
-        assert_eq!(find_device_slot(&slots, |class| *class == "mouse"), Some(2));
+        assert_eq!(find_device_slot(&slots, |class| class == "mouse"), Some(2));
     }
 
     #[test]
     fn mass_storage_discovery_visits_every_matching_slot() {
-        let mut slots = [None; MAX_SLOTS + 1];
+        const MAX_SLOTS: usize = 255;
+        let mut slots: [Option<&str>; MAX_SLOTS + 1] = [None; MAX_SLOTS + 1];
         slots[0] = Some("storage"); // Reserved slot must be ignored.
         slots[1] = Some("storage");
         slots[2] = Some("keyboard");
         slots[MAX_SLOTS] = Some("storage");
         let mut found = alloc::vec::Vec::new();
-        for_each_device_slot(&slots, |class| *class == "storage", &mut |id| {
-            found.push(id)
-        });
+        for_each_device_slot(&slots, |class| class == "storage", &mut |id| found.push(id));
         assert_eq!(found, [1, MAX_SLOTS as u8]);
     }
 

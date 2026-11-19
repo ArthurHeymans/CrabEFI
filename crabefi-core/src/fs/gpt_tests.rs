@@ -162,3 +162,65 @@ fn invalid_partition_ranges_are_rejected_for_discovery_and_measurement() {
         assert!(build_gpt_measurement_event(&mut disk, &header).is_ok());
     }
 }
+
+#[test]
+fn every_used_entry_of_a_large_table_is_a_partition() {
+    // 64 used entries in the standard 128-entry array: far past the 16
+    // partitions the scan used to keep.
+    const USED: usize = 64;
+    const ENTRIES: usize = 128;
+    let mut disk = disk(512, false);
+    disk.prefix.resize(2 * 512 + ENTRIES * 128, 0);
+    disk.prefix[512 + 80..512 + 84].copy_from_slice(&(ENTRIES as u32).to_le_bytes());
+    for index in 0..USED {
+        let entry = &mut disk.prefix[2 * 512 + index * 128..2 * 512 + (index + 1) * 128];
+        entry[..16].copy_from_slice(&ESP_TYPE_GUID);
+        entry[16..32].fill(index as u8 + 1);
+        let first = 2048 + index as u64 * 2048;
+        entry[32..40].copy_from_slice(&first.to_le_bytes());
+        entry[40..48].copy_from_slice(&(first + 2047).to_le_bytes());
+    }
+
+    let header = read_gpt_header(&mut disk).unwrap();
+    let partitions = read_partitions(&mut disk, &header).unwrap();
+    assert_eq!(partitions.len(), USED);
+    for (index, partition) in partitions.iter().enumerate() {
+        assert_eq!(partition.number, index as u32 + 1);
+        assert_eq!(partition.first_lba, 2048 + index as u64 * 2048);
+    }
+    assert_eq!(read_partitions_auto(&mut disk).unwrap().len(), USED);
+}
+
+#[test]
+fn a_full_heap_is_reported_instead_of_truncating_the_table() {
+    let mut disk = disk(512, false);
+    let header = read_gpt_header(&mut disk).unwrap();
+    for budget in [0, 1] {
+        // Both the scratch buffer and the growing partition list are fallible.
+        let (result, _) =
+            crate::test_allocator::with_budget(budget, || read_partitions(&mut disk, &header));
+        assert!(matches!(result, Err(GptError::OutOfMemory)));
+        let (result, _) =
+            crate::test_allocator::with_budget(budget, || read_partitions_auto(&mut disk));
+        assert!(matches!(result, Err(GptError::OutOfMemory)));
+    }
+}
+
+#[test]
+fn gpt_measurement_reports_allocation_failures() {
+    let mut disk = disk(512, false);
+    let header = read_gpt_header(&mut disk).unwrap();
+    let expected = build_gpt_measurement_event(&mut disk, &header).unwrap();
+    for budget in 0..3 {
+        let (result, _) = crate::test_allocator::with_budget(budget, || {
+            build_gpt_measurement_event(&mut disk, &header)
+        });
+        assert!(
+            matches!(result, Err(GptError::OutOfMemory)),
+            "budget {budget}"
+        );
+    }
+    let (result, _) =
+        crate::test_allocator::with_budget(3, || build_gpt_measurement_event(&mut disk, &header));
+    assert_eq!(result.unwrap(), expected);
+}

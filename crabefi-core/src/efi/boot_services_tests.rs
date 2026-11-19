@@ -6,6 +6,12 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use r_efi::efi::{self, Guid, Handle, Status};
 
+use super::events::{close_event, create_event};
+use super::images::unload_image;
+use super::protocols_db::{
+    handle_protocol, install_protocol_interface, locate_handle, register_protocol_notify,
+    reinstall_protocol_interface,
+};
 use super::*;
 use crate::efi::tables::{LoadedImageEntry, Tables, init_caches, tables, with_tables_mut};
 
@@ -70,10 +76,39 @@ fn next(registration: *mut c_void) -> Result<Handle, Status> {
     }
 }
 
+#[test]
+fn failed_first_protocol_install_reclaims_only_the_new_handle() {
+    let _execution = IMAGE_EXECUTION_TEST_LOCK.lock().unwrap();
+    with_tables_mut(|state| *state = Tables::new());
+    init_caches().unwrap();
+    let existing = create_handle().unwrap();
+    let mut handle: Handle = null_mut();
+    let try_install = |handle: &mut Handle| {
+        crate::test_allocator::with_budget(0, || {
+            install_protocol_interface(handle, &mut { A }, efi::NATIVE_INTERFACE, null_mut())
+        })
+    };
+
+    assert_eq!(try_install(&mut handle), (Status::OUT_OF_RESOURCES, 1));
+    assert!(handle.is_null());
+    assert_eq!(tables().handles.len(), 1);
+    assert_eq!(tables().handles[0].handle, existing);
+
+    handle = existing;
+    assert_eq!(try_install(&mut handle), (Status::OUT_OF_RESOURCES, 1));
+    assert_eq!(handle, existing);
+    assert_eq!(tables().handles.len(), 1);
+    assert!(tables().handles[0].protocols.is_empty());
+    with_tables_mut(|state| *state = Tables::new());
+}
+
 // One test owns the global database throughout: no parallel tests race its cells.
 #[test]
 fn protocol_transactions_cursors_and_open_lifecycle() {
-    let _execution = crate::efi::boot_services::IMAGE_EXECUTION_TEST_LOCK.lock().unwrap();
+    super::allocator::with_host_pages(check_protocol_lifecycle);
+}
+
+fn check_protocol_lifecycle() {
     with_tables_mut(|state| *state = Tables::new());
     init_caches().unwrap();
     let a = core::ptr::dangling_mut::<u64>().cast::<c_void>();
@@ -276,14 +311,16 @@ fn protocol_transactions_cursors_and_open_lifecycle() {
     assert_eq!(remove_protocol(handle, &A, Some(b)), Status::SUCCESS);
     assert!(tables().open_protocols.is_empty());
 
-    // Synthetic loaded image: no allocation, so the free attempt safely fails;
-    // the observable relationship teardown still exercises real UnloadImage.
+    // Give the synthetic image an owned page so real UnloadImage can free it.
     let handle = handles[2];
+    let alloc_base = crate::efi::allocate_pages(1).unwrap().as_ptr() as u64;
     with_tables_mut(|state| {
-        state.loaded_images[0] = LoadedImageEntry {
+        state.loaded_images.push(LoadedImageEntry {
             handle: agent,
+            alloc_base,
+            num_pages: 1,
             ..LoadedImageEntry::empty()
-        }
+        })
     });
     assert_eq!(
         open_protocol(
@@ -350,5 +387,55 @@ fn protocol_transactions_cursors_and_open_lifecycle() {
     assert_eq!(unload_image(agent), Status::SUCCESS);
     assert!(tables().open_protocols.is_empty());
     assert_eq!(remove_protocol(handle, &A, Some(a)), Status::SUCCESS);
+    with_tables_mut(|state| *state = Tables::new());
+}
+
+// Six NVMe drives with partitions need far more than the 128 handles and
+// eight protocols per handle the database used to hold.
+#[test]
+fn handle_database_grows_past_old_fixed_limits() {
+    const HANDLES: usize = 300;
+    const PROTOCOLS: u32 = 20;
+    let _execution = crate::efi::boot_services::IMAGE_EXECUTION_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    with_tables_mut(|state| *state = Tables::new());
+    init_caches().unwrap();
+    let interface = core::ptr::dangling_mut::<u64>().cast::<c_void>();
+
+    let disks: Vec<Handle> = (0..HANDLES).map(|_| install(A, interface)).collect();
+    let mut size = 0;
+    assert_eq!(
+        locate_handle(
+            efi::BY_PROTOCOL,
+            &mut { A },
+            null_mut(),
+            &mut size,
+            null_mut()
+        ),
+        Status::BUFFER_TOO_SMALL
+    );
+    assert_eq!(size, HANDLES * core::mem::size_of::<Handle>());
+
+    let guids: Vec<Guid> = (0..PROTOCOLS)
+        .map(|index| Guid::from_fields(0x100 + index, 0, 0, 0, 0, &[0; 6]))
+        .collect();
+    let last = disks[HANDLES - 1];
+    for guid in &guids {
+        assert_eq!(install_protocol(last, guid, interface), Status::SUCCESS);
+    }
+    for guid in &guids {
+        assert_eq!(get_protocol_on_handle(last, guid), interface);
+    }
+    for guid in &guids {
+        assert_eq!(remove_protocol(last, guid, None), Status::SUCCESS);
+    }
+    assert_eq!(get_protocol_on_handle(last, &A), interface);
+
+    // Removing the last protocol reclaims each handle.
+    for disk in disks {
+        assert_eq!(remove_protocol(disk, &A, None), Status::SUCCESS);
+    }
+    assert!(tables().handles.is_empty());
     with_tables_mut(|state| *state = Tables::new());
 }

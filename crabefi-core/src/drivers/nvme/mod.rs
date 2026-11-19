@@ -164,6 +164,14 @@ mod io_cmd {
 const ADMIN_QUEUE_LIMIT: u16 = 16;
 const IO_QUEUE_LIMIT: u16 = 64;
 const CONTROLLER_PAGE_SIZE: usize = 4096;
+
+/// NSIDs in one Identify CNS 02h (active namespace ID list) page.
+///
+/// The NVMe base specification fixes this data structure at 4 KiB of 32-bit
+/// NSIDs; controllers with more active namespaces are read page by page.
+const ACTIVE_NSID_LIST_ENTRIES: usize = 1024;
+/// CNS 02h rejects these values as starting cursors.
+const FIRST_INVALID_NSID_CURSOR: u32 = 0xFFFF_FFFE;
 const COMMAND_TIMEOUT_MS: u64 = 5000;
 const SHUTDOWN_TIMEOUT_MS: u64 = 5000;
 
@@ -467,7 +475,7 @@ pub struct NvmeController {
     io_sq_dma: Option<DmaBuffer>,
     io_cq_dma: Option<DmaBuffer>,
     /// Detected namespaces
-    namespaces: heapless::Vec<NvmeNamespace, 8>,
+    namespaces: alloc::vec::Vec<NvmeNamespace>,
     /// Permanent Identify payload, retained across command timeouts.
     identify: DmaBuffer,
     /// Controller memory page size selected in CC.MPS.
@@ -509,6 +517,82 @@ pub enum NvmeError {
     DmaDomainUnavailable,
     /// A completion entry did not match a submitted command or queue.
     MalformedCompletion,
+}
+
+/// Validate the ordered prefix and return the cursor for a full page. In
+/// particular a repeated page must not restart discovery at the same cursor.
+fn active_nsid_page(
+    ids: &[u32; ACTIVE_NSID_LIST_ENTRIES],
+    after: u32,
+) -> Result<(&[u32], Option<u32>), NvmeError> {
+    let mut previous = after;
+    for (index, &id) in ids.iter().enumerate() {
+        if id == 0 {
+            return Ok((&ids[..index], None));
+        }
+        if id <= previous || id == u32::MAX {
+            return Err(NvmeError::InvalidNamespace);
+        }
+        previous = id;
+    }
+    // A controller may not accept a cursor of FFFFFFFEh or FFFFFFFFh.
+    Ok((
+        ids,
+        (previous < FIRST_INVALID_NSID_CURSOR).then_some(previous),
+    ))
+}
+
+/// Identify each namespace in order, stopping when `visit` returns false.
+fn walk_active_namespaces<T>(
+    controller: &mut T,
+    mut read_page: impl FnMut(&mut T, u32) -> Result<[u32; ACTIVE_NSID_LIST_ENTRIES], NvmeError>,
+    mut visit: impl FnMut(&mut T, u32) -> Result<bool, NvmeError>,
+) -> Result<(), NvmeError> {
+    let mut after = 0;
+    loop {
+        let ids = read_page(controller, after)?;
+        let (ids, next) = active_nsid_page(&ids, after).inspect_err(|_| {
+            log::error!("NVMe: invalid active NSID list after {after}");
+        })?;
+        for &id in ids {
+            if !visit(controller, id)? {
+                return Ok(());
+            }
+        }
+        let Some(next) = next else { return Ok(()) };
+        after = next;
+    }
+}
+
+#[cfg(test)]
+mod namespace_page_tests {
+    use super::*;
+
+    #[test]
+    fn walk_visits_namespaces_on_both_pages_with_the_correct_cursor() {
+        let first = core::array::from_fn(|index| (index as u32 + 1) * 2);
+        let mut second = [0; ACTIVE_NSID_LIST_ENTRIES];
+        second[..2].copy_from_slice(&[2051, 2054]);
+        let mut visited = alloc::vec::Vec::new();
+        let mut next_page = [(0, first), (2048, second)].into_iter();
+        walk_active_namespaces(
+            &mut visited,
+            |_, cursor| {
+                let (expected_cursor, page) = next_page.next().expect("unexpected Identify page");
+                assert_eq!(cursor, expected_cursor);
+                Ok(page)
+            },
+            |visited, id| {
+                visited.push(id);
+                Ok(true)
+            },
+        )
+        .unwrap();
+        assert!(next_page.next().is_none());
+        assert_eq!(visited[..ACTIVE_NSID_LIST_ENTRIES], first);
+        assert_eq!(visited[ACTIVE_NSID_LIST_ENTRIES..], [2051, 2054]);
+        assert!(active_nsid_page(&first, 2048).is_err());
+    }
 }
 
 /// Validate BAR0 before constructing a typed register reference. BAR sizes may
@@ -701,7 +785,7 @@ impl NvmeController {
             io_queue: QueueState::new(io_depth),
             io_sq_dma: None,
             io_cq_dma: None,
-            namespaces: heapless::Vec::new(),
+            namespaces: alloc::vec::Vec::new(),
             identify,
             controller_page_size: CONTROLLER_PAGE_SIZE,
             staging: None,
@@ -1192,87 +1276,29 @@ impl NvmeController {
 
     /// Identify namespaces
     fn identify_namespaces(&mut self) -> Result<(), NvmeError> {
-        let mut largest_block = 0usize;
-        let identify_addr = self.identify.dma_address();
-        self.identify.as_mut_slice().fill(0);
-        self.identify
-            .sync_for_device(0..self.identify.len(), DmaDirection::FromDevice)
-            .map_err(|_| NvmeError::DmaError)?;
-        let mut cmd = SubmissionQueueEntry::new();
-        cmd.set_opcode(admin_cmd::IDENTIFY);
-        cmd.prp1 = identify_addr;
-        cmd.cdw10 = 0x02;
-        let cid = self.submit_admin_command(cmd)?;
-        self.wait_admin_completion(cid)?;
-        self.identify
-            .sync_for_cpu(0..self.identify.len(), DmaDirection::FromDevice)
-            .map_err(|_| NvmeError::DmaError)?;
-        let mut namespace_ids = [0u32; 1024];
-        namespace_ids.copy_from_slice(unsafe {
-            core::slice::from_raw_parts(self.identify.cpu_address() as *const u32, 1024)
-        });
-
-        for nsid in namespace_ids.into_iter().take_while(|nsid| *nsid != 0) {
-            self.identify.as_mut_slice().fill(0);
-            self.identify
-                .sync_for_device(0..self.identify.len(), DmaDirection::FromDevice)
-                .map_err(|_| NvmeError::DmaError)?;
-            let mut cmd = SubmissionQueueEntry::new();
-            cmd.set_opcode(admin_cmd::IDENTIFY);
-            cmd.nsid = nsid;
-            cmd.prp1 = identify_addr;
-            let cid = self.submit_admin_command(cmd)?;
-            self.wait_admin_completion(cid)?;
-            self.identify
-                .sync_for_cpu(0..self.identify.len(), DmaDirection::FromDevice)
-                .map_err(|_| NvmeError::DmaError)?;
-            let ns = unsafe { &*(self.identify.cpu_address() as *const IdentifyNamespace) };
-            if ns.nsze == 0 {
-                log::warn!("NVMe namespace {} has zero size; skipping", nsid);
-                continue;
-            }
-            let Some(block_size) = decode_lba_size(ns.flbas, ns.nlbaf, &ns.lbaf) else {
-                log::warn!(
-                    "NVMe namespace {} has unsupported LBA/metadata format",
-                    nsid
-                );
-                continue;
+        walk_active_namespaces(self, Self::active_namespace_ids, |controller, nsid| {
+            let Some(namespace) = controller.identify_namespace(nsid)? else {
+                return Ok(true);
             };
-            let max_transfer = max_prp_transfer(self.controller_page_size)
-                .ok_or(NvmeError::UnsupportedLbaFormat)?;
-            if block_size as usize > max_transfer {
-                log::warn!(
-                    "NVMe namespace {} LBA size {} exceeds PRP limit {}",
-                    nsid,
-                    block_size,
-                    max_transfer
-                );
-                continue;
+            if controller.namespaces.try_reserve(1).is_err() {
+                log::error!("NVMe: out of heap; stopping namespace discovery at {nsid}");
+                if controller.namespaces.is_empty() {
+                    return Err(NvmeError::AllocationFailed);
+                }
+                return Ok(false);
             }
-            largest_block = largest_block.max(block_size as usize);
-            let namespace = NvmeNamespace {
-                nsid,
-                num_blocks: ns.nsze,
-                block_size,
-            };
-            let size_mb = namespace
-                .num_blocks
-                .saturating_mul(u64::from(namespace.block_size))
-                / (1024 * 1024);
-            log::info!(
-                "NVMe Namespace {}: {} blocks x {} bytes = {} MB",
-                nsid,
-                namespace.num_blocks,
-                namespace.block_size,
-                size_mb
-            );
-            if self.namespaces.push(namespace).is_err() {
-                log::warn!("NVMe: namespace list full; skipping namespace {}", nsid);
-            }
-        }
+            controller.namespaces.push(namespace);
+            Ok(true)
+        })?;
         if self.namespaces.is_empty() {
             return Err(NvmeError::NoNamespaces);
         }
+        let largest_block = self
+            .namespaces
+            .iter()
+            .map(|namespace| namespace.block_size as usize)
+            .max()
+            .unwrap_or(0);
         self.staging = Some(
             DmaBuffer::allocate_in_domain(
                 largest_block.max(CONTROLLER_PAGE_SIZE),
@@ -1282,6 +1308,92 @@ impl NvmeController {
             .map_err(|_| NvmeError::AllocationFailed)?,
         );
         Ok(())
+    }
+
+    /// Read one Identify CNS 02h page: the active NSIDs greater than `after`.
+    fn active_namespace_ids(
+        &mut self,
+        after: u32,
+    ) -> Result<[u32; ACTIVE_NSID_LIST_ENTRIES], NvmeError> {
+        self.identify.as_mut_slice().fill(0);
+        self.identify
+            .sync_for_device(0..self.identify.len(), DmaDirection::FromDevice)
+            .map_err(|_| NvmeError::DmaError)?;
+        let mut cmd = SubmissionQueueEntry::new();
+        cmd.set_opcode(admin_cmd::IDENTIFY);
+        cmd.nsid = after;
+        cmd.prp1 = self.identify.dma_address();
+        cmd.cdw10 = 0x02;
+        let cid = self.submit_admin_command(cmd)?;
+        self.wait_admin_completion(cid)?;
+        self.identify
+            .sync_for_cpu(0..self.identify.len(), DmaDirection::FromDevice)
+            .map_err(|_| NvmeError::DmaError)?;
+        let mut namespace_ids = [0u32; ACTIVE_NSID_LIST_ENTRIES];
+        namespace_ids.copy_from_slice(unsafe {
+            core::slice::from_raw_parts(
+                self.identify.cpu_address() as *const u32,
+                ACTIVE_NSID_LIST_ENTRIES,
+            )
+        });
+        Ok(namespace_ids)
+    }
+
+    /// Identify one active namespace; `None` if CrabEFI cannot use it.
+    fn identify_namespace(&mut self, nsid: u32) -> Result<Option<NvmeNamespace>, NvmeError> {
+        self.identify.as_mut_slice().fill(0);
+        self.identify
+            .sync_for_device(0..self.identify.len(), DmaDirection::FromDevice)
+            .map_err(|_| NvmeError::DmaError)?;
+        let mut cmd = SubmissionQueueEntry::new();
+        cmd.set_opcode(admin_cmd::IDENTIFY);
+        cmd.nsid = nsid;
+        cmd.prp1 = self.identify.dma_address();
+        let cid = self.submit_admin_command(cmd)?;
+        self.wait_admin_completion(cid)?;
+        self.identify
+            .sync_for_cpu(0..self.identify.len(), DmaDirection::FromDevice)
+            .map_err(|_| NvmeError::DmaError)?;
+        let ns = unsafe { &*(self.identify.cpu_address() as *const IdentifyNamespace) };
+        if ns.nsze == 0 {
+            log::warn!("NVMe namespace {} has zero size; skipping", nsid);
+            return Ok(None);
+        }
+        let Some(block_size) = decode_lba_size(ns.flbas, ns.nlbaf, &ns.lbaf) else {
+            log::warn!(
+                "NVMe namespace {} has unsupported LBA/metadata format",
+                nsid
+            );
+            return Ok(None);
+        };
+        let max_transfer =
+            max_prp_transfer(self.controller_page_size).ok_or(NvmeError::UnsupportedLbaFormat)?;
+        if block_size as usize > max_transfer {
+            log::warn!(
+                "NVMe namespace {} LBA size {} exceeds PRP limit {}",
+                nsid,
+                block_size,
+                max_transfer
+            );
+            return Ok(None);
+        }
+        let namespace = NvmeNamespace {
+            nsid,
+            num_blocks: ns.nsze,
+            block_size,
+        };
+        let size_mb = namespace
+            .num_blocks
+            .saturating_mul(u64::from(namespace.block_size))
+            / (1024 * 1024);
+        log::info!(
+            "NVMe Namespace {}: {} blocks x {} bytes = {} MB",
+            nsid,
+            namespace.num_blocks,
+            namespace.block_size,
+            size_mb
+        );
+        Ok(Some(namespace))
     }
 
     /// Get the first namespace

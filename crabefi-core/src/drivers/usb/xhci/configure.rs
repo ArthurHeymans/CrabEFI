@@ -113,7 +113,7 @@ impl super::XhciController {
         if let Some(slot) = self
             .slots
             .get_mut(slot_id as usize)
-            .and_then(|s| s.as_mut())
+            .and_then(|s| s.as_deref_mut())
         {
             slot.is_mass_storage = true;
             slot.mass_storage_interface = ms_interface_number;
@@ -187,7 +187,7 @@ impl super::XhciController {
         if let Some(slot) = self
             .slots
             .get_mut(slot_id as usize)
-            .and_then(|s| s.as_mut())
+            .and_then(|s| s.as_deref_mut())
         {
             slot.is_hid_keyboard = true;
             slot.interrupt_in_ep = interrupt_in;
@@ -232,7 +232,7 @@ impl super::XhciController {
         let already_configured = self
             .slots
             .get(slot_id as usize)
-            .and_then(|s| s.as_ref())
+            .and_then(|s| s.as_deref())
             .map(|s| s.is_hid_keyboard || s.is_mass_storage)
             .unwrap_or(false);
 
@@ -285,7 +285,7 @@ impl super::XhciController {
             let slot = self
                 .slots
                 .get_mut(slot_id as usize)
-                .and_then(|s| s.as_mut())
+                .and_then(|s| s.as_deref_mut())
                 .ok_or(XhciError::DeviceNotFound)?;
 
             slot.transfer_rings[in_dci - 1] = Some(ring);
@@ -339,7 +339,7 @@ impl super::XhciController {
         let input_ctx_ptr = self
             .slots
             .get(slot_id as usize)
-            .and_then(|s| s.as_ref())
+            .and_then(|s| s.as_deref())
             .ok_or(XhciError::DeviceNotFound)?
             .input_context as u64;
 

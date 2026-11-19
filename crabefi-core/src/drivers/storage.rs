@@ -8,22 +8,19 @@
 use alloc::vec::Vec;
 use core::fmt::Write;
 
-use heapless::{String, Vec as FixedVec};
+use heapless::String;
 
 use crate::cell::Local;
 use crate::drivers::block::{BlockDevice, BlockDeviceInfo, BlockError};
 use crate::drivers::pci::PciAddress;
 use crate::drivers::{ahci, nvme, sdhci, usb};
 
-/// Maximum number of platform-provided block devices.
-const MAX_PLATFORM_BLOCK_DEVICES: usize = 8;
-
 /// Platform-provided block devices registered by [`crate::init_platform()`].
 ///
 /// Every entry points to a device that lives for the firmware's entire
-/// lifetime (`init_platform` is `-> !`).
-static PLATFORM_BLOCK_DEVICES: Local<FixedVec<*mut dyn BlockDevice, MAX_PLATFORM_BLOCK_DEVICES>> =
-    Local::new(FixedVec::new());
+/// lifetime (`init_platform` is `-> !`). The list itself lives on the
+/// boot-services heap.
+static PLATFORM_BLOCK_DEVICES: Local<Vec<*mut dyn BlockDevice>> = Local::new(Vec::new());
 
 /// Register platform-provided block devices from [`crate::PlatformConfig`].
 ///
@@ -34,12 +31,19 @@ static PLATFORM_BLOCK_DEVICES: Local<FixedVec<*mut dyn BlockDevice, MAX_PLATFORM
 pub unsafe fn register_platform_block_devices(devices: &mut [&mut dyn BlockDevice]) {
     PLATFORM_BLOCK_DEVICES.with_mut(|registered| {
         registered.clear();
-        for device in devices.iter_mut().take(MAX_PLATFORM_BLOCK_DEVICES) {
+        if registered.try_reserve_exact(devices.len()).is_err() {
+            log::error!(
+                "Out of heap registering {} platform block device(s)",
+                devices.len()
+            );
+            return;
+        }
+        for device in devices.iter_mut() {
             let device: *mut dyn BlockDevice = *device;
             // SAFETY: extends the config borrow to 'static; the caller
             // guarantees the referent outlives the firmware.
             let device: *mut (dyn BlockDevice + 'static) = unsafe { core::mem::transmute(device) };
-            let _ = registered.push(device);
+            registered.push(device);
         }
         log::info!("Registered {} platform block device(s)", registered.len());
     });

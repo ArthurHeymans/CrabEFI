@@ -268,13 +268,10 @@ fn read_image_file(
 pub(crate) fn find_handle_with_protocol(protocol_guid: &Guid) -> Option<Handle> {
     let efi_state = super::tables::tables();
 
-    efi_state.handles[..efi_state.handle_count]
+    efi_state
+        .handles
         .iter()
-        .find(|e| {
-            e.protocols[..e.protocol_count]
-                .iter()
-                .any(|p| p.guid == *protocol_guid)
-        })
+        .find(|e| e.protocols.iter().any(|p| p.guid == *protocol_guid))
         .map(|e| e.handle)
 }
 
@@ -380,9 +377,10 @@ fn find_best_sfs_handle_for_device_path(device_path: *mut DevicePathProtocol) ->
     let mut best_handle: Option<Handle> = None;
     let mut best_score: usize = 0;
 
-    for entry in &efi_state.handles[..efi_state.handle_count] {
+    for entry in &efi_state.handles {
         // Must have SimpleFileSystem
-        let has_sfs = entry.protocols[..entry.protocol_count]
+        let has_sfs = entry
+            .protocols
             .iter()
             .any(|p| p.guid == SIMPLE_FILE_SYSTEM_GUID);
         if !has_sfs {
@@ -390,7 +388,8 @@ fn find_best_sfs_handle_for_device_path(device_path: *mut DevicePathProtocol) ->
         }
 
         // Get handle's device path
-        let handle_dp = entry.protocols[..entry.protocol_count]
+        let handle_dp = entry
+            .protocols
             .iter()
             .find(|p| p.guid == dp_guid)
             .map(|p| p.interface as *const DevicePathProtocol);
@@ -430,7 +429,8 @@ pub(crate) fn get_device_handle_from_parent(parent_handle: Handle) -> Handle {
         .iter()
         .find(|entry| entry.handle == parent_handle)
         .and_then(|entry| {
-            entry.protocols[..entry.protocol_count]
+            entry
+                .protocols
                 .iter()
                 .find(|proto| {
                     proto.guid == LOADED_IMAGE_PROTOCOL_GUID && !proto.interface.is_null()

@@ -610,9 +610,7 @@ fn try_boot_file_on_device(
     // An MBR target is matched against the MBR itself, also on a hybrid disk
     // whose GPT would otherwise win.
     let partitions = storage::with_disk(device.id, |disk| match target {
-        PartitionTarget::Mbr { .. } => gpt::read_mbr_partitions(disk)
-            .ok()
-            .map(|partitions| partitions.into_iter().collect::<heapless::Vec<_, 16>>()),
+        PartitionTarget::Mbr { .. } => gpt::read_mbr_partitions(disk).ok(),
         _ => gpt::read_partitions_auto(disk).ok(),
     })
     .ok()

@@ -346,12 +346,18 @@ pub(super) extern "efiapi" fn load_image(
 
     // Store the loaded image info so StartImage can find it
     let store_result = with_tables_mut(|efi_state| {
-        let slot = efi_state
-            .loaded_images
-            .iter_mut()
-            .find(|entry| entry.handle.is_null());
+        // Reuse a slot freed by UnloadImage, else grow the table.
+        let images = &mut efi_state.loaded_images;
+        let slot = match images.iter().position(|entry| entry.handle.is_null()) {
+            Some(index) => Some(index),
+            None if images.try_reserve(1).is_ok() => {
+                images.push(LoadedImageEntry::empty());
+                Some(images.len() - 1)
+            }
+            None => None,
+        };
 
-        match slot {
+        match slot.map(|index| &mut images[index]) {
             Some(entry) => {
                 entry.handle = new_handle;
                 entry.image_base = loaded_image.image_base;
@@ -378,7 +384,7 @@ pub(super) extern "efiapi" fn load_image(
     });
 
     if !store_result {
-        log::error!("BS.LoadImage: No space in loaded images table");
+        log::error!("BS.LoadImage: out of heap for the loaded images table");
         #[cfg(feature = "tpm")]
         if let Some(measurement) = deferred_measurement {
             let _ = allocator::free_pool(measurement.event_data);
@@ -667,15 +673,8 @@ fn reclaim_image_handle(image_handle: Handle) {
 }
 
 fn remove_image_handle_records(state: &mut Tables, image_handle: Handle) {
-    if let Some(index) = state.handles[..state.handle_count]
-        .iter()
-        .position(|h| h.handle == image_handle)
-    {
-        state
-            .handles
-            .copy_within(index + 1..state.handle_count, index);
-        state.handle_count -= 1;
-        state.handles[state.handle_count] = super::super::tables::HandleEntry::empty();
+    if let Some(index) = state.handles.iter().position(|h| h.handle == image_handle) {
+        state.handles.remove(index);
     }
     state
         .open_protocols
@@ -772,29 +771,20 @@ mod tests {
         let other = 2usize as Handle;
         for count in [0, 1, 2] {
             let mut state = Tables::new();
-            let mut record = HandleEntry {
-                handle: image,
-                ..HandleEntry::empty()
-            };
-            record.protocol_count = count;
-            for protocol in &mut record.protocols[..count] {
-                *protocol = ProtocolEntry {
+            let mut record = HandleEntry::new(image);
+            record.protocols.resize(
+                count,
+                ProtocolEntry {
                     guid: LOADED_IMAGE_PROTOCOL_GUID,
                     interface: 0x1000usize as *mut c_void,
                     generation: 1,
-                };
-            }
+                },
+            );
             state.handles.push(record);
-            state.handles.push(HandleEntry {
-                handle: other,
-                ..HandleEntry::empty()
-            });
-            state.handle_count = 2;
+            state.handles.push(HandleEntry::new(other));
             remove_image_handle_records(&mut state, image);
-            assert_eq!(state.handle_count, 1);
+            assert_eq!(state.handles.len(), 1);
             assert_eq!(state.handles[0].handle, other);
-            assert!(state.handles[1].handle.is_null());
-            assert_eq!(state.handles[1].protocol_count, 0);
         }
     }
 

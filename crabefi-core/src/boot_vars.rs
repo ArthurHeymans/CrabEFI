@@ -59,9 +59,6 @@ const NV_BS_RT: u32 =
 /// BS+RT attributes for volatile boot variables (BootCurrent)
 const BS_RT: u32 = attributes::BOOTSERVICE_ACCESS | attributes::RUNTIME_ACCESS;
 
-/// Maximum number of boot options we can track
-const MAX_BOOT_OPTIONS: usize = 16;
-
 /// Maximum description length (in UCS-2 characters, including null)
 const MAX_DESCRIPTION_CHARS: usize = 64;
 
@@ -368,8 +365,8 @@ pub fn delete_boot_next() {
 ///
 /// Returns an ordered list of Boot#### option numbers.
 /// Returns an empty list if BootOrder is not set.
-pub fn read_boot_order() -> HeaplessVec<u16, MAX_BOOT_OPTIONS> {
-    let mut order = HeaplessVec::new();
+pub fn read_boot_order() -> alloc::vec::Vec<u16> {
+    let mut order = alloc::vec::Vec::new();
 
     let Some((_, data)) = read_variable(&BOOT_ORDER_NAME) else {
         log::debug!("BootOrder: not set");
@@ -381,17 +378,12 @@ pub fn read_boot_order() -> HeaplessVec<u16, MAX_BOOT_OPTIONS> {
         return order;
     }
 
-    for chunk in data.as_chunks::<2>().0 {
-        let num = u16::from_le_bytes(*chunk);
-        if order.push(num).is_err() {
-            log::warn!(
-                "BootOrder: truncated at {} entries (max {})",
-                order.len(),
-                MAX_BOOT_OPTIONS
-            );
-            break;
-        }
+    let chunks = data.as_chunks::<2>().0;
+    if order.try_reserve_exact(chunks.len()).is_err() {
+        log::error!("BootOrder: out of heap for {} entries", chunks.len());
+        return order;
     }
+    order.extend(chunks.iter().map(|chunk| u16::from_le_bytes(*chunk)));
 
     if !order.is_empty() {
         log::info!("BootOrder: {} entries", order.len());
@@ -420,17 +412,18 @@ pub fn read_boot_option(option_number: u16) -> Option<LoadOption> {
 ///
 /// Skips entries that don't exist or can't be parsed (matching edk2 behavior
 /// which also silently drops invalid entries).
-pub fn read_boot_options() -> HeaplessVec<LoadOption, MAX_BOOT_OPTIONS> {
+pub fn read_boot_options() -> alloc::vec::Vec<LoadOption> {
     let order = read_boot_order();
-    let mut options = HeaplessVec::new();
+    let mut options = alloc::vec::Vec::new();
 
     for &num in order.iter() {
         match read_boot_option(num) {
             Some(opt) => {
-                if options.push(opt).is_err() {
-                    log::warn!("Boot options list full at {} entries", options.len());
+                if options.try_reserve(1).is_err() {
+                    log::error!("Boot options: out of heap at {} entries", options.len());
                     break;
                 }
+                options.push(opt);
             }
             None => {
                 log::debug!("Boot{:04X}: not found or invalid, skipping", num);
@@ -651,7 +644,7 @@ pub struct BootVarState {
     /// Cached BootNext value (read and cached early)
     pub boot_next: Option<u16>,
     /// BootOrder entries
-    pub boot_order: HeaplessVec<u16, MAX_BOOT_OPTIONS>,
+    pub boot_order: alloc::vec::Vec<u16>,
     /// Timeout in seconds (None = use default)
     pub timeout: Option<u16>,
 }

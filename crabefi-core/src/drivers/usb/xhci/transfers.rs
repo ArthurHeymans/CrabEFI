@@ -28,7 +28,7 @@ impl super::XhciController {
         let slot = self
             .slots
             .get_mut(slot_id as usize)
-            .and_then(|s| s.as_mut())
+            .and_then(|s| s.as_deref_mut())
             .ok_or(XhciError::DeviceNotFound)?;
 
         let ring = slot.transfer_rings[0]
@@ -135,7 +135,7 @@ impl super::XhciController {
             let slot = self
                 .slots
                 .get_mut(slot_id as usize)
-                .and_then(|slot| slot.as_mut())
+                .and_then(|slot| slot.as_deref_mut())
                 .ok_or(XhciError::DeviceNotFound)?;
             let input = slot.input_context;
             unsafe {
@@ -181,7 +181,7 @@ impl super::XhciController {
         let full_speed = self
             .slots
             .get(slot_id as usize)
-            .and_then(|slot| slot.as_ref())
+            .and_then(|slot| slot.as_deref())
             .is_some_and(|slot| !slot.is_superspeed && slot.speed == 1);
         if full_speed {
             self.update_full_speed_ep0_max_packet(slot_id, short_desc[7] as u16)?;

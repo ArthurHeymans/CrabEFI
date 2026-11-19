@@ -7,13 +7,15 @@
 use crate::drivers::storage::{self, StorageId};
 use crate::fs::fat::{FatError, FatFilesystem};
 use crate::fs::gpt::Partition;
-use heapless::{String, Vec};
+use alloc::vec::Vec;
+use heapless::String;
 
 #[derive(Debug)]
 pub enum ReadError {
     InvalidPath,
     InvalidSize,
     NotAFile,
+    OutOfMemory,
     Fat(FatError),
     #[cfg(all(feature = "ext4", target_arch = "x86_64"))]
     Ext(ext4_view::Ext4Error),
@@ -25,7 +27,7 @@ impl From<FatError> for ReadError {
     }
 }
 
-pub type Names<const N: usize> = Vec<String<256>, N>;
+pub type Names = Vec<String<256>>;
 
 pub trait BootFilesystem {
     fn file_size(&mut self, path: &str) -> Result<u64, ReadError>;
@@ -34,8 +36,8 @@ pub trait BootFilesystem {
     fn read_file_at(&mut self, path: &str, offset: u64, out: &mut [u8])
     -> Result<usize, ReadError>;
 
-    fn list_files(&mut self, directory: &str, suffix: &str) -> Result<Names<32>, ReadError>;
-    fn list_subdirectories(&mut self, directory: &str) -> Result<Names<16>, ReadError>;
+    fn list_files(&mut self, directory: &str, suffix: &str) -> Result<Names, ReadError>;
+    fn list_subdirectories(&mut self, directory: &str) -> Result<Names, ReadError>;
 
     /// Read the whole file into caller-owned storage; never silently truncate.
     fn read_file_all(&mut self, path: &str, out: &mut [u8]) -> Result<usize, ReadError> {
@@ -84,12 +86,12 @@ impl BootFilesystem for FatFilesystem<'_> {
         Ok(self.read_file(&entry, offset as u32, &mut out[..len])?)
     }
 
-    fn list_files(&mut self, directory: &str, suffix: &str) -> Result<Names<32>, ReadError> {
+    fn list_files(&mut self, directory: &str, suffix: &str) -> Result<Names, ReadError> {
         check_path(directory)?;
         Ok(self.list_directory_files(directory, suffix)?)
     }
 
-    fn list_subdirectories(&mut self, directory: &str) -> Result<Names<16>, ReadError> {
+    fn list_subdirectories(&mut self, directory: &str) -> Result<Names, ReadError> {
         check_path(directory)?;
         Ok(FatFilesystem::list_subdirectories(self, directory)?)
     }

@@ -28,6 +28,30 @@ hide devices even when enumeration succeeds. The sweep reads IDs and command
 registers without probing BARs. Runtime Services never retain the inventory or
 its backing allocation.
 
+The NVMe, AHCI, SDHCI and USB controller registries, NVMe namespaces, xHCI
+slot table, partition results, FAT directory listings, BLS and GRUB entries,
+boot menu, BootOrder, platform block devices, and handle and loaded image
+registries use the boot heap instead of fixed list capacities. Hardware
+limits still apply (e.g. xHCI MaxSlots and 32 AHCI ports per HBA), as do
+on-disk format and parser limits (e.g. four MBR primary entries and GPT
+entry-array validation). NVMe reads active NSIDs 1024 at a time until the
+list ends. The event table stays at 32 slots because an event handle encodes
+its slot.
+
+Controllers themselves sit in BootServicesData pages owned by the registries.
+If registration fails after hardware bring-up, the driver stops the controller
+before dropping DMA buffers. If it cannot confirm the stop, it leaves the
+buffers allocated rather than returning them for reuse during boot.
+The last code to read any of these lists is the `ExitBootServices` DMA quiesce
+(controller shutdown and USB cleanup), which runs before the allocator commits
+the final map and allocates nothing. After that only the separate runtime
+image runs, and it has no pointer into the boot heap, the registries, the PCI
+inventory, or the EFI tables; payload MM and the variable store likewise use
+only their own runtime or reserved memory. BootServicesData is therefore the
+right type for all of them. An embedder that supplies its own global allocator
+(fstart) must likewise back it with memory that the OS may reclaim but that
+stays intact until `ExitBootServices` returns.
+
 The separate runtime image performs RSA verification on fixed stack
 buffers instead of an allocation arena. Operands are `[u64; 64]` arrays
 (4096-bit maximum) always processed at full width, combined by a

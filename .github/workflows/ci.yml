@@ -310,6 +310,11 @@ jobs:
         run: ./crabefi test --app hello --nvme --disable-kvm --timeout 120
       - name: Boot from the seventh NVMe controller
         run: CRABEFI_EXTRA_NVME=6 ./crabefi test --app hello --nvme --disable-kvm --timeout 180
+      - name: Publish all namespaces on an NVMe controller with ten namespaces
+        env:
+          CRABEFI_EXTRA_NVME: '1'
+          CRABEFI_MULTI_NS_NVME: '1'
+        run: ./crabefi test --app hello --nvme --disable-kvm --timeout 180
       - name: Test NVMe filesystem write protection
         run: >-
           ./crabefi test --app directory-test --nvme --disable-kvm --timeout 180
