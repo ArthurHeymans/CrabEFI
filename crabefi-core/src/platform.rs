@@ -1429,6 +1429,37 @@ impl<'a> PlatformConfigBuilder<'a> {
         }
     }
 
+    /// Start a native boot config without an EFI Runtime Services image.
+    #[cfg(all(
+        feature = "native-boot",
+        target_arch = "x86_64",
+        not(feature = "secure-boot-enforced")
+    ))]
+    pub fn new_native(
+        memory_map: &'a [MemoryRegion],
+        timer: &'a dyn Timer,
+        reset: &'a dyn ResetHandler,
+        block_devices: &'a mut [&'a mut dyn BlockDevice],
+    ) -> Self {
+        Self::new(
+            memory_map,
+            timer,
+            reset,
+            block_devices,
+            RuntimeImageSource {
+                bytes: &[],
+                expected_sha256: [0; 32],
+            },
+            RuntimePlatformConfig {
+                time: Default::default(),
+                reset: Default::default(),
+                external_ranges: &[],
+                deferred_buffer: DeferredBufferConfig::disabled(),
+                mm_proxy: Default::default(),
+            },
+        )
+    }
+
     /// Firmware-visible boot timestamp recorder.
     pub fn timestamp_recorder(mut self, value: &'a dyn TimestampRecorder) -> Self {
         self.timestamp_recorder = Some(value);

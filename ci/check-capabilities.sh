@@ -13,6 +13,15 @@ if grep -E '^(xhci |rflasher-|rsa |x509-cert |cms |der |const-oid |signature |no
     echo 'Unexpected optional capability dependency in the basic core' >&2
     exit 1
 fi
+cargo tree --locked -p crabefi-coreboot --target x86_64-unknown-none \
+    --no-default-features --features native-only --edges normal --prefix none > "$TMP/native-tree"
+if grep -E '^(crabefi-runtime-bundle |crabefi-pkcs7 |rflasher-|sha1 )' "$TMP/native-tree"; then
+    echo 'Unexpected UEFI capability dependency in the native-only payload' >&2
+    exit 1
+fi
+# The core's additive TPM feature may also be enabled by another consumer.
+cargo check --locked -p crabefi-coreboot --target x86_64-unknown-none --release \
+    --no-default-features --features native-only,crabefi/tpm
 cargo tree --locked --manifest-path crabefi-runtime-image/Cargo.toml --target x86_64-unknown-none \
     --no-default-features --edges normal --prefix none > "$TMP/runtime-tree"
 if grep -E '^(rsa |crypto-bigint |allocator-api2 |sha2 )' "$TMP/runtime-tree"; then

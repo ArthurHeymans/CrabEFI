@@ -117,6 +117,10 @@ enum Commands {
         #[arg(long)]
         entry64: bool,
 
+        /// Boot Linux directly without UEFI (x86-64 only)
+        #[arg(long, conflicts_with = "ui")]
+        native_only: bool,
+
         /// Enable experimental BLS boot from ext2/3/4 (x86-64 only)
         #[arg(long)]
         ext4: bool,
@@ -167,6 +171,10 @@ enum Commands {
         #[arg(long, requires = "disk")]
         runtime_replay: bool,
 
+        /// Boot Linux directly without UEFI (x86-64 only)
+        #[arg(long, requires = "disk", conflicts_with_all = ["coreboot_rom", "app", "runtime_replay", "ui"])]
+        native_only: bool,
+
         /// Enable experimental BLS boot from ext2/3/4 (x86-64 only)
         #[arg(long, conflicts_with = "coreboot_rom")]
         ext4: bool,
@@ -186,6 +194,7 @@ enum Commands {
         ///
         /// Use "grub-linux" for the GRUB + Linux boot-chain test.
         /// Use "ext4-linux" (also "ext2-linux" or "ext3-linux") for native Linux boot.
+        /// Use "native-only-linux" or "native-only-fat-linux" to test without UEFI.
         /// Use "uefi-sct-smoke" for the UEFI SCT smoke subset.
         /// Use "windows-boot-smoke" for a Windows Boot Manager smoke test.
         #[arg(long, default_value = "hello")]
@@ -320,7 +329,15 @@ fn main() -> Result<()> {
             ui,
             entry64,
             ext4,
-        } => cmd_build_payload(release, ui, arch, machine, entry64, ext4_features(ext4)),
+            native_only,
+        } => cmd_build_payload(
+            release,
+            ui,
+            arch,
+            machine,
+            entry64,
+            boot_features(native_only, ext4),
+        ),
         Commands::BundleRuntime { secure_boot } => runtime::bundle(arch, secure_boot),
         Commands::Run {
             coreboot_rom,
@@ -334,6 +351,7 @@ fn main() -> Result<()> {
             runtime_replay,
             ui,
             ext4,
+            native_only,
         } => cmd_run(
             coreboot_rom,
             ahci,
@@ -347,7 +365,7 @@ fn main() -> Result<()> {
             ui,
             arch,
             machine,
-            ext4_features(ext4),
+            boot_features(native_only, ext4),
         ),
         Commands::Test {
             coreboot_rom,
@@ -400,8 +418,13 @@ fn main() -> Result<()> {
 }
 
 // Native coreboot run/test/screenshot commands always use the default entry.
-fn ext4_features(enabled: bool) -> &'static [&'static str] {
-    if enabled { &["ext4"] } else { &[] }
+fn boot_features(native_only: bool, ext4: bool) -> &'static [&'static str] {
+    match (native_only, ext4) {
+        (false, false) => &[],
+        (false, true) => &["ext4"],
+        (true, false) => &["native-only"],
+        (true, true) => &["native-only", "ext4"],
+    }
 }
 
 fn cmd_build(release: bool, ui: bool, arch: Arch, machine: Machine) -> Result<()> {
@@ -412,7 +435,7 @@ fn ext_linux_filesystem(app: &str) -> Option<&'static str> {
     match app {
         "ext2-linux" => Some("ext2"),
         "ext3-linux" => Some("ext3"),
-        "ext4-linux" => Some("ext4"),
+        "ext4-linux" | "native-only-linux" => Some("ext4"),
         _ => None,
     }
 }
@@ -426,6 +449,8 @@ fn test_payload_features(app: &str) -> Vec<&'static str> {
         "mm-seal-test" => vec!["payload-mm-test-lose-ready-to-boot"],
         "runtime-replay-interrupt-test" => vec!["replay-test-reset-after-persist"],
         "boot-events-test" => vec!["boot-event-log"],
+        "native-only-linux" => vec!["native-only", "ext4"],
+        "native-only-fat-linux" => vec!["native-only"],
         app if ext_linux_filesystem(app).is_some() => vec!["ext4"],
         _ => Vec::new(),
     };
@@ -443,12 +468,15 @@ pub(crate) fn capsule_on_disk_only() -> bool {
 
 /// Target directory of a payload build; variants never overwrite the default.
 fn payload_target_dir(entry64: bool, features: &[&str]) -> String {
+    let mut variants = Vec::new();
     if entry64 {
-        "target/entry64".to_string()
-    } else if features.is_empty() {
+        variants.push("entry64");
+    }
+    variants.extend_from_slice(features);
+    if variants.is_empty() {
         "target".to_string()
     } else {
-        format!("target/{}", features.join("+"))
+        format!("target/{}", variants.join("+"))
     }
 }
 
@@ -463,6 +491,13 @@ fn cmd_build_payload(
     if entry64 && arch != Arch::X86_64 {
         bail!("--entry64 is only supported on x86-64");
     }
+    let native_only = extra_features.contains(&"native-only");
+    if native_only && arch != Arch::X86_64 {
+        bail!("--native-only is only supported on x86-64");
+    }
+    if native_only && std::env::var_os("CRABEFI_PAYLOAD_MM").is_some() {
+        bail!("--native-only is incompatible with CRABEFI_PAYLOAD_MM");
+    }
     if extra_features.contains(&"ext4") && arch != Arch::X86_64 {
         bail!("--ext4 is only supported on x86-64");
     }
@@ -475,8 +510,12 @@ fn cmd_build_payload(
     println!("Building CrabEFI ({})...", label);
 
     let project_root = project_root();
-    println!("Building and auditing separate Runtime Services image...");
-    let runtime = runtime::build(arch)?;
+    let runtime = if native_only {
+        None
+    } else {
+        println!("Building and auditing separate Runtime Services image...");
+        Some(runtime::build(arch)?)
+    };
 
     let mut cmd = std::process::Command::new("cargo");
     let toolchain = format!("+{}", pinned_toolchain()?);
@@ -495,8 +534,10 @@ fn cmd_build_payload(
     if release {
         cmd.arg("--release");
     }
-    let mut features = vec!["external-runtime-image"];
-    features.extend_from_slice(extra_features);
+    let mut features = extra_features.to_vec();
+    if !native_only {
+        features.push("external-runtime-image");
+    }
     if ui {
         features.push("ui");
     }
@@ -538,11 +579,13 @@ fn cmd_build_payload(
         Arch::Riscv64 => "riscv64gc-unknown-none-elf",
     };
     cmd.arg("--target").arg(target_triple);
-    cmd.env("RUNTIME_IMAGE_PATH", &runtime.image);
-    cmd.env(
-        "RUNTIME_IMAGE_SHA256",
-        runtime.digest.map(|byte| format!("{byte:02x}")).concat(),
-    );
+    if let Some(runtime) = runtime {
+        cmd.env("RUNTIME_IMAGE_PATH", &runtime.image);
+        cmd.env(
+            "RUNTIME_IMAGE_SHA256",
+            runtime.digest.map(|byte| format!("{byte:02x}")).concat(),
+        );
+    }
 
     // Architecture-specific: set PAYLOAD_BASE for the linker script.
     match arch {
@@ -778,11 +821,16 @@ fn cmd_test(
     if app == "runtime-replay-interrupt-test" && std::env::var_os("CRABEFI_PAYLOAD_MM").is_some() {
         bail!("runtime-replay-interrupt-test needs the retained journal, not payload MM");
     }
+    let native_fat = app == "native-only-fat-linux";
+    if (app == "native-only-linux" || native_fat) && ui {
+        bail!("{app} uses the text menu; omit --ui");
+    }
     let ext_filesystem = ext_linux_filesystem(app);
-    if ext_filesystem.is_some() && (arch != Arch::X86_64 || sdhci) {
+    let native_disk = native_fat || ext_filesystem.is_some();
+    if native_disk && (arch != Arch::X86_64 || sdhci) {
         bail!("{app} needs x86-64 with AHCI or NVMe storage");
     }
-    let storage = if ahci || (ext_filesystem.is_some() && !nvme) {
+    let storage = if ahci || (native_disk && !nvme) {
         qemu::StorageType::Ahci
     } else if nvme {
         qemu::StorageType::Nvme
@@ -853,7 +901,14 @@ fn cmd_test(
             .map(resolve_project_path)
             .unwrap_or_else(|| project_root().join("boot-assets").join(arch.dir_name()))
     };
-    if let Some(filesystem) = ext_filesystem {
+    if native_fat {
+        let assets_dir = boot_assets();
+        let kernel = assets_dir.join("vmlinuz");
+        require_boot_assets(arch, &assets_dir, &[("vmlinuz", &kernel)])?;
+        cmd_build_test_app("hello", arch)?;
+        let efi_app = find_test_app_efi("hello", arch)?;
+        disk::create_native_fat_disk(&disk_path, &efi_app, &kernel)?;
+    } else if let Some(filesystem) = ext_filesystem {
         let assets_dir = boot_assets();
         let kernel = assets_dir.join("vmlinuz");
         let initramfs = assets_dir.join("initramfs.cpio");

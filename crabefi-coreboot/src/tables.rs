@@ -431,6 +431,7 @@ pub const MAX_CAPSULES: usize = 32;
 /// Contains the firmware identity and version information used for
 /// ESRT (EFI System Resource Table) and capsule update validation.
 /// Reference: coreboot/src/commonlib/include/commonlib/coreboot_tables.h
+#[cfg_attr(feature = "native-only", allow(dead_code))]
 #[derive(Debug, Clone, Copy)]
 pub struct EfiFwInfo {
     /// Firmware class GUID (identifies the firmware component for updates)
@@ -448,6 +449,7 @@ pub struct EfiFwInfo {
 /// Points to a coalesced capsule in memory that coreboot prepared from
 /// CapsuleUpdateData* EFI variables after a warm reboot.
 /// Reference: coreboot/src/commonlib/include/commonlib/coreboot_tables.h
+#[cfg_attr(feature = "native-only", allow(dead_code))]
 #[derive(Debug, Clone, Copy)]
 pub struct CapsuleRegion {
     /// Physical base address of the capsule data
@@ -523,6 +525,7 @@ pub struct CorebootInfo {
 }
 
 /// Information about a TPM event log found in CBMEM.
+#[cfg_attr(feature = "native-only", allow(dead_code))]
 #[derive(Debug, Clone, Copy)]
 pub struct TpmLogInfo {
     /// Physical address of the log data.

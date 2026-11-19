@@ -2,11 +2,14 @@
 //!
 //! This module handles framebuffer information extracted from coreboot tables.
 
+#[cfg(not(feature = "native-only"))]
 use core::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(not(feature = "native-only"))]
 static FRAMEBUFFER_RECORD_ADDR: AtomicU64 = AtomicU64::new(0);
 
 /// Store the coreboot framebuffer record address for later invalidation.
+#[cfg(not(feature = "native-only"))]
 pub fn store_framebuffer_record_addr(addr: u64) {
     FRAMEBUFFER_RECORD_ADDR.store(addr, Ordering::Release);
 }
@@ -23,6 +26,7 @@ pub fn store_framebuffer_record_addr(addr: u64) {
 ///
 /// This function modifies memory in the coreboot tables area. It must only
 /// be called when it's safe to modify that memory (at ExitBootServices).
+#[cfg(not(feature = "native-only"))]
 pub unsafe fn invalidate_framebuffer_record() {
     let record_addr = FRAMEBUFFER_RECORD_ADDR.load(Ordering::Acquire);
 

@@ -68,6 +68,32 @@ This writes `target/entry64/x86_64-unknown-none/release/crabefi`, separately fro
 the default coreboot payload. Native `run`, `test` and `screenshot` commands
 continue to build the default coreboot entry; they do not accept `--entry64`.
 
+### Native Linux-only payload (x86-64)
+
+Use `--native-only` to boot Linux directly from BLS Type #1 or supported
+`grub.cfg` entries on FAT, without running an EFI application. This mode uses
+CrabEFI's text boot menu. If a kernel fails to load, the menu returns with
+autoboot disabled so you can choose another entry. Add `--ext4` for BLS entries
+on supported fixed ext2/3/4 disks.
+
+```bash
+./crabefi build --native-only
+./crabefi run --native-only --disk disk.img --ahci
+```
+
+The ELF is written to `target/native-only/x86_64-unknown-none/release/crabefi`,
+separate from the default UEFI payload. For a direct Cargo build:
+
+```bash
+cargo build -p crabefi-coreboot --release --target x86_64-unknown-none \
+    --no-default-features --features native-only
+```
+
+This mode does not build or embed a Runtime Services image. It cannot launch
+EFI binaries (including shim, GRUB EFI, systemd-boot, and UKIs), and does not
+provide UEFI variables, Secure Boot, measured boot, or capsule updates. Use it
+only with trusted boot media. The default UEFI build is unchanged.
+
 ### Direct Cargo build
 
 `crabefi-coreboot` uses the checked-in, architecture-matched runtime bundle by
@@ -385,7 +411,13 @@ ci/build-boot-assets.sh --arch x86_64
 ./crabefi test --app ext4-linux --disable-kvm --timeout 180
 ```
 
-Use `ext2-linux` or `ext3-linux` to test the other ext formats.
+Use `ext2-linux` or `ext3-linux` to test the other ext formats. Use
+`native-only-linux` to run the ext4 test with the native-only payload and
+verify that it boots without an EFI System Table.
+
+The `native-only-fat-linux` test requires `busybox-static` and `cpio`. It checks
+that a disk's EFI fallback is ignored, a broken default BLS entry returns to an
+interactive menu, and selecting the GRUB entry boots Linux with ACPI but no EFI.
 
 ### Windows Boot Manager smoke test
 

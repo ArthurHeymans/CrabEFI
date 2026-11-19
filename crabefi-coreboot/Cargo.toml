@@ -8,8 +8,10 @@ description = "CrabEFI as a coreboot payload binary"
 
 [features]
 default = ["bundled-runtime-image"]
-bundled-runtime-image = ["crabefi/bundled-runtime-image"]
-external-runtime-image = []
+bundled-runtime-image = ["crabefi/full", "crabefi/bundled-runtime-image"]
+external-runtime-image = ["crabefi/full"]
+# Boot Linux directly from disk on x86-64, without a UEFI environment.
+native-only = ["crabefi/native-boot", "crabefi/xhci"]
 # Experimental native Linux boot from ext2/3/4 on x86-64.
 ext4 = ["crabefi/ext4"]
 # Use the long-mode RDI entry for u-root/LinuxBoot instead of coreboot's
@@ -54,7 +56,6 @@ boot-event-log = ["crabefi/boot-event-log"]
 
 [dependencies]
 crabefi = { package = "crabefi-core", path = "../crabefi-core", features = [
-  "full",
   "global-allocator",
   "platform-entry",
 ] }

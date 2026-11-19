@@ -21,6 +21,8 @@ use crate::efi;
 use crate::menu;
 use crate::timestamp;
 
+const NATIVE_BOOT_TIMEOUT_SECONDS: u32 = 5;
+
 /// Set once USB host controllers have been bound.
 static USB_READY: LocalCell<bool> = LocalCell::new(false);
 
@@ -29,7 +31,7 @@ static USB_READY: LocalCell<bool> = LocalCell::new(false);
 /// Called once before firmware-UI capability checks and boot dispatch, so USB
 /// input is enumerated before an indefinite setup session can be accepted.
 /// Without `with_usb`, USB controllers stay untouched until [`ensure_usb`].
-pub(crate) fn init_storage_subsystem(with_usb: bool) {
+pub(crate) fn init_storage_subsystem<const NATIVE: bool>(with_usb: bool) {
     log::info!("Initializing storage subsystem...");
     timestamp::record(timestamp::TS_CRABEFI_STORAGE_INIT_START);
 
@@ -47,7 +49,9 @@ pub(crate) fn init_storage_subsystem(with_usb: bool) {
     }
 
     // Initialize pass-through protocols for TCG Opal support
-    efi::protocols::pass_thru_init::init();
+    if !NATIVE {
+        efi::protocols::pass_thru_init::init();
+    }
 
     log::info!("Storage subsystem initialized");
     timestamp::record(timestamp::TS_CRABEFI_STORAGE_INIT_DONE);
@@ -187,7 +191,15 @@ pub(crate) fn run(boot_var_state: boot_vars::BootVarState, firmware_ui_requested
     } else {
         "no boot option started"
     });
-    show_boot_menu(timeout_seconds, firmware_ui_requested);
+    show_boot_menu::<false>(timeout_seconds, firmware_ui_requested);
+}
+
+/// Start the native menu directly; there are no EFI variables or load options.
+pub(crate) fn run_native() {
+    // With no BootNext/BootOrder phase, the menu is the first boot path
+    // and needs USB storage and keyboards from the start.
+    init_storage_subsystem::<true>(true);
+    show_boot_menu::<true>(NATIVE_BOOT_TIMEOUT_SECONDS, false);
 }
 
 /// Automatic boot is deliberately separate: setup must not even delete BootNext.
@@ -326,12 +338,12 @@ fn try_boot_order(boot_var_state: &boot_vars::BootVarState) -> bool {
 }
 
 /// Discover boot entries and show setup indefinitely only on an explicit request.
-fn show_boot_menu(timeout_seconds: u32, firmware_ui_requested: bool) {
+fn show_boot_menu<const NATIVE: bool>(timeout_seconds: u32, firmware_ui_requested: bool) {
     // A choice the boot policy refuses (the setup menu may have tightened it
     // since the entries were listed) shows the menu again, rebuilt under the
     // current policy and waiting for the user.
     let mut countdown = Some(timeout_seconds);
-    while show_boot_menu_once(countdown, firmware_ui_requested) == MenuOutcome::Refused {
+    while show_boot_menu_once::<NATIVE>(countdown, firmware_ui_requested) == MenuOutcome::Retry {
         countdown = None;
     }
 }
@@ -339,15 +351,18 @@ fn show_boot_menu(timeout_seconds: u32, firmware_ui_requested: bool) {
 #[derive(PartialEq, Eq)]
 enum MenuOutcome {
     Done,
-    Refused,
+    Retry,
 }
 
 /// `countdown` is the configured timeout, or `None` to wait for the user.
-fn show_boot_menu_once(countdown: Option<u32>, firmware_ui_requested: bool) -> MenuOutcome {
+fn show_boot_menu_once<const NATIVE: bool>(
+    countdown: Option<u32>,
+    firmware_ui_requested: bool,
+) -> MenuOutcome {
     // ---- Phase 3: Fallback to device discovery and interactive menu ----
     log::info!("=== Fallback: discovering boot entries from storage ===");
 
-    let mut boot_menu = menu::discover_boot_entries();
+    let mut boot_menu = menu::discover_entries::<NATIVE>();
     // After a refused choice the user is in the menu on purpose, like an
     // explicit setup request: keep the menu even without media.
     let keep_menu = firmware_ui_requested || countdown.is_none();
@@ -356,13 +371,15 @@ fn show_boot_menu_once(countdown: Option<u32>, firmware_ui_requested: bool) -> M
         log::warn!("No bootable media found!");
 
         #[cfg(feature = "ui")]
-        crate::ui::show_no_media_screen();
+        if !NATIVE {
+            crate::ui::show_no_media_screen();
+        }
 
         return MenuOutcome::Done;
     }
 
     let (graphical, timeout_seconds) = menu_configuration(
-        cfg!(feature = "ui"),
+        !NATIVE && cfg!(feature = "ui"),
         crate::handoff::framebuffer().is_some(),
         countdown.unwrap_or(0),
         firmware_ui_requested,
@@ -425,12 +442,12 @@ fn show_boot_menu_once(countdown: Option<u32>, firmware_ui_requested: bool) -> M
     let selected = if graphical {
         crate::ui::show_graphical_menu(&mut boot_menu)
     } else {
-        menu::show_menu(&mut boot_menu)
+        menu::show_menu_for_mode::<NATIVE>(&mut boot_menu)
     };
     #[cfg(not(feature = "ui"))]
     let selected = {
         let _ = graphical;
-        menu::show_menu(&mut boot_menu)
+        menu::show_menu_for_mode::<NATIVE>(&mut boot_menu)
     };
     log::info!("Menu returned: {:?}", selected);
 
@@ -449,13 +466,17 @@ fn show_boot_menu_once(countdown: Option<u32>, firmware_ui_requested: bool) -> M
                     entry.name,
                     if automatic { " on timeout" } else { "" }
                 );
-                return MenuOutcome::Refused;
+                return MenuOutcome::Retry;
             }
             log::info!("Booting: {} from {}", entry.name, entry.path);
             log::info!("Entry kind: {:?}", entry.kind);
             log::info!("Storage: {:?}", entry.storage);
-            boot_selected_entry(&entry);
+            boot_selected_entry::<NATIVE>(&entry);
             log::warn!("boot_selected_entry returned - boot failed!");
+            if NATIVE {
+                log::info!("Returning to native boot menu without autoboot");
+                return MenuOutcome::Retry;
+            }
         } else {
             log::error!("Failed to get entry at index {}", selected_index);
         }
@@ -700,15 +721,17 @@ fn try_boot_file_on_device(
 /// - UEFI/UKI entries: Load and execute EFI application
 /// - BLS/GRUB Linux entries: Direct Linux boot via linux_boot module
 /// - Payload entries: Chainload coreboot payload
-fn boot_selected_entry(entry: &menu::BootEntry) {
+fn boot_selected_entry<const NATIVE: bool>(entry: &menu::BootEntry) {
     log::info!("boot_selected_entry called");
 
     // First, dispatch based on entry kind
     match &entry.kind {
         // UEFI entries use the existing EFI boot path
         menu::BootEntryKind::Uefi | menu::BootEntryKind::BlsUki => {
-            log::info!("Dispatching to UEFI boot path");
-            boot_uefi_entry(entry);
+            if !NATIVE {
+                log::info!("Dispatching to UEFI boot path");
+                boot_uefi_entry(entry);
+            }
         }
 
         // Direct Linux boot entries (BLS Type #1 or GRUB)
@@ -725,7 +748,7 @@ fn boot_selected_entry(entry: &menu::BootEntry) {
             #[cfg(target_arch = "x86_64")]
             {
                 log::info!("Dispatching to direct Linux boot");
-                boot_linux_entry(entry, linux_path, initrd_paths, cmdline);
+                boot_linux_entry::<NATIVE>(entry, linux_path, initrd_paths, cmdline);
             }
             #[cfg(not(target_arch = "x86_64"))]
             {
@@ -787,7 +810,7 @@ fn boot_uefi_path(entry: &menu::BootEntry, path: &str) -> bool {
 ///
 /// x86-only: uses bzImage boot protocol.
 #[cfg(target_arch = "x86_64")]
-fn boot_linux_entry(
+fn boot_linux_entry<const NATIVE: bool>(
     entry: &menu::BootEntry,
     linux_path: &heapless::String<128>,
     initrd_paths: &crate::bls::Initrds,
@@ -797,7 +820,7 @@ fn boot_linux_entry(
     // when Secure Boot is active (filtered in scan_partition_for_entries), but
     // check here as well in case an entry somehow makes it through.
     // Direct boot bypasses signature verification which violates Secure Boot.
-    if cfg!(feature = "secure-boot-enforced") || efi::auth::is_secure_boot_enabled() {
+    if !NATIVE && (cfg!(feature = "secure-boot-enforced") || efi::auth::is_secure_boot_enabled()) {
         log::warn!("Direct Linux boot disabled: Secure Boot is active");
         // Only FAT volumes can provide a fallback loader through EFI SFS.
         if matches!(entry.filesystem, crate::fs::boot::Kind::Fat) {
@@ -829,7 +852,7 @@ fn boot_linux_entry(
         .collect::<heapless::Vec<&str, { crate::bls::MAX_INITRDS }>>();
     let loaded =
         crate::fs::boot::with_filesystem(entry.storage, &entry.partition, entry.filesystem, |fs| {
-            crate::linux_boot::load_linux_from_fs(
+            crate::linux_boot::load_linux_from_fs::<NATIVE>(
                 fs,
                 linux_path,
                 &paths,
@@ -849,8 +872,9 @@ fn boot_linux_entry(
             // ExitBootServices, but it can still reach payload MM through
             // the request buffer: end the firmware phase and switch MM to
             // the runtime view first.
-            #[cfg(target_arch = "x86_64")]
-            crate::efi::payload_mm::enter_runtime();
+            if !NATIVE {
+                crate::efi::payload_mm::enter_runtime();
+            }
             unsafe {
                 loaded.boot_direct();
             }

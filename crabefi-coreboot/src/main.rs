@@ -36,6 +36,7 @@ mod arch_entry;
 #[path = "arch/x86_64/entry.rs"]
 mod arch_entry;
 mod cbmem_console;
+#[cfg(not(feature = "native-only"))]
 mod fmap;
 mod framebuffer;
 mod memory;
@@ -98,6 +99,7 @@ fn in_table_memory(map: &[memory::MemoryRegion], start: u64, length: u64) -> boo
     })
 }
 
+#[cfg(not(feature = "native-only"))]
 fn runtime_image_source() -> crabefi::RuntimeImageSource<'static> {
     #[cfg(feature = "bundled-runtime-image")]
     {
@@ -132,6 +134,7 @@ fn boot_policy() -> crabefi::BootPolicy {
     }
 }
 
+#[cfg(not(feature = "native-only"))]
 fn runtime_platform_config() -> crabefi::RuntimePlatformConfig<'static> {
     unsafe extern "C" {
         static _deferred_buffer_start: u8;
@@ -233,8 +236,10 @@ impl crabefi::Timer for CorebootTimer {
 struct CorebootReset;
 
 /// Coreboot-specific lifecycle callbacks injected into the generic core.
+#[cfg(not(feature = "native-only"))]
 struct CorebootHooks;
 
+#[cfg(not(feature = "native-only"))]
 impl crabefi::PlatformHooks for CorebootHooks {
     fn on_exit_boot_services(&self) {
         // Invalidate the coreboot framebuffer record to prevent a race between
@@ -295,12 +300,14 @@ impl crabefi::ResetHandler for CorebootReset {
 /// indirectly via an FMAP region on the boot medium. Both mechanisms are
 /// coreboot-specific, so they live in the coreboot payload instead of the
 /// platform-agnostic CrabEFI persistence path.
+#[cfg(not(feature = "native-only"))]
 struct CorebootVariableStoreLocator {
     smmstorev2: Option<tables::Smmstorev2Info>,
     boot_media: Option<tables::BootMediaInfo>,
     spi_flash: Option<tables::SpiFlashInfo>,
 }
 
+#[cfg(not(feature = "native-only"))]
 impl CorebootVariableStoreLocator {
     fn new(cb_info: &tables::CorebootInfo) -> Self {
         Self {
@@ -374,6 +381,7 @@ impl CorebootVariableStoreLocator {
     }
 }
 
+#[cfg(not(feature = "native-only"))]
 impl crabefi::VariableStoreLocator for CorebootVariableStoreLocator {
     fn locate_variable_store(
         &self,
@@ -430,6 +438,7 @@ impl crabefi::VariableStoreLocator for CorebootVariableStoreLocator {
 }
 
 /// Coreboot SPI/FMAP implementation of the platform capsule backend.
+#[cfg(not(feature = "native-only"))]
 struct CorebootCapsuleBackend {
     firmware_info: Option<crabefi::FirmwareInfo>,
     fmap_offset: Option<u64>,
@@ -438,6 +447,7 @@ struct CorebootCapsuleBackend {
     fmap_regions: alloc::vec::Vec<crabefi::FmapRegion>,
 }
 
+#[cfg(not(feature = "native-only"))]
 impl CorebootCapsuleBackend {
     fn new(
         firmware_info: Option<crabefi::FirmwareInfo>,
@@ -623,8 +633,10 @@ impl CorebootCapsuleBackend {
 }
 
 // Capsule signing roots from CRABEFI_CAPSULE_TRUST_CERTS (build.rs).
+#[cfg(not(feature = "native-only"))]
 include!(concat!(env!("OUT_DIR"), "/capsule_trust.rs"));
 
+#[cfg(not(feature = "native-only"))]
 impl crabefi::CapsuleBackend for CorebootCapsuleBackend {
     fn firmware_info(&self) -> Option<&crabefi::FirmwareInfo> {
         self.firmware_info.as_ref()
@@ -1163,10 +1175,12 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         .framebuffer
         .map(crabefi::FramebufferConfig::from)
         .filter(|fb| fb.size() != 0 && fb.physical_address != 0);
+    #[cfg(not(feature = "native-only"))]
     if let Some(addr) = cb_info.framebuffer_record_addr {
         framebuffer::store_framebuffer_record_addr(addr);
     }
 
+    #[cfg(not(feature = "native-only"))]
     if let Some(ref spi_flash) = cb_info.spi_flash
         && let Some(window) = spi_flash.mmap_windows.first()
     {
@@ -1213,6 +1227,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
 
     // Initialize logging (idempotent — init_platform() will call it again).
     crabefi::logger::init();
+    #[cfg(not(feature = "native-only"))]
     apply_early_log_level(&cb_info);
 
     if let Some(fb) = validated_framebuffer {
@@ -1313,7 +1328,9 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     };
 
     let reset = CorebootReset;
+    #[cfg(not(feature = "native-only"))]
     let hooks = CorebootHooks;
+    #[cfg(not(feature = "native-only"))]
     let variable_store_locator = CorebootVariableStoreLocator::new(&cb_info);
     #[cfg(target_arch = "x86_64")]
     let timestamp_recorder_ref = timestamp_recorder
@@ -1346,6 +1363,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         unsafe { core::slice::from_raw_parts(addr as *const u8, size as usize) }
     });
 
+    #[cfg(not(feature = "native-only"))]
     let firmware_info = cb_info.efi_fw_info.map(|fw_info| crabefi::FirmwareInfo {
         guid: fw_info.guid,
         version: fw_info.version,
@@ -1353,9 +1371,12 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         fw_size: fw_info.fw_size,
     });
 
+    #[cfg(not(feature = "native-only"))]
     let mut capsule_regions =
         [crabefi::CapsuleRegion { base: 0, size: 0 }; crabefi::handoff::MAX_CAPSULES];
+    #[cfg(not(feature = "native-only"))]
     let mut capsule_count = 0;
+    #[cfg(not(feature = "native-only"))]
     for capsule in cb_info.capsules.iter() {
         if capsule_count >= capsule_regions.len() {
             break;
@@ -1367,8 +1388,27 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         capsule_count += 1;
     }
 
+    #[cfg(not(feature = "native-only"))]
     let mut capsule_backend = CorebootCapsuleBackend::new(firmware_info, cb_info.boot_media);
 
+    #[cfg(feature = "native-only")]
+    let mut config = {
+        let mut config = crabefi::PlatformConfigBuilder::new_native(
+            &memory_regions[..region_count],
+            &timer,
+            &reset,
+            &mut [],
+        )
+        .boot_policy(boot_policy())
+        .build();
+        config.timestamp_recorder = timestamp_recorder_ref;
+        config.framebuffer = framebuffer;
+        config.acpi_rsdp = cb_info.acpi_rsdp;
+        config.fdt = fdt_slice;
+        config
+    };
+
+    #[cfg(not(feature = "native-only"))]
     let mut config = crabefi::PlatformConfig {
         memory_map: &memory_regions[..region_count],
         timer: &timer,
@@ -1466,15 +1506,20 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     // init_platform() — its allocator init is idempotent so the second
     // call is a no-op.
     // ================================================================
-    crabefi::efi::allocator::init_from_platform(config.memory_map);
-    #[cfg(feature = "payload-mm")]
-    payload_mm::reserve_buffer();
-    match crabefi::heap::init() {
-        Ok(()) | Err(crabefi::heap::HeapInitError::AlreadyInitialized) => {
-            config.heap_pre_initialized = true;
-        }
-        Err(e) => {
-            panic!("Failed to initialize heap allocator: {e}");
+    #[cfg(feature = "native-only")]
+    crabefi::prepare_native_memory(&mut config);
+    #[cfg(not(feature = "native-only"))]
+    {
+        crabefi::efi::allocator::init_from_platform(config.memory_map);
+        #[cfg(feature = "payload-mm")]
+        payload_mm::reserve_buffer();
+        match crabefi::heap::init() {
+            Ok(()) | Err(crabefi::heap::HeapInitError::AlreadyInitialized) => {
+                config.heap_pre_initialized = true;
+            }
+            Err(e) => {
+                panic!("Failed to initialize heap allocator: {e}");
+            }
         }
     }
 
@@ -1507,6 +1552,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         // its _CRS names the command buffers, not the registers.
         #[cfg(target_arch = "x86_64")]
         // SAFETY: coreboot identity maps its ACPI tables.
+        #[cfg(not(feature = "native-only"))]
         let crb = unsafe { acpi::find_tpm2_table(rsdp) }.and_then(|tpm2| {
             let start = match tpm2.start_method {
                 7 => crabefi::CrbStart::Crb,
@@ -1516,6 +1562,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
             (tpm2.control_area != 0).then_some((tpm2.control_area, start))
         });
         #[cfg(target_arch = "x86_64")]
+        #[cfg(not(feature = "native-only"))]
         if let Some((control_area, start)) = crb {
             log::info!("ACPI TPM2 table describes a CRB TPM at {:#x}", control_area);
             if let Some(ref mut tpm) = config.tpm_event_log {
@@ -1559,6 +1606,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
 
         // Linux reads the TPM2 table's log area before the EFI log.
         #[cfg(target_arch = "x86_64")]
+        #[cfg(not(feature = "native-only"))]
         if let Some(ref mut tpm) = config.tpm_event_log
             && tpm.tpm2_device.is_some()
         {
@@ -1577,6 +1625,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     //
     // Parse coreboot firmware configuration options now that the heap is
     // available. cb_info.cfr_raw is still in scope — no static needed.
+    #[cfg(not(feature = "native-only"))]
     if let Some(cfr_raw) = cb_info.cfr_raw
         && let Some(cfr) = crabefi::cfr::parse_cfr(cfr_raw)
     {
@@ -1591,7 +1640,11 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
     // ================================================================
     // Phase 8: Hand off to the library (never returns)
     // ================================================================
-    crabefi::init_platform(config)
+    #[cfg(feature = "native-only")]
+    let init = crabefi::init_native_platform;
+    #[cfg(not(feature = "native-only"))]
+    let init = crabefi::init_platform;
+    init(config)
 }
 
 // ============================================================================
@@ -1604,6 +1657,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
 /// full EFI variable services are not initialized yet. Coreboot-specific code is
 /// limited to discovering the memory-mapped SMMSTORE region; parsing the EDK2
 /// variable-store format is handled by the generic CrabEFI logger helper.
+#[cfg(not(feature = "native-only"))]
 fn apply_early_log_level(cb_info: &tables::CorebootInfo) {
     let Some(smmstore) = cb_info.smmstorev2 else {
         return;
