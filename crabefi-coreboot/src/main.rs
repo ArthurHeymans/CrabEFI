@@ -646,12 +646,16 @@ impl crabefi::CapsuleBackend for CorebootCapsuleBackend {
     fn firmware_slots_expected(&mut self) -> bool {
         #[cfg(feature = "ab-test-slots")]
         return true;
+        // From the FMAP, which a lost slot header leaves intact. The PSP
+        // directory is no guide: AMD's PSP firmware lists A/B slot headers
+        // even in single-image layouts, where both point into one CBFS.
         #[cfg(not(feature = "ab-test-slots"))]
-        self.boot_media.is_some_and(|boot_media| {
-            amd_ab::lists_slots(&mut |offset, buf: &mut [u8]| {
-                payload_mm::read_flash(boot_media, offset, buf)
-            })
-        })
+        {
+            self.load_fmap();
+            self.fmap_regions
+                .iter()
+                .any(|region| matches!(region.name.as_str(), "COREBOOT_B" | "RECOVERY_B"))
+        }
     }
 
     #[cfg(feature = "payload-mm")]

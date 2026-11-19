@@ -74,32 +74,6 @@ fn parse_ish(offset: u32, raw: [u8; ISH_SIZE]) -> Ish {
     }
 }
 
-/// Whether the PSP L1 directory lists slot headers (an A/B layout), without
-/// reading the headers themselves: a lost or unreachable header must not make
-/// the flash look like a single image. A failed read counts as A/B, so it
-/// cannot either.
-pub fn lists_slots(read: &mut impl FnMut(u32, &mut [u8]) -> bool) -> bool {
-    let mut efs = [0u8; 0x18];
-    if !read(EFS_OFFSET, &mut efs) {
-        return true;
-    }
-    if u32_at(&efs, 0) != EFS_SIGNATURE {
-        return false;
-    }
-    let l1 = u32_at(&efs, EFS_PSP_DIR as usize);
-    let mut header = [0u8; 16];
-    if !read(l1, &mut header) {
-        return true;
-    }
-    if &header[..4] != b"$PSP" {
-        return false;
-    }
-    (0..u32_at(&header, 8).min(MAX_L1_ENTRIES)).any(|i| {
-        let mut entry = [0u8; 16];
-        !read(l1 + 16 + 16 * i, &mut entry) || matches!(entry[0], ISH_TYPE_A | ISH_TYPE_B)
-    })
-}
-
 /// ISH of slot A and B, read with `read(flash offset, buffer)`.
 pub fn read_ishes(read: &mut impl FnMut(u32, &mut [u8]) -> bool) -> Option<[Ish; 2]> {
     let mut efs = [0u8; 0x18];
