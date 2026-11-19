@@ -815,7 +815,7 @@ impl EhciController {
             }
 
             // Check line status - if it's K-state (Low Speed), release to companion
-            if port_reg.portsc.read(PORTSC::LS) == PORTSC::LS::KState.into() {
+            if port_reg.portsc.matches_all(PORTSC::LS::KState) {
                 log::debug!(
                     "EHCI: Port {} has low-speed device, releasing to companion",
                     port

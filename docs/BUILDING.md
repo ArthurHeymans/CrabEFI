@@ -372,6 +372,20 @@ retained in a unique directory under the requested report root (default:
 [UEFI conformance priorities](UEFI_CONFORMANCE.md) for exact scopes, required
 interface gaps, and why these results are not a complete compliance claim.
 
+### Native Linux boot from ext smoke test
+
+On x86-64, enable experimental ext support with `./crabefi build --ext4`
+or `./crabefi run --ext4 --ahci`. It is not part of `full`. The smoke test
+builds a GPT disk with no FAT ESP, boots a BLS entry from `/boot`, and checks
+that the initramfs ran. Supply a Linux `bzImage` with serial console and gzip
+initramfs support and a static BusyBox. The test uses `mke2fs` (e2fsprogs),
+`sfdisk`, `cpio`, and the usual CrabEFI QEMU tools.
+
+```sh
+ci/run-ext4-boot-smoke.sh /path/to/bzImage /path/to/static-busybox
+# Optional third argument: ext2, ext3, or ext4 (default).
+```
+
 ### Windows Boot Manager smoke test
 
 CrabEFI can also run a Windows/WinPE boot smoke test in QEMU. The preferred

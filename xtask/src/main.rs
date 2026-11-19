@@ -116,6 +116,10 @@ enum Commands {
         /// Build the 64-bit x86 entry for u-root/LinuxBoot (not coreboot)
         #[arg(long)]
         entry64: bool,
+
+        /// Enable experimental BLS boot from ext2/3/4 (x86-64 only)
+        #[arg(long)]
+        ext4: bool,
     },
 
     /// Regenerate the checked-in Cargo runtime bundle for one architecture
@@ -162,6 +166,10 @@ enum Commands {
         /// Enable the x86-64 runtime test's two-boot replay on an existing disk
         #[arg(long, requires = "disk")]
         runtime_replay: bool,
+
+        /// Enable experimental BLS boot from ext2/3/4 (x86-64 only)
+        #[arg(long, conflicts_with = "coreboot_rom")]
+        ext4: bool,
 
         /// Enable graphical UI with mouse support
         #[arg(long)]
@@ -311,7 +319,8 @@ fn main() -> Result<()> {
             release,
             ui,
             entry64,
-        } => cmd_build_with_entry(release, ui, arch, machine, entry64),
+            ext4,
+        } => cmd_build_payload(release, ui, arch, machine, entry64, ext4_features(ext4)),
         Commands::BundleRuntime { secure_boot } => runtime::bundle(arch, secure_boot),
         Commands::Run {
             coreboot_rom,
@@ -324,6 +333,7 @@ fn main() -> Result<()> {
             disk,
             runtime_replay,
             ui,
+            ext4,
         } => cmd_run(
             coreboot_rom,
             ahci,
@@ -337,6 +347,7 @@ fn main() -> Result<()> {
             ui,
             arch,
             machine,
+            ext4_features(ext4),
         ),
         Commands::Test {
             coreboot_rom,
@@ -389,18 +400,12 @@ fn main() -> Result<()> {
 }
 
 // Native coreboot run/test/screenshot commands always use the default entry.
-fn cmd_build(release: bool, ui: bool, arch: Arch, machine: Machine) -> Result<()> {
-    cmd_build_with_entry(release, ui, arch, machine, false)
+fn ext4_features(enabled: bool) -> &'static [&'static str] {
+    if enabled { &["ext4"] } else { &[] }
 }
 
-fn cmd_build_with_entry(
-    release: bool,
-    ui: bool,
-    arch: Arch,
-    machine: Machine,
-    entry64: bool,
-) -> Result<()> {
-    cmd_build_payload(release, ui, arch, machine, entry64, &[])
+fn cmd_build(release: bool, ui: bool, arch: Arch, machine: Machine) -> Result<()> {
+    cmd_build_payload(release, ui, arch, machine, false, &[])
 }
 
 /// Payload Cargo features a test app needs beyond the default build.
@@ -447,6 +452,9 @@ fn cmd_build_payload(
 ) -> Result<()> {
     if entry64 && arch != Arch::X86_64 {
         bail!("--entry64 is only supported on x86-64");
+    }
+    if extra_features.contains(&"ext4") && arch != Arch::X86_64 {
+        bail!("--ext4 is only supported on x86-64");
     }
     let label = match (arch, machine) {
         (Arch::X86_64, _) => "x86_64".to_string(),
@@ -590,6 +598,7 @@ fn cmd_run(
     ui: bool,
     arch: Arch,
     machine: Machine,
+    extra_features: &[&str],
 ) -> Result<()> {
     if runtime_replay && arch != Arch::X86_64 {
         bail!("--runtime-replay is only supported on x86-64");
@@ -615,10 +624,10 @@ fn cmd_run(
         }
     } else {
         // Build CrabEFI first
-        cmd_build(true, ui, arch, machine)?;
+        cmd_build_payload(true, ui, arch, machine, false, extra_features)?;
 
         // Prepare ROM with CrabEFI payload
-        let crabefi_elf = rom::get_crabefi_elf(arch);
+        let crabefi_elf = rom::get_crabefi_elf_in(&payload_target_dir(false, extra_features), arch);
         rom::prepare_rom(&crabefi_elf, temp_dir.path(), arch, machine)?
     };
 
@@ -1263,7 +1272,7 @@ mod entry_tests {
     #[test]
     fn entry64_rejects_other_architectures_before_building() {
         for arch in [Arch::Aarch64, Arch::Riscv64] {
-            let err = cmd_build_with_entry(true, false, arch, Machine::Sbsa, true).unwrap_err();
+            let err = cmd_build_payload(true, false, arch, Machine::Sbsa, true, &[]).unwrap_err();
             assert!(
                 err.to_string()
                     .contains("--entry64 is only supported on x86-64")

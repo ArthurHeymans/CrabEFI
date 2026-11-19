@@ -29,7 +29,7 @@ pub mod entry;
 
 pub use entry::{BlsEntry, BlsParseError, Initrds, LoaderConf, MAX_INITRDS};
 
-use crate::fs::fat::FatFilesystem;
+use crate::fs::boot::BootFilesystem;
 use heapless::{String, Vec};
 
 /// Maximum number of BLS entries we can discover
@@ -39,10 +39,10 @@ const MAX_BLS_ENTRIES: usize = 16;
 const MAX_CONF_SIZE: usize = 4096;
 
 /// Path to BLS entries directory
-const ENTRIES_DIR: &str = "loader\\entries";
+const ENTRIES_DIR: &str = "loader/entries";
 
 /// Path to loader.conf
-const LOADER_CONF_PATH: &str = "loader\\loader.conf";
+const LOADER_CONF_PATH: &str = "loader/loader.conf";
 
 /// Error during BLS discovery
 #[derive(Debug)]
@@ -107,27 +107,40 @@ impl Default for BlsDiscovery {
     }
 }
 
-/// Discover BLS entries on a FAT filesystem
+/// Discover BLS entries on a boot filesystem
 ///
 /// This function scans `/loader/entries/` for .conf files and parses them.
 ///
 /// # Arguments
 ///
-/// * `fs` - FAT filesystem to scan
+/// * `fs` - Filesystem to scan
 ///
 /// # Returns
 ///
 /// `BlsDiscovery` containing all valid entries found
-pub fn discover_entries(fs: &mut FatFilesystem<'_>) -> Result<BlsDiscovery, BlsError> {
+pub fn discover_entries(fs: &mut dyn BootFilesystem) -> Result<BlsDiscovery, BlsError> {
+    discover_entries_at(fs, "")
+}
+
+pub(crate) fn discover_entries_at(
+    fs: &mut dyn BootFilesystem,
+    prefix: &str,
+) -> Result<BlsDiscovery, BlsError> {
     let mut discovery = BlsDiscovery::new();
+    let mut loader_conf = String::<64>::new();
+    let mut entries_dir = String::<64>::new();
+    core::fmt::write(&mut loader_conf, format_args!("{prefix}{LOADER_CONF_PATH}"))
+        .map_err(|_| BlsError::FsError)?;
+    core::fmt::write(&mut entries_dir, format_args!("{prefix}{ENTRIES_DIR}"))
+        .map_err(|_| BlsError::FsError)?;
 
     // Try to read loader.conf
-    if let Ok(size) = fs.file_size(LOADER_CONF_PATH)
+    if let Ok(size) = fs.file_size(&loader_conf)
         && size > 0
-        && size <= MAX_CONF_SIZE as u32
+        && size <= MAX_CONF_SIZE as u64
     {
         let mut buf = [0u8; MAX_CONF_SIZE];
-        if let Ok(bytes_read) = fs.read_file_all(LOADER_CONF_PATH, &mut buf)
+        if let Ok(bytes_read) = fs.read_file_all(&loader_conf, &mut buf)
             && let Ok(content) = core::str::from_utf8(&buf[..bytes_read])
         {
             discovery.loader_conf = Some(LoaderConf::parse(content));
@@ -137,11 +150,13 @@ pub fn discover_entries(fs: &mut FatFilesystem<'_>) -> Result<BlsDiscovery, BlsE
 
     // List .conf files in the entries directory using directory enumeration
     // This is much faster than probing hardcoded filenames one-by-one
-    if let Ok(conf_files) = fs.list_directory_files(ENTRIES_DIR, ".conf") {
-        log::debug!("Found {} .conf files in {}", conf_files.len(), ENTRIES_DIR);
+    if let Ok(conf_files) = fs.list_files(&entries_dir, ".conf") {
+        log::debug!("Found {} .conf files in {}", conf_files.len(), entries_dir);
         for filename in conf_files.iter() {
-            let mut path: String<280> = String::new();
-            let _ = core::fmt::write(&mut path, format_args!("{}\\{}", ENTRIES_DIR, filename));
+            let mut path: String<320> = String::new();
+            if core::fmt::write(&mut path, format_args!("{entries_dir}/{filename}")).is_err() {
+                continue;
+            }
             if let Some(entry) = try_load_entry(fs, path.as_str()) {
                 let _ = discovery.entries.push(entry);
             }
@@ -167,11 +182,11 @@ pub fn discover_entries(fs: &mut FatFilesystem<'_>) -> Result<BlsDiscovery, BlsE
 }
 
 /// Try to load and parse a single BLS entry file
-fn try_load_entry(fs: &mut FatFilesystem<'_>, path: &str) -> Option<BlsEntry> {
+fn try_load_entry(fs: &mut dyn BootFilesystem, path: &str) -> Option<BlsEntry> {
     // Check if file exists and get size
     let size = fs.file_size(path).ok()?;
 
-    if size == 0 || size > MAX_CONF_SIZE as u32 {
+    if size == 0 || size > MAX_CONF_SIZE as u64 {
         return None;
     }
 
@@ -185,7 +200,7 @@ fn try_load_entry(fs: &mut FatFilesystem<'_>, path: &str) -> Option<BlsEntry> {
     // Parse the entry
     match BlsEntry::parse(content) {
         Ok(mut entry) => {
-            let name = path.rsplit('\\').next().unwrap_or(path);
+            let name = path.rsplit('/').next().unwrap_or(path);
             let _ = entry
                 .id
                 .push_str(name.strip_suffix(".conf").unwrap_or(name));
@@ -236,10 +251,9 @@ fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
 ///
 /// # Arguments
 ///
-/// * `fs` - FAT filesystem to check
-pub fn has_bls_entries(fs: &mut FatFilesystem<'_>) -> bool {
-    // Check if loader.conf or the entries directory exists
-    fs.file_size(LOADER_CONF_PATH).is_ok() || fs.find_file(ENTRIES_DIR).is_ok()
+/// * `fs` - Filesystem to check
+pub fn has_bls_entries(fs: &mut dyn BootFilesystem) -> bool {
+    fs.file_size(LOADER_CONF_PATH).is_ok() || fs.list_files(ENTRIES_DIR, ".conf").is_ok()
 }
 
 #[cfg(test)]

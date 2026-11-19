@@ -281,15 +281,32 @@ pub fn load_linux_from_disk(
     framebuffer: Option<&crate::platform::FramebufferConfig>,
     use_efi_handover: bool,
 ) -> Result<LoadedLinux, LinuxBootError> {
-    use crate::fs::fat::FatFilesystem;
-
-    log::info!("Loading Linux kernel: {}", kernel_path);
-
-    // Mount FAT filesystem
-    let mut fs = FatFilesystem::new(disk, partition_start).map_err(|e| {
+    let mut fs = crate::fs::fat::FatFilesystem::new(disk, partition_start).map_err(|e| {
         log::error!("Failed to mount FAT filesystem: {:?}", e);
         LinuxBootError::FileRead
     })?;
+    load_linux_from_fs(
+        &mut fs,
+        kernel_path,
+        initrd_paths,
+        cmdline,
+        acpi_rsdp,
+        framebuffer,
+        use_efi_handover,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn load_linux_from_fs(
+    fs: &mut dyn crate::fs::boot::BootFilesystem,
+    kernel_path: &str,
+    initrd_paths: &[&str],
+    cmdline: &str,
+    acpi_rsdp: Option<u64>,
+    framebuffer: Option<&crate::platform::FramebufferConfig>,
+    use_efi_handover: bool,
+) -> Result<LoadedLinux, LinuxBootError> {
+    log::info!("Loading Linux kernel: {}", kernel_path);
 
     // Get kernel file size
     let kernel_size = fs.file_size(kernel_path).map_err(|e| {
@@ -303,7 +320,7 @@ pub fn load_linux_from_disk(
         kernel_size / 1024
     );
 
-    if kernel_size as usize > MAX_KERNEL_SIZE {
+    if kernel_size > MAX_KERNEL_SIZE as u64 {
         log::error!(
             "Kernel too large: {} > {} bytes",
             kernel_size,
@@ -312,16 +329,10 @@ pub fn load_linux_from_disk(
         return Err(LinuxBootError::KernelTooLarge);
     }
 
-    // Find the kernel file entry
-    let kernel_entry = fs.find_file(kernel_path).map_err(|e| {
-        log::error!("Failed to find kernel file: {:?}", e);
-        LinuxBootError::FileNotFound
-    })?;
-
     // Read the first 1KB to parse the header
     let mut header_buf = [0u8; 1024];
     let bytes_read = fs
-        .read_file(&kernel_entry, 0, &mut header_buf)
+        .read_file_at(kernel_path, 0, &mut header_buf)
         .map_err(|e| {
             log::error!("Failed to read kernel header: {:?}", e);
             LinuxBootError::FileRead
@@ -332,7 +343,7 @@ pub fn load_linux_from_disk(
     }
 
     // Parse the bzImage header
-    let bzimage = BzImage::parse_header(&header_buf, kernel_size)?;
+    let bzimage = BzImage::parse_header(&header_buf, kernel_size as u32)?;
 
     // Check if EFI handover is requested but not available
     if use_efi_handover && !bzimage.header.supports_efi_handover() {
@@ -340,9 +351,7 @@ pub fn load_linux_from_disk(
         return Err(LinuxBootError::NoEfiHandover);
     }
 
-    // DMA the protected-mode kernel directly to the target address
-    // We skip the setup sectors by using the offset parameter in read_file
-    // This avoids an intermediate buffer and extra memcpy
+    // Read the protected-mode kernel into the destination, skipping setup sectors.
     let setup_size = bzimage.setup_size;
     let pm_kernel_size = bzimage.kernel_size as usize;
 
@@ -388,13 +397,8 @@ pub fn load_linux_from_disk(
     let kernel_dest =
         unsafe { core::slice::from_raw_parts_mut(DEFAULT_KERNEL_ADDR as *mut u8, pm_kernel_size) };
 
-    // Re-mount filesystem (previous borrow ended)
-    let mut fs = FatFilesystem::new(disk, partition_start).map_err(|_| LinuxBootError::FileRead)?;
-
-    // Read kernel directly to target address, skipping setup sectors
-    // The FAT read_file function with offset will DMA directly to our buffer
     let bytes_read = fs
-        .read_file(&kernel_entry, setup_size, kernel_dest)
+        .read_file_at(kernel_path, u64::from(setup_size), kernel_dest)
         .map_err(|e| {
             log::error!("Failed to read kernel: {:?}", e);
             LinuxBootError::FileRead
@@ -414,7 +418,7 @@ pub fn load_linux_from_disk(
     crate::arch::sync_instruction_cache(DEFAULT_KERNEL_ADDR, pm_kernel_size);
 
     log::info!(
-        "Kernel loaded directly to {:#x} ({} bytes via DMA)",
+        "Kernel loaded directly to {:#x} ({} bytes)",
         DEFAULT_KERNEL_ADDR,
         bytes_read
     );
@@ -441,14 +445,15 @@ pub fn load_linux_from_disk(
     let mut initrd_size = 0u32;
 
     if !initrd_paths.is_empty() {
-        let mut fs =
-            FatFilesystem::new(disk, partition_start).map_err(|_| LinuxBootError::FileRead)?;
         let mut sizes: heapless::Vec<usize, { crate::bls::MAX_INITRDS }> = heapless::Vec::new();
         for path in initrd_paths {
             let size = fs.file_size(path).map_err(|e| {
                 log::error!("Failed to get initrd file size of {}: {:?}", path, e);
                 LinuxBootError::FileNotFound
             })?;
+            if size > MAX_INITRD_SIZE as u64 {
+                return Err(LinuxBootError::InitrdTooLarge);
+            }
             log::info!("Initrd {}: {} bytes", path, size);
             sizes
                 .push(size as usize)

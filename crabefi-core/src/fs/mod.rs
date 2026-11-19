@@ -1,8 +1,11 @@
 //! Filesystem support
 //!
-//! This module provides FAT, GPT, and ISO9660/El Torito support for reading
-//! the EFI System Partition and booting from installation media.
+//! FAT for EFI System Partitions and El Torito boot images, and optional
+//! read-only ext2/ext3/ext4 for direct Linux boot.
 
+pub mod boot;
+#[cfg(all(feature = "ext4", target_arch = "x86_64"))]
+mod ext;
 pub mod fat;
 pub mod gpt;
 pub mod iso9660;

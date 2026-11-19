@@ -795,18 +795,17 @@ fn boot_linux_entry(
     initrd_paths: &crate::bls::Initrds,
     cmdline: &heapless::String<512>,
 ) {
-    use crate::fs;
-
     // Defense in depth: Direct Linux boot entries should not appear in the menu
     // when Secure Boot is active (filtered in scan_partition_for_entries), but
     // check here as well in case an entry somehow makes it through.
     // Direct boot bypasses signature verification which violates Secure Boot.
     if cfg!(feature = "secure-boot-enforced") || efi::auth::is_secure_boot_enabled() {
         log::warn!("Direct Linux boot disabled: Secure Boot is active");
-        log::info!("Falling back to UEFI boot path for secure verification");
-        // The entry path is the direct kernel, not a UEFI loader. Start the
-        // architecture fallback loader on this same ESP under verification.
-        boot_uefi_path(entry, menu::EFI_BOOT_PATH);
+        // Only FAT volumes can provide a fallback loader through EFI SFS.
+        if matches!(entry.filesystem, crate::fs::boot::Kind::Fat) {
+            log::info!("Falling back to UEFI boot path for secure verification");
+            boot_uefi_path(entry, menu::EFI_BOOT_PATH);
+        }
         return;
     }
 
@@ -817,32 +816,6 @@ fn boot_linux_entry(
     }
     log::info!("  Cmdline: {}", cmdline);
 
-    // Convert Linux-style paths (forward slashes) to FAT-style paths (backslashes)
-    let kernel_path = match fs::linux_path_to_fat(linux_path) {
-        Ok(p) => p,
-        Err(e) => {
-            log::error!("Invalid kernel path '{}': {:?}", linux_path, e);
-            return;
-        }
-    };
-    let mut initrd_fat_paths: crate::bls::Initrds = heapless::Vec::new();
-    for initrd_path in initrd_paths {
-        match fs::linux_path_to_fat(initrd_path) {
-            Ok(p) => {
-                let _ = initrd_fat_paths.push(p);
-            }
-            Err(e) => {
-                log::error!("Invalid initrd path '{}': {:?}", initrd_path, e);
-                return;
-            }
-        }
-    }
-
-    log::debug!("FAT kernel path: {}", kernel_path);
-    for p in &initrd_fat_paths {
-        log::debug!("FAT initrd path: {}", p);
-    }
-
     let acpi_rsdp = crate::handoff::get().acpi_rsdp;
     let framebuffer = crate::handoff::framebuffer();
 
@@ -852,24 +825,25 @@ fn boot_linux_entry(
         if framebuffer.is_some() { "yes" } else { "no" }
     );
 
-    let loaded = crate::drivers::storage::with_disk(entry.storage, |disk| {
-        crate::linux_boot::load_linux_from_disk(
-            disk,
-            entry.partition.first_lba,
-            &kernel_path,
-            &initrd_fat_paths
-                .iter()
-                .map(|p| p.as_str())
-                .collect::<heapless::Vec<&str, { crate::bls::MAX_INITRDS }>>(),
-            cmdline,
-            acpi_rsdp,
-            framebuffer.as_ref(),
-            false, // Don't use EFI handover for direct boot
-        )
-    });
+    let paths = initrd_paths
+        .iter()
+        .map(|p| p.as_str())
+        .collect::<heapless::Vec<&str, { crate::bls::MAX_INITRDS }>>();
+    let loaded =
+        crate::fs::boot::with_filesystem(entry.storage, &entry.partition, entry.filesystem, |fs| {
+            crate::linux_boot::load_linux_from_fs(
+                fs,
+                linux_path,
+                &paths,
+                cmdline,
+                acpi_rsdp,
+                framebuffer.as_ref(),
+                false, // Don't use EFI handover for direct boot
+            )
+        });
 
     match loaded {
-        Ok(Ok(mut loaded)) => {
+        Some(Ok(mut loaded)) => {
             // The disk/controller borrow must be released before shutdown:
             // direct boot quiesces every firmware-owned DMA engine.
             log::info!("Linux loaded successfully, booting...");
@@ -883,8 +857,11 @@ fn boot_linux_entry(
                 loaded.boot_direct();
             }
         }
-        Ok(Err(e)) => log::error!("Failed to load Linux: {:?}", e),
-        Err(e) => log::error!("Failed to access disk for Linux boot: {}", e),
+        Some(Err(e)) => log::error!("Failed to load Linux: {:?}", e),
+        None => log::error!(
+            "Failed to mount {:?} volume for Linux boot",
+            entry.filesystem
+        ),
     }
 
     // Note: We intentionally don't fall back to UEFI boot here.

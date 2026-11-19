@@ -728,7 +728,8 @@ jobs:
       - name: Install test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 mtools dosfstools zstd coreboot-utils
+          sudo apt-get install -y qemu-system-x86 mtools dosfstools zstd \
+            coreboot-utils e2fsprogs busybox-static cpio fdisk
       - name: Download CrabEFI ELF
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
@@ -741,6 +742,12 @@ jobs:
           path: boot-assets/x86_64/
       - name: Run GRUB + Linux boot-chain test
         run: ./crabefi test --app grub-linux --boot-assets-dir boot-assets/x86_64 --disable-kvm --timeout 180
+      - name: Run native ext4 Linux boot smoke test
+        env:
+          SMOKE_TIMEOUT: 600
+        run: |
+          ci/run-ext4-boot-smoke.sh boot-assets/x86_64/vmlinuz \
+            "$(command -v busybox)"
   test-grub-linux-aarch64:
     name: Test aarch64/sbsa (GRUB + Linux)
     runs-on: ubuntu-latest

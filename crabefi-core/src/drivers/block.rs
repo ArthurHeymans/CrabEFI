@@ -59,6 +59,8 @@ impl core::fmt::Display for BlockError {
     }
 }
 
+impl core::error::Error for BlockError {}
+
 /// Block-level storage device interface.
 ///
 /// # Implementor's Guide
