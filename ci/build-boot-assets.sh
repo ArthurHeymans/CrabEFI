@@ -184,8 +184,6 @@ else
                 --enable  SERIAL_8250           \
                 --enable  SERIAL_8250_CONSOLE   \
                 --enable  EARLY_PRINTK          \
-                --enable  BINFMT_SCRIPT         \
-                --enable  RD_GZIP               \
                 --enable  X86_X2APIC            \
                 --enable  RELOCATABLE
             ;;

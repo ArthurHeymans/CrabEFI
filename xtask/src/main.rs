@@ -185,6 +185,7 @@ enum Commands {
         /// Test app to run (default: hello)
         ///
         /// Use "grub-linux" for the GRUB + Linux boot-chain test.
+        /// Use "ext4-linux" (also "ext2-linux" or "ext3-linux") for native Linux boot.
         /// Use "uefi-sct-smoke" for the UEFI SCT smoke subset.
         /// Use "windows-boot-smoke" for a Windows Boot Manager smoke test.
         #[arg(long, default_value = "hello")]
@@ -214,8 +215,7 @@ enum Commands {
         #[arg(long)]
         ui: bool,
 
-        /// Directory containing pre-built boot assets (vmlinuz, grubx64.efi, grub.cfg).
-        /// Required when --app grub-linux is used.
+        /// Directory containing pre-built Linux boot assets (default: boot-assets/<arch>).
         #[arg(long)]
         boot_assets_dir: Option<PathBuf>,
 
@@ -408,6 +408,15 @@ fn cmd_build(release: bool, ui: bool, arch: Arch, machine: Machine) -> Result<()
     cmd_build_payload(release, ui, arch, machine, false, &[])
 }
 
+fn ext_linux_filesystem(app: &str) -> Option<&'static str> {
+    match app {
+        "ext2-linux" => Some("ext2"),
+        "ext3-linux" => Some("ext3"),
+        "ext4-linux" => Some("ext4"),
+        _ => None,
+    }
+}
+
 /// Payload Cargo features a test app needs beyond the default build.
 fn test_payload_features(app: &str) -> Vec<&'static str> {
     let mut features = match app {
@@ -417,6 +426,7 @@ fn test_payload_features(app: &str) -> Vec<&'static str> {
         "mm-seal-test" => vec!["payload-mm-test-lose-ready-to-boot"],
         "runtime-replay-interrupt-test" => vec!["replay-test-reset-after-persist"],
         "boot-events-test" => vec!["boot-event-log"],
+        app if ext_linux_filesystem(app).is_some() => vec!["ext4"],
         _ => Vec::new(),
     };
     if capsule_on_disk_only() {
@@ -768,7 +778,11 @@ fn cmd_test(
     if app == "runtime-replay-interrupt-test" && std::env::var_os("CRABEFI_PAYLOAD_MM").is_some() {
         bail!("runtime-replay-interrupt-test needs the retained journal, not payload MM");
     }
-    let storage = if ahci {
+    let ext_filesystem = ext_linux_filesystem(app);
+    if ext_filesystem.is_some() && (arch != Arch::X86_64 || sdhci) {
+        bail!("{app} needs x86-64 with AHCI or NVMe storage");
+    }
+    let storage = if ahci || (ext_filesystem.is_some() && !nvme) {
         qemu::StorageType::Ahci
     } else if nvme {
         qemu::StorageType::Nvme
@@ -833,23 +847,24 @@ fn cmd_test(
 
     let disk_path = temp_dir.path().join("test.img");
 
-    if app == "grub-linux" {
-        // ── GRUB + Linux boot-chain test ─────────────────────────────
-        // Instead of building a UEFI test app, we create a disk with
-        // GRUB as the boot application and a Linux kernel.
-        let assets_dir = boot_assets_dir
+    let boot_assets = || {
+        boot_assets_dir
             .as_deref()
-            .map(|p| {
-                if p.is_relative() {
-                    // Resolve relative paths against the project root,
-                    // since the crabefi wrapper cd's into xtask/ before
-                    // running us.
-                    project_root().join(p)
-                } else {
-                    p.to_path_buf()
-                }
-            })
-            .unwrap_or_else(|| project_root().join("boot-assets").join(arch.dir_name()));
+            .map(resolve_project_path)
+            .unwrap_or_else(|| project_root().join("boot-assets").join(arch.dir_name()))
+    };
+    if let Some(filesystem) = ext_filesystem {
+        let assets_dir = boot_assets();
+        let kernel = assets_dir.join("vmlinuz");
+        let initramfs = assets_dir.join("initramfs.cpio");
+        require_boot_assets(
+            arch,
+            &assets_dir,
+            &[("vmlinuz", &kernel), ("initramfs.cpio", &initramfs)],
+        )?;
+        disk::create_ext_linux_disk(&disk_path, &kernel, &initramfs, filesystem)?;
+    } else if app == "grub-linux" {
+        let assets_dir = boot_assets();
 
         let grub_efi_name = match arch {
             Arch::X86_64 => "grubx64.efi",
@@ -861,23 +876,16 @@ fn cmd_test(
         let initramfs = assets_dir.join("initramfs.cpio");
         let grub_cfg = assets_dir.join("grub.cfg");
 
-        for (label, path) in [
-            (grub_efi_name, &grub_efi),
-            ("vmlinuz", &kernel),
-            ("initramfs.cpio", &initramfs),
-            ("grub.cfg", &grub_cfg),
-        ] {
-            if !path.exists() {
-                anyhow::bail!(
-                    "Boot asset not found: {} (looked in {})\n\
-                     Run ci/build-boot-assets.sh --arch {} to build them, \
-                     or pass --boot-assets-dir",
-                    label,
-                    assets_dir.display(),
-                    arch.dir_name(),
-                );
-            }
-        }
+        require_boot_assets(
+            arch,
+            &assets_dir,
+            &[
+                (grub_efi_name, &grub_efi),
+                ("vmlinuz", &kernel),
+                ("initramfs.cpio", &initramfs),
+                ("grub.cfg", &grub_cfg),
+            ],
+        )?;
 
         disk::create_grub_linux_disk(
             disk_path.to_string_lossy().as_ref(),
@@ -1015,6 +1023,20 @@ fn cmd_test(
     } else {
         qemu::run_tests(&config, &disk_path, app)
     }
+}
+
+fn require_boot_assets(arch: Arch, dir: &Path, assets: &[(&str, &Path)]) -> Result<()> {
+    for (label, path) in assets {
+        if !path.is_file() {
+            bail!(
+                "Boot asset not found: {label} (looked in {})\n\
+                 Run ci/build-boot-assets.sh --arch {} to build them, or pass --boot-assets-dir",
+                dir.display(),
+                arch.dir_name(),
+            );
+        }
+    }
+    Ok(())
 }
 
 fn resolve_project_path(path: &Path) -> PathBuf {

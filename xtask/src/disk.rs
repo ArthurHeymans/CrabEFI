@@ -1,7 +1,6 @@
 //! Disk Image Creation
 //!
-//! This module provides functionality to create GPT disk images with FAT32
-//! EFI System Partitions for testing CrabEFI.
+//! Creates GPT disk images for CrabEFI integration tests.
 
 use anyhow::{Context, Result, bail};
 use std::fs::{File, OpenOptions};
@@ -17,8 +16,8 @@ const DEFAULT_DISK_SIZE: u64 = 64 * 1024 * 1024;
 /// the default 64 MiB smoke-test disk.
 const WINDOWS_MEDIA_DISK_SIZE: u64 = 1024 * 1024 * 1024;
 const SECTOR_SIZE: u64 = 512;
-/// ESP starts at 1MiB to leave room for GPT
-const ESP_START_SECTOR: u64 = 2048; // 1MiB / 512
+/// The sole test partition starts at 1 MiB to leave room for GPT.
+const PARTITION_START_SECTOR: u64 = 2048;
 
 /// GPT signature "EFI PART"
 const GPT_SIGNATURE: u64 = 0x5452415020494645;
@@ -33,12 +32,18 @@ const GPT_NUM_ENTRIES: u32 = 128;
 const ESP_TYPE_GUID: [u8; 16] = [
     0x28, 0x73, 0x2A, 0xC1, 0x1F, 0xF8, 0xD2, 0x11, 0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B,
 ];
+/// Linux filesystem data GUID: 0FC63DAF-8483-4772-8E79-3D69D8477DE4.
+const LINUX_TYPE_GUID: [u8; 16] = [
+    0xaf, 0x3d, 0xc6, 0x0f, 0x83, 0x84, 0x72, 0x47, 0x8e, 0x79, 0x3d, 0x69, 0xd8, 0x47, 0x7d, 0xe4,
+];
+
+pub const EXT_BOOT_SUCCESS: &str = "CRABEFI_EXT_BOOT_SMOKE_OK";
 
 #[derive(Clone, Copy, Debug)]
 struct DiskGeometry {
     disk_size: u64,
     total_sectors: u64,
-    esp_end_sector: u64,
+    partition_end_sector: u64,
 }
 
 impl DiskGeometry {
@@ -48,7 +53,7 @@ impl DiskGeometry {
             disk_size,
             total_sectors,
             // Last usable sector before the 33-sector backup GPT area.
-            esp_end_sector: total_sectors - 34,
+            partition_end_sector: total_sectors - 34,
         }
     }
 }
@@ -64,7 +69,7 @@ pub fn mtools_esp_image(disk_path: &Path) -> String {
     format!(
         "{}@@{}",
         disk_path.to_string_lossy(),
-        ESP_START_SECTOR * SECTOR_SIZE
+        PARTITION_START_SECTOR * SECTOR_SIZE
     )
 }
 
@@ -73,8 +78,8 @@ pub fn mtools_esp_image(disk_path: &Path) -> String {
 pub fn check_test_filesystem(disk_path: &Path) -> Result<()> {
     let mut disk = File::open(disk_path)?;
     let geometry = DiskGeometry::new(disk.metadata()?.len());
-    let length = (geometry.esp_end_sector - ESP_START_SECTOR + 1) * SECTOR_SIZE;
-    disk.seek(SeekFrom::Start(ESP_START_SECTOR * SECTOR_SIZE))?;
+    let length = (geometry.partition_end_sector - PARTITION_START_SECTOR + 1) * SECTOR_SIZE;
+    disk.seek(SeekFrom::Start(PARTITION_START_SECTOR * SECTOR_SIZE))?;
     let mut partition = tempfile::NamedTempFile::new()?;
     let copied = std::io::copy(&mut disk.take(length), &mut partition)?;
     anyhow::ensure!(copied == length, "truncated test ESP");
@@ -114,26 +119,12 @@ fn create_test_disk_with_size(
     println!("Creating test disk: {}", output);
     let geometry = DiskGeometry::new(disk_size);
 
-    // Create empty disk image
-    let mut file = File::create(output).context("failed to create disk image")?;
-    file.set_len(geometry.disk_size)?;
-
-    // Write protective MBR
-    write_protective_mbr(&mut file, geometry)?;
-
-    // Write primary GPT header and partition entries
-    write_gpt_header(&mut file, true, geometry)?;
-    write_gpt_partition_entries(&mut file, true, geometry)?;
-
-    // Write backup GPT header and partition entries
-    write_gpt_partition_entries(&mut file, false, geometry)?;
-    write_gpt_header(&mut file, false, geometry)?;
-
-    file.flush()?;
-    drop(file);
-
-    // Create FAT32 filesystem in the ESP partition
-    create_fat32_in_partition(output, ESP_START_SECTOR, geometry.esp_end_sector)?;
+    create_partitioned_disk(Path::new(output), geometry, ESP_TYPE_GUID, "EFI System")?;
+    create_fat32_in_partition(
+        output,
+        PARTITION_START_SECTOR,
+        geometry.partition_end_sector,
+    )?;
 
     // If we have an EFI app, copy it
     if let Some(app_path) = efi_app {
@@ -141,6 +132,28 @@ fn create_test_disk_with_size(
     }
 
     println!("Created: {}", output);
+    Ok(())
+}
+
+/// Build a GPT disk with one partition, using the same entry bytes for both copies and their CRC.
+fn create_partitioned_disk(
+    output: &Path,
+    geometry: DiskGeometry,
+    type_guid: [u8; 16],
+    name: &str,
+) -> Result<()> {
+    let mut file = File::create(output).context("failed to create disk image")?;
+    file.set_len(geometry.disk_size)?;
+    write_protective_mbr(&mut file, geometry)?;
+
+    let entries = gpt_partition_entries(geometry, type_guid, name);
+    let entries_crc = crc32(&entries);
+    for (primary, entries_lba) in [(true, 2), (false, geometry.total_sectors - 33)] {
+        file.seek(SeekFrom::Start(entries_lba * SECTOR_SIZE))?;
+        file.write_all(&entries)?;
+        write_gpt_header(&mut file, primary, geometry, entries_lba, entries_crc)?;
+    }
+    file.flush()?;
     Ok(())
 }
 
@@ -177,7 +190,13 @@ fn write_protective_mbr(file: &mut File, geometry: DiskGeometry) -> Result<()> {
 }
 
 /// Write GPT header (primary or backup)
-fn write_gpt_header(file: &mut File, primary: bool, geometry: DiskGeometry) -> Result<()> {
+fn write_gpt_header(
+    file: &mut File,
+    primary: bool,
+    geometry: DiskGeometry,
+    entries_lba: u64,
+    entries_crc: u32,
+) -> Result<()> {
     let mut header = [0u8; 512];
 
     // Signature "EFI PART"
@@ -216,7 +235,7 @@ fn write_gpt_header(file: &mut File, primary: bool, geometry: DiskGeometry) -> R
     header[40..48].copy_from_slice(&first_usable.to_le_bytes());
 
     // Last usable LBA (before backup GPT)
-    let last_usable = geometry.total_sectors - 34;
+    let last_usable = geometry.partition_end_sector;
     header[48..56].copy_from_slice(&last_usable.to_le_bytes());
 
     // Disk GUID (random but deterministic for testing)
@@ -227,11 +246,6 @@ fn write_gpt_header(file: &mut File, primary: bool, geometry: DiskGeometry) -> R
     header[56..72].copy_from_slice(&disk_guid);
 
     // Partition entries starting LBA
-    let entries_lba = if primary {
-        2
-    } else {
-        geometry.total_sectors - 33
-    };
     header[72..80].copy_from_slice(&entries_lba.to_le_bytes());
 
     // Number of partition entries
@@ -240,8 +254,7 @@ fn write_gpt_header(file: &mut File, primary: bool, geometry: DiskGeometry) -> R
     // Size of partition entry
     header[84..88].copy_from_slice(&GPT_ENTRY_SIZE.to_le_bytes());
 
-    // CRC32 of partition entries (calculated separately)
-    let entries_crc = calculate_partition_entries_crc(geometry)?;
+    // CRC32 of partition entries
     header[88..92].copy_from_slice(&entries_crc.to_le_bytes());
 
     // Calculate header CRC32
@@ -256,21 +269,14 @@ fn write_gpt_header(file: &mut File, primary: bool, geometry: DiskGeometry) -> R
     Ok(())
 }
 
-/// Write GPT partition entries
-fn write_gpt_partition_entries(
-    file: &mut File,
-    primary: bool,
-    geometry: DiskGeometry,
-) -> Result<()> {
+fn gpt_partition_entries(geometry: DiskGeometry, type_guid: [u8; 16], name: &str) -> Vec<u8> {
     // Each entry is 128 bytes, we have 128 entries = 16384 bytes = 32 sectors
     let entries_size = (GPT_NUM_ENTRIES * GPT_ENTRY_SIZE) as usize;
     let mut entries = vec![0u8; entries_size];
 
-    // First entry: EFI System Partition
+    // First (and only) entry
     let entry = &mut entries[0..128];
-
-    // Partition type GUID (ESP)
-    entry[0..16].copy_from_slice(&ESP_TYPE_GUID);
+    entry[0..16].copy_from_slice(&type_guid);
 
     // Unique partition GUID
     let part_guid: [u8; 16] = [
@@ -279,57 +285,23 @@ fn write_gpt_partition_entries(
     ];
     entry[16..32].copy_from_slice(&part_guid);
 
-    // Starting LBA
-    entry[32..40].copy_from_slice(&ESP_START_SECTOR.to_le_bytes());
-
-    // Ending LBA
-    entry[40..48].copy_from_slice(&geometry.esp_end_sector.to_le_bytes());
+    // Starting and ending LBA
+    entry[32..40].copy_from_slice(&PARTITION_START_SECTOR.to_le_bytes());
+    entry[40..48].copy_from_slice(&geometry.partition_end_sector.to_le_bytes());
 
     // Attributes (none)
     entry[48..56].copy_from_slice(&0u64.to_le_bytes());
 
-    // Partition name (UTF-16LE): "EFI System"
-    let name = "EFI System";
-    for (i, c) in name.chars().enumerate() {
-        let offset = 56 + i * 2;
-        entry[offset..offset + 2].copy_from_slice(&(c as u16).to_le_bytes());
+    // Partition name (UTF-16LE)
+    for (field, unit) in entry[56..]
+        .as_chunks_mut::<2>()
+        .0
+        .iter_mut()
+        .zip(name.encode_utf16())
+    {
+        *field = unit.to_le_bytes();
     }
-
-    // Write entries
-    let entries_lba = if primary {
-        2
-    } else {
-        geometry.total_sectors - 33
-    };
-    let offset = entries_lba * SECTOR_SIZE;
-    file.seek(SeekFrom::Start(offset))?;
-    file.write_all(&entries)?;
-
-    Ok(())
-}
-
-/// Calculate CRC32 of partition entries (for GPT header)
-fn calculate_partition_entries_crc(geometry: DiskGeometry) -> Result<u32> {
-    let entries_size = (GPT_NUM_ENTRIES * GPT_ENTRY_SIZE) as usize;
-    let mut entries = vec![0u8; entries_size];
-
-    // Recreate the first entry
-    let entry = &mut entries[0..128];
-    entry[0..16].copy_from_slice(&ESP_TYPE_GUID);
-    let part_guid: [u8; 16] = [
-        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
-        0x10,
-    ];
-    entry[16..32].copy_from_slice(&part_guid);
-    entry[32..40].copy_from_slice(&ESP_START_SECTOR.to_le_bytes());
-    entry[40..48].copy_from_slice(&geometry.esp_end_sector.to_le_bytes());
-    let name = "EFI System";
-    for (i, c) in name.chars().enumerate() {
-        let offset = 56 + i * 2;
-        entry[offset..offset + 2].copy_from_slice(&(c as u16).to_le_bytes());
-    }
-
-    Ok(crc32(&entries))
+    entries
 }
 
 /// Simple CRC32 implementation (IEEE polynomial)
@@ -415,7 +387,7 @@ fn install_efi_app(disk_path: &str, app_path: &str, arch: Arch) -> Result<()> {
     }
 
     // Use mtools -i option with @@ offset syntax to access partition
-    let disk_with_offset = format!("{}@@{}", disk_path, ESP_START_SECTOR * SECTOR_SIZE);
+    let disk_with_offset = mtools_esp_image(Path::new(disk_path));
 
     // Create directory structure
     let _ = Command::new("mmd")
@@ -457,7 +429,7 @@ pub fn create_directory_test_disk(output: &str, efi_app: &str, arch: Arch) -> Re
     // Start with a normal test disk that has the EFI app
     create_test_disk(output, Some(efi_app), arch)?;
 
-    let disk_with_offset = format!("{}@@{}", output, ESP_START_SECTOR * SECTOR_SIZE);
+    let disk_with_offset = mtools_esp_image(Path::new(output));
 
     // Create \EFI\Linux directory
     let _ = Command::new("mmd")
@@ -606,7 +578,7 @@ pub fn create_grub_linux_disk(
     // Start with a bare GPT + ESP disk
     create_test_disk(output, None, arch)?;
 
-    let disk_with_offset = format!("{}@@{}", output, ESP_START_SECTOR * SECTOR_SIZE);
+    let disk_with_offset = mtools_esp_image(Path::new(output));
 
     // ── Install GRUB as the default UEFI boot application ────────────
     let _ = Command::new("mmd")
@@ -665,6 +637,58 @@ pub fn create_grub_linux_disk(
     println!("  Installed initramfs.cpio");
 
     println!("Created: {}", output);
+    Ok(())
+}
+
+/// Create a test disk with no ESP, so the kernel and initramfs can only be read through ext.
+pub fn create_ext_linux_disk(
+    output: &Path,
+    kernel: &Path,
+    initramfs: &Path,
+    filesystem: &str,
+) -> Result<()> {
+    let root = tempfile::tempdir().context("create ext test filesystem tree")?;
+    let boot = root.path().join("boot");
+    let entries = boot.join("loader/entries");
+    std::fs::create_dir_all(&entries)?;
+    std::fs::copy(kernel, boot.join("vmlinuz")).context("copy vmlinuz to ext tree")?;
+    std::fs::copy(initramfs, boot.join("initramfs.cpio")).context("copy initramfs to ext tree")?;
+    std::fs::write(
+        entries.join("native.conf"),
+        format!(
+            "title Native ext boot smoke\nlinux /vmlinuz\ninitrd /initramfs.cpio\noptions console=ttyS0,115200 nokaslr panic=1 rdinit=/bbin/echo {EXT_BOOT_SUCCESS}\n"
+        ),
+    )?;
+
+    // A parseable but unusable root entry must not hide the /boot entry.
+    let loader = root.path().join("loader");
+    std::fs::create_dir_all(loader.join("entries"))?;
+    std::fs::write(loader.join("loader.conf"), "default stale\n")?;
+    std::fs::write(
+        loader.join("entries/stale.conf"),
+        "title Stale entry\nlinux /boot/vmlinuz\ninitrd /missing.cpio\n",
+    )?;
+
+    // Larger than the small FAT candidate heuristic. Explicitly bound mke2fs
+    // to whole filesystem blocks inside the partition; leave backup GPT intact.
+    const BLOCK_SIZE: u64 = 4096;
+    let geometry = DiskGeometry::new(546 * 1024 * 1024);
+    create_partitioned_disk(output, geometry, LINUX_TYPE_GUID, "Linux filesystem")?;
+    let offset = PARTITION_START_SECTOR * SECTOR_SIZE;
+    let blocks =
+        (geometry.partition_end_sector - PARTITION_START_SECTOR + 1) * SECTOR_SIZE / BLOCK_SIZE;
+    let status = Command::new("mke2fs")
+        .args(["-q", "-F", "-t", filesystem, "-b"])
+        .arg(BLOCK_SIZE.to_string())
+        .arg("-d")
+        .arg(root.path())
+        .arg("-E")
+        .arg(format!("offset={offset},nodiscard"))
+        .arg(output)
+        .arg(blocks.to_string())
+        .status()
+        .context("run mke2fs (install e2fsprogs)")?;
+    anyhow::ensure!(status.success(), "mke2fs exited with {status}");
     Ok(())
 }
 

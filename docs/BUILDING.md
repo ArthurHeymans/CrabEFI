@@ -377,14 +377,15 @@ interface gaps, and why these results are not a complete compliance claim.
 On x86-64, enable experimental ext support with `./crabefi build --ext4`
 or `./crabefi run --ext4 --ahci`. It is not part of `full`. The smoke test
 builds a GPT disk with no FAT ESP, boots a BLS entry from `/boot`, and checks
-that the initramfs ran. Supply a Linux `bzImage` with serial console and gzip
-initramfs support and a static BusyBox. The test uses `mke2fs` (e2fsprogs),
-`sfdisk`, `cpio`, and the usual CrabEFI QEMU tools.
+that the initramfs ran. It reuses the `vmlinuz` and `initramfs.cpio` from the
+GRUB boot test and requires `mke2fs` (e2fsprogs). It defaults to AHCI storage.
 
 ```sh
-ci/run-ext4-boot-smoke.sh /path/to/bzImage /path/to/static-busybox
-# Optional third argument: ext2, ext3, or ext4 (default).
+ci/build-boot-assets.sh --arch x86_64
+./crabefi test --app ext4-linux --disable-kvm --timeout 180
 ```
+
+Use `ext2-linux` or `ext3-linux` to test the other ext formats.
 
 ### Windows Boot Manager smoke test
 

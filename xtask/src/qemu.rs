@@ -1248,6 +1248,21 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
                 failed += 1;
             }
         }
+        app if crate::ext_linux_filesystem(app).is_some() => {
+            // The kernel logs its command line too. Only a standalone marker
+            // line proves that /bbin/echo ran from the ext-backed initramfs.
+            if result
+                .output
+                .lines()
+                .any(|line| line.trim() == crate::disk::EXT_BOOT_SUCCESS)
+            {
+                println!("[PASS] ext_userspace: Linux ran the initramfs from the ext volume");
+                passed += 1;
+            } else {
+                println!("[FAIL] ext_userspace: Initramfs marker not found in output");
+                failed += 1;
+            }
+        }
         "tcg-test" => {
             // TCG (TPM 1.2) and TCG2 (TPM 2.0) protocol tests
             if result.output.contains("TCG Protocol Test") {
