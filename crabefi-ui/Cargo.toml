@@ -16,6 +16,6 @@ default-log-level-error = []
 [dependencies]
 log = { workspace = true }
 heapless = { workspace = true }
-noto-sans-mono-bitmap = { optional = true, version = "0.3", default-features = false, features = [
+noto-sans-mono-bitmap = { optional = true, version = "0.4", default-features = false, features = [
   "regular", "bold", "size_16", "size_20", "size_24", "size_32", "unicode-basic-latin",
 ] }
