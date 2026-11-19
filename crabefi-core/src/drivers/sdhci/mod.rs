@@ -16,9 +16,6 @@ use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
 
 use regs::*;
 
-/// Maximum number of SDHCI controllers we can track
-const MAX_SDHCI_CONTROLLERS: usize = 4;
-
 /// Block size for SD cards (always 512 bytes)
 const SD_BLOCK_SIZE: u32 = 512;
 
@@ -209,6 +206,13 @@ impl SdhciController {
 
         controller.init().await?;
         Ok(controller)
+    }
+
+    fn discard_unregistered(mut self) {
+        if let Err(error) = self.reset_all() {
+            log::error!("SDHCI: reset failed; retaining DMA buffer: {:?}", error);
+            core::mem::forget(self);
+        }
     }
 
     /// Initialize the SDHCI controller
@@ -1379,7 +1383,7 @@ impl SdhciController {
 // ============================================================================
 
 /// Registry of initialized SDHCI controllers
-static SDHCI_CONTROLLERS: super::ControllerRegistry<SdhciController, MAX_SDHCI_CONTROLLERS> =
+static SDHCI_CONTROLLERS: super::ControllerRegistry<SdhciController> =
     super::ControllerRegistry::new("SDHCI");
 
 /// Initialize a single SDHCI controller from a PCI device
@@ -1418,7 +1422,9 @@ pub async fn init_controller(dev: &pci::PciDevice) -> Result<SdhciController, ()
 // Failures are logged at the error site; callers only branch on success.
 #[allow(clippy::result_unit_err)]
 pub fn register_controller(address: PciAddress, controller: SdhciController) -> Result<(), ()> {
-    SDHCI_CONTROLLERS.register(controller)?;
+    SDHCI_CONTROLLERS
+        .register(controller, SdhciController::discard_unregistered)
+        .map_err(|e| log::error!("SDHCI: not registering controller at {}: {}", address, e))?;
     log::info!("SDHCI controller at {} initialized", address);
     Ok(())
 }
@@ -1451,8 +1457,9 @@ pub(crate) fn bind_emmc(device: crate::peripheral::MmioPeripheral) {
             return;
         }
     };
-    if SDHCI_CONTROLLERS.register(controller).is_ok() {
-        log::info!("MMIO SDHCI controller initialized");
+    match SDHCI_CONTROLLERS.register(controller, SdhciController::discard_unregistered) {
+        Ok(()) => log::info!("MMIO SDHCI controller initialized"),
+        Err(e) => log::error!("SDHCI: not registering MMIO controller: {}", e),
     }
 }
 

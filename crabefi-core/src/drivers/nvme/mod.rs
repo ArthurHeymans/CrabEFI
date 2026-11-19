@@ -1572,6 +1572,20 @@ impl NvmeController {
         regs.vs.get()
     }
 
+    fn discard_unregistered(self) {
+        let regs = unsafe { &*self.regs };
+        regs.cc.modify(CC::EN::CLEAR + CC::SHN.val(0));
+        if !wait_for(cap_timeout_ms(regs.cap.read(CAP::TO)), || {
+            regs.csts.read(CSTS::RDY) == 0
+        }) {
+            log::error!(
+                "NVMe {}: RDY stayed set; retaining DMA allocations for unregistered controller",
+                self.pci_address
+            );
+            core::mem::forget(self);
+        }
+    }
+
     fn shutdown_controller(&mut self) {
         self.refresh_dma_quarantine();
         let regs = unsafe { &*self.regs };
@@ -1623,7 +1637,7 @@ impl NvmeController {
 }
 
 /// Registry of initialized NVMe controllers
-static NVME_CONTROLLERS: super::ControllerRegistry<NvmeController, 4> =
+static NVME_CONTROLLERS: super::ControllerRegistry<NvmeController> =
     super::ControllerRegistry::new("NVMe");
 
 /// Initialize a single NVMe controller from a PCI device
@@ -1662,7 +1676,9 @@ pub async fn init_controller(dev: &pci::PciDevice) -> Result<NvmeController, ()>
 // Failures are logged at the error site; callers only branch on success.
 #[allow(clippy::result_unit_err)]
 pub fn register_controller(address: pci::PciAddress, controller: NvmeController) -> Result<(), ()> {
-    NVME_CONTROLLERS.register(controller)?;
+    NVME_CONTROLLERS
+        .register(controller, NvmeController::discard_unregistered)
+        .map_err(|e| log::error!("NVMe: not registering controller at {}: {}", address, e))?;
     log::info!("NVMe controller at {} initialized", address);
     Ok(())
 }

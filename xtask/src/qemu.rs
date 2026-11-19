@@ -567,6 +567,7 @@ fn add_storage_args_x86_64(
             cmd.args(["-device", "ide-hd,drive=disk0,bus=ide.0"]);
         }
         StorageType::Nvme => {
+            add_extra_nvme_args(cmd);
             cmd.args([
                 "-drive",
                 &format!(
@@ -588,6 +589,45 @@ fn add_storage_args_x86_64(
             cmd.args(["-device", "sd-card,drive=sddrive0"]);
         }
     }
+}
+
+/// `CRABEFI_EXTRA_NVME=N`: N blank NVMe controllers, enumerated before the boot disk.
+fn extra_nvme_controllers() -> u32 {
+    std::env::var("CRABEFI_EXTRA_NVME")
+        .ok()
+        .and_then(|count| count.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Put single-namespace controllers ahead of the only bootable disk on the PCI bus.
+fn add_extra_nvme_args(cmd: &mut Command) {
+    for controller in 0..extra_nvme_controllers() {
+        let id = format!("extra-nvme{controller}");
+        cmd.args([
+            "-blockdev",
+            &format!("driver=null-co,node-name={id},size=67108864,read-zeroes=on"),
+        ]);
+        cmd.args([
+            "-device",
+            &format!("nvme,serial=extra{controller},drive={id}"),
+        ]);
+    }
+}
+
+/// In addition to booting, require successful registration of every controller.
+fn check_nvme_controller_count(output: &str, extra: u32) -> Result<(), String> {
+    let controllers = extra as usize + 1;
+    let registered = output
+        .lines()
+        .filter(|line| line.contains("NVMe controller at") && line.contains("initialized"))
+        .count();
+    if registered != controllers {
+        return Err(format!(
+            "{registered} of {controllers} NVMe controllers registered"
+        ));
+    }
+
+    Ok(())
 }
 
 /// Add storage arguments for aarch64 (SBSA)
@@ -1023,6 +1063,23 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
             } else {
                 println!("[FAIL] efi_app_executed: EFI application did not complete");
                 failed += 1;
+            }
+
+            let extra = extra_nvme_controllers();
+            if config.arch == Arch::X86_64
+                && matches!(config.storage, StorageType::Nvme)
+                && extra != 0
+            {
+                match check_nvme_controller_count(&result.output, extra) {
+                    Ok(()) => {
+                        println!("[PASS] extra_nvme: every controller registered");
+                        passed += 1;
+                    }
+                    Err(reason) => {
+                        println!("[FAIL] extra_nvme: {reason}");
+                        failed += 1;
+                    }
+                }
             }
         }
         "storage-security-test" => {
