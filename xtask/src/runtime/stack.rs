@@ -29,18 +29,45 @@ struct Node {
     external: BTreeSet<String>,
     /// SMC, HVC and ECALL instructions, accepted only in [`FIRMWARE_CALLS`].
     privileged: BTreeSet<String>,
+    /// Calls that switch to the private runtime stack ([`PRIVATE_ENTRY`]).
+    switches: BTreeSet<u64>,
 }
 
-/// The audited functions allowed to call PSCI (SMC/HVC) or SBI (ECALL). The
-/// handler runs at a higher privilege level on its own stack, so the call is
-/// a leaf for this image; anywhere else it is an unknown transfer.
-const FIRMWARE_CALLS: [&str; 2] = ["4arch7aarch645reset", "4arch7riscv645reset"];
+/// The audited functions allowed to call PSCI (SMC/HVC) or SBI (ECALL), by
+/// demangled path. The handler runs at a higher privilege level on its own
+/// stack, so the call is a leaf for this image; anywhere else it is an
+/// unknown transfer.
+const FIRMWARE_CALLS: [&str; 2] = [
+    "crabefi_runtime_image::arch::aarch64::reset",
+    "crabefi_runtime_image::arch::riscv64::reset",
+];
+
+/// The function each service runs in after switching to the private stack.
+/// Its instantiations are generic, so they share this path prefix.
+const PRIVATE_ENTRY: &str = "crabefi_runtime_image::stack::trampoline::<";
+
+/// The private stack itself; its size is the private budget.
+const PRIVATE_STACK: &str = "crabefi_runtime_image::stack::STACK";
+
+/// The stack UEFI guarantees a runtime caller (UEFI 2.10, 2.3.4.2 and
+/// following): 4 KiB on x64, 8 KiB on AArch64 and RISC-V.
+fn caller_budget(arch: Arch) -> u64 {
+    match arch {
+        Arch::X86_64 => 4 * 1024,
+        Arch::Aarch64 | Arch::Riscv64 => 8 * 1024,
+    }
+}
+
+/// A symbol's demangled path without its crate hash.
+fn path(name: &str) -> String {
+    format!("{:#}", rustc_demangle::demangle(name))
+}
 
 /// The one function allowed to call out of the image: the BootActive bridge
 /// into boot firmware. Seal zeroes its address, so the call is unreachable
 /// once the OS owns the machine. It must remain a distinct symbol; inlined
-/// into a caller, its call fails the audit as an ordinary indirect transfer.
-const BOOT_BRIDGE: &str = "16call_boot_bridge";
+/// into a caller, its call fails the audit as an ordinary indirect call.
+const BOOT_BRIDGE: &str = "crabefi_runtime_image::services::call_boot_bridge";
 
 fn decoder(arch: Arch) -> Result<Capstone> {
     let cs = match arch {
@@ -88,12 +115,16 @@ fn decode(cs: &Capstone, arch: Arch, start: u64, bytes: &[u8], frame: Option<u64
     let starts: BTreeSet<_> = instructions.iter().map(|i| i.address()).collect();
     let mut next = start;
     let mut falls_through = true;
+    // A function never runs off its end, so a call as its last instruction
+    // is a call that does not return, not a fall-through into the next symbol.
+    let mut last_is_call = false;
     let mut previous = None;
     let mut pairs = Vec::new();
     let mut destinations = BTreeSet::new();
     for insn in instructions.iter() {
         let pc = insn.address();
         next = pc + insn.bytes().len() as u64;
+        last_is_call = false;
         let pair = (arch == Arch::Riscv64)
             .then(|| riscv_pair(pc, previous, insn.bytes()))
             .flatten();
@@ -137,6 +168,7 @@ fn decode(cs: &Capstone, arch: Arch, start: u64, bytes: &[u8], frame: Option<u64
         let call = !rv_jump
             && (has(group::CS_GRP_CALL)
                 || matches!(op, "call" | "bl" | "blr" | "jal" | "jalr" | "c.jalr"));
+        last_is_call = call;
         if !(call
             || rv_jump
             || has(group::CS_GRP_JUMP)
@@ -168,7 +200,8 @@ fn decode(cs: &Capstone, arch: Arch, start: u64, bytes: &[u8], frame: Option<u64
         match (target, pair) {
             (None, Some(addr)) => pairs.push((pc, addr)),
             (None, None) => {
-                node.unknown.insert(format!("indirect transfer at {pc:#x}"));
+                let kind = if call { "call" } else { "transfer" };
+                node.unknown.insert(format!("indirect {kind} at {pc:#x}"));
             }
             (Some(addr), _) => {
                 if call || !starts.contains(&addr) {
@@ -186,7 +219,7 @@ fn decode(cs: &Capstone, arch: Arch, start: u64, bytes: &[u8], frame: Option<u64
     }
     if next != end || bytes.is_empty() {
         node.unknown.insert(format!("undecoded bytes at {next:#x}"));
-    } else if falls_through {
+    } else if falls_through && !last_is_call {
         node.targets.insert(end);
     }
     // LLVM's static frame excludes the return address pushed by x86 CALL.
@@ -204,6 +237,23 @@ struct Usage {
     bound: Option<u64>,
     unknown: BTreeSet<String>,
     external: BTreeSet<String>,
+}
+
+/// Trampolines reachable from `addr` on the caller's stack.
+fn switches_from(addr: u64, nodes: &BTreeMap<u64, Node>) -> BTreeSet<u64> {
+    let mut seen = BTreeSet::new();
+    let mut pending = vec![addr];
+    let mut switches = BTreeSet::new();
+    while let Some(addr) = pending.pop() {
+        if !seen.insert(addr) {
+            continue;
+        }
+        if let Some(node) = nodes.get(&addr) {
+            switches.extend(node.switches.iter().copied());
+            pending.extend(node.targets.iter().copied());
+        }
+    }
+    switches
 }
 
 fn usage(
@@ -256,7 +306,6 @@ pub(super) fn audit(
     file: &object::File<'_>,
     arch: Arch,
     relocs: &[RuntimeRelocation],
-    budget: u64,
     output: &Path,
 ) -> Result<()> {
     // .stack_sizes in the final ELF contains relocated addresses and ULEB128 sizes.
@@ -282,6 +331,8 @@ pub(super) fn audit(
     }
     let cs = decoder(arch)?;
     let mut nodes = BTreeMap::new();
+    let mut private_entries = BTreeSet::new();
+    let mut bridges = 0;
     for sym in file
         .symbols()
         .filter(|s| s.kind() == object::SymbolKind::Text && s.size() > 0)
@@ -295,9 +346,12 @@ pub(super) fn audit(
             .data_range(addr, sym.size())?
             .context("function outside section")?;
         let mut n = decode(&cs, arch, addr, bytes, frames.get(&addr).copied())?;
-        let name = sym.name()?;
+        let name = path(sym.name()?);
+        if name.starts_with(PRIVATE_ENTRY) {
+            private_entries.insert(addr);
+        }
         let privileged = core::mem::take(&mut n.privileged);
-        if FIRMWARE_CALLS.iter().any(|stub| name.ends_with(stub)) {
+        if FIRMWARE_CALLS.contains(&name.as_str()) {
             n.external.extend(
                 privileged
                     .into_iter()
@@ -310,11 +364,12 @@ pub(super) fn audit(
                     .map(|call| format!("unaudited privileged call {call}")),
             );
         }
-        if name.ends_with(BOOT_BRIDGE) {
+        if name == BOOT_BRIDGE {
+            bridges += 1;
             let calls: Vec<_> = n
                 .unknown
                 .iter()
-                .filter(|reason| reason.starts_with("indirect transfer"))
+                .filter(|reason| reason.starts_with("indirect call"))
                 .cloned()
                 .collect();
             anyhow::ensure!(
@@ -333,6 +388,24 @@ pub(super) fn audit(
         entry.unknown.extend(n.unknown);
         entry.external.extend(n.external);
     }
+    anyhow::ensure!(bridges <= 1, "{bridges} symbols named {BOOT_BRIDGE}");
+    // A call into a trampoline continues on the private stack: charge it
+    // there, not to the caller's stack.
+    for node in nodes.values_mut() {
+        let switches: BTreeSet<u64> = node
+            .targets
+            .intersection(&private_entries)
+            .copied()
+            .collect();
+        node.targets.retain(|target| !switches.contains(target));
+        node.switches = switches;
+    }
+    let private_budget = file
+        .symbols()
+        .find(|sym| sym.name().is_ok_and(|name| path(name) == PRIVATE_STACK))
+        .context("missing private runtime stack")?
+        .size();
+    let caller_budget = caller_budget(arch);
     // LLVM may merge EFI entries. Resolve all 14 slots by relocation, rather
     // than guessing which Rust names survived LTO.
     let state = file
@@ -369,28 +442,54 @@ pub(super) fn audit(
                 .context("unrelocated EFI service slot")?
                 .target_offset,
         );
-        let u = usage(addr, &nodes, &mut BTreeSet::new(), &mut cache);
-        // Every entry must retain a complete static bound in every release
-        // profile. Only the BootActive bridge is excluded, and reported.
-        if u.bound.is_none() {
+        let caller = usage(addr, &nodes, &mut BTreeSet::new(), &mut cache);
+        // The private stack carries whatever any trampoline reachable from
+        // this entry on the caller's stack runs.
+        let mut private = Usage::default();
+        let switches = switches_from(addr, &nodes);
+        anyhow::ensure!(
+            !switches.is_empty(),
+            "{name} does not switch to the private stack"
+        );
+        for switch in switches {
+            let u = usage(switch, &nodes, &mut BTreeSet::new(), &mut cache);
+            private.modeled = private.modeled.max(u.modeled);
+            private.unknown.extend(u.unknown);
+            private.external.extend(u.external);
+        }
+        private.bound = private.unknown.is_empty().then_some(private.modeled);
+        // Every entry must retain a complete static bound on both stacks in
+        // every release profile. Only the BootActive bridge is excluded, and
+        // reported.
+        if caller.bound.is_none() || private.bound.is_none() {
             incomplete.push(name);
         }
-        if u.modeled > budget {
+        if caller.modeled > caller_budget || private.modeled > private_budget {
             over.push(name);
         }
-        report.push(json!({"entry":name,"address":addr,"bound_bytes":u.bound,"modeled_bytes":u.modeled,"unknown":u.unknown,"excluded_external_calls":u.external}));
+        let mut excluded = caller.external.clone();
+        excluded.extend(private.external.iter().cloned());
+        let mut unknown = caller.unknown.clone();
+        unknown.extend(private.unknown.iter().cloned());
+        report.push(json!({
+            "entry": name,
+            "address": addr,
+            "caller_bound_bytes": caller.bound,
+            "caller_modeled_bytes": caller.modeled,
+            "private_bound_bytes": private.bound,
+            "private_modeled_bytes": private.modeled,
+            "unknown": unknown,
+            "excluded_external_calls": excluded,
+        }));
     }
-    let complete = report
-        .iter()
-        .filter(|r| !r["bound_bytes"].is_null())
-        .count();
+    let complete = SERVICES.len() - incomplete.len();
     println!(
-        "EFI stack audit: {complete}/{} entries have a sealed-phase static frame bound (see stack-chains.json)",
+        "EFI stack audit: {complete}/{} entries bounded within {caller_budget} caller and {private_budget} private bytes (see stack-chains.json)",
         SERVICES.len()
     );
     write_json(
         output.join("stack-chains.json"),
-        &json!({"model":"Sealed-phase, image-local bound from LLVM static frames; tail edges charged as calls. Excludes caller-owned stack, interrupts and asynchronous reentry. Assumes the PSCI/SBI handlers called from the audited reset stubs run on their own stack, and excludes the BootActive boot bridge, which runs boot firmware on the caller stack and is disabled at seal. Each entry lists the calls it excludes.", "budget_bytes":budget,"entries": report}),
+        &json!({"model":"Sealed-phase, image-local bounds from LLVM static frames; tail edges charged as calls. The caller bound covers each entry up to its switch to the private stack and is checked against the UEFI minimum for the architecture; the private bound covers what runs on the private stack and is checked against its size. Excludes interrupts and asynchronous reentry. Assumes the PSCI/SBI handlers called from the audited reset stubs run on their own stack, and excludes the BootActive boot bridge, which runs boot firmware and is disabled at seal. Each entry lists the calls it excludes.", "caller_budget_bytes":caller_budget,"private_budget_bytes":private_budget,"entries": report}),
     )?;
     anyhow::ensure!(over.is_empty(), "EFI stack-chain budget exceeded: {over:?}");
     anyhow::ensure!(
