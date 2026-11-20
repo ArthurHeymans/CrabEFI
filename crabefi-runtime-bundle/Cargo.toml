@@ -15,4 +15,4 @@ path = "src/lib.rs"
 
 [dev-dependencies]
 crabefi-runtime-abi = { path = "../crabefi-runtime-abi" }
-sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
+sha2 = { version = "0.11", default-features = false }
