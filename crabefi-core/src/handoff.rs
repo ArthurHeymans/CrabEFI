@@ -6,8 +6,6 @@
 //! Nothing here is touched from the log path, so borrowing it never conflicts
 //! with logging.
 
-use core::cell::Ref;
-
 use heapless::Vec;
 
 use crate::cell::{Local, LocalCell};
@@ -95,7 +93,7 @@ static CALLBACKS: LocalCell<Callbacks> = LocalCell::new(Callbacks::new());
 /// Borrow the handoff data.
 #[inline]
 #[track_caller]
-pub fn get() -> Ref<'static, Handoff> {
+pub fn get() -> crate::cell::Borrowed<'static, Handoff> {
     HANDOFF.borrow()
 }
 

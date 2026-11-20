@@ -63,6 +63,8 @@ pub(crate) fn with_image_callback<R>(callback: impl FnOnce() -> R) -> R {
             IMAGE_CALLBACK_DEPTH.set(self.0);
         }
     }
+    // Foreign code may call any Boot Service, which may borrow any cell.
+    crate::cell::assert_no_live_borrows();
     let previous = image_callback_depth();
     let _restore = RestoreDepth(previous);
     IMAGE_CALLBACK_DEPTH.set(
