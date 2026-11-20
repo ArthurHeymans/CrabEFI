@@ -13,12 +13,21 @@ extern crate std;
 
 pub mod arch;
 pub(crate) mod barrier;
-pub mod bls;
-pub mod boot;
+#[allow(dead_code, reason = "the menu uses only part of the BLS discovery API")]
+pub(crate) mod bls;
+#[allow(
+    dead_code,
+    reason = "the boot manager selects an explicit path rather than the ESP fallback"
+)]
+pub(crate) mod boot;
 pub mod boot_event_log;
 mod boot_manager;
 pub mod boot_policy;
-pub mod boot_vars;
+#[allow(
+    dead_code,
+    reason = "not all load-option attributes and variable helpers are used"
+)]
+pub(crate) mod boot_vars;
 #[cfg(feature = "bundled-runtime-image")]
 mod bundled_runtime;
 pub mod cell;
@@ -27,30 +36,54 @@ pub mod cfr;
 #[cfg(feature = "cfr")]
 pub mod cfr_menu;
 #[cfg(feature = "ui")]
-pub mod cursor;
+pub(crate) mod cursor;
 pub mod drivers;
 pub mod efi;
 pub mod exec;
 #[cfg(feature = "fb-log")]
-pub mod fb_log;
+pub(crate) mod fb_log;
 pub mod fdt;
-pub mod framebuffer_console;
+#[allow(
+    dead_code,
+    reason = "menus use a subset of the text drawing primitives"
+)]
+pub(crate) mod framebuffer_console;
 pub mod fs;
-pub mod grub;
+#[allow(
+    dead_code,
+    reason = "discovery parses grub.cfg directly rather than probing first"
+)]
+pub(crate) mod grub;
 pub mod handoff;
 pub mod heap;
 #[cfg(target_arch = "x86_64")]
-pub mod linux_boot;
+#[allow(
+    dead_code,
+    reason = "not all bzImage protocol fields and handover paths are used"
+)]
+pub(crate) mod linux_boot;
 pub mod logger;
 pub mod menu;
-pub mod menu_common;
+#[allow(
+    dead_code,
+    reason = "dialog and line helpers depend on the enabled settings menus"
+)]
+pub(crate) mod menu_common;
 mod os_indications;
-pub mod payload;
-pub mod pe;
+#[allow(
+    dead_code,
+    reason = "payload discovery and chainloading are not enabled"
+)]
+pub(crate) mod payload;
+#[allow(
+    dead_code,
+    reason = "the loader uses a subset of the PE header metadata"
+)]
+pub(crate) mod pe;
 pub mod peripheral;
 pub mod platform;
 #[cfg(feature = "secure-boot")]
-pub mod secure_boot_menu;
+pub(crate) mod secure_boot_menu;
 #[cfg(test)]
 mod test_allocator;
 pub mod time;

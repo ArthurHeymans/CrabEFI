@@ -35,7 +35,7 @@ pub mod bzimage;
 pub mod params;
 
 pub use bzimage::{BOOT_PARAMS_ADDR, BzImage, BzImageError, CMDLINE_ADDR, DEFAULT_KERNEL_ADDR};
-pub use params::{BootParams, E820Entry, E820MapError, SetupHeader};
+pub use params::{BootParams, E820Entry, E820MapError};
 
 use crate::drivers::block::BlockDevice;
 use crate::efi::allocator::{self, AllocateType, MemoryType, PAGE_SIZE};

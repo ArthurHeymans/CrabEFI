@@ -10,6 +10,23 @@ use crabefi::{
     ResetHandler, ResetType, RuntimePlatformConfig, RuntimeResetConfig, RuntimeTimeConfig, Timer,
 };
 
+// A platform can construct menu entries without depending on crabefi-ui.
+const _: fn() = || {
+    use crabefi::menu::{BootEntryKind, Initrds, MAX_INITRDS, PayloadFormat};
+
+    let initrd_paths = Initrds::new();
+    assert_eq!(initrd_paths.capacity(), MAX_INITRDS);
+    let _ = BootEntryKind::BlsLinux {
+        linux_path: Default::default(),
+        initrd_paths,
+        cmdline: Default::default(),
+    };
+    let _ = BootEntryKind::Payload {
+        path: Default::default(),
+        format: PayloadFormat::Elf,
+    };
+};
+
 // The embedding firmware, rather than crabefi-core, owns this symbol. The
 // fixture never runs, so the empty heap intentionally remains uninitialized.
 #[global_allocator]

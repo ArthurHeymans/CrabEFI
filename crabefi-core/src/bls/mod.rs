@@ -27,7 +27,9 @@
 
 pub mod entry;
 
-pub use entry::{BlsEntry, BlsParseError, Initrds, LoaderConf, MAX_INITRDS};
+#[cfg(any(target_arch = "x86_64", doc))]
+pub use entry::MAX_INITRDS;
+pub use entry::{BlsEntry, Initrds, LoaderConf};
 
 use crate::fs::boot::BootFilesystem;
 use alloc::vec::Vec;
