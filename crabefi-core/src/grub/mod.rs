@@ -187,7 +187,7 @@ fn parse_config_file(fs: &mut dyn BootFilesystem, path: &str) -> Result<GrubConf
 }
 
 /// Parse GRUB configuration content
-fn parse_grub_content(content: &str) -> Result<GrubConfig, GrubError> {
+pub(crate) fn parse_grub_content(content: &str) -> Result<GrubConfig, GrubError> {
     let mut config = GrubConfig::new();
     let mut current_entry: Option<GrubEntry> = None;
     let mut in_menuentry = false;

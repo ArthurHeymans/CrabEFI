@@ -12,6 +12,7 @@ members = [
   "crabefi-ui",
 ]
 exclude = [
+  "fuzz",
   "xtask",
   "ui-harness",
   "crabefi-runtime-abi",

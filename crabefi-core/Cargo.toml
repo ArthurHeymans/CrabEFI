@@ -60,6 +60,8 @@ platform-entry = []
 global-allocator = []
 # Enable logging output to framebuffer (very slow, for debugging only)
 fb-log = []
+# Entry points for the cargo-fuzz targets in fuzz/. Never enable in firmware.
+fuzzing = []
 # Enable graphical UI with mouse support (PS/2 and USB HID mouse drivers,
 # cursor rendering, SimplePointerProtocol, and graphical setup utility)
 ui = ["crabefi-ui/screens"]

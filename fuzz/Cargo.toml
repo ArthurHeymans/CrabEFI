@@ -1,0 +1,58 @@
+[package]
+name = "crabefi-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+crabefi = { package = "crabefi-core", path = "../crabefi-core", features = ["fuzzing"] }
+crabefi-pkcs7 = { path = "../crabefi-pkcs7" }
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "pe"
+path = "fuzz_targets/pe.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "partitions"
+path = "fuzz_targets/partitions.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fat"
+path = "fuzz_targets/fat.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "iso9660"
+path = "fuzz_targets/iso9660.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "boot_config"
+path = "fuzz_targets/boot_config.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pkcs7"
+path = "fuzz_targets/pkcs7.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1
