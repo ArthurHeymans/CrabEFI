@@ -127,18 +127,10 @@ impl KeyDatabase {
 
         // Serialize X.509 certificates (variable size, one list per cert)
         for entry in x509_entries {
-            let sig_size = (16 + entry.data.len()) as u32; // Owner GUID + data
-            let list_size = (EfiSignatureList::HEADER_SIZE + sig_size as usize) as u32;
-
-            // Write EFI_SIGNATURE_LIST header
-            result.extend_from_slice(&entry.cert_type);
-            result.extend_from_slice(&list_size.to_le_bytes());
-            result.extend_from_slice(&0u32.to_le_bytes()); // signature_header_size
-            result.extend_from_slice(&sig_size.to_le_bytes());
-
-            // Write EFI_SIGNATURE_DATA
-            result.extend_from_slice(&entry.owner);
-            result.extend_from_slice(&entry.data);
+            let at = result.len();
+            result.resize(at + EfiSignatureList::x509_size(entry.data.len()), 0);
+            EfiSignatureList::write_x509(&mut result[at..], &entry.owner, &entry.data)
+                .expect("sized above");
         }
 
         // Serialize SHA-256 hashes (fixed size, can be in one list)

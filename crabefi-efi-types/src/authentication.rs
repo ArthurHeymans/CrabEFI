@@ -187,6 +187,30 @@ pub struct EfiSignatureList {
 
 impl EfiSignatureList {
     pub const HEADER_SIZE: usize = core::mem::size_of::<Self>();
+
+    /// The size of a list holding one X.509 certificate of `der_len` bytes:
+    /// the header, the owner GUID and the certificate.
+    pub const fn x509_size(der_len: usize) -> usize {
+        Self::HEADER_SIZE + 16 + der_len
+    }
+
+    /// Write a list holding the X.509 certificate `der`, owned by `owner`,
+    /// to the start of `out`, as signature databases keep certificates (one
+    /// list each, their sizes differ). Returns its size; `None` if `out` is
+    /// too small.
+    pub fn write_x509(out: &mut [u8], owner: &[u8; 16], der: &[u8]) -> Option<usize> {
+        let size = Self::x509_size(der.len());
+        let signature_size = u32::try_from(16 + der.len()).ok()?;
+        let list_size = u32::try_from(size).ok()?;
+        let out = out.get_mut(..size)?;
+        out[..16].copy_from_slice(&crate::secure_boot::EFI_CERT_X509_GUID);
+        out[16..20].copy_from_slice(&list_size.to_le_bytes());
+        out[20..24].copy_from_slice(&0u32.to_le_bytes());
+        out[24..28].copy_from_slice(&signature_size.to_le_bytes());
+        out[28..44].copy_from_slice(owner);
+        out[44..].copy_from_slice(der);
+        Some(size)
+    }
 }
 
 /// Validate that every byte belongs to a complete EFI signature list.
@@ -307,6 +331,32 @@ impl<'a> Iterator for SignatureIterator<'a> {
 #[cfg(test)]
 mod tests {
     use super::EfiTime;
+
+    #[test]
+    fn default_databases_are_valid_signature_lists() {
+        use super::{
+            EfiSignatureList, SignatureIterator, SignatureListIterator, validate_signature_database,
+        };
+        use crate::secure_boot::defaults;
+        for (der, owner) in core::iter::once(&defaults::PK)
+            .chain(defaults::KEK)
+            .chain(defaults::DB)
+        {
+            let mut list = [0u8; 2048];
+            let size = EfiSignatureList::write_x509(&mut list, owner, der).unwrap();
+            assert_eq!(size, EfiSignatureList::x509_size(der.len()));
+            assert!(validate_signature_database(&list[..size]));
+            let (header, bytes) = SignatureListIterator::new(&list[..size]).next().unwrap();
+            assert_eq!(
+                header.signature_type,
+                crate::secure_boot::EFI_CERT_X509_GUID
+            );
+            let mut signatures = SignatureIterator::new(header, bytes);
+            assert_eq!(signatures.next(), Some((*owner, *der)));
+            assert_eq!(signatures.next(), None);
+            assert!(EfiSignatureList::write_x509(&mut list[..size - 1], owner, der).is_none());
+        }
+    }
 
     fn time(year: u16, month: u8, day: u8) -> EfiTime {
         EfiTime {
