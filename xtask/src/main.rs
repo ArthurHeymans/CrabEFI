@@ -534,6 +534,12 @@ fn cmd_build_payload(
     if release {
         cmd.arg("--release");
     }
+    // CRABEFI_DEBUG_ASSERTIONS=1: keep the payload's debug assertions, such as
+    // the check that no firmware borrow is live across a foreign call, in a
+    // release build. Only the payload: the runtime image must stay panic-free.
+    if std::env::var_os("CRABEFI_DEBUG_ASSERTIONS").is_some() {
+        cmd.args(["--config", "profile.release.debug-assertions=true"]);
+    }
     let mut features = extra_features.to_vec();
     if !native_only {
         features.push("external-runtime-image");
