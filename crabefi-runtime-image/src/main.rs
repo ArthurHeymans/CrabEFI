@@ -12,12 +12,14 @@ mod arch;
 mod auth;
 mod deferred;
 mod efi;
+mod entry;
 #[cfg(all(feature = "mm", target_arch = "x86_64", target_os = "none"))]
 mod mm;
 mod mm_protocol;
 #[cfg(all(target_arch = "x86_64", not(feature = "mm")))]
 mod proxy;
 mod services;
+mod stack;
 mod state;
 mod store;
 mod svam;

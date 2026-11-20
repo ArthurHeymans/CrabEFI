@@ -451,7 +451,7 @@ fn normalize(
         anyhow::anyhow!("normalized runtime image failed ABI self-validation: {error}")
     })?;
     run_audit_tools(elf_path, output, arch, relocations.len())?;
-    stack::audit(&file, arch, &relocations, STACK_BUDGET, output)?;
+    stack::audit(&file, arch, &relocations, output)?;
     println!(
         "Runtime size ({}, {}): {} bytes normalized, {} bytes executable sections",
         arch.dir_name(),
