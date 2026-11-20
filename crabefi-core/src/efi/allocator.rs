@@ -1827,6 +1827,22 @@ unsafe extern "C" {
     static __boot_data_end: u8;
 }
 
+/// Keep the native payload, stack, and page tables out of the E820 RAM map
+/// and out of the allocator. Already reserved fragments are left alone, so
+/// this is safe to call both before platform discovery and at library entry.
+#[cfg(feature = "platform-entry")]
+pub(crate) fn reserve_native_boot_image() {
+    let start = &raw const __boot_code_start as u64 & !(PAGE_SIZE - 1);
+    let end = (&raw const __boot_data_end as u64).next_multiple_of(PAGE_SIZE);
+    assert!(end > start, "invalid native boot image linker range");
+    reserve_region_fragments(
+        start,
+        (end - start) / PAGE_SIZE,
+        MemoryType::BootServicesData,
+    )
+    .expect("could not reserve the native boot image");
+}
+
 /// Reserve the CrabEFI boot image regions using linker-provided section boundaries.
 ///
 /// Only available with the `platform-entry` feature (when CrabEFI owns

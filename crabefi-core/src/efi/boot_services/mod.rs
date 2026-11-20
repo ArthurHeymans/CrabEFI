@@ -677,6 +677,8 @@ type UninstallMultipleFn = extern "efiapi" fn(Handle, *mut c_void, *mut c_void) 
 #[cfg(target_arch = "x86_64")]
 core::arch::global_asm!(
     r#"
+    // Keep the EFI-only thunks in a discardable section for native payloads.
+    .pushsection .text.efi_protocol_thunks,"ax",@progbits
     .global crabefi_install_multiple_protocol_interfaces_entry
     .type crabefi_install_multiple_protocol_interfaces_entry,@function
 crabefi_install_multiple_protocol_interfaces_entry:
@@ -698,6 +700,7 @@ crabefi_uninstall_multiple_protocol_interfaces_entry:
     call crabefi_uninstall_multiple_protocol_interfaces_x64
     add rsp, 40
     ret
+    .popsection
 "#
 );
 

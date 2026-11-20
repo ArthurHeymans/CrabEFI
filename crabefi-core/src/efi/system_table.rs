@@ -223,29 +223,27 @@ struct AcpiRegion {
     end: u64,
 }
 
-/// Collect all ACPI table regions, merge overlapping ones, then mark them
-fn mark_acpi_tables_memory(rsdp_addr: u64) {
-    use super::allocator::{PAGE_SIZE, mark_as_acpi_reclaim};
+/// Visit the page-aligned ranges in the platform-provided ACPI table chain.
+/// The platform supplies identity-mapped ACPI tables, as for EFI publication.
+fn visit_acpi_table_ranges(rsdp_addr: u64, mut visit: impl FnMut(AcpiRegion)) {
+    use super::allocator::PAGE_SIZE;
 
-    log::info!("Marking ACPI table memory regions as AcpiReclaimMemory...");
-
-    // Collect all ACPI regions first
-    let mut regions: [AcpiRegion; MAX_ACPI_REGIONS] =
-        [AcpiRegion { start: 0, end: 0 }; MAX_ACPI_REGIONS];
-    let mut region_count = 0;
-
-    // Helper to add a region (page-aligned)
+    if rsdp_addr == 0 {
+        return;
+    }
     let mut add_region = |addr: u64, size: u64| {
-        if region_count >= MAX_ACPI_REGIONS || size == 0 {
+        if size == 0 {
             return;
         }
         let page_start = addr & !(PAGE_SIZE - 1);
-        let page_end = (addr + size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-        regions[region_count] = AcpiRegion {
+        let page_end = addr
+            .checked_add(size)
+            .and_then(|end| end.checked_next_multiple_of(PAGE_SIZE))
+            .expect("ACPI table range overflow");
+        visit(AcpiRegion {
             start: page_start,
             end: page_end,
-        };
-        region_count += 1;
+        });
     };
 
     let rsdp = unsafe { &*(rsdp_addr as *const AcpiRsdp) };
@@ -302,7 +300,11 @@ fn mark_acpi_tables_memory(rsdp_addr: u64) {
     // Parse each table entry
     let header_size = core::mem::size_of::<AcpiSdtHeader>();
     let entry_size = if is_xsdt { 8 } else { 4 };
-    let num_entries = (root_length as usize - header_size) / entry_size;
+    let Some(entries_size) = (root_length as usize).checked_sub(header_size) else {
+        log::warn!("ACPI root table is shorter than its header");
+        return;
+    };
+    let num_entries = entries_size / entry_size;
     log::debug!(
         "  {} has {} table entries",
         if is_xsdt { "XSDT" } else { "RSDT" },
@@ -337,7 +339,7 @@ fn mark_acpi_tables_memory(rsdp_addr: u64) {
         add_region(table_addr, table_length as u64);
 
         // If this is FADT, also add DSDT and FACS
-        if table_sig == b"FACP" {
+        if table_sig == b"FACP" && table_length >= 44 {
             let fadt_ptr = table_addr as *const u8;
 
             // Get DSDT address (use read_unaligned: FADT field offsets are not naturally aligned)
@@ -380,9 +382,115 @@ fn mark_acpi_tables_memory(rsdp_addr: u64) {
             }
         }
     }
+}
 
-    // Sort regions by start address
-    regions[..region_count].sort_unstable_by_key(|r| r.start);
+/// Protect ACPI pages from native boot allocations and describe them to Linux
+/// without installing an EFI configuration table. Preserve any pre-existing
+/// non-RAM types, including NVS, even if an ACPI table crosses a map boundary.
+pub(crate) fn reserve_native_acpi_ram(rsdp: u64) {
+    use super::allocator::{MemoryType, reserve_region_fragments};
+
+    reserve_acpi_ram(rsdp, |start, pages| {
+        reserve_region_fragments(start, pages, MemoryType::AcpiReclaimMemory)
+    });
+}
+
+fn reserve_acpi_ram(rsdp: u64, mut reserve: impl FnMut(u64, u64) -> Result<(), efi::Status>) {
+    visit_acpi_table_ranges(rsdp, |region| {
+        let pages = (region.end - region.start) / super::allocator::PAGE_SIZE;
+        reserve(region.start, pages).expect("could not reserve native ACPI table memory");
+    });
+}
+
+#[cfg(test)]
+mod native_acpi_tests {
+    use super::*;
+    use crate::efi::allocator::{MemoryAllocator, MemoryDescriptor, MemoryType, PAGE_SIZE_USIZE};
+    use crate::platform::{MemoryRegion, MemoryType as PlatformMemoryType};
+
+    #[test]
+    fn reserves_native_acpi_ram_across_a_platform_map_boundary() {
+        const PAGE: usize = PAGE_SIZE_USIZE;
+        #[repr(align(4096))]
+        struct Tables([u8; 4 * PAGE]);
+        let mut tables = Tables([0; 4 * PAGE]);
+        let base = tables.0.as_ptr() as u64;
+        let xsdt = base + PAGE as u64;
+        let sdt_offset = 2 * PAGE - 16;
+        let sdt = base + sdt_offset as u64;
+        tables.0[..8].copy_from_slice(b"RSD PTR ");
+        tables.0[15] = 2;
+        tables.0[20..24].copy_from_slice(&36u32.to_le_bytes());
+        tables.0[24..32].copy_from_slice(&xsdt.to_le_bytes());
+        tables.0[PAGE..PAGE + 4].copy_from_slice(b"XSDT");
+        tables.0[PAGE + 4..PAGE + 8].copy_from_slice(&44u32.to_le_bytes());
+        tables.0[PAGE + 36..PAGE + 44].copy_from_slice(&sdt.to_le_bytes());
+        tables.0[sdt_offset..sdt_offset + 4].copy_from_slice(b"APIC");
+        tables.0[sdt_offset + 4..sdt_offset + 8].copy_from_slice(&44u32.to_le_bytes());
+
+        let mut allocator = MemoryAllocator::new();
+        allocator.init_from_platform(&[
+            MemoryRegion {
+                base,
+                size: PAGE as u64,
+                region_type: PlatformMemoryType::Ram,
+            },
+            MemoryRegion {
+                base: xsdt,
+                size: PAGE as u64,
+                region_type: PlatformMemoryType::AcpiNvs,
+            },
+            MemoryRegion {
+                base: base + 2 * PAGE as u64,
+                size: 2 * PAGE as u64,
+                region_type: PlatformMemoryType::Ram,
+            },
+        ]);
+        reserve_acpi_ram(base, |start, pages| {
+            allocator.reserve_region_fragments(start, pages, MemoryType::AcpiReclaimMemory)
+        });
+        let mut map = [MemoryDescriptor::default(); 4];
+        let mut size = core::mem::size_of_val(&map);
+        assert_eq!(
+            allocator.get_memory_map(&mut size, Some(&mut map), &mut 0, &mut 0, &mut 0),
+            efi::Status::SUCCESS
+        );
+        assert_eq!(size, core::mem::size_of_val(&map));
+        assert_eq!(
+            map.map(|entry| (
+                entry.physical_start,
+                entry.number_of_pages,
+                MemoryType::try_from(entry.memory_type).ok()
+            )),
+            [
+                (base, 1, Some(MemoryType::AcpiReclaimMemory)),
+                (xsdt, 1, Some(MemoryType::AcpiMemoryNvs)),
+                (
+                    base + 2 * PAGE as u64,
+                    1,
+                    Some(MemoryType::AcpiReclaimMemory)
+                ),
+                (
+                    base + 3 * PAGE as u64,
+                    1,
+                    Some(MemoryType::ConventionalMemory)
+                ),
+            ]
+        );
+    }
+}
+
+/// Collect all ACPI table regions, merge overlapping ones, then mark them.
+fn mark_acpi_tables_memory(rsdp_addr: u64) {
+    use super::allocator::{PAGE_SIZE, mark_as_acpi_reclaim};
+
+    log::info!("Marking ACPI table memory regions as AcpiReclaimMemory...");
+    let mut regions = heapless::Vec::<AcpiRegion, MAX_ACPI_REGIONS>::new();
+    visit_acpi_table_ranges(rsdp_addr, |region| {
+        let _ = regions.push(region);
+    });
+    let region_count = regions.len();
+    regions.sort_unstable_by_key(|r| r.start);
 
     // Merge overlapping/adjacent regions
     let mut merged: [AcpiRegion; MAX_ACPI_REGIONS] =

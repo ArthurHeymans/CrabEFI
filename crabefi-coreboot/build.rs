@@ -21,17 +21,44 @@ fn main() {
     };
     let bundled_runtime = std::env::var_os("CARGO_FEATURE_BUNDLED_RUNTIME_IMAGE").is_some();
     let external_runtime = std::env::var_os("CARGO_FEATURE_EXTERNAL_RUNTIME_IMAGE").is_some();
-    match (bundled_runtime, external_runtime) {
-        (true, false) => {}
-        (false, true) => embed_runtime_image(runtime_architecture),
-        (true, true) => {
-            panic!("bundled-runtime-image and external-runtime-image are mutually exclusive")
+    let native_only = std::env::var_os("CARGO_FEATURE_NATIVE_ONLY").is_some();
+    match (bundled_runtime, external_runtime, native_only) {
+        (true, false, false) => {}
+        (false, true, false) => embed_runtime_image(runtime_architecture),
+        (false, false, true) => {
+            assert!(target.starts_with("x86_64"), "native-only requires x86-64");
+            for (env, feature) in [
+                ("SECURE_BOOT_ENFORCED", "secure-boot-enforced"),
+                ("PAYLOAD_MM", "payload-mm"),
+                ("CAPSULE_ON_DISK_ONLY", "capsule-on-disk-only"),
+                ("BOOT_EVENT_LOG", "boot-event-log"),
+                ("EXTERNAL_BOOT_SETTING", "external-boot-setting"),
+                (
+                    "REPLAY_TEST_RESET_AFTER_PERSIST",
+                    "replay-test-reset-after-persist",
+                ),
+                (
+                    "PAYLOAD_MM_TEST_LOSE_READY_TO_BOOT",
+                    "payload-mm-test-lose-ready-to-boot",
+                ),
+                ("UI", "ui"),
+                ("USB_ON_DEMAND", "usb-on-demand"),
+            ] {
+                assert!(
+                    std::env::var_os(format!("CARGO_FEATURE_{env}")).is_none(),
+                    "native-only is incompatible with {feature}"
+                );
+            }
         }
-        (false, false) => panic!("select either bundled-runtime-image or external-runtime-image"),
+        _ => panic!(
+            "select exactly one of bundled-runtime-image, external-runtime-image, or native-only (use --no-default-features to replace bundled-runtime-image)"
+        ),
     }
-    embed_capsule_trust_store();
-    if std::env::var_os("CARGO_FEATURE_PAYLOAD_MM").is_some() {
-        embed_payload_mm_image();
+    if !native_only {
+        embed_capsule_trust_store();
+        if std::env::var_os("CARGO_FEATURE_PAYLOAD_MM").is_some() {
+            embed_payload_mm_image();
+        }
     }
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let manifest_path = std::path::Path::new(&manifest_dir);

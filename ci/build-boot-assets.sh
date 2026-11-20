@@ -181,6 +181,8 @@ else
             "$KCFG" "${KCFG_ARGS[@]}" \
                 --enable  64BIT                 \
                 --enable  X86_64                \
+                --enable  PCI                   \
+                --enable  BINFMT_SCRIPT         \
                 --enable  SERIAL_8250           \
                 --enable  SERIAL_8250_CONSOLE   \
                 --enable  EARLY_PRINTK          \
@@ -219,6 +221,15 @@ else
     esac
 
     "${KMAKE[@]}" olddefconfig
+    if [ "$ARCH" = x86_64 ]; then
+        # The native FAT test runs a script as init and checks ACPI via sysfs.
+        for option in BINFMT_SCRIPT PCI ACPI; do
+            if ! grep -qx "CONFIG_${option}=y" "$KSRC/.config"; then
+                echo "Missing CONFIG_${option}=y in the x86-64 test kernel" >&2
+                exit 1
+            fi
+        done
+    fi
 
     echo "    Compiling (this takes 1-3 minutes)..."
     "${KMAKE[@]}" -j"$(nproc)" "${KERN_IMAGE##*/}"

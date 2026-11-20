@@ -207,6 +207,7 @@ fn init_persistence_and_boot(
     // backend stays live throughout boot. The runtime never receives its vtable:
     // it uses the boot bridge only while BootActive, erases that bridge on seal,
     // and ExitBootServices then detaches this boot-owned reference.
+    #[cfg(feature = "variable-store")]
     let variable_storage = unsafe {
         core::mem::transmute::<platform::VariableStorage<'_>, platform::VariableStorage<'static>>(
             variable_storage,
@@ -313,7 +314,7 @@ fn init_persistence_and_boot(
     // before Secure Boot init and capsule-on-disk look for files on the ESP.
     boot_policy::apply_variable();
     let usb_init = boot_policy::get().usb_init;
-    boot_manager::init_storage_subsystem(usb_init == boot_policy::UsbInit::Always);
+    boot_manager::init_storage_subsystem::<false>(usb_init == boot_policy::UsbInit::Always);
 
     if persistence_available {
         #[cfg(feature = "secure-boot")]
@@ -467,7 +468,55 @@ mod linker_range_tests {
 /// };
 /// crabefi::init_platform(config); // never returns
 /// ```
-pub fn init_platform(mut config: PlatformConfig) -> ! {
+pub fn init_platform(config: PlatformConfig) -> ! {
+    init_platform_inner::<false>(config)
+}
+
+/// Start the x86-64 native Linux boot menu without publishing EFI services.
+/// EFI-only configuration fields (including the runtime image) are unused.
+/// Call [`prepare_native_memory`] first only if the platform needs to allocate
+/// before entry. This entry point is not available with `secure-boot-enforced`.
+#[cfg(all(
+    feature = "native-boot",
+    target_arch = "x86_64",
+    not(feature = "secure-boot-enforced")
+))]
+pub fn init_native_platform(config: PlatformConfig) -> ! {
+    init_platform_inner::<true>(config)
+}
+
+/// Initialize native boot memory before optional platform discovery.
+///
+/// The allocator and heap are normally initialized by [`init_native_platform`].
+/// Platforms that need to allocate earlier should call this instead of bootstrapping
+/// the heap directly, so ACPI and the linked payload are protected before use.
+#[cfg(all(
+    feature = "native-boot",
+    target_arch = "x86_64",
+    not(feature = "secure-boot-enforced")
+))]
+pub fn prepare_native_memory(config: &mut PlatformConfig<'_>) {
+    prepare_native_memory_inner(config);
+}
+
+fn prepare_native_memory_inner(config: &mut PlatformConfig<'_>) {
+    efi::allocator::init_from_platform(config.memory_map);
+    if let Some(rsdp) = config.acpi_rsdp {
+        efi::system_table::reserve_native_acpi_ram(rsdp);
+    }
+    #[cfg(feature = "platform-entry")]
+    efi::allocator::reserve_native_boot_image();
+    if !config.heap_pre_initialized {
+        heap::init().unwrap_or_else(|e| panic!("Failed to initialize heap allocator: {e}"));
+        config.heap_pre_initialized = true;
+    }
+    assert!(
+        heap::is_initialized(),
+        "Failed to initialize heap allocator"
+    );
+}
+
+fn init_platform_inner<const NATIVE: bool>(mut config: PlatformConfig) -> ! {
     // ---- 1. Install exception / interrupt vectors ----
     //
     // On aarch64: without this, VBAR_ELx defaults to 0x0 and any exception
@@ -638,6 +687,11 @@ pub fn init_platform(mut config: PlatformConfig) -> ! {
         config.runtime.deferred_buffer = DeferredBufferConfig::disabled();
     }
 
+    // Native keyboard registration allocates, even without a platform keyboard.
+    if NATIVE {
+        prepare_native_memory_inner(&mut config);
+    }
+
     // ---- 8. Initialize keyboard subsystem ----
     drivers::keyboard_common::init();
     if let Some(input) = config.console_input.take() {
@@ -654,18 +708,21 @@ pub fn init_platform(mut config: PlatformConfig) -> ! {
         ));
     }
 
-    // ---- 9. Initialize EFI environment ----
-    //
-    // Always runs — sets up the EFI memory map, system table, ACPI/SMBIOS
-    // configuration tables, and runtime region reservations.  The page
-    // allocator is idempotent: if the caller already bootstrapped it
-    // (to get a heap before entry), re-initialization is skipped.
-    efi::init_from_platform(&mut config);
-    timestamp::record(timestamp::TS_CRABEFI_EFI_INIT);
+    // ---- 9. Initialize the boot environment ----
+    // Both modes need the allocator for DMA and Linux's E820 map. Only
+    // UEFI mode installs system tables, protocols and a runtime image.
+    if NATIVE {
+        if let Some(fb) = config.framebuffer {
+            handoff::store_framebuffer(fb);
+        }
+        peripheral::bind(core::mem::take(&mut config.peripherals));
+    } else {
+        efi::init_from_platform(&mut config);
+        timestamp::record(timestamp::TS_CRABEFI_EFI_INIT);
+    }
 
     // Initialize mouse cursor system (ui feature only).
-    // Must come after efi::init_from_platform(), which stores the framebuffer
-    // in global state via handoff::store_framebuffer().
+    // The boot environment stores the framebuffer in global state above.
     #[cfg(feature = "ui")]
     {
         drivers::pointer::init();
@@ -680,13 +737,14 @@ pub fn init_platform(mut config: PlatformConfig) -> ! {
     // an EFI Configuration Table for fwupd/LVFS discovery. Delivery flags and
     // OsIndicationsSupported are finalized after persistence is initialized.
     let firmware_info = handoff::get().efi_fw_info;
-    if let Some(fw_info) = firmware_info {
-        efi::esrt::install_esrt(&fw_info, false);
-        log::info!("ESRT installed for firmware updates");
+    if !NATIVE {
+        if let Some(fw_info) = firmware_info {
+            efi::esrt::install_esrt(&fw_info, false);
+            log::info!("ESRT installed for firmware updates");
+        }
+        log::info!("CrabEFI initialized successfully!");
+        log::info!("EFI System Table at: {:p}", efi::get_system_table());
     }
-
-    log::info!("CrabEFI initialized successfully!");
-    log::info!("EFI System Table at: {:p}", efi::get_system_table());
 
     // ---- 12. Discover PCI ECAM and initialize PCI ----
     //
@@ -731,6 +789,15 @@ pub fn init_platform(mut config: PlatformConfig) -> ! {
         // config.block_devices live forever.
         unsafe {
             drivers::storage::register_platform_block_devices(config.block_devices);
+        }
+    }
+
+    if NATIVE {
+        log::info!("Native-only boot: UEFI services are disabled");
+        boot_manager::run_native();
+        log::info!("Boot manager finished — halting");
+        loop {
+            arch::halt();
         }
     }
 

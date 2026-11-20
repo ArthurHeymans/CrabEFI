@@ -10,6 +10,8 @@ readme = "../README.md"
 
 [features]
 default = []
+# Enable the x86-64 native Linux entry point, without starting UEFI services.
+native-boot = []
 # Capabilities are additive; external firmware opts into its exact hardware set.
 xhci = ["dep:xhci"]
 # TPM devices, TCG protocols, event tables and measured boot.

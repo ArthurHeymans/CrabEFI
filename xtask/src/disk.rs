@@ -38,6 +38,7 @@ const LINUX_TYPE_GUID: [u8; 16] = [
 ];
 
 pub const EXT_BOOT_SUCCESS: &str = "CRABEFI_EXT_BOOT_SMOKE_OK";
+pub const NATIVE_FAT_SUCCESS: &str = "CRABEFI_NATIVE_FAT_NO_EFI_OK";
 
 #[derive(Clone, Copy, Debug)]
 struct DiskGeometry {
@@ -637,6 +638,79 @@ pub fn create_grub_linux_disk(
     println!("  Installed initramfs.cpio");
 
     println!("Created: {}", output);
+    Ok(())
+}
+
+/// Create a FAT disk with three choices: an EFI fallback (which must be
+/// ignored), a broken default BLS entry, and a working native GRUB entry.
+pub fn create_native_fat_disk(output: &Path, efi_app: &str, kernel: &Path) -> Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let root = fixture.path().join("root");
+    std::fs::create_dir_all(root.join("sys"))?;
+    let busybox = Command::new("busybox")
+        .args(["which", "busybox"])
+        .output()
+        .context("run busybox (install busybox-static)")?;
+    anyhow::ensure!(busybox.status.success(), "could not locate busybox-static");
+    std::fs::copy(
+        std::str::from_utf8(&busybox.stdout)?.trim(),
+        root.join("busybox"),
+    )?;
+    let script = format!(
+        "#!/busybox sh\n\
+         /busybox mount -t sysfs sysfs /sys || exit 1\n\
+         [ -d /sys/firmware/acpi/tables ] || exit 1\n\
+         [ ! -e /sys/firmware/efi ] || exit 1\n\
+         echo {NATIVE_FAT_SUCCESS}\n\
+         /busybox poweroff -f\n"
+    );
+    let init = root.join("init");
+    std::fs::write(&init, script)?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&init, std::fs::Permissions::from_mode(0o755))?;
+    let initramfs = fixture.path().join("initramfs.cpio");
+    let mut cpio = Command::new("cpio")
+        .args(["-o", "-H", "newc", "--quiet"])
+        .current_dir(&root)
+        .stdin(std::process::Stdio::piped())
+        .stdout(File::create(&initramfs)?)
+        .spawn()
+        .context("run cpio")?;
+    let input_result = cpio
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"sys\nbusybox\ninit\n");
+    let status = cpio.wait()?;
+    input_result?;
+    anyhow::ensure!(status.success(), "cpio exited with {status}");
+
+    let grub_cfg = fixture.path().join("grub.cfg");
+    std::fs::write(
+        &grub_cfg,
+        "menuentry 'Working native GRUB entry' {\n\
+          linux /vmlinuz console=ttyS0,115200 rdinit=/init nokaslr panic=1\n\
+          initrd /initramfs.cpio\n\
+         }\n",
+    )?;
+    create_grub_linux_disk(
+        output.to_str().context("non-UTF8 test disk path")?,
+        efi_app,
+        kernel.to_str().context("non-UTF8 kernel path")?,
+        initramfs.to_str().context("non-UTF8 initramfs path")?,
+        grub_cfg.to_str().context("non-UTF8 GRUB config path")?,
+        Arch::X86_64,
+    )?;
+    let esp = mtools_esp_image(output);
+    create_mtools_dir(&esp, "::/loader")?;
+    create_mtools_dir(&esp, "::/loader/entries")?;
+    write_text_file_to_esp(&esp, "::/loader/loader.conf", "default broken\n")?;
+    write_text_file_to_esp(
+        &esp,
+        "::/loader/entries/broken.conf",
+        "title Broken native BLS default\nlinux /broken.bin\n",
+    )?;
+    write_text_file_to_esp(&esp, "::/broken.bin", &"not a bzImage\n".repeat(80))?;
     Ok(())
 }
 

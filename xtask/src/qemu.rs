@@ -16,6 +16,7 @@ mod boot_events;
 pub(crate) mod boot_policy;
 mod filesystem;
 mod fwui;
+mod native_fat;
 pub(crate) mod sct;
 mod secure_boot_auth;
 
@@ -995,6 +996,9 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
     if app_name == "fwui-test" {
         return fwui::run(config, disk_path);
     }
+    if app_name == "native-only-fat-linux" {
+        return native_fat::run(config, disk_path);
+    }
     if app_name == "boot-policy-test" {
         return boot_policy::run(config, disk_path);
     }
@@ -1393,6 +1397,19 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
             } else {
                 println!("[FAIL] ext_userspace: Initramfs marker not found in output");
                 failed += 1;
+            }
+            if app == "native-only-linux" {
+                if result
+                    .output
+                    .contains("Native-only boot: UEFI services are disabled")
+                    && !result.output.contains("EFI System Table at:")
+                {
+                    println!("[PASS] native_only: Booted without publishing EFI services");
+                    passed += 1;
+                } else {
+                    println!("[FAIL] native_only: Expected a native-only payload");
+                    failed += 1;
+                }
             }
         }
         "tcg-test" => {

@@ -247,6 +247,10 @@ impl BootMenu {
 ///
 /// A `BootMenu` containing all discovered boot entries.
 pub fn discover_boot_entries() -> BootMenu {
+    discover_entries::<false>()
+}
+
+pub(crate) fn discover_entries<const NATIVE: bool>() -> BootMenu {
     let mut menu = BootMenu::new();
 
     log::info!("Discovering boot entries...");
@@ -259,20 +263,23 @@ pub fn discover_boot_entries() -> BootMenu {
     }
     for device in &devices {
         match storage::with_disk(device.id, gpt::read_partitions_auto) {
-            Ok(Ok(partitions)) => discover_entries_on_disk(device, &partitions, &mut menu),
+            Ok(Ok(partitions)) => {
+                discover_entries_on_disk::<NATIVE>(device, &partitions, &mut menu)
+            }
             Ok(Err(gpt::GptError::OutOfMemory)) => {
                 log::error!(
                     "Boot menu: out of heap scanning partitions on {}",
                     device.label
                 );
             }
-            _ => try_el_torito_fallback(device, &mut menu),
+            _ if !NATIVE => try_el_torito_fallback(device, &mut menu),
+            _ => {}
         }
     }
 
     // Keep FAT volumes and El Torito images ahead of ext boot entries.
     #[cfg(all(feature = "ext4", target_arch = "x86_64"))]
-    if !crate::efi::auth::is_secure_boot_enabled() {
+    if NATIVE || !crate::efi::auth::is_secure_boot_enabled() {
         discover_ext_entries(&devices, &mut menu);
     }
 
@@ -290,7 +297,7 @@ pub fn discover_boot_entries() -> BootMenu {
 /// * `device` - Disk holding the partitions
 /// * `partitions` - Partition table of the disk
 /// * `menu` - Boot menu to add entries to
-fn discover_entries_on_disk(
+fn discover_entries_on_disk<const NATIVE: bool>(
     device: &StorageDevice,
     partitions: &[gpt::Partition],
     menu: &mut BootMenu,
@@ -301,7 +308,7 @@ fn discover_entries_on_disk(
         if partition.is_esp || is_potential_esp(partition) {
             boot_fs::with_filesystem(device.id, partition, FilesystemKind::Fat, |fs| {
                 // An empty file cannot be a bootloader.
-                if matches!(fs.file_size(EFI_BOOT_PATH), Ok(1..)) {
+                if !NATIVE && matches!(fs.file_size(EFI_BOOT_PATH), Ok(1..)) {
                     let mut name: String<64> = String::new();
                     let _ = write!(name, "Boot Entry ({})", device.label);
                     if !menu.add_entry(BootEntry::new(
@@ -314,7 +321,7 @@ fn discover_entries_on_disk(
                         return;
                     }
                 }
-                scan_partition_for_entries(
+                scan_partition_for_entries::<NATIVE>(
                     fs,
                     FilesystemKind::Fat,
                     device,
@@ -457,7 +464,7 @@ fn check_bootloader_exists(disk: &mut dyn BlockDevice, partition_start: u64) -> 
 }
 
 /// Scan a mounted volume for same-volume BLS and GRUB direct Linux entries.
-fn scan_partition_for_entries(
+fn scan_partition_for_entries<const NATIVE: bool>(
     fs: &mut dyn BootFilesystem,
     filesystem: FilesystemKind,
     device: &StorageDevice,
@@ -465,7 +472,7 @@ fn scan_partition_for_entries(
     partition: &gpt::Partition,
     menu: &mut BootMenu,
 ) {
-    if crate::efi::auth::is_secure_boot_enabled() {
+    if !NATIVE && crate::efi::auth::is_secure_boot_enabled() {
         log::debug!("Secure Boot active: skipping direct Linux boot entry discovery");
         return;
     }
@@ -607,6 +614,11 @@ fn scan_bls_from(
 /// Boot [`BootMenu::entry_for_boot`] for that index so a one-shot
 /// command-line edit made in the menu applies to this boot attempt.
 pub fn show_menu(menu: &mut BootMenu) -> Option<usize> {
+    show_menu_for_mode::<false>(menu)
+}
+
+pub(crate) fn show_menu_for_mode<const NATIVE: bool>(menu: &mut BootMenu) -> Option<usize> {
+    let draw_menu = draw_menu::<NATIVE>;
     menu.clear_edited_cmdline();
     // An empty, indefinite menu still provides firmware/security settings.
     // The boot manager uses this for explicit setup requests without media.
@@ -708,14 +720,14 @@ pub fn show_menu(menu: &mut BootMenu) -> Option<usize> {
                     draw_status("File browser not yet implemented", &mut fb_console);
                 }
                 #[cfg(feature = "secure-boot")]
-                KeyPress::Char('s') | KeyPress::Char('S') => {
+                KeyPress::Char('s') | KeyPress::Char('S') if !NATIVE => {
                     // Open Secure Boot settings menu
                     crate::secure_boot_menu::show_secure_boot_menu();
                     // Redraw boot menu after returning
                     menu_common::clear_screen(&mut fb_console);
                     draw_menu(menu, &mut fb_console);
                 }
-                KeyPress::Char('f') | KeyPress::Char('F') => {
+                KeyPress::Char('f') | KeyPress::Char('F') if !NATIVE => {
                     // Open platform-provided firmware settings menu.
                     if let Some(hooks) = crate::handoff::callbacks().hooks {
                         if !hooks.show_firmware_settings() {
@@ -912,7 +924,7 @@ fn menu_scroll_offset(menu: &BootMenu, fb_console: &Option<FramebufferConsole>) 
 }
 
 /// Draw the menu on both outputs
-fn draw_menu(menu: &BootMenu, fb_console: &mut Option<FramebufferConsole>) {
+fn draw_menu<const NATIVE: bool>(menu: &BootMenu, fb_console: &mut Option<FramebufferConsole>) {
     let cols = fb_console.as_ref().map(|c| c.cols()).unwrap_or(80) as usize;
     let rows = fb_console.as_ref().map(|c| c.rows()).unwrap_or(25) as usize;
     let visible_rows = menu_visible_rows(fb_console);
@@ -961,15 +973,22 @@ fn draw_menu(menu: &BootMenu, fb_console: &mut Option<FramebufferConsole>) {
     }
 
     if menu.entry_count() == 0 {
-        draw_status(
-            "No bootable media - firmware settings are still available",
-            fb_console,
-        );
+        let message = if NATIVE {
+            "No bootable media"
+        } else {
+            "No bootable media - firmware settings are still available"
+        };
+        draw_status(message, fb_console);
     }
 
     // Draw help text
     let help_row = rows.saturating_sub(5);
-    draw_help(help_row, fb_console, cols);
+    let help = if NATIVE {
+        "Enter: Boot | C: Cmdline | R: Reset"
+    } else {
+        HELP_TEXT
+    };
+    menu_common::draw_help(help_row, help, fb_console, cols);
 }
 
 /// Draw a category separator line
@@ -1112,11 +1131,6 @@ fn draw_scroll_indicator(row: usize, indicator: &str, fb_console: &mut Option<Fr
         let _ = console.write_str(indicator);
         console.reset_colors();
     }
-}
-
-/// Draw the help text
-fn draw_help(row: usize, fb_console: &mut Option<FramebufferConsole>, cols: usize) {
-    menu_common::draw_help(row, HELP_TEXT, fb_console, cols);
 }
 
 /// Draw the countdown timer

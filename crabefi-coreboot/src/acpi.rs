@@ -441,7 +441,7 @@ struct SdtHeader {
     creator_revision: U32,
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(feature = "native-only")))]
 #[repr(C)]
 #[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
 struct TcpaClientTable {
@@ -451,7 +451,7 @@ struct TcpaClientTable {
     log_area_start_address: U64,
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", any(test, not(feature = "native-only"))))]
 #[repr(C)]
 #[derive(FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
 struct Tpm2Prefix {
@@ -462,7 +462,7 @@ struct Tpm2Prefix {
     start_method: U32,
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", any(test, not(feature = "native-only"))))]
 #[repr(C)]
 #[derive(FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
 struct Tpm2WithLogArea {
@@ -663,7 +663,7 @@ pub mod fbpt_offsets {
 /// # Safety
 /// `rsdp_addr` and all referenced ACPI/log memory must be identity mapped and
 /// remain valid for the firmware boot-services lifetime.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(feature = "native-only")))]
 pub unsafe fn find_tcpa_event_log(rsdp_addr: u64) -> Option<&'static [u8]> {
     let (address, length) = unsafe { find_table(rsdp_addr, b"TCPA") }?;
     if length < size_of::<TcpaClientTable>() {
@@ -692,7 +692,7 @@ pub unsafe fn find_tcpa_event_log(rsdp_addr: u64) -> Option<&'static [u8]> {
 }
 
 /// The TPM interface the ACPI TPM2 table describes.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", any(test, not(feature = "native-only"))))]
 pub struct Tpm2Table {
     pub start_method: u32,
     pub control_area: u64,
@@ -704,7 +704,7 @@ pub struct Tpm2Table {
 /// The RSDP, root table, and referenced SDT headers must be readable and
 /// identity mapped. The root table and TPM2 table must be readable for their
 /// advertised lengths.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", any(test, not(feature = "native-only"))))]
 pub unsafe fn find_tpm2_table(rsdp_addr: u64) -> Option<Tpm2Table> {
     let (address, length) = unsafe { find_table(rsdp_addr, b"TPM2") }?;
     if length < size_of::<Tpm2Prefix>() {
@@ -732,7 +732,7 @@ pub unsafe fn find_tpm2_table(rsdp_addr: u64) -> Option<Tpm2Table> {
 /// identity mapped. The root table must be readable for its advertised
 /// length, and the TPM2 table must be exclusively accessible and writable
 /// for its advertised length while this function runs.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(feature = "native-only")))]
 pub unsafe fn take_tpm2_log_area(rsdp_addr: u64, size: usize) -> Option<&'static mut [u8]> {
     use crabefi::efi::allocator::{AllocateType, MemoryType, allocate_pages};
 
@@ -772,7 +772,7 @@ pub unsafe fn take_tpm2_log_area(rsdp_addr: u64, size: usize) -> Option<&'static
     Some(area)
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", any(test, not(feature = "native-only"))))]
 fn set_tpm2_log_area(table: &mut [u8], length: u32, address: u64) -> Option<()> {
     let (fields, tail) = Tpm2WithLogArea::mut_from_prefix(table).ok()?;
     fields.log_area_minimum_length.set(length);
@@ -788,7 +788,7 @@ fn set_tpm2_log_area(table: &mut [u8], length: u32, address: u64) -> Option<()> 
     Some(())
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(feature = "native-only")))]
 fn tcpa_log_used_length(log: &[u8]) -> Option<usize> {
     const HEADER_SIZE: usize = 4 + 4 + 20 + 4;
     let mut offset = 0usize;
