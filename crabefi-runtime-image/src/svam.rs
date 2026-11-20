@@ -157,13 +157,14 @@ fn validate_descriptor_stream(
             return Err(efi::Status::INVALID_PARAMETER);
         }
         let current = mapping(descriptor)?;
+        let physical_end = current
+            .physical_end()
+            .ok_or(efi::Status::INVALID_PARAMETER)?;
         (0..index).try_for_each(|previous_index| {
             let previous = mapping(read_descriptor(map, stride, previous_index)?)?;
             if overlaps(
                 current.physical,
-                current
-                    .physical_end()
-                    .ok_or(efi::Status::INVALID_PARAMETER)?,
+                physical_end,
                 previous.physical,
                 previous
                     .physical_end()
@@ -647,6 +648,86 @@ fn canonical_virtual(address: u64) -> bool {
             high == 0
         } else {
             high == (u64::MAX >> (bit + 1))
+        }
+    }
+}
+
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    #[kani::proof]
+    fn svam_overlap_agrees_with_intersection() {
+        let (a, b, c, d): (u64, u64, u64, u64) = kani::any();
+        kani::assume(a < b && c < d);
+        assert_eq!(overlaps(a, b, c, d), a.max(c) < b.min(d));
+    }
+
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn svam_validated_pair_has_disjoint_extents() {
+        let descriptor = || efi::MemoryDescriptor {
+            r#type: efi::RUNTIME_SERVICES_DATA,
+            physical_start: kani::any(),
+            virtual_start: kani::any(),
+            number_of_pages: kani::any(),
+            attribute: efi::MEMORY_RUNTIME,
+        };
+        let pair = [descriptor(), descriptor()];
+        let stride = size_of::<efi::MemoryDescriptor>();
+        if validate_descriptor_stream(pair.as_ptr().cast(), stride, 1).is_ok() {
+            let end = u128::from(pair[0].physical_start)
+                + u128::from(pair[0].number_of_pages) * u128::from(PAGE_SIZE);
+            assert!(end <= u128::from(u64::MAX));
+        }
+        let accepted = validate_descriptor_stream(pair.as_ptr().cast(), stride, 2).is_ok();
+        kani::cover!(accepted && pair[0].virtual_start != 0 && pair[1].virtual_start != 0);
+        if accepted {
+            for (a, b) in [
+                (pair[0].physical_start, pair[1].physical_start),
+                (pair[0].virtual_start, pair[1].virtual_start),
+            ] {
+                if a == 0 || b == 0 {
+                    continue;
+                }
+                let a_end =
+                    u128::from(a) + u128::from(pair[0].number_of_pages) * u128::from(PAGE_SIZE);
+                let b_end =
+                    u128::from(b) + u128::from(pair[1].number_of_pages) * u128::from(PAGE_SIZE);
+                assert!(a_end <= u128::from(u64::MAX) && b_end <= u128::from(u64::MAX));
+                assert!(a_end <= u128::from(b) || b_end <= u128::from(a));
+            }
+        }
+    }
+
+    #[kani::proof]
+    fn svam_covered_translation_preserves_every_byte() {
+        let m = Mapping {
+            physical: kani::any(),
+            virtual_address: kani::any(),
+            byte_len: kani::any(),
+            memory_type: kani::any(),
+            attributes: kani::any(),
+        };
+        let (start, end, byte, kind): (u64, u64, u64, u32) = kani::any();
+        kani::assume(start <= byte && byte < end);
+        let limit = u128::from(m.physical) + u128::from(m.byte_len);
+        let accepted = covers_runtime(&m, kind, start, end);
+        assert_eq!(
+            accepted,
+            m.memory_type == kind
+                && m.attributes & efi::MEMORY_RUNTIME != 0
+                && m.virtual_address != 0
+                && m.physical <= start
+                && limit <= u128::from(u64::MAX)
+                && u128::from(end) <= limit
+        );
+        // The descriptor validator checks the exclusive virtual end before resolution.
+        if accepted && m.virtual_end().is_some() {
+            let base = virtual_base(start, &m).unwrap();
+            let translated = virtual_base(byte, &m).unwrap();
+            assert_eq!(translated - base, byte - start);
+            assert!(translated >= m.virtual_address && translated < m.virtual_end().unwrap());
         }
     }
 }

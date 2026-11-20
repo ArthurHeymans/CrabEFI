@@ -862,17 +862,55 @@ fn actual_loader_seal_svam_and_runtime_services_with_and_without_retained_stagin
         for descriptor in &mut descriptors[..count] {
             descriptor.virtual_start = ram.2 as u64 + (descriptor.physical_start - ram.0 as u64);
         }
+        let set_map = |map: &mut [allocator::MemoryDescriptor]| unsafe {
+            ((*runtime).set_virtual_address_map)(
+                core::mem::size_of_val(map),
+                core::mem::size_of::<allocator::MemoryDescriptor>(),
+                efi::MEMORY_DESCRIPTOR_VERSION,
+                map.as_mut_ptr().cast(),
+            )
+        };
+        // Unlike the guest identity-map smoke test, a premature pointer patch
+        // here is observable: every accepted mapping moves to the second alias.
+        // EFI_RUNTIME_SERVICES is a fully initialized header followed by pointers.
+        let table_snapshot = || unsafe {
+            std::slice::from_raw_parts(runtime.cast::<u8>(), size_of::<efi::RuntimeServices>())
+                .to_vec()
+        };
+        let original = table_snapshot();
+        let mut incomplete = descriptors[..count].to_vec();
+        for descriptor in &mut incomplete {
+            if descriptor.memory_type == efi::RUNTIME_SERVICES_DATA {
+                descriptor.virtual_start = 0;
+            }
+        }
+        assert_eq!(set_map(&mut incomplete), efi::Status::NOT_FOUND);
         assert_eq!(
-            unsafe {
-                ((*runtime).set_virtual_address_map)(
-                    count * core::mem::size_of::<allocator::MemoryDescriptor>(),
-                    core::mem::size_of::<allocator::MemoryDescriptor>(),
-                    efi::MEMORY_DESCRIPTOR_VERSION,
-                    descriptors.as_mut_ptr().cast(),
-                )
-            },
-            efi::Status::SUCCESS
+            table_snapshot(),
+            original,
+            "failed transition patched EFI table"
         );
+        if retained {
+            // Keep image sections valid and remove only retained RAM. This
+            // fails after section resolution, while the lease is still held.
+            let mut missing_retained = descriptors[..count].to_vec();
+            let mapping = missing_retained
+                .iter_mut()
+                .find(|d| d.physical_start == deferred_buffer.base)
+                .unwrap();
+            let pages = deferred_buffer.size as u64 / 4096;
+            assert!(mapping.number_of_pages >= pages);
+            if mapping.number_of_pages == pages {
+                mapping.virtual_start = 0;
+            } else {
+                mapping.physical_start += pages * 4096;
+                mapping.virtual_start += pages * 4096;
+                mapping.number_of_pages -= pages;
+            }
+            assert_eq!(set_map(&mut missing_retained), efi::Status::NOT_FOUND);
+            assert_eq!(table_snapshot(), original);
+        }
+        assert_eq!(set_map(&mut descriptors[..count]), efi::Status::SUCCESS);
         // The table itself and its function pointers now reside in the second alias.
         runtime = (ram.2 as usize + (client.runtime_services() as usize - ram.0 as usize))
             as *mut efi::RuntimeServices;

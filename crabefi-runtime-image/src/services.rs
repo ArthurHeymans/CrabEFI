@@ -3097,6 +3097,87 @@ mod tests {
     }
 
     #[test]
+    fn enrolled_kek_cannot_delete_pk_or_advance_its_metadata() {
+        macro_rules! guest_fixture {
+            ($file:literal) => {
+                include_bytes!(concat!(
+                    "../../test-apps/secure-boot-auth-test/fixtures/esp/sbtest/",
+                    $file
+                ))
+            };
+        }
+        let kek = guest_fixture!("kek.esl");
+        let delete = guest_fixture!("b-pk-delete-signed-by-kek.auth");
+        // Same envelope and timestamp in both runs. Only the signer's role
+        // changes: acceptance as PK rules out rejection due to malformed CMS.
+        for (pk, expected) in [
+            (
+                guest_fixture!("pk.esl").as_slice(),
+                efi::Status::SECURITY_VIOLATION,
+            ),
+            (kek.as_slice(), efi::Status::SUCCESS),
+        ] {
+            let mut fixture = Fixture::retained();
+            for (var, bytes) in [
+                (SecureBootVariable::Kek, kek.as_slice()),
+                (SecureBootVariable::PK, pk),
+            ] {
+                let mut envelope = unsigned_envelope(2024);
+                envelope.extend_from_slice(bytes);
+                assert_eq!(
+                    fixture.apply(Phase::BootActive, var, AUTH_ATTRIBUTES, &envelope),
+                    efi::Status::SUCCESS
+                );
+            }
+            let snapshot = |f: &Fixture| {
+                let keys = [SecureBootVariable::PK, SecureBootVariable::Kek].map(|v| {
+                    let slot = f.store.find(v.guid(), v.name(), false).unwrap();
+                    (
+                        slot.attributes,
+                        slot.timestamp,
+                        f.store.auth_timestamp(v),
+                        f.store.data(slot).unwrap().to_vec(),
+                    )
+                });
+                (
+                    keys,
+                    f.store.setup_mode(),
+                    f.store.secure_boot_enabled(),
+                    f.store.remaining_storage(),
+                    f.buffer.clone(),
+                )
+            };
+            let before = snapshot(&fixture);
+            assert_eq!(
+                fixture.apply(
+                    Phase::Virtual,
+                    SecureBootVariable::PK,
+                    AUTH_ATTRIBUTES,
+                    delete
+                ),
+                expected
+            );
+            if expected == efi::Status::SECURITY_VIOLATION {
+                assert_eq!(
+                    snapshot(&fixture),
+                    before,
+                    "rejection changed keys, replay floor, mode, or retained journal"
+                );
+            } else {
+                assert!(fixture.store.setup_mode());
+                let pk = SecureBootVariable::PK;
+                let kek_var = SecureBootVariable::Kek;
+                assert!(fixture.store.find(pk.guid(), pk.name(), false).is_none());
+                let slot = fixture
+                    .store
+                    .find(kek_var.guid(), kek_var.name(), false)
+                    .unwrap();
+                assert_eq!(fixture.store.data(slot).unwrap(), kek.as_slice());
+            }
+        }
+    }
+
+    #[test]
     fn real_service_path_covers_all_secure_databases() {
         let mut fixture = Fixture::retained();
         fixture.enroll();
