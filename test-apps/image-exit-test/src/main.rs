@@ -39,7 +39,7 @@ fn fail(st: *mut SystemTable, reason: &str) -> Status {
 fn loaded(bs: &BootServices, handle: Handle) -> Result<*mut loaded_image::Protocol, Status> {
     let mut interface = ptr::null_mut();
     let mut guid = loaded_image::PROTOCOL_GUID;
-    let status = (bs.handle_protocol)(handle, &mut guid, &mut interface);
+    let status = unsafe { (bs.handle_protocol)(handle, &mut guid, &mut interface) };
     if status != Status::SUCCESS || interface.is_null() {
         Err(Status::NOT_FOUND)
     } else {
@@ -90,7 +90,9 @@ fn self_path(bs: &BootServices, image: &loaded_image::Protocol) -> Option<PathBu
     let prefix = if file_only {
         let mut device: *mut c_void = ptr::null_mut();
         let mut guid = device_path::PROTOCOL_GUID;
-        if (bs.handle_protocol)(image.device_handle, &mut guid, &mut device) != Status::SUCCESS {
+        if unsafe { (bs.handle_protocol)(image.device_handle, &mut guid, &mut device) }
+            != Status::SUCCESS
+        {
             return None;
         }
         let prefix = unsafe { path_size(device.cast()) }?.checked_sub(4)?;
@@ -114,21 +116,23 @@ fn run_child(handle: Handle, st: *mut SystemTable, depth: u32) -> Result<(), &'s
     let image = loaded(bs, handle).map_err(|_| "parent protocol missing")?;
     let mut path = self_path(bs, unsafe { &*image }).ok_or("self path unavailable")?;
     let mut child = ptr::null_mut();
-    let status = (bs.load_image)(
-        efi::Boolean::FALSE,
-        handle,
-        path.0.as_mut_ptr().cast(),
-        ptr::null_mut(),
-        0,
-        &mut child,
-    );
+    let status = unsafe {
+        (bs.load_image)(
+            efi::Boolean::FALSE,
+            handle,
+            path.0.as_mut_ptr().cast(),
+            ptr::null_mut(),
+            0,
+            &mut child,
+        )
+    };
     if status != Status::SUCCESS || child.is_null() {
         return Err("LoadImage from disk failed");
     }
     let child_protocol = match loaded(bs, child) {
         Ok(protocol) => protocol,
         Err(_) => {
-            (bs.unload_image)(child);
+            unsafe { (bs.unload_image)(child) };
             return Err("child protocol missing before StartImage");
         }
     };
@@ -139,7 +143,7 @@ fn run_child(handle: Handle, st: *mut SystemTable, depth: u32) -> Result<(), &'s
     }
     let mut size = 0usize;
     let mut data = ptr::null_mut();
-    let status = (bs.start_image)(child, &mut size, &mut data);
+    let status = unsafe { (bs.start_image)(child, &mut size, &mut data) };
     let (expected_status, expected_data) = expected(depth);
     let correct = status == expected_status
         && size == size_of_val(expected_data)
@@ -149,7 +153,7 @@ fn run_child(handle: Handle, st: *mut SystemTable, depth: u32) -> Result<(), &'s
     let free_status = if data.is_null() {
         Status::SUCCESS
     } else {
-        (bs.free_pool)(data.cast())
+        unsafe { (bs.free_pool)(data.cast()) }
     };
     if !correct {
         return Err("StartImage status or UTF16 exit data mismatch");
@@ -159,7 +163,7 @@ fn run_child(handle: Handle, st: *mut SystemTable, depth: u32) -> Result<(), &'s
     }
     let mut stale = ptr::null_mut();
     let mut guid = loaded_image::PROTOCOL_GUID;
-    if (bs.handle_protocol)(child, &mut guid, &mut stale) == Status::SUCCESS {
+    if unsafe { (bs.handle_protocol)(child, &mut guid, &mut stale) } == Status::SUCCESS {
         return Err("unloaded child protocol remains accessible");
     }
     Ok(())
@@ -179,7 +183,7 @@ fn expected(depth: u32) -> (Status, &'static [u16]) {
 fn exit_from_helper(handle: Handle, st: *mut SystemTable, depth: u32) -> Status {
     let (status, data) = expected(depth);
     let bs = unsafe { &*(*st).boot_services };
-    (bs.exit)(handle, status, size_of_val(data), data.as_ptr().cast_mut());
+    unsafe { (bs.exit)(handle, status, size_of_val(data), data.as_ptr().cast_mut()) };
     fail(st, "Exit returned to its helper")
 }
 

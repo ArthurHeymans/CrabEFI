@@ -143,10 +143,11 @@ impl ImageTables {
                     | efi::RT_SUPPORTED_QUERY_VARIABLE_INFO,
             },
             memory_attributes: efi::MemoryAttributesTable {
-                version: efi::MEMORY_ATTRIBUTES_TABLE_VERSION,
+                // Keep producing the v1 table: its reserved word is `flags` in v2.
+                version: 1,
                 number_of_entries: 0,
                 descriptor_size: core::mem::size_of::<efi::MemoryDescriptor>() as u32,
-                reserved: 0,
+                flags: 0,
                 entry: [EMPTY_DESCRIPTOR; MAX_RUNTIME_DESCRIPTORS],
             },
             esrt: EsrtTable {

@@ -106,7 +106,8 @@ struct Buffer {
 impl Buffer {
     fn new(len: usize) -> Option<Self> {
         let mut ptr = null_mut();
-        let status = (boot_services().allocate_pool)(efi::LOADER_DATA, len.max(1), &mut ptr);
+        let status =
+            unsafe { (boot_services().allocate_pool)(efi::LOADER_DATA, len.max(1), &mut ptr) };
         (status == Status::SUCCESS).then_some(Self {
             ptr: ptr.cast(),
             len,
@@ -132,7 +133,7 @@ impl Buffer {
 
 impl Drop for Buffer {
     fn drop(&mut self) {
-        (boot_services().free_pool)(self.ptr.cast());
+        unsafe { (boot_services().free_pool)(self.ptr.cast()) };
     }
 }
 
@@ -245,13 +246,15 @@ impl Variable {
         let mut size = 0;
         let mut name = self.name;
         let mut guid = self.guid;
-        let status = (runtime_services().get_variable)(
-            name.as_mut_ptr(),
-            &mut guid,
-            &mut attributes,
-            &mut size,
-            null_mut(),
-        );
+        let status = unsafe {
+            (runtime_services().get_variable)(
+                name.as_mut_ptr(),
+                &mut guid,
+                &mut attributes,
+                &mut size,
+                null_mut(),
+            )
+        };
         if status != Status::BUFFER_TOO_SMALL {
             return Err(if status == Status::SUCCESS {
                 Status::BAD_BUFFER_SIZE
@@ -260,13 +263,15 @@ impl Variable {
             });
         }
         let buffer = Buffer::new(size).ok_or(Status::OUT_OF_RESOURCES)?;
-        let status = (runtime_services().get_variable)(
-            name.as_mut_ptr(),
-            &mut guid,
-            &mut attributes,
-            &mut size,
-            buffer.ptr.cast(),
-        );
+        let status = unsafe {
+            (runtime_services().get_variable)(
+                name.as_mut_ptr(),
+                &mut guid,
+                &mut attributes,
+                &mut size,
+                buffer.ptr.cast(),
+            )
+        };
         if status != Status::SUCCESS || size != buffer.len {
             return Err(status);
         }
@@ -276,13 +281,15 @@ impl Variable {
     fn set(&self, attributes: u32, data: &[u8]) -> Status {
         let mut name = self.name;
         let mut guid = self.guid;
-        (runtime_services().set_variable)(
-            name.as_mut_ptr(),
-            &mut guid,
-            attributes,
-            data.len(),
-            data.as_ptr() as *mut c_void,
-        )
+        unsafe {
+            (runtime_services().set_variable)(
+                name.as_mut_ptr(),
+                &mut guid,
+                attributes,
+                data.len(),
+                data.as_ptr() as *mut c_void,
+            )
+        }
     }
 
     fn byte(&self) -> Option<u8> {
@@ -619,21 +626,23 @@ fn load_image(file: &str) -> Option<(Status, Handle)> {
     let image = read_file(file)?;
     let mut handle = HANDLE_SENTINEL as Handle;
     // SAFETY: valid image buffer and handle output.
-    let status = (boot_services().load_image)(
-        efi::Boolean::FALSE,
-        unsafe { IMAGE_HANDLE },
-        null_mut(),
-        image.ptr.cast(),
-        image.len,
-        &mut handle,
-    );
+    let status = unsafe {
+        (boot_services().load_image)(
+            efi::Boolean::FALSE,
+            IMAGE_HANDLE,
+            null_mut(),
+            image.ptr.cast(),
+            image.len,
+            &mut handle,
+        )
+    };
     Some((status, handle))
 }
 
 fn start_image(handle: Handle) -> Status {
     let mut exit_size = 0;
     let mut exit_data = null_mut();
-    (boot_services().start_image)(handle, &mut exit_size, &mut exit_data)
+    unsafe { (boot_services().start_image)(handle, &mut exit_size, &mut exit_data) }
 }
 
 fn usable(handle: Handle) -> bool {
@@ -670,7 +679,7 @@ fn step_load(results: &mut Results, id: &str, args: &[&str]) {
         ("verify", None) => {
             // Verification only: never start third-party images such as shim.
             if status == Status::SUCCESS {
-                (boot_services().unload_image)(handle);
+                unsafe { (boot_services().unload_image)(handle) };
             }
             results.check(
                 id,
@@ -680,13 +689,13 @@ fn step_load(results: &mut Results, id: &str, args: &[&str]) {
         }
         ("deny", None) => {
             if status == Status::SUCCESS {
-                (boot_services().unload_image)(handle);
+                unsafe { (boot_services().unload_image)(handle) };
                 return results.check(id, false, format_args!("LoadImage SUCCESS"));
             }
             // SECURITY_VIOLATION may come with a loaded, never-startable image.
             let started = if status == Status::SECURITY_VIOLATION && usable(handle) {
                 let exit = start_image(handle);
-                (boot_services().unload_image)(handle);
+                unsafe { (boot_services().unload_image)(handle) };
                 Some(exit)
             } else {
                 None
@@ -715,7 +724,7 @@ fn step_load_status(results: &mut Results, id: &str, args: &[&str]) {
         handle.is_null()
     } else if status == Status::SECURITY_VIOLATION && usable(handle) {
         let exit = start_image(handle);
-        (boot_services().unload_image)(handle);
+        unsafe { (boot_services().unload_image)(handle) };
         exit == Status::SECURITY_VIOLATION
     } else {
         false
@@ -782,7 +791,7 @@ fn finish_stage(results: &Results, stage: usize) {
 }
 
 fn reset(reset_type: efi::ResetType) -> ! {
-    (runtime_services().reset_system)(reset_type, Status::SUCCESS, 0, null_mut());
+    unsafe { (runtime_services().reset_system)(reset_type, Status::SUCCESS, 0, null_mut()) };
     loop {
         core::hint::spin_loop();
     }
