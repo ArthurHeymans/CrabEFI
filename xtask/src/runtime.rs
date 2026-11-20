@@ -188,6 +188,10 @@ fn runtime_rustflags(arch: Arch, map_path: &Path) -> OsString {
         arguments.extend([OsString::from("-Z"), OsString::from("fixed-x18=yes")]);
     }
     arguments.extend([
+        // A jump table is an indirect branch the stack audit cannot follow.
+        // Without them, every indirect transfer is a genuine call.
+        OsString::from("-C"),
+        OsString::from("jump-tables=no"),
         OsString::from("-C"),
         OsString::from("linker=rust-lld"),
         OsString::from("-C"),
@@ -1223,6 +1227,7 @@ mod tests {
         let expected = format!("link-arg=-Map={}", map_path.display());
         assert!(arguments.contains(&expected.as_str()));
         assert!(arguments.contains(&"link-arg=--no-relax"));
+        assert!(arguments.contains(&"jump-tables=no"));
         assert!(!arguments.iter().any(|argument| argument == &"runtime"));
 
         fs::remove_dir_all(directory).unwrap();

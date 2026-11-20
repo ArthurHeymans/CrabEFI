@@ -25,7 +25,22 @@ struct Node {
     frame: Option<u64>,
     targets: BTreeSet<u64>,
     unknown: BTreeSet<String>,
+    /// Calls into another image whose stack use this image cannot bound.
+    external: BTreeSet<String>,
+    /// SMC, HVC and ECALL instructions, accepted only in [`FIRMWARE_CALLS`].
+    privileged: BTreeSet<String>,
 }
+
+/// The audited functions allowed to call PSCI (SMC/HVC) or SBI (ECALL). The
+/// handler runs at a higher privilege level on its own stack, so the call is
+/// a leaf for this image; anywhere else it is an unknown transfer.
+const FIRMWARE_CALLS: [&str; 2] = ["4arch7aarch645reset", "4arch7riscv645reset"];
+
+/// The one function allowed to call out of the image: the BootActive bridge
+/// into boot firmware. Seal zeroes its address, so the call is unreachable
+/// once the OS owns the machine. It must remain a distinct symbol; inlined
+/// into a caller, its call fails the audit as an ordinary indirect transfer.
+const BOOT_BRIDGE: &str = "16call_boot_bridge";
 
 fn decoder(arch: Arch) -> Result<Capstone> {
     let cs = match arch {
@@ -100,21 +115,19 @@ fn decode(cs: &Capstone, arch: Arch, start: u64, bytes: &[u8], frame: Option<u64
         if ret {
             continue;
         }
+        // PSCI (SMC/HVC) and SBI (ECALL) run at a higher privilege level and
+        // return to the next instruction. Whether that level has its own
+        // stack is a platform property, so only audited stubs may do this.
+        if matches!(op, "smc" | "hvc" | "ecall") {
+            node.privileged.insert(format!("{op} at {pc:#x}"));
+            continue;
+        }
         if has(group::CS_GRP_INT)
             || has(group::CS_GRP_IRET)
             || has(group::CS_GRP_RET)
             || matches!(
                 op,
-                "eret"
-                    | "ecall"
-                    | "ud2"
-                    | "brk"
-                    | "smc"
-                    | "hvc"
-                    | "sret"
-                    | "mret"
-                    | "ebreak"
-                    | "c.ebreak"
+                "eret" | "ud2" | "brk" | "sret" | "mret" | "ebreak" | "c.ebreak"
             )
         {
             node.unknown
@@ -190,6 +203,7 @@ struct Usage {
     modeled: u64,
     bound: Option<u64>,
     unknown: BTreeSet<String>,
+    external: BTreeSet<String>,
 }
 
 fn usage(
@@ -203,8 +217,7 @@ fn usage(
     }
     let unknown = |reason: &str| Usage {
         unknown: [format!("{reason} at {addr:#x}")].into(),
-        modeled: 0,
-        bound: None,
+        ..Usage::default()
     };
     let Some(n) = nodes.get(&addr) else {
         return unknown("unknown target");
@@ -213,6 +226,7 @@ fn usage(
         return unknown("cycle");
     }
     let mut reasons = n.unknown.clone();
+    let mut external = n.external.clone();
     if n.frame.is_none() {
         reasons.insert(format!("missing frame (assembly or dynamic) at {addr:#x}"));
     }
@@ -220,6 +234,7 @@ fn usage(
     for &target in &n.targets {
         let u = usage(target, nodes, active, cache);
         reasons.extend(u.unknown);
+        external.extend(u.external);
         largest = largest.max(u.modeled);
     }
     active.remove(&addr);
@@ -228,6 +243,7 @@ fn usage(
         modeled,
         bound: reasons.is_empty().then_some(modeled),
         unknown: reasons,
+        external,
     };
     // A cycle reason is path-dependent; avoid caching partial cycle traversal.
     if !u.unknown.iter().any(|s| s.starts_with("cycle")) {
@@ -278,12 +294,44 @@ pub(super) fn audit(
             .section_by_index(section)?
             .data_range(addr, sym.size())?
             .context("function outside section")?;
-        let n = decode(&cs, arch, addr, bytes, frames.get(&addr).copied())?;
+        let mut n = decode(&cs, arch, addr, bytes, frames.get(&addr).copied())?;
+        let name = sym.name()?;
+        let privileged = core::mem::take(&mut n.privileged);
+        if FIRMWARE_CALLS.iter().any(|stub| name.ends_with(stub)) {
+            n.external.extend(
+                privileged
+                    .into_iter()
+                    .map(|call| format!("firmware {call}")),
+            );
+        } else {
+            n.unknown.extend(
+                privileged
+                    .into_iter()
+                    .map(|call| format!("unaudited privileged call {call}")),
+            );
+        }
+        if name.ends_with(BOOT_BRIDGE) {
+            let calls: Vec<_> = n
+                .unknown
+                .iter()
+                .filter(|reason| reason.starts_with("indirect transfer"))
+                .cloned()
+                .collect();
+            anyhow::ensure!(
+                calls.len() == 1 && n.unknown.len() == 1,
+                "boot bridge must make exactly one indirect call: {:?}",
+                n.unknown
+            );
+            n.unknown.clear();
+            n.external
+                .extend(calls.into_iter().map(|c| format!("boot bridge {c}")));
+        }
         // Function aliases can share an address. Never drop a possible edge.
         let entry: &mut Node = nodes.entry(addr).or_default();
         entry.frame = n.frame;
         entry.targets.extend(n.targets);
         entry.unknown.extend(n.unknown);
+        entry.external.extend(n.external);
     }
     // LLVM may merge EFI entries. Resolve all 14 slots by relocation, rather
     // than guessing which Rust names survived LTO.
@@ -322,28 +370,27 @@ pub(super) fn audit(
                 .target_offset,
         );
         let u = usage(addr, &nodes, &mut BTreeSet::new(), &mut cache);
-        // These two entries reach the boot bridge, bounded certificate recursion,
-        // or platform reset. Do not invent a bound for them. Every other entry
-        // must retain a complete static bound in every release profile.
-        if u.bound.is_none() && !matches!(*name, "SetVariable" | "ResetSystem") {
+        // Every entry must retain a complete static bound in every release
+        // profile. Only the BootActive bridge is excluded, and reported.
+        if u.bound.is_none() {
             incomplete.push(name);
         }
         if u.modeled > budget {
             over.push(name);
         }
-        report.push(json!({"entry":name,"address":addr,"bound_bytes":u.bound,"modeled_bytes":u.modeled,"unknown":u.unknown}));
+        report.push(json!({"entry":name,"address":addr,"bound_bytes":u.bound,"modeled_bytes":u.modeled,"unknown":u.unknown,"excluded_external_calls":u.external}));
     }
     let complete = report
         .iter()
         .filter(|r| !r["bound_bytes"].is_null())
         .count();
     println!(
-        "EFI stack audit: {complete}/{} entries have complete static frame bounds (see stack-chains.json)",
+        "EFI stack audit: {complete}/{} entries have a sealed-phase static frame bound (see stack-chains.json)",
         SERVICES.len()
     );
     write_json(
         output.join("stack-chains.json"),
-        &json!({"model":"LLVM static frames; tail edges charged as calls. Excludes caller-owned stack, interrupts and asynchronous reentry.", "budget_bytes":budget,"entries": report}),
+        &json!({"model":"Sealed-phase, image-local bound from LLVM static frames; tail edges charged as calls. Excludes caller-owned stack, interrupts and asynchronous reentry. Assumes the PSCI/SBI handlers called from the audited reset stubs run on their own stack, and excludes the BootActive boot bridge, which runs boot firmware on the caller stack and is disabled at seal. Each entry lists the calls it excludes.", "budget_bytes":budget,"entries": report}),
     )?;
     anyhow::ensure!(over.is_empty(), "EFI stack-chain budget exceeded: {over:?}");
     anyhow::ensure!(
@@ -408,6 +455,44 @@ mod tests {
                 u.unknown
             );
         }
+    }
+
+    #[test]
+    fn higher_privilege_calls_are_recorded_but_traps_are_unknown() {
+        let cs = decoder(Arch::Aarch64).unwrap();
+        // smc #0; ret
+        let n = decode(
+            &cs,
+            Arch::Aarch64,
+            0,
+            &[3, 0, 0, 0xd4, 0xc0, 3, 0x5f, 0xd6],
+            Some(16),
+        )
+        .unwrap();
+        assert!(n.unknown.is_empty() && n.targets.is_empty());
+        assert_eq!(n.privileged, ["smc at 0x0".to_string()].into());
+        // brk #0; ret
+        let n = decode(
+            &cs,
+            Arch::Aarch64,
+            0,
+            &[0, 0, 0x20, 0xd4, 0xc0, 3, 0x5f, 0xd6],
+            Some(16),
+        )
+        .unwrap();
+        assert!(n.unknown.iter().any(|s| s.starts_with("exception")));
+        let cs = decoder(Arch::Riscv64).unwrap();
+        // ecall; ret
+        let n = decode(
+            &cs,
+            Arch::Riscv64,
+            0,
+            &[0x73, 0, 0, 0, 0x82, 0x80],
+            Some(16),
+        )
+        .unwrap();
+        assert!(n.unknown.is_empty() && n.targets.is_empty());
+        assert_eq!(n.privileged, ["ecall at 0x0".to_string()].into());
     }
 
     #[test]
