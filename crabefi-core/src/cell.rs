@@ -15,8 +15,10 @@
 //! fails the first test that reaches the call instead of only the rare
 //! reentrant path that would hit the conflicting borrow.
 //!
-//! The check covers `Local` borrows at those two boundaries only: a wrapper
-//! that makes several foreign calls is checked once, on entry.
+//! The check covers `Local` borrows at those boundaries only: a wrapper that
+//! makes several foreign calls checks once, on entry, so code that takes
+//! borrows between the calls, like the `LoadImage` file reader, must check
+//! before each call.
 //!
 //! [`StaticMut`] covers the remaining case: firmware-lifetime singletons
 //! (EFI protocol tables, the Boot Services table) that are shared with EFI

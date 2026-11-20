@@ -56,6 +56,7 @@ pub(crate) fn image_callback_depth() -> usize {
 /// # Returns
 /// The callback's return value. A nested StartImage establishes its own boundary
 /// at this depth and can still Exit normally.
+#[track_caller]
 pub(crate) fn with_image_callback<R>(callback: impl FnOnce() -> R) -> R {
     struct RestoreDepth(usize);
     impl Drop for RestoreDepth {
