@@ -8,7 +8,6 @@
 
 #![no_std]
 #![no_main]
-#![allow(unsafe_op_in_unsafe_fn)]
 
 extern crate alloc;
 
@@ -244,6 +243,7 @@ impl crabefi::PlatformHooks for CorebootHooks {
     fn on_exit_boot_services(&self) {
         // Invalidate the coreboot framebuffer record to prevent a race between
         // Linux simplefb (coreboot) and efifb (EFI GOP).
+        // SAFETY: only this ExitBootServices hook modifies the saved record.
         unsafe {
             framebuffer::invalidate_framebuffer_record();
         }
@@ -909,6 +909,7 @@ fn extract_coreboot_table_from_fdt(fdt_ptr: u64) -> (u64, u32) {
         return (0, fdt_size);
     }
 
+    // SAFETY: OpenSBI supplies a readable FDT spanning its header's total size.
     let fdt_blob = unsafe { core::slice::from_raw_parts(fdt_ptr as *const u8, fdt_size as usize) };
 
     let coreboot_table_ptr = if let Ok(dt) = fdt::Fdt::new(fdt_blob) {
@@ -944,6 +945,7 @@ fn extract_timer_freq_from_fdt(fdt_ptr: u64, fdt_size: u32) {
         return;
     }
 
+    // SAFETY: OpenSBI supplies a readable FDT spanning its header's total size.
     let fdt_blob = unsafe { core::slice::from_raw_parts(fdt_ptr as *const u8, fdt_size as usize) };
 
     if let Ok(dt) = fdt::Fdt::new(fdt_blob)
@@ -990,6 +992,10 @@ fn riscv_fdt_only_boot(fdt_ptr: u64, fdt_size: u32) -> ! {
         fdt_size
     );
 
+    if fdt_ptr == 0 || fdt_size < 40 {
+        panic!("FDT-only boot requires a non-null FDT with a complete header");
+    }
+
     // Initialize timing — use 10 MHz default first, then override with the
     // actual frequency from the FDT /cpus/timebase-frequency property.
     crabefi::time::init(None);
@@ -1011,6 +1017,8 @@ fn riscv_fdt_only_boot(fdt_ptr: u64, fdt_size: u32) -> ! {
     let reset = CorebootReset;
     let hooks = CorebootHooks;
 
+    // SAFETY: fdt_ptr is non-null and OpenSBI keeps the header's advertised
+    // fdt_size bytes mapped and readable through handoff.
     let fdt_slice = unsafe { core::slice::from_raw_parts(fdt_ptr as *const u8, fdt_size as usize) };
 
     let config = crabefi::PlatformConfig {
@@ -1059,6 +1067,7 @@ fn build_memory_map_from_fdt(
         return count;
     }
 
+    // SAFETY: OpenSBI supplies a readable FDT spanning its header's total size.
     let fdt_blob = unsafe { core::slice::from_raw_parts(fdt_ptr as *const u8, fdt_size as usize) };
     if let Ok(dt) = fdt::Fdt::new(fdt_blob) {
         // Find /memory nodes
@@ -1350,8 +1359,10 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         let fdt_ptr = RISCV_FDT_PTR.load(Ordering::Relaxed);
         let fdt_size = RISCV_FDT_SIZE.load(Ordering::Relaxed);
         if fdt_ptr != 0 && fdt_size >= 40 {
+            // SAFETY: these are the saved OpenSBI FDT and its header length.
             Some(unsafe { core::slice::from_raw_parts(fdt_ptr as *const u8, fdt_size as usize) })
         } else {
+            // SAFETY: coreboot supplies the mapped FDT address and length.
             cb_info.devicetree.map(|(addr, size)| unsafe {
                 core::slice::from_raw_parts(addr as *const u8, size as usize)
             })
@@ -1589,6 +1600,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
                         }
                         tpm.format = crabefi::TpmLogFormat::Sha1Only;
                         if tpm.existing_log.is_none() {
+                            // SAFETY: coreboot maps the TCPA table and its log for the boot.
                             tpm.existing_log = unsafe { acpi::find_tcpa_event_log(rsdp) };
                         }
                         tpm.tpm1_tis_base = Some(0xfed4_0000);
