@@ -383,3 +383,26 @@ pub fn load(
     );
     Ok(())
 }
+
+/// Require exclusive MM variable authority before booting.
+pub(crate) fn load_or_halt(cb_info: &crate::tables::CorebootInfo) {
+    // Before any flash access: from here on the flash may only be writable from SMM.
+    // Fail closed: without the MM variable authority (or with a corrupt store)
+    // Secure Boot keys are missing or unprotected, so nothing may be booted.
+    // coreboot's SMMSTORE handler writes the same flash region raw, so it
+    // would let the OS change variables around payload MM's verification.
+    if let Err(error) = if cb_info.smmstorev2_offered {
+        Err("coreboot also offers SMMSTORE, which writes the variable store around payload MM")
+    } else {
+        load(
+            &cb_info.payload_mm,
+            cb_info.boot_media,
+            cb_info.spi_flash.as_ref(),
+        )
+    } {
+        log::error!("payload MM unavailable ({error}): refusing to boot");
+        loop {
+            crabefi::arch::halt();
+        }
+    }
+}
