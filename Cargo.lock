@@ -109,11 +109,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "crabefi-bounds"
+version = "0.1.0"
+
+[[package]]
 name = "crabefi-core"
 version = "0.1.0"
 dependencies = [
  "atomic_refcell",
  "bitflags",
+ "crabefi-bounds",
  "crabefi-efi-types",
  "crabefi-pkcs7",
  "crabefi-runtime-abi",
