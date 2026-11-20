@@ -19,6 +19,10 @@ pub enum BzImageError {
     UnsupportedVersion,
     /// Kernel is not relocatable
     NotRelocatable,
+    /// Kernel does not advertise the required 64-bit entry point
+    Missing64BitEntry,
+    /// The advertised entry point is outside the loaded image
+    EntryOutsideImage,
     /// Failed to read from disk
     ReadError,
     /// Kernel too large to fit in memory
@@ -117,6 +121,12 @@ impl BzImage {
             return Err(BzImageError::NotRelocatable);
         }
 
+        // xloadflags is defined starting with boot protocol 2.12.
+        if header.version < 0x020c || !header.has_64bit_entry() {
+            log::error!("bzImage does not advertise a 64-bit entry point");
+            return Err(BzImageError::Missing64BitEntry);
+        }
+
         let setup_size = header.setup_size();
         // setup_sects is file-controlled: a claimed setup that covers (or
         // exceeds) the whole file would otherwise saturate to a zero-byte
@@ -130,6 +140,10 @@ impl BzImage {
             return Err(BzImageError::FileTooSmall);
         };
 
+        if header.entry64_offset() >= u64::from(kernel_size) {
+            return Err(BzImageError::EntryOutsideImage);
+        }
+
         // Copy packed fields to local variables
         let version = header.version;
         let relocatable = header.is_relocatable();
@@ -140,13 +154,6 @@ impl BzImage {
             kernel_size,
             relocatable
         );
-
-        if header.supports_efi_handover() {
-            log::info!(
-                "  EFI handover supported at offset {:#x}",
-                header.efi_handover_offset_64()
-            );
-        }
 
         Ok(Self {
             header,
@@ -171,11 +178,11 @@ impl BzImage {
     ///
     /// * `kernel_addr` - Address where kernel was loaded
     pub fn efi_handover_entry(&self, kernel_addr: u64) -> Option<u64> {
-        if self.header.supports_efi_handover() {
-            Some(kernel_addr + self.header.efi_handover_offset_64() as u64)
-        } else {
-            None
+        if !self.header.supports_efi_handover() {
+            return None;
         }
+        let offset = u64::from(self.header.handover_offset) + self.header.entry64_offset();
+        (offset < u64::from(self.kernel_size)).then(|| kernel_addr + offset)
     }
 }
 
@@ -300,9 +307,26 @@ mod tests {
             .copy_from_slice(&SetupHeader::HEADER_MAGIC);
         data[field(core::mem::offset_of!(SetupHeader, version))
             ..field(core::mem::offset_of!(SetupHeader, version)) + 2]
-            .copy_from_slice(&SetupHeader::MIN_VERSION.to_le_bytes());
+            .copy_from_slice(&0x020cu16.to_le_bytes());
+        let flags = field(core::mem::offset_of!(SetupHeader, xloadflags));
+        data[flags..flags + 2].copy_from_slice(&SetupHeader::XLF_KERNEL_64.to_le_bytes());
         data[field(core::mem::offset_of!(SetupHeader, relocatable_kernel))] = 1;
         data
+    }
+
+    #[test]
+    fn rejects_missing_or_truncated_direct_entry() {
+        let mut data = header_bytes(1);
+        let flags = HEADER_OFFSET + core::mem::offset_of!(SetupHeader, xloadflags);
+        data[flags..flags + 2].fill(0);
+        assert!(matches!(
+            BzImage::parse_header(&data, 4096),
+            Err(BzImageError::Missing64BitEntry)
+        ));
+        assert!(matches!(
+            BzImage::parse_header(&header_bytes(1), 1024 + 512),
+            Err(BzImageError::EntryOutsideImage)
+        ));
     }
 
     #[test]

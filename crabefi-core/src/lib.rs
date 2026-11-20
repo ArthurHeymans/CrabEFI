@@ -504,9 +504,9 @@ fn prepare_native_memory_inner(config: &mut PlatformConfig<'_>) {
     if let Some(rsdp) = config.acpi_rsdp {
         efi::system_table::reserve_native_acpi_ram(rsdp);
     }
+    #[cfg(feature = "platform-entry")]
+    efi::allocator::reserve_native_boot_image();
     if !config.heap_pre_initialized {
-        #[cfg(feature = "platform-entry")]
-        efi::allocator::reserve_boot_image_region();
         heap::init().unwrap_or_else(|e| panic!("Failed to initialize heap allocator: {e}"));
         config.heap_pre_initialized = true;
     }

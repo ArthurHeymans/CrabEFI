@@ -13,7 +13,7 @@
 //! ## Direct Boot
 //!
 //! The traditional Linux boot protocol:
-//! 1. Load protected-mode kernel to 0x100000 (1MB)
+//! 1. Load protected-mode kernel to 0x1000000 (16 MiB)
 //! 2. Load initrd near top of memory (below 4GB, 2MB aligned)
 //! 3. Copy command line to low memory (~0x4b000)
 //! 4. Set up boot_params with memory map, ACPI info
@@ -38,8 +38,10 @@ pub use bzimage::{BOOT_PARAMS_ADDR, BzImage, BzImageError, CMDLINE_ADDR, DEFAULT
 pub use params::{BootParams, E820Entry, E820MapError, SetupHeader};
 
 use crate::drivers::block::BlockDevice;
+use crate::efi::allocator::{self, AllocateType, MemoryType, PAGE_SIZE};
 #[cfg(test)]
 use crate::platform::MemoryRegion;
+use r_efi::efi::Status;
 
 /// Maximum kernel size we support (64 MB)
 const MAX_KERNEL_SIZE: usize = 64 * 1024 * 1024;
@@ -113,6 +115,42 @@ impl From<E820MapError> for LinuxBootError {
     }
 }
 
+/// Keep each Linux destination out of the firmware allocator until handoff.
+/// On error (or if a loaded kernel is discarded), release it for the next boot.
+struct BootPages {
+    base: u64,
+    count: u64,
+}
+
+impl BootPages {
+    fn claim(mut base: u64, size: u64) -> Result<Self, LinuxBootError> {
+        let count = size.div_ceil(PAGE_SIZE);
+        let status = allocator::allocate_pages(
+            AllocateType::AllocateAddress,
+            MemoryType::BootServicesData,
+            count,
+            &mut base,
+        );
+        if status != Status::SUCCESS {
+            log::error!("Cannot claim Linux boot pages at {base:#x} ({count} pages): {status:?}");
+            return Err(LinuxBootError::MemoryError);
+        }
+        Ok(Self { base, count })
+    }
+}
+
+impl Drop for BootPages {
+    fn drop(&mut self) {
+        let status = allocator::free_pages(self.base, self.count);
+        if status != Status::SUCCESS {
+            log::warn!(
+                "Could not release Linux boot pages at {:#x}: {status:?}",
+                self.base
+            );
+        }
+    }
+}
+
 /// Loaded Linux kernel ready for boot
 pub struct LoadedLinux {
     /// Boot parameters (zero page)
@@ -127,6 +165,8 @@ pub struct LoadedLinux {
     pub initrd_addr: Option<u64>,
     /// Initrd size
     pub initrd_size: u32,
+    // Retain the reservations across the filesystem borrow and DMA shutdown.
+    _boot_pages: [Option<BootPages>; 4],
 }
 
 impl LoadedLinux {
@@ -345,8 +385,9 @@ pub(crate) fn load_linux_from_fs<const NATIVE: bool>(
     // Parse the bzImage header
     let bzimage = BzImage::parse_header(&header_buf, kernel_size as u32)?;
 
-    // Check if EFI handover is requested but not available
-    if use_efi_handover && !bzimage.header.supports_efi_handover() {
+    let entry_point = bzimage.entry_point_64(DEFAULT_KERNEL_ADDR);
+    let efi_handover_entry = bzimage.efi_handover_entry(DEFAULT_KERNEL_ADDR);
+    if use_efi_handover && efi_handover_entry.is_none() {
         log::warn!("EFI handover requested but kernel doesn't support it");
         return Err(LinuxBootError::NoEfiHandover);
     }
@@ -362,7 +403,8 @@ pub(crate) fn load_linux_from_fs<const NATIVE: bool>(
         pm_kernel_size
     );
 
-    // Prepare boot parameters first so we can validate addresses BEFORE writing
+    // Snapshot E820 before claiming Linux-owned buffers. They must appear as
+    // usable RAM to Linux, unlike the firmware's own heap and DMA allocations.
     let mut boot_params = bzimage::prepare_boot_params(
         &bzimage,
         acpi_rsdp,
@@ -371,29 +413,24 @@ pub(crate) fn load_linux_from_fs<const NATIVE: bool>(
         CMDLINE_ADDR,
     )?;
 
-    // Validate that all hardcoded addresses are in usable RAM BEFORE writing to them
     let cmdline_size = cmdline.len() as u64 + 1; // +1 for null terminator
-    if !is_valid_ram_region(&boot_params, CMDLINE_ADDR as u64, cmdline_size) {
-        log::error!(
-            "Command line address {:#x} (size {}) is not in usable RAM",
-            CMDLINE_ADDR,
-            cmdline_size
-        );
-        return Err(LinuxBootError::MemoryError);
+    let params_size = core::mem::size_of::<BootParams>() as u64;
+    let kernel_span = (pm_kernel_size as u64).max(u64::from(bzimage.header.init_size));
+    let boot_ranges = [
+        (BOOT_PARAMS_ADDR, params_size),
+        (u64::from(CMDLINE_ADDR), cmdline_size),
+        (DEFAULT_KERNEL_ADDR, kernel_span),
+    ];
+    let mut boot_pages = [None, None, None, None];
+    for (slot, (addr, size)) in boot_pages.iter_mut().zip(boot_ranges) {
+        if !is_valid_ram_region(&boot_params, addr, size) {
+            log::error!("Linux boot range at {addr:#x} ({size} bytes) is not in usable RAM");
+            return Err(LinuxBootError::MemoryError);
+        }
+        *slot = Some(BootPages::claim(addr, size)?);
     }
 
-    // Validate kernel load address before loading
-    if !is_valid_ram_region(&boot_params, DEFAULT_KERNEL_ADDR, pm_kernel_size as u64) {
-        log::error!(
-            "Kernel address {:#x} (size {}) is not in usable RAM",
-            DEFAULT_KERNEL_ADDR,
-            pm_kernel_size
-        );
-        return Err(LinuxBootError::MemoryError);
-    }
-
-    // Create a slice pointing directly to the kernel load address
-    // This allows DMA to go directly to the target memory
+    // SAFETY: The allocator holds the destination exclusively until handoff.
     let kernel_dest =
         unsafe { core::slice::from_raw_parts_mut(DEFAULT_KERNEL_ADDR as *mut u8, pm_kernel_size) };
 
@@ -427,10 +464,6 @@ pub(crate) fn load_linux_from_fs<const NATIVE: bool>(
     unsafe {
         bzimage::set_cmdline(cmdline, CMDLINE_ADDR)?;
     }
-
-    // Calculate entry points
-    let entry_point = bzimage.entry_point_64(DEFAULT_KERNEL_ADDR);
-    let efi_handover_entry = bzimage.efi_handover_entry(DEFAULT_KERNEL_ADDR);
 
     log::info!(
         "Entry points: direct={:#x}, handover={:?}",
@@ -472,10 +505,10 @@ pub(crate) fn load_linux_from_fs<const NATIVE: bool>(
 
         // Place the initrds in usable RAM above the loaded kernel, respecting
         // the kernel-provided initrd_addr_max limit.
-        let min_initrd_addr = DEFAULT_KERNEL_ADDR
-            .checked_add(pm_kernel_size as u64)
-            .ok_or(LinuxBootError::MemoryError)?;
-        let initrd_load_addr = find_initrd_address(&boot_params, total as u64, min_initrd_addr)?;
+        let min_initrd_addr = DEFAULT_KERNEL_ADDR + kernel_span;
+        let span = (total as u64).next_multiple_of(PAGE_SIZE);
+        let initrd_load_addr = find_initrd_address(&boot_params, span, min_initrd_addr)?;
+        boot_pages[3] = Some(BootPages::claim(initrd_load_addr, span)?);
 
         log::info!(
             "Loading {} byte(s) of initrd to {:#x}",
@@ -556,6 +589,7 @@ pub(crate) fn load_linux_from_fs<const NATIVE: bool>(
         efi_handover_entry,
         initrd_addr,
         initrd_size,
+        _boot_pages: boot_pages,
     })
 }
 
@@ -657,7 +691,7 @@ fn find_initrd_address(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::MemoryType;
+    use crate::platform::MemoryType as PlatformMemoryType;
 
     fn boot_params_with_regions(regions: &[MemoryRegion]) -> BootParams {
         let mut boot_params = BootParams::new();
@@ -666,11 +700,50 @@ mod tests {
     }
 
     #[test]
+    fn boot_pages_exclude_other_allocations_and_release_on_error() {
+        allocator::with_host_pages(|| {
+            let (base, size) = allocator::with_descriptors(|map| {
+                let free = map
+                    .iter()
+                    .find(|e| {
+                        e.memory_type == MemoryType::ConventionalMemory as u32
+                            && e.number_of_pages >= 2
+                    })
+                    .unwrap();
+                (free.physical_start, free.number_of_pages * PAGE_SIZE)
+            });
+            let last_page = base + size - PAGE_SIZE;
+            let attempt = || -> Result<(), LinuxBootError> {
+                let _initrd = BootPages::claim(last_page, PAGE_SIZE)?;
+                let mut dma = 0;
+                assert_eq!(
+                    allocator::allocate_pages_in_range(
+                        MemoryType::BootServicesData,
+                        1,
+                        base,
+                        base + size - 1,
+                        &mut dma
+                    ),
+                    Status::SUCCESS
+                );
+                assert_eq!(dma, last_page - PAGE_SIZE);
+                assert_eq!(allocator::free_pages(dma, 1), Status::SUCCESS);
+                Err(LinuxBootError::FileRead)
+            };
+            assert!(matches!(attempt(), Err(LinuxBootError::FileRead)));
+            assert_eq!(
+                allocator::get_memory_type_at(last_page),
+                Some(MemoryType::ConventionalMemory)
+            );
+        });
+    }
+
+    #[test]
     fn initrd_uses_high_part_of_ram_region_starting_below_kernel() {
         let regions = [MemoryRegion {
             base: 0x0010_0000,
             size: 0x1ff0_0000,
-            region_type: MemoryType::Ram,
+            region_type: PlatformMemoryType::Ram,
         }];
         let boot_params = boot_params_with_regions(&regions);
         let initrd_size = 43_000_445;
@@ -689,7 +762,7 @@ mod tests {
         let regions = [MemoryRegion {
             base: 0x0010_0000,
             size: 0x02f0_0000,
-            region_type: MemoryType::Ram,
+            region_type: PlatformMemoryType::Ram,
         }];
         let boot_params = boot_params_with_regions(&regions);
         let min_addr = 0x01e0_0000;

@@ -91,8 +91,10 @@ cargo build -p crabefi-coreboot --release --target x86_64-unknown-none \
 
 This mode does not build or embed a Runtime Services image. It cannot launch
 EFI binaries (including shim, GRUB EFI, systemd-boot, and UKIs), and does not
-provide UEFI variables, Secure Boot, measured boot, or capsule updates. Use it
-only with trusted boot media. The default UEFI build is unchanged.
+provide UEFI variables, Secure Boot, measured boot, or capsule updates. It
+does not measure the kernel, initrd, or command line into the TPM. Do not rely
+on TPM policies in this mode to bind secrets to those boot inputs. Use it only
+with trusted boot media. The default UEFI build is unchanged.
 
 ### Direct Cargo build
 
@@ -415,7 +417,8 @@ Use `ext2-linux` or `ext3-linux` to test the other ext formats. Use
 `native-only-linux` to run the ext4 test with the native-only payload and
 verify that it boots without an EFI System Table.
 
-The `native-only-fat-linux` test requires `busybox-static` and `cpio`. It checks
+The `native-only-fat-linux` test requires `busybox-static` and `cpio` and uses
+USB storage by default. It checks
 that a disk's EFI fallback is ignored, a broken default BLS entry returns to an
 interactive menu, and selecting the GRUB entry boots Linux with ACPI but no EFI.
 

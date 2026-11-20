@@ -263,7 +263,9 @@ pub(crate) fn discover_entries<const NATIVE: bool>() -> BootMenu {
     }
     for device in &devices {
         match storage::with_disk(device.id, gpt::read_partitions_auto) {
-            Ok(Ok(partitions)) => discover_entries_on_disk::<NATIVE>(device, &partitions, &mut menu),
+            Ok(Ok(partitions)) => {
+                discover_entries_on_disk::<NATIVE>(device, &partitions, &mut menu)
+            }
             Ok(Err(gpt::GptError::OutOfMemory)) => {
                 log::error!(
                     "Boot menu: out of heap scanning partitions on {}",
@@ -271,7 +273,7 @@ pub(crate) fn discover_entries<const NATIVE: bool>() -> BootMenu {
                 );
             }
             _ if !NATIVE => try_el_torito_fallback(device, &mut menu),
-            _ => {},
+            _ => {}
         }
     }
 

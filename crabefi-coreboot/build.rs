@@ -42,6 +42,7 @@ fn main() {
                     "payload-mm-test-lose-ready-to-boot",
                 ),
                 ("UI", "ui"),
+                ("USB_ON_DEMAND", "usb-on-demand"),
             ] {
                 assert!(
                     std::env::var_os(format!("CARGO_FEATURE_{env}")).is_none(),

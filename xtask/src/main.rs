@@ -826,11 +826,13 @@ fn cmd_test(
         bail!("{app} uses the text menu; omit --ui");
     }
     let ext_filesystem = ext_linux_filesystem(app);
-    let native_disk = native_fat || ext_filesystem.is_some();
-    if native_disk && (arch != Arch::X86_64 || sdhci) {
+    if native_fat && arch != Arch::X86_64 {
+        bail!("{app} needs x86-64");
+    }
+    if ext_filesystem.is_some() && (arch != Arch::X86_64 || sdhci) {
         bail!("{app} needs x86-64 with AHCI or NVMe storage");
     }
-    let storage = if ahci || (native_disk && !nvme) {
+    let storage = if ahci || (ext_filesystem.is_some() && !nvme) {
         qemu::StorageType::Ahci
     } else if nvme {
         qemu::StorageType::Nvme
