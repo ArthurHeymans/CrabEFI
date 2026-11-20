@@ -93,7 +93,7 @@ pub fn verify_pkcs7_signature_hash(
         };
         let content_digest = signed_attributes_digest(signer.signed_attributes, content_hash)?;
         if verify_rsa_signature(signer_certificate, signer.signature, &content_digest)
-            && certificate_authorized(signer_certificate, trusted, certificates, 0)?
+            && certificate_authorized(signer_certificate, trusted, certificates)?
         {
             return Ok(true);
         }
@@ -376,31 +376,74 @@ fn find_signer<'a>(
 }
 
 fn certificate_authorized(
-    certificate: PolicyCertificate<'_>,
+    signer: PolicyCertificate<'_>,
     trusted: PolicyCertificate<'_>,
     certificates: &[&[u8]],
-    depth: usize,
 ) -> Result<bool, AuthError> {
-    if certificate.certificate.encoded == trusted.certificate.encoded {
-        return Ok(true);
+    /// One certificate on the current issuer path and the next candidate
+    /// issuer to try for it.
+    #[derive(Clone, Copy)]
+    struct Step<'a> {
+        certificate: PolicyCertificate<'a>,
+        next: usize,
     }
-    if depth >= MAX_CHAIN_DEPTH {
-        return Err(AuthError::ChainTooDeep);
-    }
-    if certificate.certificate.issuer == trusted.certificate.subject
-        && verify_certificate(certificate, trusted)
-    {
-        return Ok(true);
-    }
-    for raw in certificates {
-        let issuer = parse_certificate(raw)?;
-        if issuer.certificate.encoded != certificate.certificate.encoded
-            && certificate.certificate.issuer == issuer.certificate.subject
-            && issuer.can_sign_certificates
-            && verify_certificate(certificate, issuer)
-            && certificate_authorized(issuer, trusted, certificates, depth + 1)?
+
+    /// Accept a certificate on the path, reject an over-deep chain, or
+    /// return `None` to search for its issuers.
+    fn decide(
+        certificate: PolicyCertificate<'_>,
+        trusted: PolicyCertificate<'_>,
+        depth: usize,
+    ) -> Result<Option<bool>, AuthError> {
+        if certificate.certificate.encoded == trusted.certificate.encoded {
+            return Ok(Some(true));
+        }
+        if depth >= MAX_CHAIN_DEPTH {
+            return Err(AuthError::ChainTooDeep);
+        }
+        if certificate.certificate.issuer == trusted.certificate.subject
+            && verify_certificate(certificate, trusted)
         {
-            return Ok(true);
+            return Ok(Some(true));
+        }
+        Ok(None)
+    }
+
+    // Depth-first search over issuer links, in the order a recursive search
+    // would try them. The explicit path keeps the stack depth static, so the
+    // link-time audit can bound SetVariable.
+    let mut path = heapless::Vec::<Step<'_>, MAX_CHAIN_DEPTH>::new();
+    if let Some(accepted) = decide(signer, trusted, 0)? {
+        return Ok(accepted);
+    }
+    path.push(Step {
+        certificate: signer,
+        next: 0,
+    })
+    .map_err(|_| AuthError::ChainTooDeep)?;
+    while let Some(step) = path.last_mut() {
+        let certificate = step.certificate;
+        let Some(raw) = certificates.get(step.next) else {
+            path.pop();
+            continue;
+        };
+        step.next += 1;
+        let issuer = parse_certificate(raw)?;
+        if issuer.certificate.encoded == certificate.certificate.encoded
+            || certificate.certificate.issuer != issuer.certificate.subject
+            || !issuer.can_sign_certificates
+            || !verify_certificate(certificate, issuer)
+        {
+            continue;
+        }
+        match decide(issuer, trusted, path.len())? {
+            Some(accepted) => return Ok(accepted),
+            None => path
+                .push(Step {
+                    certificate: issuer,
+                    next: 0,
+                })
+                .map_err(|_| AuthError::ChainTooDeep)?,
         }
     }
     Ok(false)

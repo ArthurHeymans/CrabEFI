@@ -92,7 +92,9 @@ pub(super) fn persist_through_bridge(
     )
 }
 
-// The image audit allows a single register call site for the bridge.
+// The image audit allows a single register call site for the bridge, and the
+// link-time stack audit excuses this function's one indirect call by name.
+// Keep it a distinct symbol.
 #[inline(never)]
 fn call_boot_bridge(address: u64, request: &BridgeRequest) -> Result<(), efi::Status> {
     if address == 0 {
