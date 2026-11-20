@@ -101,9 +101,12 @@ fn call_boot_bridge(address: u64, request: &BridgeRequest) -> Result<(), efi::St
         return Err(efi::Status::WRITE_PROTECTED);
     }
     type Bridge = unsafe extern "C" fn(*const BridgeRequest) -> usize;
+    // The loader passes the bridge as an integer address. Recover the provenance
+    // the boot image exposed for it; a bare integer is not a callable pointer.
+    let bridge = core::ptr::with_exposed_provenance::<u8>(address as usize);
     // SAFETY: runtime initialization receives this bridge address from the
     // boot loader. It is used only in BootActive and zeroed at seal.
-    let bridge: Bridge = unsafe { core::mem::transmute(address as usize) };
+    let bridge: Bridge = unsafe { core::mem::transmute(bridge) };
     // SAFETY: `request` and the buffers it names outlive this synchronous call.
     match efi::Status::from_usize(unsafe { bridge(request) }) {
         efi::Status::SUCCESS => Ok(()),
