@@ -252,8 +252,8 @@ impl SettingsModel for Fixture {
         ));
         Ok(())
     }
-    fn configured_level(&self) -> LevelFilter {
-        self.simulation.borrow().configured_log_level
+    fn configured_level(&self) -> Option<LevelFilter> {
+        Some(self.simulation.borrow().configured_log_level)
     }
     fn set_configured_level(&self, level: LevelFilter) -> Result<(), &'static str> {
         let mut sim = self.simulation.borrow_mut();

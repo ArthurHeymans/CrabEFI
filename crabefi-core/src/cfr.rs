@@ -233,8 +233,8 @@ impl crabefi_ui::cfr::SettingsModel for CfrInfo {
     fn write_option_value(&self, option: &CfrOption, value: &CfrValue) -> Result<(), &'static str> {
         write_option_value(option, value)
     }
-    fn configured_level(&self) -> log::LevelFilter {
-        crate::logger::configured_level()
+    fn configured_level(&self) -> Option<log::LevelFilter> {
+        (!crate::logger::platform_owns_level()).then(crate::logger::configured_level)
     }
     fn set_configured_level(&self, level: log::LevelFilter) -> Result<(), &'static str> {
         crate::logger::set_configured_level(level).map_err(|status| {

@@ -10,10 +10,12 @@
 //! Enable with the `fb-log` feature flag.
 
 use crate::time::read_counter;
-use log::{Level, LevelFilter, Metadata, Record};
+use log::{Level, Metadata, Record};
 use r_efi::efi::Guid;
 
-pub use crabefi_ui::log_level::{DEFAULT_LEVEL, LEVEL_CHOICES, level_index, level_name};
+pub use crabefi_ui::log_level::{
+    DEFAULT_LEVEL, LEVEL_CHOICES, LevelFilter, level_index, level_name,
+};
 
 /// CrabEFI settings variable GUID.
 ///
@@ -195,13 +197,34 @@ fn level_to_data(level: LevelFilter) -> [u8; 1] {
     }]
 }
 
+/// Whether the platform set the log level ([`set_platform_level`]).
+static PLATFORM_LEVEL: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Log at `level`, the platform's: a host firmware that has its own log
+/// level setting hands it on, so one setting covers both. CrabEFI then ignores
+/// its persisted level and its setup menu offers none.
+pub fn set_platform_level(level: LevelFilter) {
+    init();
+    PLATFORM_LEVEL.store(true, core::sync::atomic::Ordering::Relaxed);
+    set_level(level);
+}
+
+/// Whether the platform owns the log level ([`set_platform_level`]).
+pub fn platform_owns_level() -> bool {
+    PLATFORM_LEVEL.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Read the configured log level from the authoritative runtime image store.
 pub fn configured_level() -> LevelFilter {
     read_persisted_level().unwrap_or_else(log::max_level)
 }
 
-/// Apply the persisted log level from the authoritative runtime image store.
+/// Apply the persisted log level from the authoritative runtime image store,
+/// unless the platform owns the level.
 pub fn apply_persisted_level() {
+    if platform_owns_level() {
+        return;
+    }
     if let Some(level) = read_persisted_level() {
         set_level(level);
         log::info!("CrabEFI log level set to {}", level_name(level));
