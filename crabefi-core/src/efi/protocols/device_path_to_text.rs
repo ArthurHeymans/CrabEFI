@@ -18,8 +18,7 @@ use r_efi::protocols::device_path_to_text;
 use crate::efi::allocator::{self, MemoryType};
 use crate::efi::utils::allocate_protocol_value_with_log;
 
-// Re-use shared helpers from device_path.rs
-use super::device_path::{MAX_DEVICE_PATH_SIZE, SUBTYPE_END_INSTANCE, device_path_size};
+use super::device_path_view::{DevicePath, Node};
 
 pub const DEVICE_PATH_TO_TEXT_GUID: Guid = device_path_to_text::PROTOCOL_GUID;
 
@@ -28,7 +27,6 @@ const TYPE_HARDWARE: u8 = 0x01;
 const TYPE_ACPI: u8 = 0x02;
 const TYPE_MESSAGING: u8 = 0x03;
 const TYPE_MEDIA: u8 = 0x04;
-const TYPE_END: u8 = 0x7F;
 
 // Hardware subtypes
 const HW_SUBTYPE_PCI: u8 = 0x01;
@@ -59,62 +57,22 @@ const SIGNATURE_TYPE_MBR: u8 = 0x01;
 const SIGNATURE_TYPE_GUID: u8 = 0x02;
 
 // ============================================================================
-// Inline node accessors (all work on packed, possibly-unaligned data)
-// ============================================================================
-
-#[inline]
-unsafe fn node_type(node: *const u8) -> u8 {
-    unsafe { *node }
-}
-
-#[inline]
-unsafe fn node_subtype(node: *const u8) -> u8 {
-    unsafe { *node.add(1) }
-}
-
-#[inline]
-unsafe fn node_len(node: *const u8) -> u16 {
-    unsafe { u16::from_le_bytes([*node.add(2), *node.add(3)]) }
-}
-
-/// Read a u8 at offset from node start.
-#[inline]
-unsafe fn read_u8(node: *const u8, off: usize) -> u8 {
-    unsafe { *node.add(off) }
-}
-
-/// Read a little-endian u16 at offset from node start.
-#[inline]
-unsafe fn read_u16(node: *const u8, off: usize) -> u16 {
-    unsafe { u16::from_le_bytes([*node.add(off), *node.add(off + 1)]) }
-}
-
-/// Read a little-endian u32 at offset from node start.
-#[inline]
-unsafe fn read_u32(node: *const u8, off: usize) -> u32 {
-    let mut buf = [0u8; 4];
-    unsafe { ptr::copy_nonoverlapping(node.add(off), buf.as_mut_ptr(), 4) };
-    u32::from_le_bytes(buf)
-}
-
-/// Read a little-endian u64 at offset from node start.
-#[inline]
-unsafe fn read_u64(node: *const u8, off: usize) -> u64 {
-    let mut buf = [0u8; 8];
-    unsafe { ptr::copy_nonoverlapping(node.add(off), buf.as_mut_ptr(), 8) };
-    u64::from_le_bytes(buf)
-}
-
-// ============================================================================
 // ASCII string builder (we build ASCII first, then convert to UCS-2)
 // ============================================================================
 
 /// Fixed-size ASCII buffer for building device path text.
 ///
-/// 512 bytes is generous — device paths rarely exceed ~200 chars.
-struct AsciiBuffer {
+/// 512 bytes is generous — device paths rarely exceed ~200 chars. Only ASCII
+/// is ever pushed, so truncation cannot split a character.
+pub(crate) struct AsciiBuffer {
     buf: [u8; 512],
     len: usize,
+}
+
+impl Default for AsciiBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl AsciiBuffer {
@@ -126,16 +84,26 @@ impl AsciiBuffer {
     }
 
     fn push_str(&mut self, s: &str) {
-        let bytes = s.as_bytes();
-        let avail = self.buf.len() - self.len;
-        let n = bytes.len().min(avail);
-        self.buf[self.len..self.len + n].copy_from_slice(&bytes[..n]);
-        self.len += n;
+        for byte in s.bytes() {
+            self.push_ascii(byte);
+        }
     }
 
-    fn as_str(&self) -> &str {
-        // Safety: we only ever push valid ASCII/UTF-8
-        unsafe { core::str::from_utf8_unchecked(&self.buf[..self.len]) }
+    /// Push one byte, replacing anything but printable ASCII with `?`.
+    fn push_ascii(&mut self, byte: u8) {
+        if self.len < self.buf.len() {
+            self.buf[self.len] = if (0x20..0x7f).contains(&byte) {
+                byte
+            } else {
+                b'?'
+            };
+            self.len += 1;
+        }
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        // Every pushed byte is printable ASCII.
+        core::str::from_utf8(&self.buf[..self.len]).unwrap_or_default()
     }
 }
 
@@ -156,272 +124,228 @@ fn ascii_to_ucs2_alloc(s: &str) -> *mut Char16 {
         Ok(p) => p as *mut u16,
         Err(_) => return ptr::null_mut(),
     };
-    unsafe {
-        for (i, c) in s.bytes().enumerate() {
-            *buf.add(i) = c as u16;
-        }
-        *buf.add(s.len()) = 0; // null terminator
+    for (i, c) in s.bytes().chain([0]).enumerate() {
+        // SAFETY: AllocatePool returned `char_count` exclusively owned u16
+        // slots, aligned for any EFI type; each is written, never read.
+        unsafe { buf.add(i).write(u16::from(c)) };
     }
     buf as *mut Char16
 }
 
 // ============================================================================
 // Per-node-type formatters
+//
+// Each reads every field it needs before writing anything. A node too short
+// for its type yields `None` and is rendered generically instead.
 // ============================================================================
 
-/// Format a PCI device path node: `Pci(Dev,Func)`
-///
-/// Layout: header(4) + function(1) + device(1) = 6 bytes
-unsafe fn fmt_pci(node: *const u8, buf: &mut AsciiBuffer) {
-    let function = unsafe { read_u8(node, 4) };
-    let device = unsafe { read_u8(node, 5) };
+/// `Pci(Dev,Func)`. Layout: header(4) + function(1) + device(1).
+fn fmt_pci(node: Node, buf: &mut AsciiBuffer) -> Option<()> {
+    let function = node.u8_at(4)?;
+    let device = node.u8_at(5)?;
     let _ = write!(buf, "Pci(0x{:X},0x{:X})", device, function);
+    Some(())
 }
 
-/// Format an ACPI device path node.
-///
 /// If HID matches PNP0A03 => `PciRoot(UID)`, PNP0A08 => `PcieRoot(UID)`,
-/// else generic `Acpi(HID,UID)`.
-///
-/// Layout: header(4) + HID(4) + UID(4) = 12 bytes
-unsafe fn fmt_acpi(node: *const u8, buf: &mut AsciiBuffer) {
-    let hid = unsafe { read_u32(node, 4) };
-    let uid = unsafe { read_u32(node, 8) };
-    match hid {
-        EISA_PNP_ID_PCI_ROOT => {
-            let _ = write!(buf, "PciRoot(0x{:X})", uid);
-        }
-        EISA_PNP_ID_PCIE_ROOT => {
-            let _ = write!(buf, "PcieRoot(0x{:X})", uid);
-        }
+/// else generic `Acpi(HID,UID)`. Layout: header(4) + HID(4) + UID(4).
+fn fmt_acpi(node: Node, buf: &mut AsciiBuffer) -> Option<()> {
+    let hid = node.u32_at(4)?;
+    let uid = node.u32_at(8)?;
+    let _ = match hid {
+        EISA_PNP_ID_PCI_ROOT => write!(buf, "PciRoot(0x{:X})", uid),
+        EISA_PNP_ID_PCIE_ROOT => write!(buf, "PcieRoot(0x{:X})", uid),
         _ if (hid & 0xffff) == EISA_PNP_VENDOR => {
-            let _ = write!(buf, "Acpi(PNP{:04X},0x{:X})", hid >> 16, uid);
+            write!(buf, "Acpi(PNP{:04X},0x{:X})", hid >> 16, uid)
         }
-        _ => {
-            let _ = write!(buf, "Acpi(0x{:08X},0x{:X})", hid, uid);
-        }
-    }
+        _ => write!(buf, "Acpi(0x{:08X},0x{:X})", hid, uid),
+    };
+    Some(())
 }
 
-/// Format a USB device path node: `USB(Port,Interface)`
-///
-/// Layout: header(4) + parent_port(1) + interface(1) = 6 bytes
-unsafe fn fmt_usb(node: *const u8, buf: &mut AsciiBuffer) {
-    let port = unsafe { read_u8(node, 4) };
-    let interface = unsafe { read_u8(node, 5) };
+/// `USB(Port,Interface)`. Layout: header(4) + parent_port(1) + interface(1).
+fn fmt_usb(node: Node, buf: &mut AsciiBuffer) -> Option<()> {
+    let port = node.u8_at(4)?;
+    let interface = node.u8_at(5)?;
     let _ = write!(buf, "USB(0x{:X},0x{:X})", port, interface);
+    Some(())
 }
 
-/// Format a SATA device path node: `Sata(Port,PortMul,Lun)`
-///
-/// Layout: header(4) + hba_port(2) + port_multiplier(2) + lun(2) = 10 bytes
-unsafe fn fmt_sata(node: *const u8, buf: &mut AsciiBuffer) {
-    let port = unsafe { read_u16(node, 4) };
-    let pmul = unsafe { read_u16(node, 6) };
-    let lun = unsafe { read_u16(node, 8) };
+/// `Sata(Port,PortMul,Lun)`. Layout: header(4) + port(2) + multiplier(2) + lun(2).
+fn fmt_sata(node: Node, buf: &mut AsciiBuffer) -> Option<()> {
+    let port = node.u16_at(4)?;
+    let pmul = node.u16_at(6)?;
+    let lun = node.u16_at(8)?;
     let _ = write!(buf, "Sata(0x{:X},0x{:X},0x{:X})", port, pmul, lun);
+    Some(())
 }
 
-/// Format an NVMe device path node: `NVMe(0xNSID,EUI64)`
-///
-/// Layout: header(4) + nsid(4) + eui64(8) = 16 bytes
-unsafe fn fmt_nvme(node: *const u8, buf: &mut AsciiBuffer) {
-    let nsid = unsafe { read_u32(node, 4) };
+/// `NVMe(0xNSID,EUI64)`. Layout: header(4) + nsid(4) + eui64(8).
+fn fmt_nvme(node: Node, buf: &mut AsciiBuffer) -> Option<()> {
+    let nsid = node.u32_at(4)?;
+    let eui: [u8; 8] = node.field(8)?;
     let _ = write!(buf, "NVMe(0x{:X},", nsid);
-    for i in (0..8).rev() {
-        if i < 7 {
+    for (i, byte) in eui.iter().rev().enumerate() {
+        if i > 0 {
             buf.push_str("-");
         }
-        let _ = write!(buf, "{:02X}", unsafe { read_u8(node, 8 + i) });
+        let _ = write!(buf, "{:02X}", byte);
     }
     buf.push_str(")");
+    Some(())
 }
 
-/// Format a Hard Drive device path node.
-///
-/// Display-only: `HD(PartNo,Type,Sig)`
-/// Full: `HD(PartNo,Type,Sig,Start,Size)`
+/// Write a mixed-endian EFI GUID stored at `offset`.
+fn write_guid(buf: &mut AsciiBuffer, guid: [u8; 16]) {
+    let data1 = u32::from_le_bytes([guid[0], guid[1], guid[2], guid[3]]);
+    let data2 = u16::from_le_bytes([guid[4], guid[5]]);
+    let data3 = u16::from_le_bytes([guid[6], guid[7]]);
+    let _ = write!(
+        buf,
+        "{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+        data1,
+        data2,
+        data3,
+        guid[8],
+        guid[9],
+        guid[10],
+        guid[11],
+        guid[12],
+        guid[13],
+        guid[14],
+        guid[15],
+    );
+}
+
+/// Display-only: `HD(PartNo,Type,Sig)`; full: `HD(PartNo,Type,Sig,Start,Size)`.
 ///
 /// Layout: header(4) + partition_number(4) + partition_start(8) + partition_size(8) +
 ///         signature(16) + partition_format(1) + signature_type(1) = 42 bytes
-unsafe fn fmt_hard_drive(node: *const u8, display_only: bool, buf: &mut AsciiBuffer) {
-    let part_num = unsafe { read_u32(node, 4) };
-    let part_start = unsafe { read_u64(node, 8) };
-    let part_size = unsafe { read_u64(node, 16) };
-    let sig_type = unsafe { read_u8(node, 41) };
+fn fmt_hard_drive(node: Node, display_only: bool, buf: &mut AsciiBuffer) -> Option<()> {
+    let part_num = node.u32_at(4)?;
+    let part_start = node.u64_at(8)?;
+    let part_size = node.u64_at(16)?;
+    let signature: [u8; 16] = node.field(24)?;
+    let sig_type = node.u8_at(41)?;
 
     let _ = write!(buf, "HD({},", part_num);
-
     match sig_type {
         SIGNATURE_TYPE_GUID => {
             buf.push_str("GPT,");
-            // Signature is a GUID at offset 24 (16 bytes)
-            // Format as standard GUID: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-            // GUID is stored in mixed-endian format
-            let data1 = unsafe { read_u32(node, 24) };
-            let data2 = unsafe { read_u16(node, 28) };
-            let data3 = unsafe { read_u16(node, 30) };
-            let _ = write!(
-                buf,
-                "{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
-                data1,
-                data2,
-                data3,
-                unsafe { read_u8(node, 32) },
-                unsafe { read_u8(node, 33) },
-                unsafe { read_u8(node, 34) },
-                unsafe { read_u8(node, 35) },
-                unsafe { read_u8(node, 36) },
-                unsafe { read_u8(node, 37) },
-                unsafe { read_u8(node, 38) },
-                unsafe { read_u8(node, 39) },
-            );
+            write_guid(buf, signature);
         }
         SIGNATURE_TYPE_MBR => {
-            let mbr_sig = unsafe { read_u32(node, 24) };
+            let mbr_sig =
+                u32::from_le_bytes([signature[0], signature[1], signature[2], signature[3]]);
             let _ = write!(buf, "MBR,0x{:08X}", mbr_sig);
         }
-        _ => {
-            buf.push_str("0");
-        }
+        _ => buf.push_str("0"),
     }
-
     if !display_only {
         let _ = write!(buf, ",0x{:X},0x{:X}", part_start, part_size);
     }
     buf.push_str(")");
+    Some(())
 }
 
-/// Format a CD-ROM device path node: `CDROM(Entry,Start,Size)`
-///
-/// Layout: header(4) + boot_entry(4) + partition_start(8) + partition_size(8) = 24 bytes
-unsafe fn fmt_cdrom(node: *const u8, display_only: bool, buf: &mut AsciiBuffer) {
-    let entry = unsafe { read_u32(node, 4) };
-    if display_only {
-        let _ = write!(buf, "CDROM(0x{:X})", entry);
+/// `CDROM(Entry,Start,Size)`. Layout: header(4) + entry(4) + start(8) + size(8).
+fn fmt_cdrom(node: Node, display_only: bool, buf: &mut AsciiBuffer) -> Option<()> {
+    let entry = node.u32_at(4)?;
+    let start = node.u64_at(8)?;
+    let size = node.u64_at(16)?;
+    let _ = if display_only {
+        write!(buf, "CDROM(0x{:X})", entry)
     } else {
-        let start = unsafe { read_u64(node, 8) };
-        let size = unsafe { read_u64(node, 16) };
-        let _ = write!(buf, "CDROM(0x{:X},0x{:X},0x{:X})", entry, start, size);
-    }
+        write!(buf, "CDROM(0x{:X},0x{:X},0x{:X})", entry, start, size)
+    };
+    Some(())
 }
 
-/// Format a Vendor Media device path node: `VenMedia(GUID)`
-///
-/// Layout: header(4) + GUID(16) [+ optional data] = 20+ bytes
-unsafe fn fmt_vendor_media(node: *const u8, buf: &mut AsciiBuffer) {
-    let data1 = unsafe { read_u32(node, 4) };
-    let data2 = unsafe { read_u16(node, 8) };
-    let data3 = unsafe { read_u16(node, 10) };
-    let _ = write!(
-        buf,
-        "VenMedia({:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X})",
-        data1,
-        data2,
-        data3,
-        unsafe { read_u8(node, 12) },
-        unsafe { read_u8(node, 13) },
-        unsafe { read_u8(node, 14) },
-        unsafe { read_u8(node, 15) },
-        unsafe { read_u8(node, 16) },
-        unsafe { read_u8(node, 17) },
-        unsafe { read_u8(node, 18) },
-        unsafe { read_u8(node, 19) },
-    );
+/// `VenMedia(GUID)`. Layout: header(4) + GUID(16) [+ optional data].
+fn fmt_vendor_media(node: Node, buf: &mut AsciiBuffer) -> Option<()> {
+    let guid: [u8; 16] = node.field(4)?;
+    buf.push_str("VenMedia(");
+    write_guid(buf, guid);
+    buf.push_str(")");
+    Some(())
 }
 
-/// Format a File Path device path node.
-///
-/// The node contains a null-terminated UCS-2 string starting at offset 4.
-/// Output is the raw path text (no wrapping keyword).
-unsafe fn fmt_file_path(node: *const u8, len: u16, buf: &mut AsciiBuffer) {
-    let str_ptr = unsafe { node.add(4) as *const u16 };
-    let max_chars = ((len as usize) - 4) / 2;
-    for i in 0..max_chars {
-        let ch = unsafe { ptr::read_unaligned(str_ptr.add(i)) };
+/// A File Path node: a NUL-terminated UCS-2 string after the header, written
+/// without a wrapping keyword. Non-ASCII characters become `?`.
+fn fmt_file_path(node: Node, buf: &mut AsciiBuffer) {
+    for unit in node.payload().as_chunks::<2>().0 {
+        let ch = u16::from_le_bytes([unit[0], unit[1]]);
         if ch == 0 {
             break;
         }
-        // Printable ASCII range — pass through. Non-ASCII becomes '?'.
-        if (0x20..0x7F).contains(&ch) {
-            let byte = [ch as u8];
-            // Safety: single ASCII byte is valid UTF-8
-            buf.push_str(unsafe { core::str::from_utf8_unchecked(&byte) });
-        } else {
-            buf.push_str("?");
-        }
+        buf.push_ascii(u8::try_from(ch).unwrap_or(b'?'));
     }
 }
 
 /// Format an unknown/generic node.
 ///
 /// Uses the EDK2 convention: known-type fallback or fully generic hex dump.
-unsafe fn fmt_unknown(node: *const u8, len: u16, buf: &mut AsciiBuffer) {
-    let ntype = unsafe { node_type(node) };
-    let nsub = unsafe { node_subtype(node) };
-
-    let type_name = match ntype {
+fn fmt_unknown(node: Node, buf: &mut AsciiBuffer) {
+    let type_name = match node.kind() {
         TYPE_HARDWARE => "HardwarePath",
         TYPE_ACPI => "AcpiPath",
         TYPE_MESSAGING => "Msg",
         TYPE_MEDIA => "MediaPath",
         _ => "",
     };
-
-    if !type_name.is_empty() {
-        let _ = write!(buf, "{}(0x{:X}", type_name, nsub);
+    let _ = if type_name.is_empty() {
+        write!(buf, "Path({},0x{:X}", node.kind(), node.subtype())
     } else {
-        let _ = write!(buf, "Path({},0x{:X}", ntype, nsub);
-    }
-
-    // Dump payload bytes (after the 4-byte header) as hex
-    let payload_len = (len as usize).saturating_sub(4);
-    if payload_len > 0 {
+        write!(buf, "{}(0x{:X}", type_name, node.subtype())
+    };
+    if !node.payload().is_empty() {
         buf.push_str(",");
-        for i in 0..payload_len {
-            let _ = write!(buf, "{:02X}", unsafe { read_u8(node, 4 + i) });
+        for byte in node.payload() {
+            let _ = write!(buf, "{:02X}", byte);
         }
     }
     buf.push_str(")");
 }
 
-/// Return the minimum byte length for a node type we decode specially.
-fn known_node_min_len(ntype: u8, nsub: u8) -> usize {
-    match (ntype, nsub) {
-        (TYPE_HARDWARE, HW_SUBTYPE_PCI) | (TYPE_MESSAGING, MSG_SUBTYPE_USB) => 6,
-        (TYPE_ACPI, ACPI_SUBTYPE_ACPI) => 12,
-        (TYPE_MESSAGING, MSG_SUBTYPE_SATA) => 10,
-        (TYPE_MESSAGING, MSG_SUBTYPE_NVME) => 16,
-        (TYPE_MEDIA, MEDIA_SUBTYPE_HARDDRIVE) => 42,
-        (TYPE_MEDIA, MEDIA_SUBTYPE_CDROM) => 24,
-        (TYPE_MEDIA, MEDIA_SUBTYPE_VENDOR) => 20,
-        _ => 4,
+/// Format a single device path node.
+pub(crate) fn format_node(node: Node, display_only: bool, buf: &mut AsciiBuffer) {
+    let formatted = match (node.kind(), node.subtype()) {
+        (TYPE_HARDWARE, HW_SUBTYPE_PCI) => fmt_pci(node, buf),
+        (TYPE_ACPI, ACPI_SUBTYPE_ACPI) => fmt_acpi(node, buf),
+        (TYPE_MESSAGING, MSG_SUBTYPE_USB) => fmt_usb(node, buf),
+        (TYPE_MESSAGING, MSG_SUBTYPE_SATA) => fmt_sata(node, buf),
+        (TYPE_MESSAGING, MSG_SUBTYPE_NVME) => fmt_nvme(node, buf),
+        (TYPE_MEDIA, MEDIA_SUBTYPE_HARDDRIVE) => fmt_hard_drive(node, display_only, buf),
+        (TYPE_MEDIA, MEDIA_SUBTYPE_CDROM) => fmt_cdrom(node, display_only, buf),
+        (TYPE_MEDIA, MEDIA_SUBTYPE_VENDOR) => fmt_vendor_media(node, buf),
+        (TYPE_MEDIA, MEDIA_SUBTYPE_FILEPATH) => {
+            fmt_file_path(node, buf);
+            Some(())
+        }
+        _ => None,
+    };
+    if formatted.is_none() {
+        fmt_unknown(node, buf);
     }
 }
 
-/// Format a single device path node into the ASCII buffer.
-unsafe fn format_node(node: *const u8, display_only: bool, buf: &mut AsciiBuffer) {
-    let ntype = unsafe { node_type(node) };
-    let nsub = unsafe { node_subtype(node) };
-    let nlen = unsafe { node_len(node) };
-
-    if nlen as usize > MAX_DEVICE_PATH_SIZE || (nlen as usize) < known_node_min_len(ntype, nsub) {
-        unsafe { fmt_unknown(node, nlen, buf) };
-        return;
+/// Text for a whole device path. Nodes are separated by `/`; instances by `,`.
+pub(crate) fn format_path(path: DevicePath, display_only: bool) -> AsciiBuffer {
+    let mut buf = AsciiBuffer::new();
+    let mut first = true;
+    for node in path.nodes() {
+        if node.is_end_instance() {
+            buf.push_str(",");
+            first = true;
+            continue;
+        }
+        if !first {
+            buf.push_str("/");
+        }
+        first = false;
+        format_node(node, display_only, &mut buf);
     }
-
-    match (ntype, nsub) {
-        (TYPE_HARDWARE, HW_SUBTYPE_PCI) => unsafe { fmt_pci(node, buf) },
-        (TYPE_ACPI, ACPI_SUBTYPE_ACPI) => unsafe { fmt_acpi(node, buf) },
-        (TYPE_MESSAGING, MSG_SUBTYPE_USB) => unsafe { fmt_usb(node, buf) },
-        (TYPE_MESSAGING, MSG_SUBTYPE_SATA) => unsafe { fmt_sata(node, buf) },
-        (TYPE_MESSAGING, MSG_SUBTYPE_NVME) => unsafe { fmt_nvme(node, buf) },
-        (TYPE_MEDIA, MEDIA_SUBTYPE_HARDDRIVE) => unsafe { fmt_hard_drive(node, display_only, buf) },
-        (TYPE_MEDIA, MEDIA_SUBTYPE_CDROM) => unsafe { fmt_cdrom(node, display_only, buf) },
-        (TYPE_MEDIA, MEDIA_SUBTYPE_VENDOR) => unsafe { fmt_vendor_media(node, buf) },
-        (TYPE_MEDIA, MEDIA_SUBTYPE_FILEPATH) => unsafe { fmt_file_path(node, nlen, buf) },
-        _ => unsafe { fmt_unknown(node, nlen, buf) },
-    }
+    buf
 }
 
 // ============================================================================
@@ -434,78 +358,26 @@ extern "efiapi" fn convert_device_node_to_text(
     display_only: Boolean,
     _allow_shortcuts: Boolean,
 ) -> *mut Char16 {
-    if device_node.is_null() {
+    // SAFETY: the caller passes null or a readable node of its claimed length.
+    let Some(node) = (unsafe { Node::from_raw(device_node) }) else {
         return ptr::null_mut();
-    }
+    };
     let mut buf = AsciiBuffer::new();
-    let is_display_only = display_only != Boolean::FALSE;
-    unsafe {
-        let nlen = node_len(device_node as *const u8) as usize;
-        if !(4..=MAX_DEVICE_PATH_SIZE).contains(&nlen) {
-            return ptr::null_mut();
-        }
-        format_node(device_node as *const u8, is_display_only, &mut buf);
-    }
+    format_node(node, display_only != Boolean::FALSE, &mut buf);
     ascii_to_ucs2_alloc(buf.as_str())
 }
 
 /// `ConvertDevicePathToText` — format a full device path as a UCS-2 string.
-///
-/// Nodes are separated by `/`. Multi-instance separators produce `,`.
 extern "efiapi" fn convert_device_path_to_text(
     device_path: *mut device_path::Protocol,
     display_only: Boolean,
     _allow_shortcuts: Boolean,
 ) -> *mut Char16 {
-    if device_path.is_null() {
+    // SAFETY: the caller passes null or a readable device path.
+    let Some(path) = (unsafe { DevicePath::from_raw(device_path) }) else {
         return ptr::null_mut();
-    }
-
-    let is_display_only = display_only != Boolean::FALSE;
-    let mut buf = AsciiBuffer::new();
-    let mut first = true;
-
-    unsafe {
-        let path_size = device_path_size(device_path);
-        if path_size == 0 {
-            return ptr::null_mut();
-        }
-
-        let mut node = device_path as *const u8;
-        let mut consumed = 0usize;
-        while consumed < path_size {
-            let ntype = node_type(node);
-            let nlen = node_len(node) as usize;
-            if nlen < 4 || consumed + nlen > path_size {
-                return ptr::null_mut();
-            }
-
-            if ntype == TYPE_END {
-                let nsub = node_subtype(node);
-                if nsub == SUBTYPE_END_INSTANCE {
-                    // Multi-instance separator
-                    buf.push_str(",");
-                    first = true;
-                    consumed += nlen;
-                    node = node.add(nlen);
-                    continue;
-                }
-                // End-entire: done
-                break;
-            }
-
-            if !first {
-                buf.push_str("/");
-            }
-            first = false;
-
-            format_node(node, is_display_only, &mut buf);
-            consumed += nlen;
-            node = node.add(nlen);
-        }
-    }
-
-    ascii_to_ucs2_alloc(buf.as_str())
+    };
+    ascii_to_ucs2_alloc(format_path(path, display_only != Boolean::FALSE).as_str())
 }
 
 // ============================================================================
@@ -524,4 +396,73 @@ pub fn create_protocol() -> *mut c_void {
         },
     );
     proto as *mut c_void
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::device_path_view::terminated;
+    use super::*;
+
+    fn node(kind: u8, subtype: u8, payload: &[u8]) -> alloc::vec::Vec<u8> {
+        let len = (payload.len() + 4) as u16;
+        let mut node = alloc::vec![kind, subtype];
+        node.extend_from_slice(&len.to_le_bytes());
+        node.extend_from_slice(payload);
+        node
+    }
+
+    fn text(parts: &[&[u8]], display_only: bool) -> alloc::string::String {
+        let path = terminated(parts).unwrap();
+        let path = DevicePath::parse(&path).unwrap();
+        format_path(path, display_only).as_str().into()
+    }
+
+    #[test]
+    fn known_nodes_render_like_edk2() {
+        let root = node(
+            TYPE_ACPI,
+            ACPI_SUBTYPE_ACPI,
+            &[0xd0, 0x41, 0x03, 0x0a, 0, 0, 0, 0],
+        );
+        let pci = node(TYPE_HARDWARE, HW_SUBTYPE_PCI, &[1, 0x1f]);
+        let mut hd = alloc::vec![0u8; 38];
+        hd[0] = 1; // partition 1
+        hd[4] = 0x22; // start
+        hd[12] = 0x10; // size
+        hd[20..36].copy_from_slice(&[
+            0x28, 0x73, 0x2a, 0xc1, 0x1f, 0xf8, 0xd2, 0x11, 0xba, 0x4b, 0, 0xa0, 0xc9, 0x3e, 0xc9,
+            0x3b,
+        ]);
+        hd[36] = 2;
+        hd[37] = SIGNATURE_TYPE_GUID;
+        let hd = node(TYPE_MEDIA, MEDIA_SUBTYPE_HARDDRIVE, &hd);
+        let file = node(
+            TYPE_MEDIA,
+            MEDIA_SUBTYPE_FILEPATH,
+            &[b'\\', 0, b'A', 0, 0xe9, 0, 0, 0],
+        );
+        assert_eq!(
+            text(&[&root, &pci, &hd, &file], false),
+            "PciRoot(0x0)/Pci(0x1F,0x1)/HD(1,GPT,C12A7328-F81F-11D2-BA4B-00A0C93EC93B,0x22,0x10)/\\A?"
+        );
+        assert_eq!(
+            text(&[&hd], true),
+            "HD(1,GPT,C12A7328-F81F-11D2-BA4B-00A0C93EC93B)"
+        );
+    }
+
+    #[test]
+    fn short_nodes_and_instances_render_generically() {
+        // A Hard Drive node one byte short of its fixed layout.
+        let short = node(TYPE_MEDIA, MEDIA_SUBTYPE_HARDDRIVE, &[0xab; 37]);
+        let rendered = text(&[&short], false);
+        assert!(rendered.starts_with("MediaPath(0x1,ABAB"), "{rendered}");
+        let usb = node(TYPE_MESSAGING, MSG_SUBTYPE_USB, &[3, 0]);
+        let separator = [0x7f, 0x01, 4, 0];
+        assert_eq!(
+            text(&[&usb, &separator, &usb], false),
+            "USB(0x3,0x0),USB(0x3,0x0)"
+        );
+        assert_eq!(text(&[&node(0x42, 7, &[])], false), "Path(66,0x7)");
+    }
 }

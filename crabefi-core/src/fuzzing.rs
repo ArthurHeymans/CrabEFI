@@ -131,3 +131,41 @@ pub fn boot_config(data: &[u8]) {
     core::hint::black_box(crate::bls::LoaderConf::parse(text));
     let _ = crate::grub::parse_grub_content(text);
 }
+
+/// Render, split and rebuild a caller-supplied device path.
+pub fn device_path(data: &[u8]) {
+    use crate::efi::protocols::device_path_to_text::{format_node, format_path};
+    use crate::efi::protocols::device_path_utilities::{append, append_instance, next_instance};
+    use crate::efi::protocols::device_path_view::{DevicePath, Node};
+
+    if let Some(node) = Node::parse(data) {
+        let mut text = crate::efi::protocols::device_path_to_text::AsciiBuffer::default();
+        format_node(node, false, &mut text);
+    }
+    let Some(path) = DevicePath::parse(data) else {
+        return;
+    };
+    for display_only in [false, true] {
+        core::hint::black_box(format_path(path, display_only).as_str());
+    }
+    // Every path construction accepts parses again in full.
+    fn parses(bytes: &[u8]) -> Option<DevicePath<'_>> {
+        DevicePath::parse(bytes).filter(|path| path.as_bytes().len() == bytes.len())
+    }
+    if let Some(doubled) = append(Some(path), Some(path)) {
+        let doubled = parses(&doubled).expect("appended path");
+        if !path.is_multi_instance() {
+            assert_eq!(doubled.strip_prefix(path), Some(path.body().len()));
+        }
+    }
+    let Some(joined) = append_instance(path, path) else {
+        return;
+    };
+    let joined = parses(&joined).expect("joined path");
+    let mut rest = Some(joined);
+    while let Some(current) = rest {
+        let (instance, next) = next_instance(current).expect("an instance is smaller");
+        assert!(parses(&instance).is_some());
+        rest = next.map(|offset| DevicePath::parse(&current.as_bytes()[offset..]).unwrap());
+    }
+}

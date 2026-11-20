@@ -13,6 +13,7 @@ targets=(
     iso9660:131072
     boot_config:4096
     pkcs7:8192
+    device_path:70000
 )
 
 # Prebuilt cargo-fuzz binaries default to the target they were built for,

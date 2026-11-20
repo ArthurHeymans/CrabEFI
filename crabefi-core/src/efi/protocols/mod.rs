@@ -10,6 +10,7 @@ pub mod device_path;
 pub mod device_path_from_text;
 pub mod device_path_to_text;
 pub mod device_path_utilities;
+pub(crate) mod device_path_view;
 pub mod disk_io;
 pub mod graphics_output;
 pub mod hii;

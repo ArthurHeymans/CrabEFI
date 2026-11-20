@@ -14,76 +14,108 @@ use r_efi::efi::{Boolean, Guid};
 use r_efi::protocols::device_path;
 use r_efi::protocols::device_path_utilities;
 
-use crate::efi::allocator;
+use alloc::vec::Vec;
+
 use crate::efi::utils::allocate_protocol_value_with_log;
 
-// Re-use shared helpers from device_path.rs
-use super::device_path::{
-    MAX_DEVICE_PATH_SIZE, MIN_NODE_LENGTH, SUBTYPE_END_INSTANCE, alloc_pool, device_path_size,
-    write_end_node,
-};
+use super::device_path::{MIN_NODE_LENGTH, SUBTYPE_END_INSTANCE, alloc_pool};
+use super::device_path_view::{DevicePath, Node, TYPE_END, terminated};
 
 pub const DEVICE_PATH_UTILITIES_GUID: Guid = device_path_utilities::PROTOCOL_GUID;
 
-/// End-of-device-path node type
-const TYPE_END: u8 = 0x7F;
-
 // ============================================================================
-// Local walking helpers (protocol-specific, not worth sharing)
+// Path construction on checked views
 // ============================================================================
 
-/// Return the length of a single device path node.
-#[inline]
-unsafe fn node_length(node: *const device_path::Protocol) -> u16 {
-    let p = node as *const u8;
-    unsafe { u16::from_le_bytes([*p.add(2), *p.add(3)]) }
+/// `AppendDevicePath`: the first path's nodes followed by the whole second
+/// path. A missing path counts as empty.
+pub(crate) fn append(first: Option<DevicePath>, second: Option<DevicePath>) -> Option<Vec<u8>> {
+    terminated(&[
+        first.map_or(&[][..], DevicePath::body),
+        second.map_or(&[][..], DevicePath::body),
+    ])
 }
 
-/// Check if a node is an end-of-device-path (either end-entire or end-instance).
-#[inline]
-unsafe fn is_end_type(node: *const device_path::Protocol) -> bool {
-    unsafe { (*(node as *const u8)) == TYPE_END }
+/// `AppendDevicePathInstance`: the path, an End-Instance separator, then the
+/// new instance.
+pub(crate) fn append_instance(path: DevicePath, instance: DevicePath) -> Option<Vec<u8>> {
+    terminated(&[path.body(), &END_INSTANCE, instance.body()])
 }
 
-/// Check if a node is an end-instance separator.
-#[inline]
-unsafe fn is_end_instance(node: *const device_path::Protocol) -> bool {
-    let p = node as *const u8;
-    unsafe { *p == TYPE_END && *p.add(1) == SUBTYPE_END_INSTANCE }
+/// The first instance as a complete path, and where the next one starts.
+pub(crate) fn next_instance(path: DevicePath) -> Option<(Vec<u8>, Option<usize>)> {
+    let (instance, rest) = path.split_first_instance();
+    let next = rest.map(|rest| path.as_bytes().len() - rest.as_bytes().len());
+    Some((terminated(&[instance])?, next))
 }
 
-/// Advance to the next node in the device path.
-#[inline]
-unsafe fn next_node(node: *const device_path::Protocol) -> *const device_path::Protocol {
-    let len = unsafe { node_length(node) } as usize;
-    unsafe { (node as *const u8).add(len) as *const device_path::Protocol }
+const END_INSTANCE: [u8; 4] = [TYPE_END, SUBTYPE_END_INSTANCE, MIN_NODE_LENGTH as u8, 0];
+
+/// Allocate `len` zeroed bytes of pool memory the caller frees, and let
+/// `fill` write them.
+fn publish_with(len: usize, fill: impl FnOnce(&mut [u8])) -> *mut device_path::Protocol {
+    let buf = alloc_pool(len);
+    if !buf.is_null() {
+        // SAFETY: AllocatePool returned `len` exclusively owned bytes; they
+        // are initialized before a slice is formed over them.
+        let out = unsafe {
+            ptr::write_bytes(buf, 0, len);
+            core::slice::from_raw_parts_mut(buf, len)
+        };
+        fill(out);
+    }
+    buf.cast()
+}
+
+/// Copy `bytes` into a new pool allocation the caller frees.
+fn publish(bytes: &[u8]) -> *mut device_path::Protocol {
+    publish_with(bytes.len(), |out| out.copy_from_slice(bytes))
+}
+
+/// Publish a path built in memory; `None` means the heap was exhausted.
+fn publish_built(bytes: Option<Vec<u8>>) -> *mut device_path::Protocol {
+    bytes.map_or(ptr::null_mut(), |bytes| publish(&bytes))
+}
+
+/// A caller's path: `Ok(None)` for null, `Err` when malformed.
+///
+/// # Safety
+/// As [`DevicePath::from_raw`]: `path` is null or points to a complete device
+/// path in one live allocation that outlives `'a`. EFI entry points satisfy
+/// this for the duration of the call; the view must not escape it.
+unsafe fn caller_path<'a>(
+    path: *const device_path::Protocol,
+) -> Result<Option<DevicePath<'a>>, ()> {
+    if path.is_null() {
+        return Ok(None);
+    }
+    // SAFETY: forwarded from the caller.
+    unsafe { DevicePath::from_raw(path) }.map(Some).ok_or(())
 }
 
 // ============================================================================
 // Protocol function implementations
+//
+// SAFETY (all `caller_path` calls): EFI callers pass null or complete device
+// paths that stay valid for the duration of the call, and no view outlives it.
 // ============================================================================
 
 /// `GetDevicePathSize` — return total byte size of a device path including End node.
 extern "efiapi" fn get_device_path_size(device_path: *const device_path::Protocol) -> usize {
-    unsafe { device_path_size(device_path) }
+    unsafe { caller_path(device_path) }
+        .ok()
+        .flatten()
+        .map_or(0, |path| path.as_bytes().len())
 }
 
 /// `DuplicateDevicePath` — allocate a copy of a device path.
 extern "efiapi" fn duplicate_device_path(
     device_path: *const device_path::Protocol,
 ) -> *mut device_path::Protocol {
-    let size = unsafe { device_path_size(device_path) };
-    if size == 0 {
-        return ptr::null_mut();
+    match unsafe { caller_path(device_path) } {
+        Ok(Some(path)) => publish(path.as_bytes()),
+        _ => ptr::null_mut(),
     }
-    let buf = alloc_pool(size);
-    if buf.is_null() {
-        return ptr::null_mut();
-    }
-    unsafe {
-        ptr::copy_nonoverlapping(device_path as *const u8, buf, size);
-    }
-    buf as *mut device_path::Protocol
 }
 
 /// `AppendDevicePath` — concatenate two device paths.
@@ -95,128 +127,51 @@ extern "efiapi" fn append_device_path(
     src1: *const device_path::Protocol,
     src2: *const device_path::Protocol,
 ) -> *mut device_path::Protocol {
-    if src1.is_null() && src2.is_null() {
-        // Return a minimal end-only device path
-        let buf = alloc_pool(MIN_NODE_LENGTH as usize);
-        if buf.is_null() {
-            return ptr::null_mut();
-        }
-        unsafe { write_end_node(buf) };
-        return buf as *mut device_path::Protocol;
+    match (unsafe { caller_path(src1) }, unsafe { caller_path(src2) }) {
+        (Ok(first), Ok(second)) => publish_built(append(first, second)),
+        _ => ptr::null_mut(),
     }
-    if src1.is_null() {
-        return duplicate_device_path(src2);
-    }
-    if src2.is_null() {
-        return duplicate_device_path(src1);
-    }
-
-    let size1 = unsafe { device_path_size(src1) };
-    let size2 = unsafe { device_path_size(src2) };
-    if size1 == 0 || size2 == 0 {
-        return ptr::null_mut();
-    }
-
-    // Src1 without its end node + Src2 complete
-    let end_size = MIN_NODE_LENGTH as usize;
-    let total = (size1 - end_size) + size2;
-    let buf = alloc_pool(total);
-    if buf.is_null() {
-        return ptr::null_mut();
-    }
-    unsafe {
-        // Copy Src1 without end node
-        ptr::copy_nonoverlapping(src1 as *const u8, buf, size1 - end_size);
-        // Copy Src2 (with its end node)
-        ptr::copy_nonoverlapping(src2 as *const u8, buf.add(size1 - end_size), size2);
-    }
-    buf as *mut device_path::Protocol
 }
 
 /// `AppendDeviceNode` — append a single node to a device path.
-///
-/// Wraps the node in a temporary device path, then calls `append_device_path`.
 extern "efiapi" fn append_device_node(
     device_path_ptr: *const device_path::Protocol,
     device_node: *const device_path::Protocol,
 ) -> *mut device_path::Protocol {
+    let Ok(path) = (unsafe { caller_path(device_path_ptr) }) else {
+        return ptr::null_mut();
+    };
     if device_node.is_null() {
-        if device_path_ptr.is_null() {
-            // Both NULL: return end-only path
-            let buf = alloc_pool(MIN_NODE_LENGTH as usize);
-            if buf.is_null() {
-                return ptr::null_mut();
-            }
-            unsafe { write_end_node(buf) };
-            return buf as *mut device_path::Protocol;
-        }
-        return duplicate_device_path(device_path_ptr);
+        return publish_built(append(path, None));
     }
-
-    unsafe {
-        let nlen = node_length(device_node) as usize;
-        if !(MIN_NODE_LENGTH as usize..=MAX_DEVICE_PATH_SIZE).contains(&nlen) {
-            return ptr::null_mut();
-        }
-        let end_size = MIN_NODE_LENGTH as usize;
-        let temp_size = nlen + end_size;
-
-        let temp = alloc_pool(temp_size);
-        if temp.is_null() {
-            return ptr::null_mut();
-        }
-        // Copy node + append end
-        ptr::copy_nonoverlapping(device_node as *const u8, temp, nlen);
-        write_end_node(temp.add(nlen));
-
-        let result = append_device_path(device_path_ptr, temp as *const device_path::Protocol);
-
-        // Free the temporary path
-        let _ = allocator::free_pool(temp);
-
-        result
+    // SAFETY: the caller passes a readable node of its claimed length.
+    let Some(node) = (unsafe { Node::from_raw(device_node) }) else {
+        return ptr::null_mut();
+    };
+    // Like EDK2, wrap the node in a path of its own first. An End-Entire node
+    // then appends nothing; an End node with another subtype or length
+    // cannot form a path and is rejected.
+    let Some(wrapped) = terminated(&[node.as_bytes()]) else {
+        return ptr::null_mut();
+    };
+    match DevicePath::parse(&wrapped) {
+        Some(node) => publish_built(append(path, Some(node))),
+        None => ptr::null_mut(),
     }
 }
 
 /// `AppendDevicePathInstance` — append a device path as a new instance.
-///
-/// Inserts an end-of-instance separator between the two paths.
 extern "efiapi" fn append_device_path_instance(
     device_path_ptr: *const device_path::Protocol,
     device_path_instance: *const device_path::Protocol,
 ) -> *mut device_path::Protocol {
-    if device_path_instance.is_null() {
-        return ptr::null_mut();
+    match (unsafe { caller_path(device_path_ptr) }, unsafe {
+        caller_path(device_path_instance)
+    }) {
+        (Ok(None), Ok(Some(instance))) => publish(instance.as_bytes()),
+        (Ok(Some(path)), Ok(Some(instance))) => publish_built(append_instance(path, instance)),
+        _ => ptr::null_mut(),
     }
-    if device_path_ptr.is_null() {
-        return duplicate_device_path(device_path_instance);
-    }
-
-    let size1 = unsafe { device_path_size(device_path_ptr) };
-    let size2 = unsafe { device_path_size(device_path_instance) };
-    if size1 == 0 || size2 == 0 {
-        return ptr::null_mut();
-    }
-
-    // Replace Src1's end-entire with end-instance, then append Src2
-    let end_size = MIN_NODE_LENGTH as usize;
-    let total = size1 + size2; // Src1 (end becomes instance-end) + Src2 (with its end)
-    // Actually: size1 includes end node. We keep it but change subtype.
-    // Then we append size2 after it.
-    let buf = alloc_pool(total);
-    if buf.is_null() {
-        return ptr::null_mut();
-    }
-    unsafe {
-        // Copy all of Src1
-        ptr::copy_nonoverlapping(device_path_ptr as *const u8, buf, size1);
-        // Change the end-entire to end-instance
-        let end_node = buf.add(size1 - end_size);
-        *end_node.add(1) = SUBTYPE_END_INSTANCE;
-        // Append Src2
-        ptr::copy_nonoverlapping(device_path_instance as *const u8, buf.add(size1), size2);
-    }
-    buf as *mut device_path::Protocol
 }
 
 /// `GetNextDevicePathInstance` — extract the next instance from a multi-instance path.
@@ -227,103 +182,45 @@ extern "efiapi" fn get_next_device_path_instance(
     device_path_instance: *mut *mut device_path::Protocol,
     size: *mut usize,
 ) -> *mut device_path::Protocol {
-    if device_path_instance.is_null() || size.is_null() {
-        if !size.is_null() {
-            unsafe { *size = 0 };
-        }
+    if size.is_null() {
         return ptr::null_mut();
     }
-
-    unsafe {
-        let dp = *device_path_instance;
-        if dp.is_null() {
-            *size = 0;
-            return ptr::null_mut();
-        }
-
-        let path_size = device_path_size(dp);
-        if path_size == 0 {
-            *size = 0;
-            return ptr::null_mut();
-        }
-
-        // Walk to the end of this instance (either end-entire or end-instance),
-        // but never beyond the validated path size.
-        let mut node = dp as *const device_path::Protocol;
-        let mut consumed = 0usize;
-        while consumed < path_size && !is_end_type(node) {
-            let nlen = node_length(node) as usize;
-            if nlen < MIN_NODE_LENGTH as usize || consumed + nlen > path_size {
-                *size = 0;
-                return ptr::null_mut();
-            }
-            consumed += nlen;
-            node = next_node(node);
-        }
-        if consumed >= path_size {
-            *size = 0;
-            return ptr::null_mut();
-        }
-
-        let end_size = MIN_NODE_LENGTH as usize;
-
-        // Size of instance nodes (not including the end node we found) + end node we'll add
-        let instance_bytes = (node as usize) - (dp as usize);
-        let result_size = instance_bytes + end_size;
-        *size = result_size;
-
-        // Allocate and copy the instance
-        let buf = alloc_pool(result_size);
-        if buf.is_null() {
-            return ptr::null_mut();
-        }
-        ptr::copy_nonoverlapping(dp as *const u8, buf, instance_bytes);
-        write_end_node(buf.add(instance_bytes));
-
-        // Advance past the separator
-        if is_end_instance(node) {
-            *device_path_instance = next_node(node) as *mut device_path::Protocol;
-        } else {
-            // End-entire: no more instances
-            *device_path_instance = ptr::null_mut();
-        }
-
-        buf as *mut device_path::Protocol
+    // SAFETY: `size` is a caller-provided output.
+    unsafe { *size = 0 };
+    if device_path_instance.is_null() {
+        return ptr::null_mut();
     }
+    // SAFETY: a non-null in/out pointer from the caller.
+    let current = unsafe { *device_path_instance };
+    let Ok(Some(path)) = (unsafe { caller_path(current) }) else {
+        return ptr::null_mut();
+    };
+    let Some((instance, next)) = next_instance(path) else {
+        return ptr::null_mut();
+    };
+    let copy = publish(&instance);
+    if copy.is_null() {
+        // Leave the cursor on this instance so a retry does not skip it.
+        return ptr::null_mut();
+    }
+    // SAFETY: caller-provided outputs; `next` lies inside the walked path.
+    unsafe {
+        *size = instance.len();
+        *device_path_instance = match next {
+            Some(offset) => current.cast::<u8>().add(offset).cast(),
+            None => ptr::null_mut(),
+        };
+    }
+    copy
 }
 
 /// `IsDevicePathMultiInstance` — check if a device path contains instance separators.
 extern "efiapi" fn is_device_path_multi_instance(
     device_path: *const device_path::Protocol,
 ) -> Boolean {
-    if device_path.is_null() {
-        return Boolean::FALSE;
-    }
-    unsafe {
-        let path_size = device_path_size(device_path);
-        if path_size == 0 {
-            return Boolean::FALSE;
-        }
-
-        let mut node = device_path;
-        let mut consumed = 0usize;
-        while consumed < path_size {
-            let p = node as *const u8;
-            let ntype = *p;
-            let nlen = u16::from_le_bytes([*p.add(2), *p.add(3)]) as usize;
-            if nlen < MIN_NODE_LENGTH as usize || consumed + nlen > path_size {
-                return Boolean::FALSE;
-            }
-            if ntype == TYPE_END {
-                if is_end_instance(node) {
-                    return Boolean::TRUE;
-                }
-                return Boolean::FALSE;
-            }
-            consumed += nlen;
-            node = next_node(node);
-        }
-        Boolean::FALSE
+    match unsafe { caller_path(device_path) } {
+        Ok(Some(path)) if path.is_multi_instance() => Boolean::TRUE,
+        _ => Boolean::FALSE,
     }
 }
 
@@ -336,20 +233,11 @@ extern "efiapi" fn create_device_node(
     if node_length < MIN_NODE_LENGTH {
         return ptr::null_mut();
     }
-    let buf = alloc_pool(node_length as usize);
-    if buf.is_null() {
-        return ptr::null_mut();
-    }
-    unsafe {
-        // Zero-init
-        ptr::write_bytes(buf, 0, node_length as usize);
-        *buf = node_type;
-        *buf.add(1) = node_sub_type;
-        let len_bytes = node_length.to_le_bytes();
-        *buf.add(2) = len_bytes[0];
-        *buf.add(3) = len_bytes[1];
-    }
-    buf as *mut device_path::Protocol
+    publish_with(usize::from(node_length), |node| {
+        node[0] = node_type;
+        node[1] = node_sub_type;
+        node[2..4].copy_from_slice(&node_length.to_le_bytes());
+    })
 }
 
 // ============================================================================
@@ -374,4 +262,42 @@ pub fn create_protocol() -> *mut c_void {
         },
     );
     proto as *mut c_void
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PCI: [u8; 6] = [0x01, 0x01, 6, 0, 0, 2];
+
+    fn path(bytes: &[u8]) -> DevicePath<'_> {
+        DevicePath::parse(bytes).unwrap()
+    }
+
+    #[test]
+    fn append_and_split_instances_round_trip() {
+        let one = terminated(&[&PCI]).unwrap();
+        let two = terminated(&[&PCI, &PCI]).unwrap();
+        assert_eq!(append(None, None), terminated(&[]));
+        assert_eq!(append(Some(path(&one)), Some(path(&one))).unwrap(), two);
+
+        let joined = append_instance(path(&one), path(&two)).unwrap();
+        let joined = path(&joined);
+        assert!(joined.is_multi_instance());
+        let (first, next) = next_instance(joined).unwrap();
+        assert_eq!(first, one);
+        let rest = path(&joined.as_bytes()[next.unwrap()..]);
+        assert_eq!(next_instance(rest), Some((two, None)));
+    }
+
+    #[test]
+    fn paths_too_large_to_read_back_are_not_built() {
+        let mut node = alloc::vec![0x04u8, 0x03];
+        node.extend_from_slice(&40_000u16.to_le_bytes());
+        node.resize(40_000, 0);
+        let large = terminated(&[&node]).unwrap();
+        let large = path(&large);
+        assert_eq!(append(Some(large), Some(large)), None);
+        assert_eq!(append_instance(large, large), None);
+    }
 }

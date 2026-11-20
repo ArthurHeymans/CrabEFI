@@ -54,5 +54,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "device_path"
+path = "fuzz_targets/device_path.rs"
+test = false
+doc = false
+bench = false
+
 [profile.release]
 debug = 1

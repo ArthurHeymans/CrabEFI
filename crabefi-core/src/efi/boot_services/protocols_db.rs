@@ -18,6 +18,8 @@ use core::ffi::c_void;
 use r_efi::efi::{self, Guid, Handle, Status};
 use r_efi::protocols::device_path::Protocol as DevicePathProtocol;
 
+use crate::efi::protocols::device_path_view::DevicePath;
+
 // ============================================================================
 // Protocol Handler Functions
 // ============================================================================
@@ -408,53 +410,6 @@ fn collect_handles(
     Ok(handles)
 }
 
-unsafe fn device_path_node_len(dp: *mut DevicePathProtocol) -> Option<usize> {
-    let len = unsafe { u16::from_le_bytes([(*dp).length[0], (*dp).length[1]]) as usize };
-    (len >= 4).then_some(len)
-}
-
-unsafe fn is_device_path_end(dp: *mut DevicePathProtocol) -> bool {
-    unsafe { (*dp).r#type == 0x7f && (*dp).sub_type == 0xff }
-}
-
-unsafe fn device_path_prefix_match(
-    handle_dp: *mut DevicePathProtocol,
-    input_dp: *mut DevicePathProtocol,
-) -> Option<*mut DevicePathProtocol> {
-    let mut handle_node = handle_dp;
-    let mut input_node = input_dp;
-
-    // Device paths are small. Bound the walk so malformed paths cannot loop forever.
-    for _ in 0..128 {
-        if unsafe { is_device_path_end(handle_node) } {
-            return Some(input_node);
-        }
-        if unsafe { is_device_path_end(input_node) } {
-            return None;
-        }
-
-        let handle_len = unsafe { device_path_node_len(handle_node)? };
-        let input_len = unsafe { device_path_node_len(input_node)? };
-        if handle_len != input_len {
-            return None;
-        }
-
-        let handle_bytes =
-            unsafe { core::slice::from_raw_parts(handle_node as *const u8, handle_len) };
-        let input_bytes =
-            unsafe { core::slice::from_raw_parts(input_node as *const u8, input_len) };
-        if handle_bytes != input_bytes {
-            return None;
-        }
-
-        handle_node =
-            unsafe { (handle_node as *const u8).add(handle_len) as *mut DevicePathProtocol };
-        input_node = unsafe { (input_node as *const u8).add(input_len) as *mut DevicePathProtocol };
-    }
-
-    None
-}
-
 pub(super) extern "efiapi" fn locate_device_path(
     protocol: *mut Guid,
     device_path: *mut *mut DevicePathProtocol,
@@ -472,6 +427,11 @@ pub(super) extern "efiapi" fn locate_device_path(
         log::debug!("  -> INVALID_PARAMETER (device_path is NULL)");
         return Status::INVALID_PARAMETER;
     }
+    // SAFETY: the caller passes a readable device path.
+    let Some(input) = (unsafe { DevicePath::from_raw(input_dp) }) else {
+        log::debug!("  -> NOT_FOUND (malformed device path)");
+        return Status::NOT_FOUND;
+    };
 
     // Find the handle with both the specified protocol and a DEVICE_PATH protocol.
     // UEFI requires the longest matching prefix, so evaluate every candidate
@@ -497,10 +457,13 @@ pub(super) extern "efiapi" fn locate_device_path(
                 return None;
             }
 
-            let remaining = unsafe { device_path_prefix_match(handle_dp, input_dp) }?;
-            // `remaining` points into the input path past the matched prefix,
-            // so its offset from the input start is the consumed length.
-            let consumed = (remaining as usize).wrapping_sub(input_dp as usize);
+            // SAFETY: installed device path interfaces are readable paths;
+            // a malformed one simply never matches.
+            let handle_path = unsafe { DevicePath::from_raw(handle_dp) }?;
+            // UEFI matches against the first instance of the input only.
+            let consumed = input.strip_prefix(handle_path)?;
+            // SAFETY: `consumed` is a node boundary inside the input path.
+            let remaining = unsafe { input_dp.cast::<u8>().add(consumed) }.cast();
             Some((consumed, entry.handle, remaining))
         })
         .max_by_key(|(consumed, _, _)| *consumed)
