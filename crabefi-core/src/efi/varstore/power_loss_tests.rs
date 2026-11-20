@@ -209,17 +209,19 @@ fn visible() -> Vec<Var> {
             // Everything but the data and timestamp is fixed by the tests.
             assert_eq!(record.guid, edk2::guid_to_bytes(&guid(record.guid[0])));
             assert!(edk2::name_matches(&record.name, &name("Var")));
+            // Unauthenticated records carry an all-zero timestamp.
             let stamp = record.timestamp.unwrap_or_default();
             let year = stamp.year;
             assert_eq!(record.attributes, attributes(year));
-            // The whole timestamp survives, not only its year.
+            // The whole timestamp survives, and the replay-floor lookup that
+            // authenticated writes use accepts the recovered store and agrees
+            // with the live record.
             assert_eq!(stamp, timestamp(year).unwrap_or_default());
-            if year != 0 {
-                // The replay floor as authenticated writes read it, through
-                // the checked walk.
-                let floor = try_get_variable_timestamp(&guid(record.guid[0]), &name("Var"));
-                assert_eq!(floor, Ok(timestamp(year)));
-            }
+            assert_eq!(
+                try_get_variable_timestamp(&guid(record.guid[0]), &name("Var"))
+                    .map(Option::unwrap_or_default),
+                Ok(stamp),
+            );
             (record.guid[0], record.data.clone(), year)
         })
         .collect();
@@ -306,7 +308,7 @@ fn power_loss_scenario(
                     });
                     let seen_again = visible();
                     assert!(
-                        seen_again == before || seen_again == after,
+                        seen_again == seen || seen_again == after,
                         "second power loss at {again} ({cut_again:?}) after {at} ({cut:?}) left {seen_again:?}"
                     );
                 }
