@@ -105,8 +105,10 @@ pub trait SettingsModel {
     fn forms(&self) -> &[CfrForm];
     fn read_option_value(&self, option: &CfrOption) -> CfrValue;
     fn write_option_value(&self, option: &CfrOption, value: &CfrValue) -> Result<(), &'static str>;
-    fn configured_level(&self) -> LevelFilter {
-        DEFAULT_LEVEL
+    /// CrabEFI's own log level; `None` hides the setting (the platform
+    /// owns the level).
+    fn configured_level(&self) -> Option<LevelFilter> {
+        Some(DEFAULT_LEVEL)
     }
     fn set_configured_level(&self, _level: LevelFilter) -> Result<(), &'static str> {
         Err("Log level storage unavailable")

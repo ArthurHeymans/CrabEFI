@@ -35,7 +35,7 @@ impl SettingsModel for Session<'_> {
         self.stored.borrow_mut().clear();
         self.model.write_option_value(option, value)
     }
-    fn configured_level(&self) -> LevelFilter {
+    fn configured_level(&self) -> Option<LevelFilter> {
         self.model.configured_level()
     }
     fn set_configured_level(&self, level: LevelFilter) -> Result<(), &'static str> {
@@ -143,16 +143,21 @@ pub fn step_external_boot(current: usize, floor: usize, forward: bool) -> usize 
 pub fn build_menu_items(cfr: &CfrInfo<'_>) -> Vec<MenuItem> {
     let mut items = Vec::new();
 
-    items.push(MenuItem::FormHeader {
-        name: String::from("CrabEFI"),
-        form_idx: None,
-    });
-    let current_level = cfr.configured_level();
-    items.push(MenuItem::CrabLogLevel {
-        current_level,
-        original_level: current_level,
-    });
-    if let Some((floor, current)) = cfr.external_boot() {
+    let level = cfr.configured_level();
+    let external_boot = cfr.external_boot();
+    if level.is_some() || external_boot.is_some() {
+        items.push(MenuItem::FormHeader {
+            name: String::from("CrabEFI"),
+            form_idx: None,
+        });
+    }
+    if let Some(current_level) = level {
+        items.push(MenuItem::CrabLogLevel {
+            current_level,
+            original_level: current_level,
+        });
+    }
+    if let Some((floor, current)) = external_boot {
         items.push(MenuItem::CrabExternalBoot {
             current,
             original: current,
@@ -838,6 +843,32 @@ mod tests {
         assert_eq!(step_external_boot(2, 1, true), 1);
         assert_eq!(step_external_boot(1, 1, false), 2);
         assert_eq!(step_external_boot(2, 2, true), 2);
+    }
+
+    #[test]
+    fn a_platform_owned_log_level_is_not_offered() {
+        struct Model;
+        impl SettingsModel for Model {
+            fn forms(&self) -> &[CfrForm] {
+                &[]
+            }
+            fn read_option_value(&self, _: &CfrOption) -> CfrValue {
+                CfrValue::Bool(false)
+            }
+            fn write_option_value(&self, _: &CfrOption, _: &CfrValue) -> Result<(), &'static str> {
+                Ok(())
+            }
+            fn configured_level(&self) -> Option<LevelFilter> {
+                None
+            }
+        }
+        // Nothing of CrabEFI's own is left, not even its header.
+        assert!(build_menu_items(&Session::new(&Model)).is_empty());
+        assert!(
+            build_menu_items(&CfrInfo::new())
+                .iter()
+                .any(|item| matches!(item, MenuItem::CrabLogLevel { .. }))
+        );
     }
 
     #[test]
