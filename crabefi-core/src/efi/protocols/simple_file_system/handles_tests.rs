@@ -125,6 +125,7 @@ fn allocator_failures_do_not_publish_partial_slabs_or_consume_reservations() {
             assert_eq!(pool.handles.len(), occupied);
             assert_eq!(pool.nodes.len(), occupied);
             assert_eq!(pool.handles.slabs.len() * SLOTS_PER_SLAB, occupied);
+            assert_eq!(pool.handles.protocols.len() * SLOTS_PER_SLAB, occupied);
             for (index, pointer) in pointers.into_iter().enumerate() {
                 assert_eq!(pointer, pool.handles.protocol(index));
                 assert!(pool.handles[index].in_use);

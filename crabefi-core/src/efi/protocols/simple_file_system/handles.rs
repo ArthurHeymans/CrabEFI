@@ -4,6 +4,7 @@
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::cell::UnsafeCell;
 use core::ops::{Index, IndexMut};
 use r_efi::efi::Status;
 use r_efi::protocols::file as efi_file;
@@ -107,17 +108,21 @@ const SLOTS_PER_SLAB: usize = 16;
 // during reallocation are not counted.
 const POOL_BUDGET: usize = 1024 * 1024;
 const SLOT_COST: usize = core::mem::size_of::<FileHandle>()
-    + core::mem::size_of::<efi_file::Protocol>()
+    + core::mem::size_of::<UnsafeCell<efi_file::Protocol>>()
     + core::mem::size_of::<OpenFile>()
-    + (core::mem::size_of::<Vec<FileHandle>>() + core::mem::size_of::<Box<[efi_file::Protocol]>>())
-        .div_ceil(SLOTS_PER_SLAB);
+    + (core::mem::size_of::<Vec<FileHandle>>()
+        + core::mem::size_of::<Box<[UnsafeCell<efi_file::Protocol>]>>())
+    .div_ceil(SLOTS_PER_SLAB);
 
 /// Inner buffers never resize or move after insertion. Growing the outer Vec
 /// moves only Vec headers, never published EFI protocol objects. Closing/reset
 /// reuses slots; it does not deallocate their published addresses.
 struct StableHandles {
     slabs: Vec<Vec<FileHandle>>,
-    protocols: Vec<Box<[efi_file::Protocol]>>,
+    /// Callers write through published pointers as well as read them (uefi-rs
+    /// forms `&mut` from a file handle), so each object sits in an
+    /// `UnsafeCell` and its pointer carries write provenance.
+    protocols: Vec<Box<[UnsafeCell<efi_file::Protocol>]>>,
     len: usize,
 }
 impl StableHandles {
@@ -129,9 +134,9 @@ impl StableHandles {
         }
     }
     /// The published protocol of slot `index`. Firmware only compares its
-    /// address; callers read its function pointers.
+    /// address and never reads or writes through it.
     fn protocol(&self, index: usize) -> *mut efi_file::Protocol {
-        (&raw const self.protocols[index / SLOTS_PER_SLAB][index % SLOTS_PER_SLAB]).cast_mut()
+        self.protocols[index / SLOTS_PER_SLAB][index % SLOTS_PER_SLAB].get()
     }
     fn len(&self) -> usize {
         self.len
@@ -199,7 +204,7 @@ impl FilePool {
         protocols
             .try_reserve_exact(SLOTS_PER_SLAB)
             .map_err(|_| Status::OUT_OF_RESOURCES)?;
-        protocols.resize_with(SLOTS_PER_SLAB, || FILE_PROTOCOL);
+        protocols.resize_with(SLOTS_PER_SLAB, || UnsafeCell::new(FILE_PROTOCOL));
         // Exact capacity: converting to a boxed slice does not reallocate.
         let protocols = protocols.into_boxed_slice();
         self.handles
