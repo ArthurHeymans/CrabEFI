@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+capstone = { version = "0.14", default-features = false, features = ["std", "full", "arch_x86", "arch_arm64", "arch_riscv"] }
 crabefi-runtime-abi = { path = "../crabefi-runtime-abi" }
 clap = { version = "4", features = ["derive"] }
 regex = "1"
