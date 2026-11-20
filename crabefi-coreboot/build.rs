@@ -23,7 +23,9 @@ fn main() {
     let external_runtime = std::env::var_os("CARGO_FEATURE_EXTERNAL_RUNTIME_IMAGE").is_some();
     let native_only = std::env::var_os("CARGO_FEATURE_NATIVE_ONLY").is_some();
     match (bundled_runtime, external_runtime, native_only) {
-        (true, false, false) => {}
+        (true, false, false) => println!(
+            "cargo:warning=bundled-runtime-image uses a checked-in image, not local runtime source edits; verify with ./crabefi check-runtime-bundle --rebuild"
+        ),
         (false, true, false) => embed_runtime_image(runtime_architecture),
         (false, false, true) => {
             assert!(target.starts_with("x86_64"), "native-only requires x86-64");
@@ -106,6 +108,9 @@ fn embed_runtime_image(expected_architecture: u16) {
     println!("cargo:rerun-if-env-changed=RUNTIME_IMAGE_SHA256");
     let source = std::env::var("RUNTIME_IMAGE_PATH")
         .expect("RUNTIME_IMAGE_PATH is mandatory; build through ./crabefi build");
+    println!(
+        "cargo:warning=external-runtime-image embeds the image supplied via RUNTIME_IMAGE_PATH: {source}"
+    );
     println!("cargo:rerun-if-changed={source}");
     let bytes = std::fs::read(&source).expect("read normalized runtime image");
     ValidatedImage::parse(&bytes, expected_architecture)

@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
+use clap::ValueEnum;
 use object::{
     Object, ObjectKind, ObjectSection, ObjectSegment, ObjectSymbol, Permissions, RelocationKind,
     RelocationTarget,
@@ -42,13 +43,7 @@ pub struct RuntimeArtifact {
 /// Build and install the normalized image used by Cargo-only library consumers.
 pub fn bundle(arch: Arch, secure_boot: bool) -> Result<()> {
     let artifact = build_with_capabilities(arch, secure_boot)?;
-    let images = project_root().join("crabefi-runtime-bundle/images");
-    let destination = if secure_boot {
-        images
-    } else {
-        images.join("basic")
-    }
-    .join(arch.dir_name());
+    let destination = bundle_directory(arch, secure_boot);
     fs::create_dir_all(&destination)?;
     atomic_copy(&artifact.image, &destination.join("runtime.img"))?;
     atomic_write(&destination.join("sha256.bin"), &artifact.digest)?;
@@ -56,6 +51,88 @@ pub fn bundle(arch: Arch, secure_boot: bool) -> Result<()> {
         "Updated bundled Runtime Services image: {}",
         destination.display()
     );
+    Ok(())
+}
+
+fn bundle_directory(arch: Arch, secure_boot: bool) -> PathBuf {
+    let images = project_root().join("crabefi-runtime-bundle/images");
+    if secure_boot {
+        images
+    } else {
+        images.join("basic")
+    }
+    .join(arch.dir_name())
+}
+
+/// Check every architecture/profile pair without replacing checked-in files.
+pub fn check_bundle(rebuild: bool) -> Result<()> {
+    for arch in [Arch::X86_64, Arch::Aarch64, Arch::Riscv64] {
+        for secure_boot in [false, true] {
+            let dir = bundle_directory(arch, secure_boot);
+            let read = |name: &str| {
+                let path = dir.join(name);
+                fs::read(&path).with_context(|| format!("read {}", path.display()))
+            };
+            let digest = check_bundle_pair(
+                &read("runtime.img")?,
+                &read("sha256.bin")?,
+                arch,
+                secure_boot,
+            )
+            .with_context(|| format!("invalid runtime bundle in {}", dir.display()))?;
+            if rebuild {
+                let fresh = build_with_capabilities(arch, secure_boot)?;
+                check_bundle_freshness(digest, fresh.digest, arch, secure_boot)
+                    .with_context(|| format!("stale runtime bundle in {}", dir.display()))?;
+            }
+        }
+    }
+    if rebuild {
+        println!("All runtime bundles match the audited builds from current sources.");
+    } else {
+        println!(
+            "All runtime bundle pairs are consistent. Use --rebuild to check source freshness."
+        );
+    }
+    Ok(())
+}
+
+fn check_bundle_pair(
+    image: &[u8],
+    digest: &[u8],
+    arch: Arch,
+    secure_boot: bool,
+) -> Result<[u8; 32]> {
+    let actual: [u8; 32] = Sha256::digest(image).into();
+    if actual.as_slice() != digest {
+        bail!("sha256.bin does not match the raw SHA-256 of runtime.img");
+    }
+    let parsed = ValidatedImage::parse(image, architecture_id(arch))
+        .map_err(|error| anyhow::anyhow!("runtime.img failed ABI validation: {error}"))?;
+    if parsed.header().feature_bits != expected_capabilities(secure_boot) {
+        bail!("runtime.img has the wrong capabilities for this bundle");
+    }
+    Ok(actual)
+}
+
+fn check_bundle_freshness(
+    bundled: [u8; 32],
+    rebuilt: [u8; 32],
+    arch: Arch,
+    secure_boot: bool,
+) -> Result<()> {
+    if bundled != rebuilt {
+        let arch = arch
+            .to_possible_value()
+            .expect("all architectures have CLI names");
+        let feature = if secure_boot { " --secure-boot" } else { "" };
+        bail!(
+            "checked-in SHA-256 {} differs from rebuilt {}; regenerate this profile with ./crabefi bundle-runtime --arch {}{feature}",
+            hex(&bundled),
+            hex(&rebuilt),
+            arch.get_name(),
+        );
+    }
     Ok(())
 }
 
@@ -211,6 +288,15 @@ fn runtime_rustflags(arch: Arch, map_path: &Path) -> OsString {
     encoded
 }
 
+fn expected_capabilities(secure_boot: bool) -> u64 {
+    crabefi_runtime_abi::feature_bits::REQUIRED
+        | if secure_boot {
+            crabefi_runtime_abi::feature_bits::SECURE_BOOT
+        } else {
+            0
+        }
+}
+
 fn normalize(
     elf_path: &Path,
     output: &Path,
@@ -223,13 +309,7 @@ fn normalize(
         bail!("runtime ELF must be ET_DYN for the requested architecture");
     }
     let capabilities = runtime_capabilities(&file)?;
-    let expected_capabilities = crabefi_runtime_abi::feature_bits::REQUIRED
-        | if secure_boot {
-            crabefi_runtime_abi::feature_bits::SECURE_BOOT
-        } else {
-            0
-        };
-    if capabilities != expected_capabilities {
+    if capabilities != expected_capabilities(secure_boot) {
         bail!("runtime ELF capabilities do not match the requested bundle");
     }
     let mut segments = file
@@ -1092,6 +1172,42 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundle_pair_checks_raw_digest_architecture_and_capabilities() {
+        let image = include_bytes!("../../crabefi-runtime-bundle/images/basic/x86_64/runtime.img");
+        let digest: [u8; 32] = Sha256::digest(image).into();
+        assert_eq!(
+            check_bundle_pair(image, &digest, Arch::X86_64, false).unwrap(),
+            digest
+        );
+        let mut corrupt = digest;
+        corrupt[0] ^= 1;
+        assert!(check_bundle_pair(image, &corrupt, Arch::X86_64, false).is_err());
+        assert!(check_bundle_pair(image, &digest[..31], Arch::X86_64, false).is_err());
+        assert!(check_bundle_pair(image, &digest, Arch::Aarch64, false).is_err());
+        assert!(check_bundle_pair(image, &digest, Arch::X86_64, true).is_err());
+    }
+
+    #[test]
+    fn matching_sidecar_is_not_proof_of_freshness() {
+        assert!(check_bundle_freshness([1; 32], [1; 32], Arch::Aarch64, true).is_ok());
+        for (arch, secure_boot, command) in [
+            (
+                Arch::Aarch64,
+                true,
+                "./crabefi bundle-runtime --arch aarch64 --secure-boot",
+            ),
+            (
+                Arch::X86_64,
+                false,
+                "./crabefi bundle-runtime --arch x86-64",
+            ),
+        ] {
+            let error = check_bundle_freshness([1; 32], [2; 32], arch, secure_boot).unwrap_err();
+            assert!(error.to_string().ends_with(command), "{error}");
+        }
+    }
 
     #[test]
     fn parses_portable_rustc_host_triples() {

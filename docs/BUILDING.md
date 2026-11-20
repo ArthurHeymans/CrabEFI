@@ -243,17 +243,27 @@ from the pad's latched interrupt status.
 
 ### Updating the Cargo runtime bundle
 
-Maintainers regenerate a bundled image from the audited runtime build with:
+Cargo builds with `bundled-runtime-image` embed a checked-in `runtime.img`;
+editing `crabefi-runtime-image` alone does **not** change that payload. In
+contrast, `./crabefi build` uses `external-runtime-image` with an audited image
+built from the local sources.
 
 ```bash
-./crabefi bundle-runtime --arch x86-64
-./crabefi bundle-runtime --arch aarch64
-./crabefi bundle-runtime --arch riscv64
+./crabefi check-runtime-bundle           # check image ABI, arch, capabilities and raw sha256.bin
+./crabefi check-runtime-bundle --rebuild # also compare to current audited, pinned-toolchain builds
 ```
 
-The generated normalized images and raw SHA-256 digests are stored under
-`crabefi-runtime-bundle/images/`. Library consumers should not need to run
-these commands; they consume the checked-in image selected by Cargo.
+Both checks cover the basic and Secure Boot profiles for all three architectures
+without updating `crabefi-runtime-bundle/images/`. A matching digest alone does
+not imply freshness: run `--rebuild` after runtime, ABI, dependency or toolchain
+changes. To update the checked-in pairs, regenerate with the affected profiles:
+
+```bash
+for arch in x86-64 aarch64 riscv64; do
+    ./crabefi bundle-runtime --arch "$arch"
+    ./crabefi bundle-runtime --arch "$arch" --secure-boot
+done
+```
 
 ## Testing
 
