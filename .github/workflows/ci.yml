@@ -45,7 +45,14 @@ jobs:
         with:
           kani-version: '0.68.0'
           working-directory: crabefi-runtime-image
-          args: --harness svam_
+          # Exact names: a renamed or deleted proof fails CI.
+          args: >-
+            --exact
+            --harness svam::proofs::svam_overlap_agrees_with_intersection
+            --harness svam::proofs::svam_validated_pair_has_disjoint_extents
+            --harness svam::proofs::svam_covered_translation_preserves_every_byte
+            --harness svam::proofs::svam_canonical_addresses_copy_their_top_bit
+            --harness svam::proofs::svam_canonical_ends_in_one_half_cover_the_range
   audit:
     name: Dependency audit
     runs-on: ubuntu-latest

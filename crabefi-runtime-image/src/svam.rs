@@ -138,8 +138,10 @@ fn validate_descriptor_stream(
             || (descriptor.virtual_start != 0
                 && (!descriptor.virtual_start.is_multiple_of(PAGE_SIZE)
                     || descriptor.virtual_start.checked_add(byte_len).is_none()
-                    || !canonical_virtual(descriptor.virtual_start)
-                    || !canonical_virtual(descriptor.virtual_start + byte_len - 1)))
+                    || !canonical_extent(
+                        descriptor.virtual_start,
+                        descriptor.virtual_start + byte_len - 1,
+                    )))
         {
             return Err(efi::Status::INVALID_PARAMETER);
         }
@@ -625,8 +627,57 @@ fn overlaps(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> bool {
     a_start < b_end && b_start < a_end
 }
 
+/// Whether bits 63 down to `top` of `address` all equal bit `top`.
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+fn sign_extended(address: u64, top: u32) -> bool {
+    let shift = 63 - top;
+    (((address << shift) as i64) >> shift) as u64 == address
+}
+
+/// Whether five-level paging (CR4.LA57) is active.
+///
+/// Runtime services run at CPL0 and read CR4. Host tests run this image in
+/// user mode, where reading CR4 faults; there the CPU's support for LA57 is
+/// the best available answer.
+#[cfg(target_arch = "x86_64")]
+fn x86_la57_active() -> bool {
+    #[cfg(kani)]
+    {
+        kani::any()
+    }
+    #[cfg(not(kani))]
+    {
+        let cs: u16;
+        // SAFETY: reading CS is allowed at every privilege level.
+        unsafe {
+            core::arch::asm!("mov {0:x}, cs", out(reg) cs, options(nomem, nostack, preserves_flags))
+        };
+        if cs & 3 != 0 {
+            return core::arch::x86_64::__cpuid_count(7, 0).ecx & (1 << 16) != 0;
+        }
+        let cr4: u64;
+        // SAFETY: at CPL0, reading CR4 has no side effects.
+        unsafe {
+            core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags))
+        };
+        cr4 & (1 << 12) != 0
+    }
+}
+
+/// Whether every address from `first` to `last` is canonical: both ends are,
+/// and they lie in the same half, so the range cannot span the hole between.
+fn canonical_extent(first: u64, last: u64) -> bool {
+    canonical_virtual(first) && canonical_virtual(last) && first >> 63 == last >> 63
+}
+
 fn canonical_virtual(address: u64) -> bool {
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    // x86-64 requires every bit above the active width to copy its top bit;
+    // checking only bits 63..48 accepted addresses with bit 47 set.
+    #[cfg(target_arch = "x86_64")]
+    {
+        sign_extended(address, if x86_la57_active() { 56 } else { 47 })
+    }
+    #[cfg(target_arch = "aarch64")]
     {
         let high = address >> 48;
         high == 0 || high == 0xffff
@@ -642,19 +693,33 @@ fn canonical_virtual(address: u64) -> bool {
             10 => 56,
             _ => return true,
         };
-        let sign = (address >> bit) & 1;
-        let high = address >> (bit + 1);
-        if sign == 0 {
-            high == 0
-        } else {
-            high == (u64::MAX >> (bit + 1))
-        }
+        sign_extended(address, bit)
     }
 }
 
 #[cfg(kani)]
 mod proofs {
     use super::*;
+
+    #[kani::proof]
+    fn svam_canonical_addresses_copy_their_top_bit() {
+        let address: u64 = kani::any();
+        let top: u32 = if kani::any() { 47 } else { 56 };
+        let high = address >> top;
+        let canonical = high == 0 || high == u64::MAX >> top;
+        assert_eq!(sign_extended(address, top), canonical);
+    }
+
+    /// Checking a range's two ends and its half covers every address in it.
+    #[kani::proof]
+    fn svam_canonical_ends_in_one_half_cover_the_range() {
+        let (first, inside, last): (u64, u64, u64) = kani::any();
+        let top: u32 = if kani::any() { 47 } else { 56 };
+        kani::assume(first <= inside && inside <= last);
+        if sign_extended(first, top) && sign_extended(last, top) && first >> 63 == last >> 63 {
+            assert!(sign_extended(inside, top));
+        }
+    }
 
     #[kani::proof]
     fn svam_overlap_agrees_with_intersection() {
@@ -722,12 +787,14 @@ mod proofs {
                 && limit <= u128::from(u64::MAX)
                 && u128::from(end) <= limit
         );
-        // The descriptor validator checks the exclusive virtual end before resolution.
-        if accepted && m.virtual_end().is_some() {
+        // The descriptor validator checks the exclusive virtual end before
+        // resolution; state that precondition independently in u128.
+        let virtual_limit = u128::from(m.virtual_address) + u128::from(m.byte_len);
+        if accepted && virtual_limit <= u128::from(u64::MAX) {
             let base = virtual_base(start, &m).unwrap();
             let translated = virtual_base(byte, &m).unwrap();
             assert_eq!(translated - base, byte - start);
-            assert!(translated >= m.virtual_address && translated < m.virtual_end().unwrap());
+            assert!(translated >= m.virtual_address && u128::from(translated) < virtual_limit);
         }
     }
 }
@@ -737,6 +804,29 @@ mod tests {
     use crabefi_runtime_abi::TimeMechanism;
 
     use super::*;
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_canonical_addresses_sign_extend_bit_47() {
+        assert!(canonical_virtual(0x0000_7fff_ffff_f000));
+        assert!(canonical_virtual(0xffff_8000_0000_0000));
+        // Noncanonical at either width.
+        assert!(!canonical_virtual(0x0100_0000_0000_0000));
+        assert!(!canonical_virtual(0xfeff_ffff_ffff_f000));
+        // Bit 47 set without sign extension is valid only with five-level paging.
+        let la57 = x86_la57_active();
+        assert_eq!(canonical_virtual(0x0000_8000_0000_0000), la57);
+        assert_eq!(canonical_virtual(0xffff_7fff_ffff_f000), la57);
+        // Canonical ends cannot hide the hole between the two halves.
+        assert!(!canonical_extent(
+            0x0000_7fff_ffff_f000,
+            0xffff_8000_0000_0fff
+        ));
+        assert!(canonical_extent(
+            0xffff_8000_0000_0000,
+            0xffff_8000_0000_0fff
+        ));
+    }
 
     #[test]
     #[cfg(target_arch = "x86_64")]
