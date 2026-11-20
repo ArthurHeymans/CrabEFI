@@ -18,10 +18,8 @@
 //! - Submenus
 
 use crate::fs::boot::BootFilesystem;
-use heapless::{String, Vec};
-
-/// Maximum number of GRUB entries we can parse
-const MAX_GRUB_ENTRIES: usize = 16;
+use alloc::vec::Vec;
+use heapless::String;
 
 /// Maximum size of grub.cfg we'll read
 const MAX_CONFIG_SIZE: usize = 32768;
@@ -77,7 +75,7 @@ impl GrubEntry {
 #[derive(Debug)]
 pub struct GrubConfig {
     /// Parsed menu entries
-    pub entries: Vec<GrubEntry, MAX_GRUB_ENTRIES>,
+    pub entries: Vec<GrubEntry>,
     /// Default entry index
     pub default_entry: usize,
     /// Timeout in seconds
@@ -266,7 +264,11 @@ fn parse_grub_content(content: &str) -> Result<GrubConfig, GrubError> {
                 && entry.is_valid()
             {
                 log::debug!("Parsed GRUB entry: {}", entry.title);
-                let _ = config.entries.push(entry);
+                if config.entries.try_reserve(1).is_ok() {
+                    config.entries.push(entry);
+                } else {
+                    log::error!("GRUB: out of heap; skipping entry '{}'", entry.title);
+                }
             }
             in_menuentry = false;
         }

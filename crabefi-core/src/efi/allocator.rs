@@ -62,8 +62,12 @@ pub const PAGE_SIZE_USIZE: usize = PAGE_SIZE as usize;
 /// (64 PDPTs * 512 PDs * 2MB each). Allocations above this will cause page faults.
 /// On aarch64: coreboot/TF-A sets up the MMU covering the full address space,
 /// including DRAM at 1TB+ on QEMU SBSA. No artificial cap needed.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(test)))]
 const MAX_IDENTITY_MAPPED_ADDRESS: u64 = 0x0f_ffff_ffff; // Last byte below 64GB
+/// Host unit tests run on the host's page tables, and [`with_host_pages`]
+/// RAM lies wherever the host allocator put it.
+#[cfg(all(target_arch = "x86_64", test))]
+const MAX_IDENTITY_MAPPED_ADDRESS: u64 = u64::MAX;
 #[cfg(target_arch = "aarch64")]
 const MAX_IDENTITY_MAPPED_ADDRESS: u64 = u64::MAX;
 /// On riscv64: No MMU (satp=0), identity mapped — no limit needed.
@@ -1928,6 +1932,36 @@ pub fn reserve_boot_image_region() {
             }
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) const HOST_TEST_PAGES: u64 = 2048;
+
+/// Give host tests a page allocator backed by leaked host memory.
+///
+/// Runs `f` with the global EFI state lock held, after importing one 8 MiB RAM
+/// region on first use. The pages stay allocated between tests; callers free
+/// what they allocate.
+#[cfg(test)]
+pub(crate) fn with_host_pages<R>(f: impl FnOnce() -> R) -> R {
+    const HOST_BYTES: usize = HOST_TEST_PAGES as usize * PAGE_SIZE_USIZE;
+    static INIT: std::sync::Once = std::sync::Once::new();
+
+    let _state = crate::efi::boot_services::IMAGE_EXECUTION_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    INIT.call_once(|| {
+        let layout = std::alloc::Layout::from_size_align(HOST_BYTES, PAGE_SIZE_USIZE).unwrap();
+        // SAFETY: nonzero layout; the region is leaked for the process lifetime.
+        let base = unsafe { std::alloc::alloc(layout) };
+        assert!(!base.is_null());
+        init_from_platform(&[crate::platform::MemoryRegion {
+            base: base as u64,
+            size: HOST_BYTES as u64,
+            region_type: crate::platform::MemoryType::Ram,
+        }]);
+    });
+    f()
 }
 
 #[cfg(test)]

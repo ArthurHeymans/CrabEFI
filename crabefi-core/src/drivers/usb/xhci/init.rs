@@ -1,7 +1,7 @@
 //! xHCI controller init and port power.
 
 use super::speed::{LinkSpeed, Usb3Protocol};
-use super::{IdentityMapper, MAX_SLOTS, TrbRing, XHCI_MMIO_SIZE, XhciError};
+use super::{IdentityMapper, TrbRing, XHCI_MMIO_SIZE, XhciError};
 use crate::barrier;
 use crate::drivers::mmio::MmioRegion;
 use crate::drivers::pci::{self, PciDevice};
@@ -154,18 +154,15 @@ impl super::XhciController {
         Self::take_bios_ownership(mmio_base, hccparams1);
 
         let num_ports = hcsparams1.number_of_ports();
-        let hw_max_slots = hcsparams1.number_of_device_slots();
-        // Cap to our Vec capacity
-        let max_slots = (hw_max_slots as usize).min(MAX_SLOTS);
+        let max_slots = hcsparams1.number_of_device_slots() as usize;
 
         log::info!(
-            "xHCI version: {}.{}.{}, ports: {}, slots: {} (hw: {})",
+            "xHCI version: {}.{}.{}, ports: {}, slots: {}",
             (hciversion >> 8) & 0xFF,
             (hciversion >> 4) & 0xF,
             hciversion & 0xF,
             num_ports,
             max_slots,
-            hw_max_slots,
         );
 
         let page_size = scratchpad_page_size(registers.operational.pagesize.read_volatile().get())
@@ -178,10 +175,11 @@ impl super::XhciController {
         );
 
         // Slot IDs are one-based; include the highest advertised slot.
-        let mut slots = heapless::Vec::new();
-        for _ in 0..=max_slots {
-            let _ = slots.push(None);
-        }
+        let mut slots = alloc::vec::Vec::new();
+        slots
+            .try_reserve_exact(max_slots + 1)
+            .map_err(|_| XhciError::AllocationFailed)?;
+        slots.resize_with(max_slots + 1, || None);
 
         let mut controller = Self {
             pci_address: pci_dev.address,
@@ -359,7 +357,8 @@ impl super::XhciController {
         // Allocate and set up DCBAA (Device Context Base Address Array)
         // DCBAA[0] is reserved for scratchpad buffer array pointer
         // DCBAA[1..max_slots] are for device context pointers
-        let dcbaa_pages = ((self.slots.capacity() as u64 + 1) * 8).div_ceil(4096);
+        // One DCBAA entry per slot ID, entry 0 being the scratchpad array.
+        let dcbaa_pages = (self.slots.len() as u64 * 8).div_ceil(4096);
         let dcbaa_mem = efi::allocate_pages(dcbaa_pages).ok_or(XhciError::AllocationFailed)?;
         dcbaa_mem.fill(0);
         self.dcbaa = dcbaa_mem.as_ptr() as u64;

@@ -123,11 +123,11 @@ impl ExtFilesystem {
         }
     }
 
-    fn list<const N: usize>(
+    fn list(
         &self,
         directory: &str,
         matches: impl Fn(&str, ext4_view::FileType) -> bool,
-    ) -> Result<Names<N>, ReadError> {
+    ) -> Result<Names, ReadError> {
         let path = ext_path(directory)?;
         let mut names = Names::new();
         let entries = self.0.read_dir(path.as_str()).map_err(ReadError::Ext)?;
@@ -141,10 +141,12 @@ impl ExtFilesystem {
                 && matches(name, entry.file_type().map_err(ReadError::Ext)?)
             {
                 // ext limits a name to 255 bytes.
-                if let Ok(name) = String::try_from(name)
-                    && names.push(name).is_err()
-                {
-                    break;
+                if let Ok(name) = String::try_from(name) {
+                    names.try_reserve(1).map_err(|_| {
+                        log::error!("ext: out of heap listing {directory}");
+                        ReadError::OutOfMemory
+                    })?;
+                    names.push(name);
                 }
             }
         }
@@ -195,13 +197,13 @@ impl BootFilesystem for ExtFilesystem {
         Ok(read)
     }
 
-    fn list_files(&mut self, directory: &str, suffix: &str) -> Result<Names<32>, ReadError> {
+    fn list_files(&mut self, directory: &str, suffix: &str) -> Result<Names, ReadError> {
         self.list(directory, |name, kind| {
             name.ends_with(suffix) && (kind.is_regular_file() || kind.is_symlink())
         })
     }
 
-    fn list_subdirectories(&mut self, directory: &str) -> Result<Names<16>, ReadError> {
+    fn list_subdirectories(&mut self, directory: &str) -> Result<Names, ReadError> {
         self.list(directory, |_, kind| kind.is_dir())
     }
 }

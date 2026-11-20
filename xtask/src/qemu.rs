@@ -567,6 +567,7 @@ fn add_storage_args_x86_64(
             cmd.args(["-device", "ide-hd,drive=disk0,bus=ide.0"]);
         }
         StorageType::Nvme => {
+            add_extra_nvme_args(cmd);
             cmd.args([
                 "-drive",
                 &format!(
@@ -588,6 +589,108 @@ fn add_storage_args_x86_64(
             cmd.args(["-device", "sd-card,drive=sddrive0"]);
         }
     }
+}
+
+/// With `CRABEFI_MULTI_NS_NVME=1`, the first extra controller has ten namespaces.
+const EXTRA_NVME_NAMESPACES: u32 = 10;
+
+/// `CRABEFI_EXTRA_NVME=N`: N blank NVMe controllers, enumerated before the boot disk.
+fn extra_nvme_controllers() -> u32 {
+    std::env::var("CRABEFI_EXTRA_NVME")
+        .ok()
+        .and_then(|count| count.parse().ok())
+        .unwrap_or(0)
+}
+
+fn multi_namespace_nvme() -> bool {
+    std::env::var("CRABEFI_MULTI_NS_NVME").as_deref() == Ok("1")
+}
+
+/// Put single-namespace controllers ahead of the only bootable disk on the PCI bus.
+/// The separate namespace-growth test adds ten namespaces to the first controller.
+fn add_extra_nvme_args(cmd: &mut Command) {
+    for controller in 0..extra_nvme_controllers() {
+        let id = format!("extra-nvme{controller}");
+        if controller != 0 || !multi_namespace_nvme() {
+            cmd.args([
+                "-blockdev",
+                &format!("driver=null-co,node-name={id},size=67108864,read-zeroes=on"),
+            ]);
+            cmd.args([
+                "-device",
+                &format!("nvme,serial=extra{controller},drive={id}"),
+            ]);
+            continue;
+        }
+
+        cmd.args(["-device", &format!("nvme,serial=extra{controller},id={id}")]);
+        for nsid in 1..=EXTRA_NVME_NAMESPACES {
+            let node = format!("{id}-ns{nsid}");
+            cmd.args([
+                "-blockdev",
+                &format!("driver=null-co,node-name={node},size=67108864,read-zeroes=on"),
+            ]);
+            cmd.args([
+                "-device",
+                &format!("nvme-ns,drive={node},bus={id},nsid={nsid}"),
+            ]);
+        }
+    }
+}
+
+/// In addition to booting, require successful registration of every controller.
+fn check_nvme_controller_count(output: &str, extra: u32) -> Result<(), String> {
+    let controllers = extra as usize + 1;
+    let registered = output
+        .lines()
+        .filter(|line| line.contains("NVMe controller at") && line.contains("initialized"))
+        .count();
+    if registered != controllers {
+        return Err(format!(
+            "{registered} of {controllers} NVMe controllers registered"
+        ));
+    }
+
+    Ok(())
+}
+
+fn check_nvme_namespace_publication(output: &str, extra: u32) -> Result<(), String> {
+    let controllers = extra as usize + 1;
+    // Check each namespace, not just the total: two installs for one NSID
+    // must not conceal a missing NSID, or an unsuccessful installation.
+    let mut installed = std::collections::BTreeSet::new();
+    for line in output.lines() {
+        let Some((_, marker)) = line.split_once("NVMe StorageSecurity installed: controller ")
+        else {
+            continue;
+        };
+        let (controller, nsid) = marker
+            .trim()
+            .split_once(", namespace ")
+            .and_then(|(c, n)| Some((c.parse::<usize>().ok()?, n.parse::<u32>().ok()?)))
+            .ok_or_else(|| format!("invalid NVMe namespace marker: {marker}"))?;
+        if !installed.insert((controller, nsid)) {
+            return Err(format!("duplicate NVMe namespace marker: {marker}"));
+        }
+    }
+    for controller in 0..controllers {
+        let count = if controller == 0 {
+            EXTRA_NVME_NAMESPACES
+        } else {
+            1
+        };
+        for nsid in 1..=count {
+            if !installed.remove(&(controller, nsid)) {
+                return Err(format!(
+                    "NVMe controller {controller}, namespace {nsid} not published"
+                ));
+            }
+        }
+    }
+    if !installed.is_empty() {
+        return Err(format!("unexpected NVMe namespaces: {installed:?}"));
+    }
+    Ok(())
 }
 
 /// Add storage arguments for aarch64 (SBSA)
@@ -1023,6 +1126,35 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
             } else {
                 println!("[FAIL] efi_app_executed: EFI application did not complete");
                 failed += 1;
+            }
+
+            let extra = extra_nvme_controllers();
+            if config.arch == Arch::X86_64
+                && matches!(config.storage, StorageType::Nvme)
+                && extra != 0
+            {
+                match check_nvme_controller_count(&result.output, extra) {
+                    Ok(()) => {
+                        println!("[PASS] extra_nvme: every controller registered");
+                        passed += 1;
+                    }
+                    Err(reason) => {
+                        println!("[FAIL] extra_nvme: {reason}");
+                        failed += 1;
+                    }
+                }
+                if multi_namespace_nvme() {
+                    match check_nvme_namespace_publication(&result.output, extra) {
+                        Ok(()) => {
+                            println!("[PASS] multi_namespace_nvme: every namespace published");
+                            passed += 1;
+                        }
+                        Err(reason) => {
+                            println!("[FAIL] multi_namespace_nvme: {reason}");
+                            failed += 1;
+                        }
+                    }
+                }
             }
         }
         "storage-security-test" => {
@@ -2230,6 +2362,37 @@ fn parse_qemu_output(output: &std::process::Output) -> Result<TestResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
+
+    #[test]
+    fn extra_nvme_requires_successful_distinct_installs() {
+        let mut output = String::new();
+        for nsid in 1..=EXTRA_NVME_NAMESPACES {
+            writeln!(
+                output,
+                "NVMe StorageSecurity installed: controller 0, namespace {nsid}"
+            )
+            .unwrap();
+        }
+        let created_only =
+            format!("{output}StorageSecurity: created protocol (media=1, type=Nvme)\n");
+        assert!(check_nvme_namespace_publication(&created_only, 1).is_err());
+        writeln!(
+            output,
+            "NVMe StorageSecurity installed: controller 1, namespace 1"
+        )
+        .unwrap();
+        assert!(check_nvme_namespace_publication(&output, 1).is_ok());
+
+        // Start with a passing fixture so missing IDs can't mask this check.
+        let duplicate =
+            format!("{output}NVMe StorageSecurity installed: controller 0, namespace 1\n");
+        assert!(
+            check_nvme_namespace_publication(&duplicate, 1)
+                .unwrap_err()
+                .starts_with("duplicate NVMe namespace marker")
+        );
+    }
 
     #[test]
     fn x86_replay_is_selected_by_scenario_not_by_disk_name_or_prior_run() {

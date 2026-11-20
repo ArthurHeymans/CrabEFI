@@ -29,7 +29,7 @@ pub fn with_tables_mut<R>(f: impl FnOnce(&mut Tables) -> R) -> R {
     TABLES.with_mut(f)
 }
 
-/// Failure to allocate the fixed-size EFI state tables.
+/// Failure to allocate the EFI state tables.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TableInitError;
 
@@ -39,56 +39,46 @@ impl core::fmt::Display for TableInitError {
     }
 }
 
-/// Allocate fixed-size EFI state tables after heap startup.
+/// Allocate the EFI state tables after heap startup.
 ///
-/// All tables keep their maximum length so their backing storage never moves.
-/// Variable payloads remain empty until a variable is loaded or written.
+/// The event table keeps its fixed length: event handles encode the slot
+/// index. Handles and loaded images grow on demand; reserving room for a
+/// typical boot up front only saves reallocations. No pointer into these
+/// tables outlives a borrow, so growth may move them.
 ///
 /// # Errors
 ///
 /// Returns [`TableInitError`] when the heap cannot back any of the tables.
 pub fn init_caches() -> Result<(), TableInitError> {
     with_tables_mut(|efi| {
-        init_entries(&mut efi.handles, MAX_HANDLES, HandleEntry::empty)?;
-        init_entries(&mut efi.events, MAX_EVENTS, EventEntry::empty)?;
-        init_entries(
-            &mut efi.loaded_images,
-            MAX_LOADED_IMAGES,
-            LoadedImageEntry::empty,
-        )?;
+        if efi.events.is_empty() {
+            efi.events
+                .try_reserve_exact(MAX_EVENTS)
+                .map_err(|_| TableInitError)?;
+            efi.events.resize_with(MAX_EVENTS, EventEntry::empty);
+        }
+        efi.handles
+            .try_reserve(INITIAL_HANDLES)
+            .map_err(|_| TableInitError)?;
+        efi.loaded_images
+            .try_reserve(INITIAL_LOADED_IMAGES)
+            .map_err(|_| TableInitError)?;
         Ok(())
     })
 }
 
-fn init_entries<T>(
-    entries: &mut Vec<T>,
-    len: usize,
-    init: impl FnMut() -> T,
-) -> Result<(), TableInitError> {
-    if !entries.is_empty() {
-        return Ok(());
-    }
-    if entries.try_reserve_exact(len).is_err() {
-        return Err(TableInitError);
-    }
-    entries.resize_with(len, init);
-    Ok(())
-}
+/// Handles reserved up front: every disk, partition and loaded image takes
+/// one, and the UEFI SCT alone keeps about 80 test images loaded. The table
+/// grows past this.
+const INITIAL_HANDLES: usize = 128;
 
-/// Maximum number of handles we can track
+/// Loaded images reserved up front; the table grows past this.
+const INITIAL_LOADED_IMAGES: usize = 32;
+
+/// Number of event slots.
 ///
-/// The UEFI SCT loads every test image up front (about 80 for the full
-/// package) and keeps them loaded, each with its own handle.
-pub const MAX_HANDLES: usize = 128;
-
-/// Maximum number of protocols per handle
-pub const MAX_PROTOCOLS_PER_HANDLE: usize = 8;
-
-/// Maximum number of events we can track
+/// Fixed because an event handle encodes its slot as `handle % MAX_EVENTS`.
 pub const MAX_EVENTS: usize = 32;
-
-/// Maximum number of loaded images we can track
-pub const MAX_LOADED_IMAGES: usize = 128;
 
 /// Protocol interface entry
 #[derive(Clone, Copy)]
@@ -99,30 +89,19 @@ pub struct ProtocolEntry {
     pub generation: u64,
 }
 
-impl ProtocolEntry {
-    pub const fn empty() -> Self {
-        Self {
-            guid: Guid::from_fields(0, 0, 0, 0, 0, &[0, 0, 0, 0, 0, 0]),
-            interface: core::ptr::null_mut(),
-            generation: 0,
-        }
-    }
-}
-
 /// Handle entry in the handle database
-#[derive(Clone, Copy)]
 pub struct HandleEntry {
     pub handle: Handle,
-    pub protocols: [ProtocolEntry; MAX_PROTOCOLS_PER_HANDLE],
-    pub protocol_count: usize,
+    /// Installed protocols in installation order, grown from the heap.
+    pub protocols: Vec<ProtocolEntry>,
 }
 
 impl HandleEntry {
-    pub const fn empty() -> Self {
+    /// A handle with no protocols installed yet.
+    pub const fn new(handle: Handle) -> Self {
         Self {
-            handle: core::ptr::null_mut(),
-            protocols: [ProtocolEntry::empty(); MAX_PROTOCOLS_PER_HANDLE],
-            protocol_count: 0,
+            handle,
+            protocols: Vec::new(),
         }
     }
 }
@@ -310,10 +289,8 @@ pub struct OpenProtocolEntry {
 
 /// Boot Services tables: handles, events, and loaded images.
 pub struct Tables {
-    /// Handle database, allocated after heap startup.
+    /// Handle database: one entry per live handle, grown from the heap.
     pub handles: Vec<HandleEntry>,
-    /// Number of active handles
-    pub handle_count: usize,
     /// Next handle value (unique identifier)
     pub next_handle: usize,
     /// Active protocol opens, grown fallibly from the firmware heap.
@@ -328,7 +305,7 @@ pub struct Tables {
     /// Event database, allocated after heap startup.
     pub events: Vec<EventEntry>,
 
-    /// Loaded images database, allocated after heap startup.
+    /// Loaded images database; a null `handle` marks a free slot.
     pub loaded_images: Vec<LoadedImageEntry>,
 
     /// Monotonic counter for GetNextMonotonicCount
@@ -344,7 +321,6 @@ impl Tables {
     pub const fn new() -> Self {
         Self {
             handles: Vec::new(),
-            handle_count: 0,
             next_handle: 1,
             open_protocols: Vec::new(),
             protocol_notifies: Vec::new(),

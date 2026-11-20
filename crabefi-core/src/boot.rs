@@ -31,9 +31,17 @@ static GPT_MEASURED: AtomicBool = AtomicBool::new(false);
 /// the partition scan.
 #[cfg(feature = "tpm")]
 fn measure_gpt_once(disk: &mut dyn BlockDevice, header: &fs::gpt::GptHeader, is_hybrid: bool) {
-    if let Ok(event_data) = fs::gpt::build_gpt_measurement_event_with(disk, header, is_hybrid)
-        && !GPT_MEASURED.swap(true, Ordering::Relaxed)
-    {
+    if GPT_MEASURED.load(Ordering::Relaxed) {
+        return;
+    }
+    let event_data = match fs::gpt::build_gpt_measurement_event_with(disk, header, is_hybrid) {
+        Ok(data) => data,
+        Err(error) => {
+            log::warn!("Could not build GPT measurement event: {error}");
+            return;
+        }
+    };
+    if !GPT_MEASURED.swap(true, Ordering::Relaxed) {
         // EDK2 measures EV_EFI_GPT_EVENT once per boot, not once per boot attempt.
         efi::tcg::measured_boot::measure_event_all(
             5,
@@ -101,6 +109,10 @@ pub fn install_block_io_protocols(
 
     let partitions = match storage::with_disk(storage, scan_partitions) {
         Ok(Ok(partitions)) => partitions,
+        Ok(Err(fs::gpt::GptError::OutOfMemory)) => {
+            log::error!("Out of heap scanning partitions on {:?}", storage);
+            return;
+        }
         Ok(Err(error)) => {
             log::debug!("Failed to read partition table: {:?}", error);
             return;
@@ -179,7 +191,7 @@ pub fn install_block_io_protocols(
 /// Falls back to an MBR partition table when no GPT is present.
 fn scan_partitions(
     disk: &mut dyn BlockDevice,
-) -> Result<heapless::Vec<fs::gpt::Partition, 16>, fs::gpt::GptError> {
+) -> Result<alloc::vec::Vec<fs::gpt::Partition>, fs::gpt::GptError> {
     // The layout is detected once and reused for the partition scan and the
     // measurement payload.
     let gpt_scan = fs::gpt::read_gpt_layout(disk).and_then(|(header, is_hybrid)| {
@@ -190,9 +202,10 @@ fn scan_partitions(
             measure_gpt_once(disk, &header, is_hybrid);
             Ok(partitions)
         }
+        Err(fs::gpt::GptError::OutOfMemory) => Err(fs::gpt::GptError::OutOfMemory),
         Err(error) => {
             log::debug!("GPT partition scan failed: {:?}; trying MBR", error);
-            Ok(fs::gpt::read_mbr_partitions(disk)?.into_iter().collect())
+            fs::gpt::read_mbr_partitions(disk)
         }
     }
 }

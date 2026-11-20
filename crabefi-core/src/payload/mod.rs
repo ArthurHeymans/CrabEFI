@@ -22,10 +22,8 @@ pub mod elf;
 pub use elf::{Elf64, ElfError};
 
 use crate::fs::fat::FatFilesystem;
-use heapless::{String, Vec};
-
-/// Maximum number of payload entries
-const MAX_PAYLOAD_ENTRIES: usize = 8;
+use alloc::vec::Vec;
+use heapless::String;
 
 /// Maximum payload file size (16 MB)
 const MAX_PAYLOAD_SIZE: usize = 16 * 1024 * 1024;
@@ -93,7 +91,7 @@ impl From<ElfError> for PayloadError {
 /// # Arguments
 ///
 /// * `fs` - FAT filesystem to search
-pub fn discover_payloads(fs: &mut FatFilesystem<'_>) -> Vec<PayloadEntry, MAX_PAYLOAD_ENTRIES> {
+pub fn discover_payloads(fs: &mut FatFilesystem<'_>) -> Vec<PayloadEntry> {
     let mut entries = Vec::new();
 
     // Try common payload filenames
@@ -142,7 +140,11 @@ pub fn discover_payloads(fs: &mut FatFilesystem<'_>) -> Vec<PayloadEntry, MAX_PA
                 let _ = entry.path.push_str(&path);
 
                 log::debug!("Found payload: {} at {} ({} bytes)", name, path, size);
-                let _ = entries.push(entry);
+                if entries.try_reserve(1).is_err() {
+                    log::error!("Payloads: out of heap; skipping {}", path);
+                    continue;
+                }
+                entries.push(entry);
             }
         }
     }

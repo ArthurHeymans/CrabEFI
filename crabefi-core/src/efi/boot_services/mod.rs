@@ -13,6 +13,10 @@ mod images;
 mod memory;
 mod protocols_db;
 
+#[cfg(test)]
+#[path = "../boot_services_tests.rs"]
+mod tests;
+
 pub use events::KEYBOARD_EVENT_ID;
 #[cfg(feature = "ui")]
 pub use events::POINTER_EVENT_ID;
@@ -22,8 +26,7 @@ use super::allocator::{self, MemoryType};
 use super::guid_fmt::GuidFmt;
 use super::protocols::loaded_image::LOADED_IMAGE_PROTOCOL_GUID;
 use super::tables::{
-    HandleEntry, MAX_PROTOCOL_NOTIFIES, MAX_PROTOCOLS_PER_HANDLE, OpenProtocolEntry, ProtocolEntry,
-    tables, with_tables_mut,
+    HandleEntry, MAX_PROTOCOL_NOTIFIES, OpenProtocolEntry, ProtocolEntry, tables, with_tables_mut,
 };
 use crate::cell::{LocalCell, StaticMut};
 use alloc::vec::Vec;
@@ -271,13 +274,15 @@ pub(super) extern "efiapi" fn open_protocol(
     );
 
     let result = with_tables_mut(|efi_state| {
-        let Some(handle_entry) = efi_state.handles[..efi_state.handle_count]
+        let Some(handle_entry) = efi_state
+            .handles
             .iter()
             .find(|entry| entry.handle == handle)
         else {
             return Err(Status::INVALID_PARAMETER);
         };
-        let Some(protocol_entry) = handle_entry.protocols[..handle_entry.protocol_count]
+        let Some(protocol_entry) = handle_entry
+            .protocols
             .iter()
             .find(|entry| entry.guid == guid)
         else {
@@ -408,14 +413,9 @@ extern "efiapi" fn open_protocol_information(
 
     let guid = unsafe { *protocol };
     let record_count = with_tables_mut(|efi_state| {
-        let protocol_exists = efi_state.handles[..efi_state.handle_count]
-            .iter()
-            .any(|entry| {
-                entry.handle == handle
-                    && entry.protocols[..entry.protocol_count]
-                        .iter()
-                        .any(|entry| entry.guid == guid)
-            });
+        let protocol_exists = efi_state.handles.iter().any(|entry| {
+            entry.handle == handle && entry.protocols.iter().any(|entry| entry.guid == guid)
+        });
         protocol_exists.then(|| {
             efi_state
                 .open_protocols
@@ -479,10 +479,7 @@ extern "efiapi" fn protocols_per_handle(
     let efi_state = tables();
 
     // Find the handle entry
-    let entry = match efi_state.handles[..efi_state.handle_count]
-        .iter()
-        .find(|e| e.handle == handle)
-    {
+    let entry = match efi_state.handles.iter().find(|e| e.handle == handle) {
         Some(e) => e,
         None => {
             log::debug!("  -> NOT_FOUND");
@@ -490,7 +487,7 @@ extern "efiapi" fn protocols_per_handle(
         }
     };
 
-    let count = entry.protocol_count;
+    let count = entry.protocols.len();
 
     if count == 0 {
         // No protocols on this handle -- return empty buffer
@@ -518,7 +515,7 @@ extern "efiapi" fn protocols_per_handle(
     let ptr_array = buf as *mut *mut Guid;
     let guid_array = unsafe { buf.add(ptrs_size) } as *mut Guid;
 
-    for (i, protocol) in entry.protocols.iter().take(count).enumerate() {
+    for (i, protocol) in entry.protocols.iter().enumerate() {
         unsafe {
             let guid_ptr = guid_array.add(i);
             *guid_ptr = protocol.guid;
@@ -658,9 +655,10 @@ extern "efiapi" fn locate_protocol(
     let efi_state = tables();
 
     // Find first handle with this protocol
-    let found = efi_state.handles[..efi_state.handle_count]
+    let found = efi_state
+        .handles
         .iter()
-        .flat_map(|entry| entry.protocols[..entry.protocol_count].iter())
+        .flat_map(|entry| entry.protocols.iter())
         .find(|proto| proto.guid == guid);
 
     if let Some(proto) = found {
@@ -827,21 +825,18 @@ fn install_multiple_pairs(handle: *mut Handle, pairs: &[(Guid, *mut c_void)]) ->
 
 fn reclaim_empty_handle(handle: Handle) -> bool {
     with_tables_mut(|efi_state| {
-        let Some(index) = efi_state.handles[..efi_state.handle_count]
+        let Some(index) = efi_state
+            .handles
             .iter()
             .position(|entry| entry.handle == handle)
         else {
             // Removing the final installed protocol already reclaimed it.
             return true;
         };
-        if efi_state.handles[index].protocol_count != 0 {
+        if !efi_state.handles[index].protocols.is_empty() {
             return false;
         }
-        efi_state
-            .handles
-            .copy_within(index + 1..efi_state.handle_count, index);
-        efi_state.handle_count -= 1;
-        efi_state.handles[efi_state.handle_count] = HandleEntry::empty();
+        efi_state.handles.remove(index);
         true
     })
 }
@@ -857,14 +852,16 @@ fn uninstall_multiple_pairs(handle: Handle, pairs: &[(Guid, *mut c_void)]) -> St
     }
 
     let validation = tables();
-    let Some(handle_entry) = validation.handles[..validation.handle_count]
+    let Some(handle_entry) = validation
+        .handles
         .iter()
         .find(|entry| entry.handle == handle)
     else {
         return Status::INVALID_PARAMETER;
     };
     for (guid, interface) in pairs {
-        if !handle_entry.protocols[..handle_entry.protocol_count]
+        if !handle_entry
+            .protocols
             .iter()
             .any(|entry| entry.guid == *guid && entry.interface == *interface)
         {
@@ -1043,22 +1040,13 @@ extern "efiapi" fn set_mem(buffer: *mut c_void, size: usize, value: u8) {
 /// Create a new handle and register it
 pub fn create_handle() -> Option<Handle> {
     with_tables_mut(|efi_state| {
-        if efi_state.handle_count == efi_state.handles.len()
-            && efi_state.handles.try_reserve(1).is_err()
-        {
+        if efi_state.handles.try_reserve(1).is_err() {
             return None;
         }
 
         let handle = efi_state.next_handle as *mut c_void;
         efi_state.next_handle += 1;
-
-        if efi_state.handle_count == efi_state.handles.len() {
-            efi_state.handles.push(HandleEntry::empty());
-        }
-        let idx = efi_state.handle_count;
-        efi_state.handles[idx].handle = handle;
-        efi_state.handles[idx].protocol_count = 0;
-        efi_state.handle_count += 1;
+        efi_state.handles.push(HandleEntry::new(handle));
 
         Some(handle)
     })
@@ -1088,38 +1076,27 @@ pub(super) fn remove_protocol(
             return Status::ACCESS_DENIED;
         }
 
-        let Some(handle_index) = efi_state.handles[..efi_state.handle_count]
+        let Some(handle_index) = efi_state
+            .handles
             .iter()
             .position(|entry| entry.handle == handle)
         else {
             return Status::NOT_FOUND;
         };
         let entry = &mut efi_state.handles[handle_index];
-        let Some(protocol_index) =
-            entry.protocols[..entry.protocol_count]
-                .iter()
-                .position(|entry| {
-                    entry.guid == *guid && interface.is_none_or(|iface| entry.interface == iface)
-                })
-        else {
+        let Some(protocol_index) = entry.protocols.iter().position(|entry| {
+            entry.guid == *guid && interface.is_none_or(|iface| entry.interface == iface)
+        }) else {
             return Status::NOT_FOUND;
         };
 
         efi_state
             .open_protocols
             .retain(|open| open.handle != handle || open.protocol != *guid);
-        entry
-            .protocols
-            .copy_within(protocol_index + 1..entry.protocol_count, protocol_index);
-        entry.protocol_count -= 1;
-        entry.protocols[entry.protocol_count] = ProtocolEntry::empty();
+        entry.protocols.remove(protocol_index);
 
-        if entry.protocol_count == 0 {
-            efi_state
-                .handles
-                .copy_within(handle_index + 1..efi_state.handle_count, handle_index);
-            efi_state.handle_count -= 1;
-            efi_state.handles[efi_state.handle_count] = HandleEntry::empty();
+        if entry.protocols.is_empty() {
+            efi_state.handles.remove(handle_index);
         }
 
         Status::SUCCESS
@@ -1139,19 +1116,13 @@ fn install_protocol_internal(
     notify: bool,
 ) -> Status {
     let (status, notify_events) = with_tables_mut(|efi_state| {
-        if let Some(entry) = efi_state.handles[..efi_state.handle_count]
-            .iter_mut()
-            .find(|e| e.handle == handle)
-        {
+        if let Some(entry) = efi_state.handles.iter_mut().find(|e| e.handle == handle) {
             // Check if protocol already installed
-            if entry.protocols[..entry.protocol_count]
-                .iter()
-                .any(|p| p.guid == *guid)
-            {
+            if entry.protocols.iter().any(|p| p.guid == *guid) {
                 return (Status::INVALID_PARAMETER, heapless::Vec::new());
             }
 
-            if entry.protocol_count >= MAX_PROTOCOLS_PER_HANDLE {
+            if entry.protocols.try_reserve(1).is_err() {
                 return (Status::OUT_OF_RESOURCES, heapless::Vec::new());
             }
 
@@ -1159,12 +1130,11 @@ fn install_protocol_internal(
                 return (Status::OUT_OF_RESOURCES, heapless::Vec::new());
             };
             efi_state.protocol_generation = generation;
-            entry.protocols[entry.protocol_count] = ProtocolEntry {
+            entry.protocols.push(ProtocolEntry {
                 guid: *guid,
                 interface,
                 generation,
-            };
-            entry.protocol_count += 1;
+            });
             let events = if notify {
                 protocols_db::protocol_notification_events(efi_state, guid)
             } else {
@@ -1191,13 +1161,10 @@ fn install_protocol_internal(
 pub fn get_protocol_on_handle(handle: Handle, guid: &Guid) -> *mut c_void {
     let efi_state = tables();
 
-    efi_state.handles[..efi_state.handle_count]
+    efi_state
+        .handles
         .iter()
         .find(|e| e.handle == handle)
-        .and_then(|e| {
-            e.protocols[..e.protocol_count]
-                .iter()
-                .find(|p| p.guid == *guid)
-        })
+        .and_then(|e| e.protocols.iter().find(|p| p.guid == *guid))
         .map_or(core::ptr::null_mut(), |p| p.interface)
 }

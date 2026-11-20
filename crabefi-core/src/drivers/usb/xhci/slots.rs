@@ -2,10 +2,28 @@
 
 use super::super::controller::DeviceDescriptor;
 use super::{TrbRing, XhciError};
+use alloc::alloc::{Layout, alloc};
+use alloc::boxed::Box;
+
 use crate::barrier;
 use crate::efi;
 use xhci::context::EndpointType;
 use xhci::ring::trb::command;
+
+fn try_box_slot(slot: UsbSlot) -> Result<Box<UsbSlot>, XhciError> {
+    let layout = Layout::new::<UsbSlot>();
+    // SAFETY: UsbSlot has nonzero size; alloc returns suitably aligned memory
+    // from the same global allocator Box uses.
+    let ptr = unsafe { alloc(layout) }.cast::<UsbSlot>();
+    if ptr.is_null() {
+        return Err(XhciError::AllocationFailed);
+    }
+    // SAFETY: the allocation succeeded and can hold one UsbSlot.
+    unsafe {
+        ptr.write(slot);
+        Ok(Box::from_raw(ptr))
+    }
+}
 
 /// Addressing information shared by root and downstream ports.
 pub(super) struct SlotRoute {
@@ -188,7 +206,7 @@ impl super::XhciController {
         let slot = self
             .slots
             .get(slot_id as usize)
-            .and_then(|s| s.as_ref())
+            .and_then(|s| s.as_deref())
             .ok_or(XhciError::DeviceNotFound)?;
 
         let ring = slot.transfer_rings[dci as usize - 1]
@@ -385,7 +403,7 @@ impl super::XhciController {
             .slots
             .get_mut(slot_id as usize)
             .ok_or(XhciError::NoFreeSlots)?;
-        *slot_entry = Some(UsbSlot {
+        *slot_entry = Some(try_box_slot(UsbSlot {
             slot_id,
             device_context: device_context as *mut u8,
             input_context: input_context as *mut u8,
@@ -413,7 +431,7 @@ impl super::XhciController {
             hub_ports: 0,
             route_string: route.route_string,
             root_port: route.root_port,
-        });
+        })?);
         core::mem::forget(pages);
 
         // SAFETY: the slot index is checked above and DCBAA is controller-owned.

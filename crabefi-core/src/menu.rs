@@ -224,6 +224,18 @@ impl BootMenu {
             default_chosen: false,
         }
     }
+
+    fn add_entry(&mut self, entry: BootEntry) -> bool {
+        if self.menu.add_entry(entry) {
+            true
+        } else {
+            log::error!(
+                "Boot menu: out of heap at {} entries",
+                self.menu.entry_count()
+            );
+            false
+        }
+    }
 }
 
 /// Discover boot entries from all storage devices
@@ -246,17 +258,19 @@ pub fn discover_boot_entries() -> BootMenu {
         devices.sort_by_key(crate::boot_policy::device_is_external);
     }
     for device in &devices {
-        let partitions = storage::with_disk(device.id, |disk| gpt::read_partitions_auto(disk).ok())
-            .ok()
-            .flatten();
-        match partitions {
-            Some(partitions) => discover_entries_on_disk(device, &partitions, &mut menu),
-            None => try_el_torito_fallback(device, &mut menu),
+        match storage::with_disk(device.id, gpt::read_partitions_auto) {
+            Ok(Ok(partitions)) => discover_entries_on_disk(device, &partitions, &mut menu),
+            Ok(Err(gpt::GptError::OutOfMemory)) => {
+                log::error!(
+                    "Boot menu: out of heap scanning partitions on {}",
+                    device.label
+                );
+            }
+            _ => try_el_torito_fallback(device, &mut menu),
         }
     }
 
-    // Ext discovery only gets slots left over after scanning all FAT volumes
-    // and El Torito images, including recovery media on later devices.
+    // Keep FAT volumes and El Torito images ahead of ext boot entries.
     #[cfg(all(feature = "ext4", target_arch = "x86_64"))]
     if !crate::efi::auth::is_secure_boot_enabled() {
         discover_ext_entries(&devices, &mut menu);
@@ -316,20 +330,22 @@ fn discover_entries_on_disk(
 #[cfg(all(feature = "ext4", target_arch = "x86_64"))]
 fn discover_ext_entries(devices: &[StorageDevice], menu: &mut BootMenu) {
     for device in devices.iter().filter(|device| !device.info.removable) {
-        if menu.entries.is_full() {
-            return;
-        }
-        let Ok(Ok(partitions)) = storage::with_disk(device.id, gpt::read_partitions_auto) else {
-            continue;
+        let partitions = match storage::with_disk(device.id, gpt::read_partitions_auto) {
+            Ok(Ok(partitions)) => partitions,
+            Ok(Err(gpt::GptError::OutOfMemory)) => {
+                log::error!(
+                    "Boot menu: out of heap scanning ext partitions on {}",
+                    device.label
+                );
+                continue;
+            }
+            _ => continue,
         };
         let kind = FilesystemKind::Ext {
             media: device.info,
             discovery: true,
         };
         for partition in partitions.iter().filter(|partition| !partition.is_esp) {
-            if menu.entries.is_full() {
-                return;
-            }
             boot_fs::with_filesystem(device.id, partition, kind, |fs| {
                 if !scan_bls_from(fs, kind, device, partition, "", menu) {
                     // On a root volume, BLS paths are relative to /boot.
@@ -500,7 +516,7 @@ fn scan_partition_for_entries(
                     entry.filesystem = filesystem;
 
                     if !menu.add_entry(entry) {
-                        return; // Menu full
+                        return; // Out of heap
                     }
 
                     log::debug!(

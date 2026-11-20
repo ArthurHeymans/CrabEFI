@@ -6,8 +6,6 @@ use alloc::string::String as OwnedString;
 use core::ops::{Deref, DerefMut};
 use heapless::{String, Vec};
 
-/// Maximum number of boot entries in one menu.
-pub const MAX_BOOT_ENTRIES: usize = 16;
 /// Maximum initrds of a direct Linux entry.
 pub const MAX_INITRDS: usize = 4;
 /// The initrds of a direct Linux entry, in order.
@@ -216,8 +214,8 @@ impl MenuEntry for DiskEntry {
 /// Boot menu state
 #[derive(Debug, Clone)]
 pub struct BootMenu<E> {
-    /// Discovered boot entries
-    pub entries: Vec<E, MAX_BOOT_ENTRIES>,
+    /// Discovered boot entries, as many as the heap holds
+    pub entries: alloc::vec::Vec<E>,
     /// Currently selected entry index
     pub selected: usize,
     /// Timeout in seconds (0 = no timeout). Menus clear it on any input, so
@@ -241,16 +239,20 @@ impl<E> BootMenu<E> {
     /// An empty menu without a timeout.
     pub const fn new() -> Self {
         Self {
-            entries: Vec::new(),
+            entries: alloc::vec::Vec::new(),
             selected: 0,
             timeout_seconds: 0,
             edited_cmdline: None,
         }
     }
 
-    /// Add a boot entry
+    /// Add a boot entry; `false` only when the heap is exhausted.
     pub fn add_entry(&mut self, entry: E) -> bool {
-        self.entries.push(entry).is_ok()
+        if self.entries.try_reserve(1).is_err() {
+            return false;
+        }
+        self.entries.push(entry);
+        true
     }
 
     /// Get the number of entries
@@ -367,6 +369,21 @@ mod one_shot_cmdline_tests {
         menu.get_entry(0)?
             .get_cmdline()
             .map(|cmdline| cmdline.as_str())
+    }
+
+    #[test]
+    fn menu_holds_every_discovered_entry() {
+        // Six disks with a handful of kernels each overflow any small table.
+        let mut menu = BootMenu::new();
+        for disk in 0..64 {
+            assert!(menu.add_entry(DiskEntry {
+                entry: BootEntry::new("Linux", "", 1, BootEntryKind::Uefi, BootCategory::Uefi),
+                disk,
+                disk_name: "NVMe".into(),
+            }));
+        }
+        assert_eq!(menu.entry_count(), 64);
+        assert_eq!(menu.get_entry(63).map(|entry| entry.disk), Some(63));
     }
 
     #[test]

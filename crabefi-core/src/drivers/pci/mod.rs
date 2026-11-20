@@ -631,60 +631,42 @@ fn disable_region_bus_mastering(
 // ============================================================================
 
 /// Find all NVMe controllers
-pub fn find_nvme_controllers() -> heapless::Vec<PciDevice, 8> {
-    let pci = PCI.borrow();
-    let devices = &pci.devices;
-    let mut result = heapless::Vec::new();
-    for dev in devices.iter() {
-        if dev.is_nvme() {
-            log::info!(
-                "Found NVMe controller at {}: {:04x}:{:04x}",
-                dev.address,
-                dev.vendor_id,
-                dev.device_id
-            );
-            let _ = result.push(dev.clone());
-        }
-    }
-    result
+pub fn find_nvme_controllers() -> alloc::vec::Vec<PciDevice> {
+    find_controllers("NVMe", PciDevice::is_nvme)
 }
 
 /// Find all AHCI controllers
-pub fn find_ahci_controllers() -> heapless::Vec<PciDevice, 8> {
-    let pci = PCI.borrow();
-    let devices = &pci.devices;
-    let mut result = heapless::Vec::new();
-    for dev in devices.iter() {
-        if dev.is_ahci() {
-            log::info!(
-                "Found AHCI controller at {}: {:04x}:{:04x}",
-                dev.address,
-                dev.vendor_id,
-                dev.device_id
-            );
-            let _ = result.push(dev.clone());
-        }
-    }
-    result
+pub fn find_ahci_controllers() -> alloc::vec::Vec<PciDevice> {
+    find_controllers("AHCI", PciDevice::is_ahci)
 }
 
 /// Find all SDHCI controllers
-pub fn find_sdhci_controllers() -> heapless::Vec<PciDevice, 8> {
-    let pci = PCI.borrow();
-    let devices = &pci.devices;
-    let mut result = heapless::Vec::new();
-    for dev in devices.iter() {
-        if dev.is_sdhci() {
+pub fn find_sdhci_controllers() -> alloc::vec::Vec<PciDevice> {
+    find_controllers("SDHCI", PciDevice::is_sdhci)
+}
+
+/// Snapshot every enumerated device of one controller class.
+///
+/// Stops early, with an error, only if the heap cannot hold the list.
+fn find_controllers(kind: &str, matches: fn(&PciDevice) -> bool) -> alloc::vec::Vec<PciDevice> {
+    with_devices(|devices| {
+        let mut result = alloc::vec::Vec::new();
+        for dev in devices.iter().filter(|dev| matches(dev)) {
             log::info!(
-                "Found SDHCI controller at {}: {:04x}:{:04x}",
+                "Found {} controller at {}: {:04x}:{:04x}",
+                kind,
                 dev.address,
                 dev.vendor_id,
                 dev.device_id
             );
-            let _ = result.push(dev.clone());
+            if result.try_reserve(1).is_err() {
+                log::error!("PCI: out of heap listing {} controllers", kind);
+                break;
+            }
+            result.push(dev.clone());
         }
-    }
-    result
+        result
+    })
 }
 
 /// Borrow all enumerated PCI devices without allocating a snapshot.
@@ -1016,5 +998,28 @@ mod tests {
         let bar = probe_bar(&AnyPciAccess::Unavailable, PciAddress::new(0, 0, 0, 0), 0);
         assert_eq!(bar.bar_type, BarType::default());
         assert_eq!(bar.address, 0);
+    }
+
+    #[test]
+    fn controller_lists_hold_every_matching_function() {
+        // More NVMe drives than the old fixed eight-entry list, mixed with
+        // other classes that must not leak into it.
+        let devices: alloc::vec::Vec<PciDevice> = (0..12u8)
+            .map(|device| PciDevice {
+                class_code: 0x01,
+                subclass: if device % 4 == 3 { 0x06 } else { 0x08 },
+                prog_if: 0x02,
+                ..PciDevice::new(PciAddress::new(0, 0x40, device, 0))
+            })
+            .collect();
+        let previous = PCI.with_mut(|pci| core::mem::replace(&mut pci.devices, devices));
+        let nvme = find_nvme_controllers();
+        let ahci = find_ahci_controllers();
+        PCI.with_mut(|pci| pci.devices = previous);
+
+        assert_eq!(nvme.len(), 9);
+        assert!(nvme.iter().all(PciDevice::is_nvme));
+        assert_eq!(ahci.len(), 3);
+        assert_eq!(nvme[8].address, PciAddress::new(0, 0x40, 10, 0));
     }
 }

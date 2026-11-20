@@ -23,6 +23,11 @@ const MIN_BLOCK_SIZE: usize = 512;
 const MAX_GPT_PARTITION_ENTRIES: usize = 4096;
 const MAX_GPT_ENTRY_ARRAY_BYTES: usize = 512 * 1024;
 
+/// Primary partition entries in an MBR (UEFI spec, Legacy MBR layout).
+///
+/// The MBR has room for exactly four 16-byte entries at offset 446.
+const MBR_PRIMARY_ENTRIES: usize = 4;
+
 /// GPT header signature "EFI PART"
 const GPT_SIGNATURE: u64 = 0x5452415020494645;
 
@@ -302,6 +307,8 @@ pub enum GptError {
     NoEsp,
     /// Buffer too small
     BufferTooSmall,
+    /// The heap could not hold the partition list or scan scratch buffer
+    OutOfMemory,
 }
 
 impl core::fmt::Display for GptError {
@@ -313,6 +320,7 @@ impl core::fmt::Display for GptError {
             GptError::NoPartitions => write!(f, "no partitions found"),
             GptError::NoEsp => write!(f, "no EFI System Partition found"),
             GptError::BufferTooSmall => write!(f, "buffer too small"),
+            GptError::OutOfMemory => write!(f, "out of memory scanning partitions"),
         }
     }
 }
@@ -426,9 +434,26 @@ pub(crate) fn build_gpt_measurement_event_with(
     let (entries_byte_offset, total_entries, total_bytes_needed) =
         gpt_entry_array_bounds(info, header, block_size, is_hybrid)?;
 
-    let mut raw_entries: Vec<u8> = Vec::new();
+    let header_size = core::mem::size_of::<GptHeader>();
+    let entries_start = header_size + core::mem::size_of::<u64>();
+    let mut event = Vec::new();
+    event
+        .try_reserve_exact(entries_start)
+        .map_err(|_| GptError::OutOfMemory)?;
+    // SAFETY: the packed header contains only integer/byte fields and can
+    // be copied as bytes without reading padding.
+    let header_bytes = unsafe {
+        core::slice::from_raw_parts(header as *const GptHeader as *const u8, header_size)
+    };
+    event.extend_from_slice(header_bytes);
+    event.resize(entries_start, 0);
+
     let mut buffer = [0u8; MAX_BLOCK_SIZE];
-    let mut entry_buf = alloc::vec![0; entry_size];
+    let mut entry_buf = Vec::new();
+    entry_buf
+        .try_reserve_exact(entry_size)
+        .map_err(|_| GptError::OutOfMemory)?;
+    entry_buf.resize(entry_size, 0);
 
     for entry_index in 0..total_entries {
         let entry_offset = entries_byte_offset
@@ -461,21 +486,16 @@ pub(crate) fn build_gpt_measurement_event_with(
             .0;
         if !entry.is_empty() {
             partition_lba_range(info, &entry, is_hybrid)?;
-            raw_entries.extend_from_slice(&entry_buf);
+            event
+                .try_reserve(entry_size)
+                .map_err(|_| GptError::OutOfMemory)?;
+            event.extend_from_slice(&entry_buf);
         }
     }
 
-    let valid_partition_count = raw_entries.len() / entry_size;
-    let header_size = core::mem::size_of::<GptHeader>();
-    let mut event = Vec::with_capacity(header_size + 8 + raw_entries.len());
-    // SAFETY: GptHeader is repr(C, packed), Copy, and contains only integer/byte
-    // fields. Taking a byte view copies its serialized little-endian layout.
-    let header_bytes = unsafe {
-        core::slice::from_raw_parts(header as *const GptHeader as *const u8, header_size)
-    };
-    event.extend_from_slice(header_bytes);
-    event.extend_from_slice(&(valid_partition_count as u64).to_le_bytes());
-    event.extend_from_slice(&raw_entries);
+    let valid_partition_count = (event.len() - entries_start) / entry_size;
+    event[header_size..entries_start]
+        .copy_from_slice(&(valid_partition_count as u64).to_le_bytes());
 
     Ok(event)
 }
@@ -487,7 +507,7 @@ pub(crate) fn build_gpt_measurement_event_with(
 pub fn read_partitions(
     device: &mut dyn BlockDevice,
     header: &GptHeader,
-) -> Result<heapless::Vec<Partition, 16>, GptError> {
+) -> Result<Vec<Partition>, GptError> {
     // Detect the on-disk layout rather than treating all large sectors as ISO media.
     let (_, is_hybrid) = read_gpt_layout(device)?;
     read_partitions_with(device, header, is_hybrid)
@@ -498,8 +518,8 @@ pub(crate) fn read_partitions_with(
     device: &mut dyn BlockDevice,
     header: &GptHeader,
     is_hybrid: bool,
-) -> Result<heapless::Vec<Partition, 16>, GptError> {
-    let mut partitions = heapless::Vec::new();
+) -> Result<Vec<Partition>, GptError> {
+    let mut partitions = Vec::new();
 
     // Use device's actual block size, capped at MAX_BLOCK_SIZE
     let info = device.info();
@@ -519,7 +539,11 @@ pub(crate) fn read_partitions_with(
     let (entries_byte_offset, total_entries, _total_bytes_needed) =
         gpt_entry_array_bounds(info, header, block_size, is_hybrid)?;
     let mut block_buf = [0u8; MAX_BLOCK_SIZE];
-    let mut entry_buf = alloc::vec![0u8; entry_size];
+    let mut entry_buf = Vec::new();
+    entry_buf
+        .try_reserve_exact(entry_size)
+        .map_err(|_| GptError::OutOfMemory)?;
+    entry_buf.resize(entry_size, 0);
 
     'entries: for entry_index in 0..total_entries {
         let entry_offset = entries_byte_offset
@@ -588,10 +612,10 @@ pub(crate) fn read_partitions_with(
                 if is_hybrid { " [hybrid]" } else { "" }
             );
 
-            if partitions.push(partition).is_err() {
-                log::warn!("Too many partitions, ignoring remaining");
-                break;
-            }
+            partitions
+                .try_reserve(1)
+                .map_err(|_| GptError::OutOfMemory)?;
+            partitions.push(partition);
         }
     }
 
@@ -607,9 +631,7 @@ pub(crate) fn read_partitions_with(
 /// This supports removable media formatted with an MBR ESP (partition type
 /// 0xEF), which is common for USB flash drives created by firmware update and
 /// OS installer tools.
-pub fn read_mbr_partitions(
-    device: &mut dyn BlockDevice,
-) -> Result<heapless::Vec<Partition, 4>, GptError> {
+pub fn read_mbr_partitions(device: &mut dyn BlockDevice) -> Result<Vec<Partition>, GptError> {
     let info = device.info();
     let block_size = (info.block_size as usize).clamp(MIN_BLOCK_SIZE, MAX_BLOCK_SIZE);
     let mut buffer = [0u8; MAX_BLOCK_SIZE];
@@ -626,8 +648,8 @@ pub fn read_mbr_partitions(
     }
     let disk_signature = u32::from_le_bytes([buffer[440], buffer[441], buffer[442], buffer[443]]);
 
-    let mut partitions = heapless::Vec::new();
-    for index in 0..4 {
+    let mut partitions = Vec::new();
+    for index in 0..MBR_PRIMARY_ENTRIES {
         let offset = 446 + index * core::mem::size_of::<MbrPartitionEntry>();
         let entry = MbrPartitionEntry::read_from_prefix(&buffer[offset..])
             .map_err(|_| GptError::InvalidMbr)?
@@ -674,10 +696,10 @@ pub fn read_mbr_partitions(
             partition.is_esp
         );
 
-        if partitions.push(partition).is_err() {
-            log::warn!("Too many MBR partitions, ignoring remaining");
-            break;
-        }
+        partitions
+            .try_reserve(1)
+            .map_err(|_| GptError::OutOfMemory)?;
+        partitions.push(partition);
     }
 
     if partitions.is_empty() {
@@ -688,23 +710,15 @@ pub fn read_mbr_partitions(
 }
 
 /// Read partitions from GPT, falling back to MBR when no GPT is present.
-pub fn read_partitions_auto(
-    device: &mut dyn BlockDevice,
-) -> Result<heapless::Vec<Partition, 16>, GptError> {
+pub fn read_partitions_auto(device: &mut dyn BlockDevice) -> Result<Vec<Partition>, GptError> {
     match read_gpt_layout(device)
         .and_then(|(header, is_hybrid)| read_partitions_with(device, &header, is_hybrid))
     {
         Ok(partitions) => Ok(partitions),
+        Err(GptError::OutOfMemory) => Err(GptError::OutOfMemory),
         Err(gpt_error) => {
             log::debug!("GPT partition scan failed: {:?}; trying MBR", gpt_error);
-            let mbr_partitions = read_mbr_partitions(device)?;
-            let mut partitions = heapless::Vec::new();
-            for partition in mbr_partitions {
-                partitions
-                    .push(partition)
-                    .map_err(|_| GptError::NoPartitions)?;
-            }
-            Ok(partitions)
+            read_mbr_partitions(device)
         }
     }
 }

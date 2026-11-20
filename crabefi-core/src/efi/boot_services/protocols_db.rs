@@ -9,7 +9,10 @@ use super::super::tables::{
     with_tables_mut,
 };
 use super::events::{event_id_for_handle, signal_event};
-use super::{create_handle, install_protocol, protocol_open_blocks_removal, remove_protocol};
+use super::{
+    create_handle, install_protocol, protocol_open_blocks_removal, reclaim_empty_handle,
+    remove_protocol,
+};
 use alloc::vec::Vec;
 use core::ffi::c_void;
 use r_efi::efi::{self, Guid, Handle, Status};
@@ -33,17 +36,25 @@ pub(super) extern "efiapi" fn install_protocol_interface(
         return Status::INVALID_PARAMETER;
     }
 
-    let target_handle = if unsafe { (*handle).is_null() } {
+    let new = unsafe { (*handle).is_null() };
+    let target_handle = if new {
         let Some(new_handle) = create_handle() else {
             return Status::OUT_OF_RESOURCES;
         };
+        // Publish before installation, so notification callbacks can see it.
         unsafe { *handle = new_handle };
         new_handle
     } else {
         unsafe { *handle }
     };
 
-    install_protocol(target_handle, &unsafe { *protocol }, interface)
+    let status = install_protocol(target_handle, &unsafe { *protocol }, interface);
+    if new && status != Status::SUCCESS {
+        // Failed installation does not signal callbacks or add any protocol.
+        reclaim_empty_handle(target_handle);
+        unsafe { *handle = core::ptr::null_mut() };
+    }
+    status
 }
 
 pub(super) extern "efiapi" fn reinstall_protocol_interface(
@@ -58,13 +69,15 @@ pub(super) extern "efiapi" fn reinstall_protocol_interface(
 
     let guid = unsafe { *protocol };
     let (status, notify_events) = with_tables_mut(|efi_state| {
-        let Some(entry) = efi_state.handles[..efi_state.handle_count]
+        let Some(entry) = efi_state
+            .handles
             .iter_mut()
             .find(|entry| entry.handle == handle)
         else {
             return (Status::NOT_FOUND, heapless::Vec::new());
         };
-        let Some(protocol_entry) = entry.protocols[..entry.protocol_count]
+        let Some(protocol_entry) = entry
+            .protocols
             .iter_mut()
             .find(|entry| entry.guid == guid && entry.interface == old_interface)
         else {
@@ -252,10 +265,12 @@ pub(super) fn next_registered_protocol(
     if protocol.is_some_and(|guid| guid != notify.protocol) {
         return Err(Status::INVALID_PARAMETER);
     }
-    efi_state.handles[..efi_state.handle_count]
+    efi_state
+        .handles
         .iter()
         .flat_map(|handle| {
-            handle.protocols[..handle.protocol_count]
+            handle
+                .protocols
                 .iter()
                 .map(move |entry| (index, handle.handle, *entry))
         })
@@ -328,9 +343,7 @@ pub(super) extern "efiapi" fn locate_handle(
                 }
                 let guid = unsafe { *protocol };
                 match collect_handles(&efi_state, |entry| {
-                    entry.protocols[..entry.protocol_count]
-                        .iter()
-                        .any(|p| p.guid == guid)
+                    entry.protocols.iter().any(|p| p.guid == guid)
                 }) {
                     Ok(handles) => handles,
                     Err(status) => return status,
@@ -382,11 +395,12 @@ fn collect_handles(
     filter: impl Fn(&HandleEntry) -> bool,
 ) -> Result<Vec<Handle>, Status> {
     let mut handles = Vec::new();
-    if handles.try_reserve_exact(efi_state.handle_count).is_err() {
+    if handles.try_reserve_exact(efi_state.handles.len()).is_err() {
         return Err(Status::OUT_OF_RESOURCES);
     }
     handles.extend(
-        efi_state.handles[..efi_state.handle_count]
+        efi_state
+            .handles
             .iter()
             .filter(|entry| filter(entry))
             .map(|entry| entry.handle),
@@ -464,10 +478,11 @@ pub(super) extern "efiapi" fn locate_device_path(
     // and keep the one that consumes the most bytes of the input path.
     let efi_state = tables();
 
-    let found = efi_state.handles[..efi_state.handle_count]
+    let found = efi_state
+        .handles
         .iter()
         .filter_map(|entry| {
-            let protocols = &entry.protocols[..entry.protocol_count];
+            let protocols = &entry.protocols;
 
             let has_protocol = protocols.iter().any(|p| p.guid == guid);
             if !has_protocol {

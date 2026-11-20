@@ -43,6 +43,8 @@ pub struct BlsEntry {
     pub devicetree: String<MAX_PATH_LEN>,
     /// Architecture (x64, ia32, arm, etc.)
     pub architecture: String<8>,
+    /// Directory order, used as the tie-breaker when sorting boot entries.
+    pub(super) scan_order: usize,
 }
 
 impl Default for BlsEntry {
@@ -65,6 +67,7 @@ impl BlsEntry {
             sort_key: String::new(),
             devicetree: String::new(),
             architecture: String::new(),
+            scan_order: 0,
         }
     }
 

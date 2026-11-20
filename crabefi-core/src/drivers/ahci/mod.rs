@@ -1746,6 +1746,14 @@ impl AhciController {
         Ok(())
     }
 
+    fn discard_unregistered(mut self) {
+        let hba = unsafe { &*(self.mmio_base as *const AhciHbaRegisters) };
+        hba.ghc.modify(GHC::IE::CLEAR);
+        while let Some(port) = self.ports.pop() {
+            self.discard_port_logged(port);
+        }
+    }
+
     fn shutdown_controller(&mut self) {
         let hba = unsafe { &*(self.mmio_base as *const AhciHbaRegisters) };
         hba.ghc.modify(GHC::IE::CLEAR);
@@ -1783,7 +1791,7 @@ impl AhciController {
 }
 
 /// Registry of initialized AHCI controllers
-static AHCI_CONTROLLERS: super::ControllerRegistry<AhciController, 4> =
+static AHCI_CONTROLLERS: super::ControllerRegistry<AhciController> =
     super::ControllerRegistry::new("AHCI");
 
 /// Initialize a single AHCI controller from a PCI device
@@ -1822,7 +1830,9 @@ pub async fn init_controller(dev: &pci::PciDevice) -> Result<AhciController, ()>
 // Failures are logged at the error site; callers only branch on success.
 #[allow(clippy::result_unit_err)]
 pub fn register_controller(address: pci::PciAddress, controller: AhciController) -> Result<(), ()> {
-    AHCI_CONTROLLERS.register(controller)?;
+    AHCI_CONTROLLERS
+        .register(controller, AhciController::discard_unregistered)
+        .map_err(|e| log::error!("AHCI: not registering controller at {}: {}", address, e))?;
     log::info!("AHCI controller at {} initialized", address);
     Ok(())
 }

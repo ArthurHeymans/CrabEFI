@@ -10,6 +10,8 @@
 //! and logical slot traversal. [`FatFile`] holds a record snapshot, not a cursor
 //! or access mode; handle ownership belongs to the filesystem's caller.
 
+use alloc::vec::Vec;
+
 use crate::drivers::block::{BlockDevice, BlockRange};
 use zerocopy::little_endian::U32;
 use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout, Unaligned};
@@ -495,6 +497,8 @@ pub enum FatError {
     InvalidName,
     /// No free clusters or directory slots
     NoSpace,
+    /// The heap could not hold the result
+    OutOfMemory,
 }
 
 impl core::fmt::Display for FatError {
@@ -518,6 +522,7 @@ impl core::fmt::Display for FatError {
             FatError::DirectoryNotEmpty => write!(f, "directory not empty"),
             FatError::InvalidName => write!(f, "invalid filename"),
             FatError::NoSpace => write!(f, "filesystem full"),
+            FatError::OutOfMemory => write!(f, "out of memory"),
         }
     }
 }
@@ -1883,25 +1888,12 @@ impl<'a> FatFilesystem<'a> {
         &mut self,
         dir_path: &str,
         suffix: &str,
-    ) -> Result<heapless::Vec<heapless::String<256>, 32>, FatError> {
-        use core::ops::ControlFlow;
-
+    ) -> Result<Vec<heapless::String<256>>, FatError> {
         let dir_cluster = self.resolve_dir_cluster(dir_path)?;
-        let mut results: heapless::Vec<heapless::String<256>, 32> = heapless::Vec::new();
-
-        let _ = self.for_each_dir_record(dir_cluster, |record, lfn_buf| {
-            let entry = &record.entry;
-            if entry.is_directory() {
-                return ControlFlow::Continue(());
-            }
-            let name = Self::entry_display_name(entry, lfn_buf);
-            if suffix_matches(&name, suffix) && results.push(name).is_err() {
-                return ControlFlow::Break(()); // Full
-            }
-            ControlFlow::Continue(())
-        })?;
-
-        Ok(results)
+        self.collect_dir_names(dir_cluster, |entry, name| {
+            !entry.is_directory() && suffix_matches(name, suffix)
+        })
+        .inspect_err(|error| log_dir_listing_error(dir_path, error))
     }
 
     /// Extract the display name from a directory entry, preferring LFN over short name
@@ -1948,25 +1940,38 @@ impl<'a> FatFilesystem<'a> {
     pub fn list_subdirectories(
         &mut self,
         dir_path: &str,
-    ) -> Result<heapless::Vec<heapless::String<256>, 16>, FatError> {
+    ) -> Result<Vec<heapless::String<256>>, FatError> {
+        let dir_cluster = self.resolve_dir_cluster(dir_path)?;
+        self.collect_dir_names(dir_cluster, |entry, name| {
+            entry.is_directory() && name != "." && name != ".."
+        })
+        .inspect_err(|error| log_dir_listing_error(dir_path, error))
+    }
+
+    /// Display names of every record in a directory that `keep` accepts.
+    fn collect_dir_names(
+        &mut self,
+        dir_cluster: u32,
+        mut keep: impl FnMut(&DirectoryEntry, &str) -> bool,
+    ) -> Result<Vec<heapless::String<256>>, FatError> {
         use core::ops::ControlFlow;
 
-        let dir_cluster = self.resolve_dir_cluster(dir_path)?;
-        let mut results: heapless::Vec<heapless::String<256>, 16> = heapless::Vec::new();
-
-        let _ = self.for_each_dir_record(dir_cluster, |record, lfn_buf| {
-            let entry = &record.entry;
-            if !entry.is_directory() {
+        let mut results = Vec::new();
+        let walk = self.for_each_dir_record(dir_cluster, |record, lfn_buf| {
+            let name: heapless::String<256> = Self::entry_display_name(&record.entry, lfn_buf);
+            if !keep(&record.entry, &name) {
                 return ControlFlow::Continue(());
             }
-            let name = Self::entry_display_name(entry, lfn_buf);
-            if name != "." && name != ".." && results.push(name).is_err() {
-                return ControlFlow::Break(()); // Full
+            if results.try_reserve(1).is_err() {
+                return ControlFlow::Break(FatError::OutOfMemory);
             }
+            results.push(name);
             ControlFlow::Continue(())
         })?;
-
-        Ok(results)
+        match walk {
+            ControlFlow::Break(error) => Err(error),
+            ControlFlow::Continue(()) => Ok(results),
+        }
     }
 
     /// Get a directory entry at a specific position (for directory enumeration)
@@ -2006,14 +2011,16 @@ impl<'a> FatFilesystem<'a> {
     }
 }
 
-/// Check if a filename ends with a given suffix (case-insensitive)
-fn suffix_matches(name: &str, suffix: &str) -> bool {
-    if name.len() < suffix.len() {
-        return false;
+fn log_dir_listing_error(dir_path: &str, error: &FatError) {
+    if matches!(error, FatError::OutOfMemory) {
+        log::error!("FAT: out of heap listing {}", dir_path);
     }
-    let name_end = &name[name.len() - suffix.len()..];
-    name_end
-        .bytes()
-        .zip(suffix.bytes())
-        .all(|(a, b)| a.eq_ignore_ascii_case(&b))
+}
+
+/// Check if a filename ends with a given suffix (ASCII case-insensitive).
+fn suffix_matches(name: &str, suffix: &str) -> bool {
+    let Some(start) = name.len().checked_sub(suffix.len()) else {
+        return false;
+    };
+    name.as_bytes()[start..].eq_ignore_ascii_case(suffix.as_bytes())
 }

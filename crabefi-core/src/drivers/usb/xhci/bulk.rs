@@ -202,7 +202,7 @@ impl super::XhciController {
         let slot = self
             .slots
             .get_mut(slot_id as usize)
-            .and_then(|s| s.as_mut())
+            .and_then(|s| s.as_deref_mut())
             .ok_or(XhciError::DeviceNotFound)?;
 
         // Allocate transfer rings for bulk endpoints
@@ -457,7 +457,7 @@ impl super::XhciController {
         let slot = self
             .slots
             .get_mut(slot_id as usize)
-            .and_then(|s| s.as_mut())
+            .and_then(|s| s.as_deref_mut())
             .ok_or(XhciError::DeviceNotFound)?;
 
         let ring = slot.transfer_rings[dci - 1]

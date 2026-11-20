@@ -581,7 +581,7 @@ impl super::XhciController {
         let is_hub_class = self
             .slots
             .get(hub_slot_id as usize)
-            .and_then(|s| s.as_ref())
+            .and_then(|s| s.as_deref())
             .map(|s| s.device_desc.device_class == 0x09)
             .unwrap_or(false);
 
@@ -597,7 +597,7 @@ impl super::XhciController {
         let (hub_is_superspeed, bcd_usb, parent_route) = self
             .slots
             .get(hub_slot_id as usize)
-            .and_then(|slot| slot.as_ref())
+            .and_then(|slot| slot.as_deref())
             .map(|slot| {
                 (
                     slot.is_superspeed,
@@ -653,7 +653,7 @@ impl super::XhciController {
         if let Some(slot) = self
             .slots
             .get_mut(hub_slot_id as usize)
-            .and_then(|s| s.as_mut())
+            .and_then(|s| s.as_deref_mut())
         {
             slot.is_hub = true;
             slot.hub_ports = num_ports;
@@ -881,7 +881,7 @@ impl super::XhciController {
         let slot = self
             .slots
             .get(slot_id as usize)
-            .and_then(|s| s.as_ref())
+            .and_then(|s| s.as_deref())
             .ok_or(XhciError::DeviceNotFound)?;
 
         let input_ctx = slot.input_context;
@@ -948,7 +948,7 @@ impl super::XhciController {
                 if let Some(slot) = self
                     .slots
                     .get_mut(slot_id as usize)
-                    .and_then(|s| s.as_mut())
+                    .and_then(|s| s.as_deref_mut())
                 {
                     slot.device_desc = desc;
                 }
@@ -1194,7 +1194,7 @@ impl super::XhciController {
                         if let Some(slot) = self
                             .slots
                             .get_mut(slot_id as usize)
-                            .and_then(|s| s.as_mut())
+                            .and_then(|s| s.as_deref_mut())
                         {
                             slot.device_desc = desc;
                         }

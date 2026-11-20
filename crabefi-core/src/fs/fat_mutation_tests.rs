@@ -166,3 +166,46 @@ fn failed_first_data_write_does_not_leak_an_unreachable_chain() {
     }
     assert_eq!(fat_value(&disk.disk, layout, 0, 3), 0);
 }
+
+#[test]
+fn directory_listings_return_every_match() {
+    // More BLS entries and EFI vendor directories than the old fixed lists
+    // of 32 files and 16 subdirectories held.
+    let mut disk = format(LAYOUTS[0]);
+    let mut fat = FatFilesystem::new(&mut disk, PARTITION_START).unwrap();
+    fat.create("loader", true).unwrap();
+    fat.create("loader\\entries", true).unwrap();
+    for index in 0..48 {
+        let path = alloc::format!("loader\\entries\\entry-{index}.conf");
+        fat.create(&path, false).unwrap();
+        fat.write_path(&path, 0, b"title Test Linux\nlinux /vmlinuz\n")
+            .unwrap();
+    }
+    fat.create("loader\\entries\\notes.txt", false).unwrap();
+    fat.create("loader\\entries\\ééé", false).unwrap();
+    fat.write_path(
+        "loader\\entries\\ééé",
+        0,
+        b"title Not BLS\nlinux /vmlinuz\n",
+    )
+    .unwrap();
+    fat.create("EFI", true).unwrap();
+    for index in 0..24 {
+        fat.create(&alloc::format!("EFI\\vendor-{index}"), true)
+            .unwrap();
+    }
+
+    let files = fat
+        .list_directory_files("loader\\entries", ".conf")
+        .unwrap();
+    assert_eq!(files.len(), 48);
+    assert!(files.iter().any(|name| name == "entry-47.conf"));
+    let bls = crate::bls::discover_entries(&mut fat).unwrap();
+    assert_eq!(bls.entries.len(), 48);
+    for (index, entry) in bls.entries.iter().enumerate() {
+        assert_eq!(entry.id.as_str(), alloc::format!("entry-{index}"));
+    }
+    let directories = fat.list_subdirectories("EFI").unwrap();
+    assert_eq!(directories.len(), 24);
+    assert!(directories.iter().any(|name| name == "vendor-23"));
+}
