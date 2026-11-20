@@ -65,7 +65,7 @@ const HELP_TEXT: &str = "Enter: Boot | F: Firmware | C: Cmdline | S: Secure Boot
 #[cfg(not(feature = "secure-boot"))]
 const HELP_TEXT: &str = "Enter: Boot | F: Firmware | C: Cmdline | R: Reset";
 
-pub use crabefi_ui::{BootCategory, BootEntryKind};
+pub use crabefi_ui::{BootCategory, BootEntryKind, Initrds, MAX_INITRDS, PayloadFormat};
 
 /// A boot entry discovered on storage media
 #[derive(Debug, Clone)]
