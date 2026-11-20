@@ -8,6 +8,7 @@ members = [
   "crabefi-coreboot",
   "crabefi-efi-types",
   "crabefi-hw",
+  "crabefi-memmap",
   "crabefi-pkcs7",
   "crabefi-runtime-bundle",
   "crabefi-ui",
