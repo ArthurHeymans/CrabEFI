@@ -353,13 +353,15 @@ fn test_os_indications_supported(ctx: &mut TestCtx) {
     let mut data_size: usize = 8;
 
     let get_variable = unsafe { (*rt).get_variable };
-    let status = get_variable(
-        name.as_ptr() as *mut Char16,
-        &EFI_GLOBAL_VARIABLE_GUID as *const Guid as *mut Guid,
-        &mut attributes,
-        &mut data_size,
-        data.as_mut_ptr() as *mut core::ffi::c_void,
-    );
+    let status = unsafe {
+        get_variable(
+            name.as_ptr() as *mut Char16,
+            &EFI_GLOBAL_VARIABLE_GUID as *const Guid as *mut Guid,
+            &mut attributes,
+            &mut data_size,
+            data.as_mut_ptr() as *mut core::ffi::c_void,
+        )
+    };
 
     if status != Status::SUCCESS {
         ctx.fail("os_ind_supported_read: GetVariable failed");
@@ -409,12 +411,14 @@ fn test_query_capsule_capabilities(ctx: &mut TestCtx) {
     let query = unsafe { (*rt).query_capsule_capabilities };
     let mut max_capsule_size = 0u64;
     let mut reset_type = efi::RESET_COLD;
-    if query(
-        core::ptr::null_mut(),
-        0,
-        &mut max_capsule_size,
-        &mut reset_type,
-    ) == Status::INVALID_PARAMETER
+    if unsafe {
+        query(
+            core::ptr::null_mut(),
+            0,
+            &mut max_capsule_size,
+            &mut reset_type,
+        )
+    } == Status::INVALID_PARAMETER
     {
         ctx.pass("query_caps_null_zero_rejected");
     } else {
@@ -430,18 +434,21 @@ fn test_query_capsule_capabilities(ctx: &mut TestCtx) {
     let header_ptr: *mut CapsuleHeader = &mut capsule_header;
     let mut headers = [header_ptr, header_ptr];
     let array = headers.as_mut_ptr().cast::<*mut efi::CapsuleHeader>();
-    if query(array, 0, &mut max_capsule_size, &mut reset_type) == Status::INVALID_PARAMETER {
+    if unsafe { query(array, 0, &mut max_capsule_size, &mut reset_type) }
+        == Status::INVALID_PARAMETER
+    {
         ctx.pass("query_caps_zero_count_rejected");
     } else {
         ctx.fail("query_caps_zero_count_rejected");
     }
-    if query(array, 2, &mut max_capsule_size, &mut reset_type) == Status::UNSUPPORTED {
+    if unsafe { query(array, 2, &mut max_capsule_size, &mut reset_type) } == Status::UNSUPPORTED {
         ctx.pass("query_caps_multiple_rejected");
     } else {
         ctx.fail("query_caps_multiple_rejected");
     }
-    if query(array, 1, core::ptr::null_mut(), &mut reset_type) == Status::INVALID_PARAMETER
-        && query(array, 1, &mut max_capsule_size, core::ptr::null_mut())
+    if unsafe { query(array, 1, core::ptr::null_mut(), &mut reset_type) }
+        == Status::INVALID_PARAMETER
+        && unsafe { query(array, 1, &mut max_capsule_size, core::ptr::null_mut()) }
             == Status::INVALID_PARAMETER
     {
         ctx.pass("query_caps_null_outputs_rejected");
@@ -450,7 +457,7 @@ fn test_query_capsule_capabilities(ctx: &mut TestCtx) {
     }
 
     unsafe { core::ptr::write_volatile(&raw mut capsule_header.flags, 0) };
-    if query(array, 1, &mut max_capsule_size, &mut reset_type) == Status::UNSUPPORTED {
+    if unsafe { query(array, 1, &mut max_capsule_size, &mut reset_type) } == Status::UNSUPPORTED {
         ctx.pass("query_caps_persist_flag_required");
     } else {
         ctx.fail("query_caps_persist_flag_required");
@@ -462,7 +469,7 @@ fn test_query_capsule_capabilities(ctx: &mut TestCtx) {
             16 * 1024 * 1024 + 1,
         );
     }
-    if query(array, 1, &mut max_capsule_size, &mut reset_type) == Status::UNSUPPORTED {
+    if unsafe { query(array, 1, &mut max_capsule_size, &mut reset_type) } == Status::UNSUPPORTED {
         ctx.pass("query_caps_oversize_rejected");
     } else {
         ctx.fail("query_caps_oversize_rejected");
@@ -471,7 +478,7 @@ fn test_query_capsule_capabilities(ctx: &mut TestCtx) {
     unsafe { core::ptr::write_volatile(&raw mut capsule_header.capsule_image_size, 1024) };
     max_capsule_size = 0;
     reset_type = efi::RESET_COLD;
-    let status = query(array, 1, &mut max_capsule_size, &mut reset_type);
+    let status = unsafe { query(array, 1, &mut max_capsule_size, &mut reset_type) };
     if DISK_ONLY {
         if status == Status::UNSUPPORTED {
             ctx.pass("query_caps_persist_unsupported");
@@ -512,7 +519,7 @@ fn test_update_capsule_validation(ctx: &mut TestCtx) {
         return;
     }
     let update = unsafe { (*rt).update_capsule };
-    if update(core::ptr::null_mut(), 0, 0) == Status::INVALID_PARAMETER {
+    if unsafe { update(core::ptr::null_mut(), 0, 0) } == Status::INVALID_PARAMETER {
         ctx.pass("update_capsule_null_rejected");
     } else {
         ctx.fail("update_capsule_null_rejected");
@@ -527,23 +534,26 @@ fn test_update_capsule_validation(ctx: &mut TestCtx) {
     let header: *mut CapsuleHeader = &mut capsule_header;
     let mut headers = [header, header];
     let array = headers.as_mut_ptr().cast::<*mut efi::CapsuleHeader>();
-    if update(array, 0, 0) == Status::INVALID_PARAMETER {
+    if unsafe { update(array, 0, 0) } == Status::INVALID_PARAMETER {
         ctx.pass("update_capsule_zero_count_rejected");
     } else {
         ctx.fail("update_capsule_zero_count_rejected");
     }
-    if update(array, 2, 1) == Status::UNSUPPORTED {
+    // SAFETY: The next three calls use 1 as a non-null sentinel, not a valid
+    // scatter/gather list. CrabEFI rejects multiple capsules or pre-ExitBootServices
+    // calls before using the address. UEFI does not guarantee this ordering.
+    if unsafe { update(array, 2, 1) } == Status::UNSUPPORTED {
         ctx.pass("update_capsule_multiple_rejected");
     } else {
         ctx.fail("update_capsule_multiple_rejected");
     }
     let mut null_header = core::ptr::null_mut();
-    if update(&mut null_header, 1, 1) == Status::UNSUPPORTED {
+    if unsafe { update(&mut null_header, 1, 1) } == Status::UNSUPPORTED {
         ctx.pass("update_capsule_pre_ebs_short_circuits_header");
     } else {
         ctx.fail("update_capsule_pre_ebs_short_circuits_header");
     }
-    if update(array, 1, 1) == Status::UNSUPPORTED {
+    if unsafe { update(array, 1, 1) } == Status::UNSUPPORTED {
         ctx.pass("update_capsule_pre_ebs_unsupported");
     } else {
         ctx.fail("update_capsule_pre_ebs_unsupported");

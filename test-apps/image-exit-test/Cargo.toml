@@ -7,7 +7,7 @@ description = "On-disk nested LoadImage/StartImage/Exit lifecycle test"
 [workspace]
 
 [dependencies]
-r-efi = "5.3"
+r-efi = "7.1"
 
 [profile.release]
 panic = "abort"

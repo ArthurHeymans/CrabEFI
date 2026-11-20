@@ -1843,10 +1843,8 @@ pub fn run_uefi_sct_smoke_tests(
         .context("SCT Summary.log was not produced")
         .and_then(|summary| sct::validate(&result.output, summary, sequence));
     use sha2::Digest;
-    let firmware_sha256 = format!(
-        "{:x}",
-        sha2::Sha256::digest(fs::read(&config.coreboot_rom)?)
-    );
+    let firmware_sha256 =
+        crate::runtime::hex(&sha2::Sha256::digest(fs::read(&config.coreboot_rom)?));
     fs::write(
         report_dir.join("result.json"),
         serde_json::to_vec_pretty(&serde_json::json!({

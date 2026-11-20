@@ -7,7 +7,7 @@ description = "Test EFI application for RegisterProtocolNotify and LocateHandle(
 [workspace]
 
 [dependencies]
-r-efi = "5.3"
+r-efi = "7.1"
 
 [profile.release]
 panic = "abort"

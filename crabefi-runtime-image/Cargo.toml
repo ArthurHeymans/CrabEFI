@@ -20,7 +20,7 @@ crabefi-pkcs7 = { path = "../crabefi-pkcs7", optional = true }
 crabefi-runtime-abi = { path = "../crabefi-runtime-abi" }
 bitflags = { version = "2", default-features = false }
 heapless = { version = "0.9", default-features = false }
-r-efi = "5.3"
+r-efi = "7.1"
 # This crate is a standalone workspace and intentionally uses sha2 0.11 so its
 # rsa 0.10 host tests share the same digest traits. Exact-pin so a new 0.11.x
 # release cannot silently change the verifier's digest implementation.
