@@ -374,3 +374,109 @@ fn loader_subclaims_remain_supported() {
         efi::Status::SUCCESS
     );
 }
+
+#[test]
+fn address_claim_cannot_span_two_loader_allocations() {
+    let mut allocator = allocator_with_ram();
+    let first = 0x10_0000;
+    for offset in [0, 2] {
+        let mut address = first + offset * PAGE_SIZE;
+        assert_eq!(
+            allocator.allocate_pages(
+                AllocateType::AllocateAddress,
+                MemoryType::LoaderData,
+                2,
+                &mut address,
+            ),
+            efi::Status::SUCCESS
+        );
+    }
+    // Both owners now share one merged LoaderData descriptor.
+    assert!(
+        allocator
+            .entries
+            .iter()
+            .any(|entry| entry.physical_start == first && entry.number_of_pages == 4)
+    );
+    let key = allocator.map_key();
+    let mut straddle = first + PAGE_SIZE;
+    assert_eq!(
+        allocator.allocate_pages(
+            AllocateType::AllocateAddress,
+            MemoryType::LoaderCode,
+            2,
+            &mut straddle,
+        ),
+        efi::Status::NOT_FOUND
+    );
+    assert_eq!(allocator.map_key(), key);
+    allocator.check_well_formed().unwrap();
+}
+
+#[test]
+fn runtime_image_layout_fails_without_changing_the_map() {
+    let ram = |map: &mut MemoryMap<2, 4>, pages| {
+        map.entries
+            .push(memory_descriptor(
+                MemoryType::ConventionalMemory,
+                0x10_0000,
+                pages,
+                attributes::EFI_MEMORY_RAM_CAPS,
+            ))
+            .unwrap();
+        map.entries
+            .push(memory_descriptor(
+                MemoryType::ReservedMemoryType,
+                0x20_0000,
+                1,
+                0,
+            ))
+            .unwrap();
+    };
+    // A full table still fits an all-code image in an exactly sized extent.
+    let mut exact = MemoryMap::<2, 4>::new();
+    ram(&mut exact, 4);
+    assert!(exact.allocate_runtime_image_layout(4, 4).is_ok());
+    exact.check_well_formed().unwrap();
+
+    // A residual and a code split need two more slots: refuse up front.
+    let mut tight = MemoryMap::<2, 4>::new();
+    ram(&mut tight, 4);
+    let (entries, key) = (tight.entries.clone(), tight.map_key());
+    assert_eq!(
+        tight.allocate_runtime_image_layout(2, 1),
+        Err(efi::Status::OUT_OF_RESOURCES)
+    );
+    assert_eq!(tight.entries, entries);
+    assert_eq!(tight.map_key(), key);
+}
+
+#[test]
+fn pe_retype_accepts_only_matching_code_and_data_types() {
+    let mut allocator = allocator_with_ram();
+    let mut base = 0;
+    assert_eq!(
+        allocator.allocate_pages(
+            AllocateType::AllocateAnyPages,
+            MemoryType::LoaderCode,
+            2,
+            &mut base
+        ),
+        efi::Status::SUCCESS
+    );
+    let key = allocator.map_key();
+    for (code, data) in [
+        (MemoryType::LoaderCode, MemoryType::ConventionalMemory),
+        (
+            MemoryType::RuntimeServicesCode,
+            MemoryType::BootServicesData,
+        ),
+    ] {
+        assert_eq!(
+            allocator.retype_pe_image(base, 2, code, data, &[]),
+            Err(efi::Status::INVALID_PARAMETER)
+        );
+    }
+    assert_eq!(allocator.map_key(), key);
+    allocator.check_well_formed().unwrap();
+}

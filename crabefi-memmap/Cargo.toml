@@ -12,5 +12,8 @@ heapless = { workspace = true }
 log = { workspace = true }
 r-efi = { workspace = true }
 
+[dev-dependencies]
+proptest = { version = "1.10", default-features = false, features = ["std"] }
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

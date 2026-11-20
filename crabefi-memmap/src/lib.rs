@@ -885,6 +885,18 @@ impl<const ENTRIES: usize, const OWNERS: usize> MemoryMap<ENTRIES, OWNERS> {
         if self.boot_services_exited {
             return Err(efi::Status::UNSUPPORTED);
         }
+        // Only matching code/data pairs describe a loaded image.
+        if !matches!(
+            (code_type, data_type),
+            (MemoryType::LoaderCode, MemoryType::LoaderData)
+                | (MemoryType::BootServicesCode, MemoryType::BootServicesData)
+                | (
+                    MemoryType::RuntimeServicesCode,
+                    MemoryType::RuntimeServicesData
+                )
+        ) {
+            return Err(efi::Status::INVALID_PARAMETER);
+        }
         let image = PageRange::from_bytes(base, pages).ok_or(efi::Status::INVALID_PARAMETER)?;
         let (index, allocation) = self
             .find_allocation(image)
@@ -962,7 +974,7 @@ impl<const ENTRIES: usize, const OWNERS: usize> MemoryMap<ENTRIES, OWNERS> {
         if covered != pages {
             return efi::Status::NOT_FOUND;
         }
-        if self.entries.len() > ENTRIES - 2 {
+        if self.entries.len() + 2 > ENTRIES {
             return efi::Status::OUT_OF_RESOURCES;
         }
         // Free in address order so the released prefix merges rather than
@@ -1048,6 +1060,15 @@ impl<const ENTRIES: usize, const OWNERS: usize> MemoryMap<ENTRIES, OWNERS> {
                 if !self.allocation_replacement_fits(allocation, range, Some(replacement)) {
                     return efi::Status::OUT_OF_RESOURCES;
                 }
+            } else if self
+                .allocations
+                .iter()
+                .any(|allocation| allocation.range.overlaps(range))
+            {
+                // Adjacent loader allocations share one merged descriptor. A
+                // claim across them belongs to no single owner and would hand
+                // out their pages a second time.
+                return efi::Status::NOT_FOUND;
             } else if self.allocations.is_full() {
                 return efi::Status::OUT_OF_RESOURCES;
             }
@@ -1379,6 +1400,31 @@ impl<const ENTRIES: usize, const OWNERS: usize> MemoryMap<ENTRIES, OWNERS> {
         if image_pages == 0 || code_pages == 0 || code_pages > image_pages {
             return Err(efi::Status::INVALID_PARAMETER);
         }
+        if self.allocations.is_full() {
+            return Err(efi::Status::OUT_OF_RESOURCES);
+        }
+        // Preflight the exact layout so a failure changes nothing, not even
+        // the key: carving the image adds a descriptor for each residual of
+        // its free extent, and splitting off the code adds one more unless
+        // the image is all code. Merges only reduce the count, and retyping
+        // compacts the map when the unmerged table is full.
+        let placement = self
+            .find_free_pages(image_pages, 0, u64::MAX)
+            .and_then(|address| PageRange::from_bytes(address, image_pages))
+            .ok_or(efi::Status::OUT_OF_RESOURCES)?;
+        let source = self
+            .find_descriptor(placement, &[MemoryType::ConventionalMemory])
+            .ok_or(efi::Status::OUT_OF_RESOURCES)?;
+        let residuals = self
+            .descriptor_split(source, placement)?
+            .replacement_count()
+            - 1;
+        let needed = residuals + usize::from(code_pages < image_pages);
+        if !fits_after_replacement(self.entries.len(), 0, needed, ENTRIES)
+            && !fits_after_replacement(self.count_merged_entries(), 0, needed, ENTRIES)
+        {
+            return Err(efi::Status::OUT_OF_RESOURCES);
+        }
         let mut base = 0;
         let status = self.allocate_pages(
             AllocateType::AllocateAnyPages,
@@ -1394,6 +1440,7 @@ impl<const ENTRIES: usize, const OWNERS: usize> MemoryMap<ENTRIES, OWNERS> {
         let code_range =
             PageRange::from_bytes(base, code_pages).ok_or(efi::Status::OUT_OF_RESOURCES)?;
         if let Err(status) = self.retype_runtime_image_code(image_range, code_range) {
+            debug_assert!(false, "runtime image split failed after preflight");
             let _ = self.free_pages(base, image_pages);
             return Err(status);
         }

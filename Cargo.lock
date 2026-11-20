@@ -190,6 +190,7 @@ dependencies = [
  "crabefi-runtime-abi",
  "heapless 0.9.3",
  "log",
+ "proptest",
  "r-efi 7.1.0",
 ]
 
