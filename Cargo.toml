@@ -16,22 +16,31 @@ exclude = [
   "ui-harness",
   "crabefi-runtime-abi",
   "crabefi-runtime-image",
-  "test-apps/hello",
-  "test-apps/mm-gate-test",
-  "test-apps/rng-test",
-  "test-apps/secure-boot-test",
-  "test-apps/storage-security-test",
+  "test-apps/ab-update-test",
+  "test-apps/boot-events-test",
+  "test-apps/boot-policy-test",
+  "test-apps/capsule-test",
+  "test-apps/device-path-test",
   "test-apps/directory-test",
   "test-apps/fw-dump",
-  "test-apps/tcg-test",
+  "test-apps/fwui-test",
+  "test-apps/hello",
+  "test-apps/image-exit-test",
+  "test-apps/mm-gate-test",
+  "test-apps/protocol-notify-test",
+  "test-apps/rng-test",
   "test-apps/runtime-image-test",
+  "test-apps/secure-boot-auth-test",
+  "test-apps/secure-boot-test",
+  "test-apps/storage-security-test",
+  "test-apps/tcg-test",
 ]
 resolver = "3"
 
 [workspace.package]
 edition = "2024"
 license = "Apache-2.0 OR MIT"
-repository = "https://github.com/user/CrabEFI"
+repository = "https://github.com/ArthurHeymans/CrabEFI"
 
 [workspace.dependencies]
 crabefi-efi-types = { path = "crabefi-efi-types" }

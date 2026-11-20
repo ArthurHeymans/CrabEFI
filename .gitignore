@@ -1,3 +1,6 @@
+# Local scratch files
+.local/
+
 # Build artifacts
 /target/
 **/target/
