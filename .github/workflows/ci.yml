@@ -45,6 +45,22 @@ jobs:
         with:
           kani-version: '0.68.0'
           command: bash ci/kani.sh
+  miri:
+    name: Miri (host tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: ./.github/actions/setup-rust
+      - name: Install Miri
+        run: |
+          rustup component add miri
+          cargo miri setup
+      - name: Run host tests under Miri
+        run: ci/miri.sh
   audit:
     name: Dependency audit
     runs-on: ubuntu-latest

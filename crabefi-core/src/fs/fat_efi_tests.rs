@@ -77,6 +77,19 @@ fn truncate(handle: *mut ef::Protocol, size: u64) {
         Status::SUCCESS
     );
 }
+/// A short open, write, read and close sequence through published
+/// EFI_FILE_PROTOCOL pointers, for Miri. The full suite below takes too long
+/// under Miri; ordinary runs cover these scenarios there, so this is ignored.
+#[test]
+#[cfg_attr(
+    not(miri),
+    ignore = "covered by efi_file_identity_metadata_and_durability"
+)]
+fn protocol_round_trip_under_miri() {
+    truncate_regrow_invalidates_read_hint();
+    two_handles_observe_the_same_file_size_and_cluster();
+}
+
 // These scenarios share the firmware's single-volume globals. Run them in one
 // host test rather than racing registrations on parallel harness threads.
 #[test]

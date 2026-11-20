@@ -414,19 +414,24 @@ mod native_acpi_tests {
         #[repr(align(4096))]
         struct Tables([u8; 4 * PAGE]);
         let mut tables = Tables([0; 4 * PAGE]);
-        let base = tables.0.as_ptr() as u64;
+        // Firmware reaches the tables by physical address. Expose one pointer
+        // and write through it, so the address stays valid for those reads.
+        let pointer = tables.0.as_mut_ptr();
+        let base = pointer.expose_provenance() as u64;
+        // SAFETY: `pointer` covers the whole array, which outlives the test.
+        let tables = unsafe { core::slice::from_raw_parts_mut(pointer, 4 * PAGE) };
         let xsdt = base + PAGE as u64;
         let sdt_offset = 2 * PAGE - 16;
         let sdt = base + sdt_offset as u64;
-        tables.0[..8].copy_from_slice(b"RSD PTR ");
-        tables.0[15] = 2;
-        tables.0[20..24].copy_from_slice(&36u32.to_le_bytes());
-        tables.0[24..32].copy_from_slice(&xsdt.to_le_bytes());
-        tables.0[PAGE..PAGE + 4].copy_from_slice(b"XSDT");
-        tables.0[PAGE + 4..PAGE + 8].copy_from_slice(&44u32.to_le_bytes());
-        tables.0[PAGE + 36..PAGE + 44].copy_from_slice(&sdt.to_le_bytes());
-        tables.0[sdt_offset..sdt_offset + 4].copy_from_slice(b"APIC");
-        tables.0[sdt_offset + 4..sdt_offset + 8].copy_from_slice(&44u32.to_le_bytes());
+        tables[..8].copy_from_slice(b"RSD PTR ");
+        tables[15] = 2;
+        tables[20..24].copy_from_slice(&36u32.to_le_bytes());
+        tables[24..32].copy_from_slice(&xsdt.to_le_bytes());
+        tables[PAGE..PAGE + 4].copy_from_slice(b"XSDT");
+        tables[PAGE + 4..PAGE + 8].copy_from_slice(&44u32.to_le_bytes());
+        tables[PAGE + 36..PAGE + 44].copy_from_slice(&sdt.to_le_bytes());
+        tables[sdt_offset..sdt_offset + 4].copy_from_slice(b"APIC");
+        tables[sdt_offset + 4..sdt_offset + 8].copy_from_slice(&44u32.to_le_bytes());
 
         let mut allocator = MemoryAllocator::new();
         allocator.init_from_platform(&[

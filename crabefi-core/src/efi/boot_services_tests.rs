@@ -114,13 +114,16 @@ fn check_protocol_lifecycle() {
     let a = core::ptr::dangling_mut::<u64>().cast::<c_void>();
     let b = core::ptr::dangling_mut::<u32>().cast::<c_void>();
     let mut transaction_handle: Handle = null_mut();
+    // The event context and the output argument must be the same raw
+    // pointer: a fresh `&mut` would invalidate the context the callback reads.
+    let transaction_handle_ptr = &raw mut transaction_handle;
     let mut event = null_mut();
     assert_eq!(
         create_event(
             efi::EVT_NOTIFY_SIGNAL,
             efi::TPL_CALLBACK,
             Some(observe),
-            (&raw mut transaction_handle).cast(),
+            transaction_handle_ptr.cast(),
             &mut event
         ),
         Status::SUCCESS
@@ -128,14 +131,14 @@ fn check_protocol_lifecycle() {
     let registration = register(A, event);
 
     assert_eq!(
-        install_multiple_pairs(&mut transaction_handle, &[(A, a), (A, a)]),
+        install_multiple_pairs(transaction_handle_ptr, &[(A, a), (A, a)]),
         Status::INVALID_PARAMETER
     );
     assert!(transaction_handle.is_null());
     assert_eq!(CALLS.load(Ordering::Relaxed), 0);
     assert_eq!(next(registration), Err(Status::NOT_FOUND));
     assert_eq!(
-        install_multiple_pairs(&mut transaction_handle, &[(A, a), (B, b)]),
+        install_multiple_pairs(transaction_handle_ptr, &[(A, a), (B, b)]),
         Status::SUCCESS
     );
     assert_eq!(CALLS.load(Ordering::Relaxed), 1);
