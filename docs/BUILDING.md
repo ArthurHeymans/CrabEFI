@@ -1,5 +1,43 @@
 # Building CrabEFI
 
+## Repository layout & build/test gotchas
+
+**Which workspace?** Run `cargo test --workspace` at the repository root for
+`crabefi-core`, the coreboot payload and their shared crates. It does not run
+tests for `xtask`, `ui-harness`, `crabefi-runtime-abi`, `crabefi-runtime-image`
+or `test-apps/*`. Use `./crabefi` for firmware and guest app builds. The root
+`.cargo/config.toml` scopes its `rustflags` to firmware targets, so host tests
+need not leave the repo. To bypass repo config as CI does for excluded crates,
+run Cargo from `$HOME`: config discovery starts at the working directory, not
+at `--manifest-path`. For example, starting at the repo root:
+
+```bash
+repo=$PWD
+toolchain=$(rustup show active-toolchain | cut -d' ' -f1)
+(cd "$HOME" && cargo +"$toolchain" test --manifest-path "$repo/crabefi-runtime-abi/Cargo.toml")
+```
+
+**Which `crabefi`?** `./crabefi` is the shell wrapper for `xtask`.
+`cargo test -p crabefi-core` selects the boot library, imported in Rust as
+`crabefi` (`[lib] name = "crabefi"`). The `crabefi-coreboot` package builds the
+firmware **binary** named `crabefi`; its `[lib]` at `src/table_tests.rs` lets
+host tests exercise payload modules without linking the firmware entry point.
+
+**Which runtime image?** `crabefi-runtime-abi` defines the image format and
+handoff; `crabefi-runtime-image` implements Runtime Services. The boot-side
+loader and client live in `crabefi-core/src/efi/runtime_image/`. Direct
+`crabefi-coreboot` builds default to `bundled-runtime-image`, which embeds a
+checked-in image from `crabefi-runtime-bundle`. Editing `crabefi-runtime-image`
+will not change that payload. Use `./crabefi build` to test your edits with a
+fresh image (`external-runtime-image`), or [regenerate the bundle](#updating-the-cargo-runtime-bundle).
+
+**Borrowing firmware state.** [`Local<T>` and `LocalCell<T>`](../crabefi-core/src/cell.rs)
+assume a single hart and no access from interrupt context. `LocalCell<T>` copies
+values; `Local<T>` checks borrows at runtime. Copy out what you need and drop
+the borrow **before** calling foreign EFI code, an event callback or a platform
+trait method. These can re-enter firmware; a conflicting borrow panics, and
+firmware uses `panic = "abort"`.
+
 ## Prerequisites
 
 ### Using Nix (Recommended)

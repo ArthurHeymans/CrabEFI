@@ -18,7 +18,7 @@ Rust screens compiled to WebAssembly, with simulated boot devices and settings.
 
 See the [docs/](docs/README.md) directory:
 
-- [Building](docs/BUILDING.md) - How to build CrabEFI and run tests
+- [Building](docs/BUILDING.md) - How to build CrabEFI and run tests; [workspace and build/test gotchas](docs/BUILDING.md#repository-layout--buildtest-gotchas)
 - [UI Testing](docs/UI_TESTING.md) - Test and screenshot the setup UI without firmware
 - [Architecture](docs/ARCHITECTURE.md) - Workspace layout and code organization
 - [Integration](docs/INTEGRATION.md) - Using CrabEFI as a library in external firmware

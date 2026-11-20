@@ -7,7 +7,7 @@ scratch allocation used on every architecture.
 
 ## Contents
 
-- [Building](BUILDING.md) — build and test commands
+- [Building](BUILDING.md) — build and test commands; [workspace and build/test gotchas](BUILDING.md#repository-layout--buildtest-gotchas)
 - [UI Testing](UI_TESTING.md) — test and screenshot the setup UI without firmware
 - [Architecture](ARCHITECTURE.md) — workspace and component organization
 - [Native Setup UI](UI.md) — keyboard interaction, text sizing, trust review and accessibility boundaries
