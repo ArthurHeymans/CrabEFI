@@ -17,15 +17,14 @@ fn pages_cover_exactly_the_length() {
     const PAGE: u64 = 4096;
     let len: usize = kani::any();
     assert_eq!(dma::pages_for_len(len, 0), None);
-    match dma::pages_for_len(len, PAGE) {
-        Some(pages) => {
-            let (len, page, pages) = (len as u128, wide(PAGE), wide(pages));
-            assert!(len > 0);
-            // Enough pages, and no spare one.
-            assert!(pages * page >= len && (pages - 1) * page < len);
-        }
-        // Rejected only when empty, or when rounding up leaves `u64`.
-        None => assert!(len == 0 || len as u128 + wide(PAGE) - 1 > wide(u64::MAX)),
+    let pages = dma::pages_for_len(len, PAGE);
+    // Accepted exactly when nonempty and rounding up to a page stays in `u64`.
+    let fits = len > 0 && len as u128 + wide(PAGE) - 1 <= wide(u64::MAX);
+    assert_eq!(pages.is_some(), fits);
+    if let Some(pages) = pages {
+        let (len, page, pages) = (len as u128, wide(PAGE), wide(pages));
+        // Enough pages, and no spare one.
+        assert!(pages * page >= len && (pages - 1) * page < len);
     }
 }
 
