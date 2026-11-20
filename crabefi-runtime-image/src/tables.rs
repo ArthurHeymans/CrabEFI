@@ -10,7 +10,7 @@ use crabefi_runtime_abi::{
 
 use heapless::Vec;
 
-use crate::{efi, services, state::SectionRecord};
+use crate::{efi, entry, state::SectionRecord};
 
 const UEFI_REVISION: u32 = (2 << 16) | 100;
 const FIRMWARE_REVISION: u32 = 0x0001_0000;
@@ -81,20 +81,20 @@ impl ImageTables {
                     crc32: 0,
                     reserved: 0,
                 },
-                get_time: services::get_time,
-                set_time: services::set_time,
-                get_wakeup_time: services::get_wakeup_time,
-                set_wakeup_time: services::set_wakeup_time,
-                set_virtual_address_map: services::set_virtual_address_map,
-                convert_pointer: services::convert_pointer,
-                get_variable: services::get_variable,
-                get_next_variable_name: services::get_next_variable_name,
-                set_variable: services::set_variable,
-                get_next_high_mono_count: services::get_next_high_mono_count,
-                reset_system: services::reset_system,
-                update_capsule: services::update_capsule,
-                query_capsule_capabilities: services::query_capsule_capabilities,
-                query_variable_info: services::query_variable_info,
+                get_time: entry::get_time,
+                set_time: entry::set_time,
+                get_wakeup_time: entry::get_wakeup_time,
+                set_wakeup_time: entry::set_wakeup_time,
+                set_virtual_address_map: entry::set_virtual_address_map,
+                convert_pointer: entry::convert_pointer,
+                get_variable: entry::get_variable,
+                get_next_variable_name: entry::get_next_variable_name,
+                set_variable: entry::set_variable,
+                get_next_high_mono_count: entry::get_next_high_mono_count,
+                reset_system: entry::reset_system,
+                update_capsule: entry::update_capsule,
+                query_capsule_capabilities: entry::query_capsule_capabilities,
+                query_variable_info: entry::query_variable_info,
             },
             system: efi::SystemTable {
                 hdr: efi::TableHeader {

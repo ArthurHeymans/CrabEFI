@@ -33,6 +33,26 @@ jobs:
           for manifest in "$GITHUB_WORKSPACE"/test-apps/*/Cargo.toml; do
             cargo fmt --manifest-path "$manifest" -- --check
           done
+  verify-svam:
+    name: Verify runtime address mapping
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: model-checking/kani-github-action@69d357bade1eb7b32bc3fc3d5c3d173c5bfa5237 # v1
+        with:
+          kani-version: '0.68.0'
+          working-directory: crabefi-runtime-image
+          # Exact names: a renamed or deleted proof fails CI.
+          args: >-
+            --exact
+            --harness svam::proofs::svam_overlap_agrees_with_intersection
+            --harness svam::proofs::svam_validated_pair_has_disjoint_extents
+            --harness svam::proofs::svam_covered_translation_preserves_every_byte
+            --harness svam::proofs::svam_canonical_addresses_copy_their_top_bit
+            --harness svam::proofs::svam_canonical_ends_in_one_half_cover_the_range
   audit:
     name: Dependency audit
     runs-on: ubuntu-latest

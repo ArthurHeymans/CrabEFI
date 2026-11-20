@@ -1504,16 +1504,21 @@ fn validate_query_attributes(attributes: u32, boot_services: bool) -> Result<(),
     Ok(())
 }
 
-// The image audit allows a single register call site for the bridge.
+// The image audit allows a single register call site for the bridge, and the
+// link-time stack audit excuses this function's one indirect call by name.
+// Keep it a distinct symbol.
 #[inline(never)]
 fn call_boot_bridge(address: u64, request: &BridgeRequest) -> Result<(), efi::Status> {
     if address == 0 {
         return Err(efi::Status::WRITE_PROTECTED);
     }
     type Bridge = unsafe extern "C" fn(*const BridgeRequest) -> usize;
+    // The loader passes the bridge as an integer address. Recover the provenance
+    // the boot image exposed for it; a bare integer is not a callable pointer.
+    let bridge = core::ptr::with_exposed_provenance::<u8>(address as usize);
     // SAFETY: runtime initialization receives this bridge address from the
     // boot loader. It is used only in BootActive and zeroed at seal.
-    let bridge: Bridge = unsafe { core::mem::transmute(address as usize) };
+    let bridge: Bridge = unsafe { core::mem::transmute(bridge) };
     // SAFETY: `request` and the buffers it names outlive this synchronous call.
     match efi::Status::from_usize(unsafe { bridge(request) }) {
         efi::Status::SUCCESS => Ok(()),
@@ -3094,6 +3099,87 @@ mod tests {
         assert_eq!(replay_into(&mut fixture, &mut reboot, |_, _, _| ()), 1);
         let slot = reboot.store.find(&guid, name, false).unwrap();
         assert_eq!(reboot.store.data(slot), Some([1].as_slice()));
+    }
+
+    #[test]
+    fn enrolled_kek_cannot_delete_pk_or_advance_its_metadata() {
+        macro_rules! guest_fixture {
+            ($file:literal) => {
+                include_bytes!(concat!(
+                    "../../test-apps/secure-boot-auth-test/fixtures/esp/sbtest/",
+                    $file
+                ))
+            };
+        }
+        let kek = guest_fixture!("kek.esl");
+        let delete = guest_fixture!("b-pk-delete-signed-by-kek.auth");
+        // Same envelope and timestamp in both runs. Only the signer's role
+        // changes: acceptance as PK rules out rejection due to malformed CMS.
+        for (pk, expected) in [
+            (
+                guest_fixture!("pk.esl").as_slice(),
+                efi::Status::SECURITY_VIOLATION,
+            ),
+            (kek.as_slice(), efi::Status::SUCCESS),
+        ] {
+            let mut fixture = Fixture::retained();
+            for (var, bytes) in [
+                (SecureBootVariable::Kek, kek.as_slice()),
+                (SecureBootVariable::PK, pk),
+            ] {
+                let mut envelope = unsigned_envelope(2024);
+                envelope.extend_from_slice(bytes);
+                assert_eq!(
+                    fixture.apply(Phase::BootActive, var, AUTH_ATTRIBUTES, &envelope),
+                    efi::Status::SUCCESS
+                );
+            }
+            let snapshot = |f: &Fixture| {
+                let keys = [SecureBootVariable::PK, SecureBootVariable::Kek].map(|v| {
+                    let slot = f.store.find(v.guid(), v.name(), false).unwrap();
+                    (
+                        slot.attributes,
+                        slot.timestamp,
+                        f.store.auth_timestamp(v),
+                        f.store.data(slot).unwrap().to_vec(),
+                    )
+                });
+                (
+                    keys,
+                    f.store.setup_mode(),
+                    f.store.secure_boot_enabled(),
+                    f.store.remaining_storage(),
+                    f.buffer.clone(),
+                )
+            };
+            let before = snapshot(&fixture);
+            assert_eq!(
+                fixture.apply(
+                    Phase::Virtual,
+                    SecureBootVariable::PK,
+                    AUTH_ATTRIBUTES,
+                    delete
+                ),
+                expected
+            );
+            if expected == efi::Status::SECURITY_VIOLATION {
+                assert_eq!(
+                    snapshot(&fixture),
+                    before,
+                    "rejection changed keys, replay floor, mode, or retained journal"
+                );
+            } else {
+                assert!(fixture.store.setup_mode());
+                let pk = SecureBootVariable::PK;
+                let kek_var = SecureBootVariable::Kek;
+                assert!(fixture.store.find(pk.guid(), pk.name(), false).is_none());
+                let slot = fixture
+                    .store
+                    .find(kek_var.guid(), kek_var.name(), false)
+                    .unwrap();
+                assert_eq!(fixture.store.data(slot).unwrap(), kek.as_slice());
+            }
+        }
     }
 
     #[test]

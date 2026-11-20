@@ -27,6 +27,9 @@ r-efi = "7.1"
 sha2 = { optional = true, version = "=0.11.0", default-features = false, features = ["oid"] }
 zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
 [dev-dependencies]
 # Host-test-only signing dependency. Keep the exact prerelease pinned so test
 # certificate generation does not drift independently of the verifier.

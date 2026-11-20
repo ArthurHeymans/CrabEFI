@@ -126,6 +126,12 @@ enum Commands {
         ext4: bool,
     },
 
+    /// Build and audit a linked runtime without replacing its checked-in bundle
+    AuditRuntime {
+        #[arg(long)]
+        secure_boot: bool,
+    },
+
     /// Regenerate the checked-in Cargo runtime bundle for one architecture
     BundleRuntime {
         /// Include UEFI authenticated variables and Secure Boot policy.
@@ -338,6 +344,9 @@ fn main() -> Result<()> {
             entry64,
             boot_features(native_only, ext4),
         ),
+        Commands::AuditRuntime { secure_boot } => {
+            runtime::build_with_capabilities(arch, secure_boot).map(|_| ())
+        }
         Commands::BundleRuntime { secure_boot } => runtime::bundle(arch, secure_boot),
         Commands::Run {
             coreboot_rom,
