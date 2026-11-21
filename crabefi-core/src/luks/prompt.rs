@@ -106,8 +106,10 @@ pub(super) fn read_passphrase(
             _ => delay_ms(10),
         }
     };
-    // Keyboards must not keep what was typed, also after Escape.
+    // Keyboards and the serial decoder must not keep what was typed, also
+    // after Escape.
     crate::drivers::keyboard_common::scrub();
+    menu_common::scrub_serial_input();
     result
 }
 

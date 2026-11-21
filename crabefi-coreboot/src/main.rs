@@ -109,6 +109,12 @@ fn tpm_event_log_config(
                 let log_data = unsafe {
                     core::slice::from_raw_parts(tpm_log.address as *const u8, tpm_log.size as usize)
                 };
+                // Classify it now: transport selection may later drop it
+                // (an ACPI PNP0C31 device), and its SHA-256 measurements
+                // must still count as TPM 2.0 evidence.
+                crabefi::efi::tcg::measured_boot::note_log_evidence(
+                    crabefi::efi::tcg::event_log::crypto_agile_log_evidence(log_data),
+                );
                 (Some(log_data), crabefi::TpmLogFormat::CryptoAgile)
             }
             // TCG 1.2 SHA1-only log — continue with EFI_TCG_PROTOCOL.

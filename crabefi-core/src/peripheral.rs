@@ -149,7 +149,7 @@ impl Peripheral {
         #[cfg(feature = "tpm")]
         if let Peripheral::I2c(device) = self {
             return i2c_driver(device.ids.iter().map(String::as_str))
-                .is_some_and(|driver| core::ptr::eq(driver.ids, crate::efi::tcg::gsc_i2c::IDS));
+                .is_some_and(|driver| driver.ids == crate::efi::tcg::gsc_i2c::IDS);
         }
         let _ = self;
         false
