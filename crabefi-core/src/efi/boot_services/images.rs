@@ -912,34 +912,36 @@ pub(super) extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: 
         map_key,
         allocator::validate_map_key,
         prepare_boot_handoff,
+        record_exit_failure,
+        notify_exit_boot_services,
         crate::drivers::quiesce_dma_for_os_handoff,
-        commit_exit,
+        allocator::commit_exit_boot_services,
         finish_exit,
     )
 }
 
-static EXIT_EVENTS_SIGNALED: crate::cell::LocalCell<bool> = crate::cell::LocalCell::new(false);
+static BEFORE_EXIT_SIGNALED: crate::cell::LocalCell<bool> = crate::cell::LocalCell::new(false);
 
-/// Notify the exit event groups on the first ExitBootServices attempt only.
-fn notify_exit_boot_services_once() {
-    if !EXIT_EVENTS_SIGNALED.get() {
-        EXIT_EVENTS_SIGNALED.set(true);
-        signal_exit_boot_services_events();
+fn signal_before_exit_boot_services_once() {
+    // UEFI 2.8+ orders the before-exit group ahead of key validation and the
+    // exit group, while handoff preparation can still allocate. Latch it once
+    // (matching EDK2 DxeMain) so a callback that allocates does not invalidate
+    // the map key on every retry and break loaders (like Linux) that retry once.
+    if !BEFORE_EXIT_SIGNALED.get() {
+        BEFORE_EXIT_SIGNALED.set(true);
+        signal_event_group(&EFI_EVENT_GROUP_BEFORE_EXIT_BOOT_SERVICES);
     }
 }
 
-fn signal_exit_boot_services_events() {
-    // TCG measured boot: measure ExitBootServices action into PCR 5.
+fn notify_exit_boot_services() {
+    // TCG measured boot: measure ExitBootServices action into PCR 5 at the
+    // point of no return (matching EDK2's invocation/success measurement).
     #[cfg(feature = "tpm")]
     super::super::tcg::measured_boot::measure_action_all(5, "Exit Boot Services Invocation");
 
-    // UEFI orders the before-exit group ahead of the exit group, while
-    // handoff preparation can still allocate.
-    signal_event_group(&EFI_EVENT_GROUP_BEFORE_EXIT_BOOT_SERVICES);
-
-    // Signal EXIT_BOOT_SERVICES event group BEFORE finalizing the memory map.
-    // Windows Boot Manager registers callbacks that must run before we lock
-    // the memory map.
+    // Signal EXIT_BOOT_SERVICES event group after the map key has been
+    // validated (so a stale-key retry never tears down drivers early) and
+    // before finalizing the allocator so handlers still have Boot Services.
     signal_event_group(&EFI_EVENT_GROUP_EXIT_BOOT_SERVICES);
 
     // Also signal any legacy EVT_SIGNAL_EXIT_BOOT_SERVICES events
@@ -977,11 +979,7 @@ fn prepare_boot_handoff() -> Result<RuntimeImageClient, Status> {
         return Err(Status::DEVICE_ERROR);
     };
 
-    // A caller whose map key went stale retries after GetMemoryMap. The
-    // notifications and the invocation measurement belong to the first attempt
-    // only: UEFI notifies exit events once, and a callback that changes the
-    // map on every run would otherwise make every retry fail.
-    notify_exit_boot_services_once();
+    signal_before_exit_boot_services_once();
 
     // Rebuild the Memory Attributes Table in-place BEFORE locking the allocator.
     // Runtime image and retained-buffer regions are registered after the
@@ -996,17 +994,13 @@ fn prepare_boot_handoff() -> Result<RuntimeImageClient, Status> {
     Ok(runtime_image)
 }
 
-fn commit_exit(map_key: usize) -> Status {
-    let status = allocator::exit_boot_services(map_key);
-    if status != Status::SUCCESS {
-        #[cfg(feature = "tpm")]
-        super::super::tcg::measured_boot::measure_action_all(
-            5,
-            "Exit Boot Services Returned with Failure",
-        );
-        log::warn!("ExitBootServices FAILED: {:?}", status);
-    }
-    status
+fn record_exit_failure(status: Status) {
+    #[cfg(feature = "tpm")]
+    super::super::tcg::measured_boot::measure_action_all(
+        5,
+        "Exit Boot Services Returned with Failure",
+    );
+    log::warn!("ExitBootServices FAILED: {:?}", status);
 }
 
 fn finish_exit(runtime_image: RuntimeImageClient) {
@@ -1191,7 +1185,10 @@ mod exit_notification_tests {
     fn check_exit_groups() {
         with_tables_mut(|state| *state = Tables::new());
         crate::efi::tables::init_caches().unwrap();
-        EXIT_EVENTS_SIGNALED.set(false);
+        BEFORE_EXIT_SIGNALED.set(false);
+        ORDER.store(0, Ordering::SeqCst);
+        BEFORE.store(0, Ordering::SeqCst);
+        EXIT.store(0, Ordering::SeqCst);
         for (group, slot) in [
             (EFI_EVENT_GROUP_EXIT_BOOT_SERVICES, &EXIT),
             (EFI_EVENT_GROUP_BEFORE_EXIT_BOOT_SERVICES, &BEFORE),
@@ -1209,14 +1206,61 @@ mod exit_notification_tests {
                 Status::SUCCESS
             );
         }
-        // A retry after a stale map key does not notify again.
-        notify_exit_boot_services_once();
-        notify_exit_boot_services_once();
+        let valid_attempt = core::cell::Cell::new(false);
+        // First attempt: BEFORE_EXIT runs once, second validation fails -> EXIT does not run.
+        let status = exit_order::attempt(
+            1,
+            |_| {
+                let ok = !valid_attempt.replace(true);
+                if ok {
+                    Status::SUCCESS
+                } else {
+                    Status::INVALID_PARAMETER
+                }
+            },
+            || {
+                signal_before_exit_boot_services_once();
+                Ok(())
+            },
+            |_| {},
+            notify_exit_boot_services,
+            || {},
+            |_| {},
+            |()| {},
+        );
+        assert_eq!(status, Status::INVALID_PARAMETER);
+        assert_eq!(
+            BEFORE.load(Ordering::SeqCst),
+            1,
+            "before-exit ran on attempt 1"
+        );
+        assert_eq!(
+            EXIT.load(Ordering::SeqCst),
+            0,
+            "exit group held back on stale key"
+        );
+
+        // Second attempt with fresh key: BEFORE_EXIT is latched (does not re-run
+        // and mutate the map again), then EXIT runs once.
+        let status = exit_order::attempt(
+            2,
+            |_| Status::SUCCESS,
+            || {
+                signal_before_exit_boot_services_once();
+                Ok(())
+            },
+            |_| {},
+            notify_exit_boot_services,
+            || {},
+            |_| {},
+            |()| {},
+        );
+        assert_eq!(status, Status::SUCCESS);
         let (before, exit) = (BEFORE.load(Ordering::SeqCst), EXIT.load(Ordering::SeqCst));
         assert!(before != 0 && exit != 0, "both groups notified");
-        assert!(before < exit, "before-exit group first");
-        assert_eq!(ORDER.load(Ordering::SeqCst), 2, "each notified once");
-        EXIT_EVENTS_SIGNALED.set(false);
+        assert!(before < exit, "before-exit group before exit group");
+        assert_eq!(ORDER.load(Ordering::SeqCst), 2, "each group notified once");
+        BEFORE_EXIT_SIGNALED.set(false);
         with_tables_mut(|state| *state = Tables::new());
     }
 }

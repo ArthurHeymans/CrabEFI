@@ -135,19 +135,7 @@ fn public_allocate_address_cannot_subclaim_runtime_image_data() {
 #[test]
 fn private_runtime_layout_split_preserves_runtime_attributes() {
     let mut allocator = allocator_with_ram();
-    let mut base = 0;
-    assert_eq!(
-        allocator.allocate_pages(
-            AllocateType::AllocateAnyPages,
-            MemoryType::RuntimeServicesData,
-            4,
-            &mut base,
-        ),
-        efi::Status::SUCCESS
-    );
-    let image = PageRange::from_bytes(base, 4).unwrap();
-    let code = PageRange::from_bytes(base, 1).unwrap();
-    allocator.retype_runtime_image_code(image, code).unwrap();
+    let base = allocator.allocate_runtime_image_layout(4, 1).unwrap();
     let code_descriptor = allocator
         .entries
         .iter()
@@ -185,6 +173,55 @@ fn private_runtime_layout_split_preserves_runtime_attributes() {
             .and_then(MemoryDescriptorExt::get_memory_type),
         Some(MemoryType::RuntimeServicesCode)
     );
+}
+
+#[test]
+fn runtime_image_layout_failure_with_unmerged_ram_leaves_map_and_key_unchanged() {
+    let mut allocator: MemoryMap<4, 4> = MemoryMap::new();
+    allocator
+        .force_add_region(0x10_0000, 4, MemoryType::ConventionalMemory)
+        .unwrap();
+    allocator
+        .force_add_region(0x10_4000, 1, MemoryType::ConventionalMemory)
+        .unwrap();
+    allocator
+        .force_add_region(0x20_0000, 1, MemoryType::ReservedMemoryType)
+        .unwrap();
+    let before_entries = allocator.descriptors().to_vec();
+    let before_key = allocator.map_key();
+
+    assert_eq!(
+        allocator.allocate_runtime_image_layout(2, 1),
+        Err(efi::Status::OUT_OF_RESOURCES)
+    );
+    assert_eq!(allocator.map_key(), before_key);
+    assert_eq!(allocator.descriptors(), before_entries.as_slice());
+    assert!(allocator.check_well_formed().is_ok());
+
+    // With one extra descriptor slot, the same layout compacts and succeeds
+    // atomically with a single map_key bump.
+    let mut roomy: MemoryMap<5, 4> = MemoryMap::new();
+    roomy
+        .force_add_region(0x10_0000, 4, MemoryType::ConventionalMemory)
+        .unwrap();
+    roomy
+        .force_add_region(0x10_4000, 1, MemoryType::ConventionalMemory)
+        .unwrap();
+    roomy
+        .force_add_region(0x20_0000, 1, MemoryType::ReservedMemoryType)
+        .unwrap();
+    let key = roomy.map_key();
+    let base = roomy.allocate_runtime_image_layout(2, 1).unwrap();
+    assert_eq!(roomy.map_key(), key + 1);
+    assert_eq!(
+        roomy.memory_type_at(base),
+        Some(MemoryType::RuntimeServicesCode)
+    );
+    assert_eq!(
+        roomy.memory_type_at(base + PAGE_SIZE),
+        Some(MemoryType::RuntimeServicesData)
+    );
+    assert!(roomy.check_well_formed().is_ok());
 }
 
 #[test]

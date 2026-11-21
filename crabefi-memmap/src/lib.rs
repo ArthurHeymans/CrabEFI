@@ -7,10 +7,12 @@
 //! code runs in firmware, in host tests and under Kani.
 //!
 //! Table capacities are const generics. Firmware instantiates the production
-//! sizes; proofs instantiate the same code with a few slots.
+//! sizes; unit and property tests instantiate the same code with small tables.
 //!
-//! [`MemoryMap::well_formed`] states the invariant every public operation
-//! preserves. Proofs and property tests check it after each operation.
+//! [`MemoryMap::check_well_formed`] states the invariant every public page
+//! operation preserves (excluding trusted platform construction). Property
+//! tests check it after every step; Kani proves the underlying range-splitting
+//! and exact-cover arithmetic over all 64-bit inputs.
 
 #![no_std]
 #![deny(unsafe_code)]
@@ -248,7 +250,6 @@ fn can_merge(left: &MemoryDescriptor, right: &MemoryDescriptor) -> bool {
 }
 
 /// EFI memory map with exact page ownership.
-#[derive(Clone)]
 pub struct MemoryMap<const ENTRIES: usize, const OWNERS: usize> {
     /// Memory map entries, sorted by physical address (ascending)
     entries: Vec<MemoryDescriptor, ENTRIES>,
@@ -278,6 +279,9 @@ impl<const ENTRIES: usize, const OWNERS: usize> MemoryMap<ENTRIES, OWNERS> {
     /// results end at or below `address_limit` (inclusive), for example the
     /// last identity-mapped byte. AllocateAddress is not limited.
     pub const fn with_address_limit(address_limit: u64) -> Self {
+        const {
+            assert!(ENTRIES >= 1 && OWNERS >= 1);
+        }
         Self {
             entries: Vec::new(),
             allocations: Vec::new(),
@@ -458,14 +462,17 @@ impl<const ENTRIES: usize, const OWNERS: usize> MemoryMap<ENTRIES, OWNERS> {
         Ok(())
     }
 
-    /// Compact the whole map so that splitting `range` fits again.
+    /// Compact the whole map so that replacing `range` inside
+    /// `descriptor_index` with `middle_parts` descriptors (plus any head/tail
+    /// residuals of the merged source descriptor) fits again.
     ///
     /// The compacted outcome is evaluated before anything is mutated, so a
-    /// retry that still would not fit leaves the exported map untouched.
+    /// retry that still would not fit leaves the map untouched.
     fn compact_for_split(
         &mut self,
         descriptor_index: usize,
         range: PageRange,
+        middle_parts: usize,
     ) -> Result<(), efi::Status> {
         let mut merged_start = descriptor_index;
         while merged_start > 0
@@ -486,9 +493,11 @@ impl<const ENTRIES: usize, const OWNERS: usize> MemoryMap<ENTRIES, OWNERS> {
             .and_then(|(first, last)| PageRange::spanning(first.start(), last.end()))
             .ok_or(efi::Status::NOT_FOUND)?;
         let split = merged.split_around(range).ok_or(efi::Status::NOT_FOUND)?;
+        let replacement_count =
+            usize::from(split.head.is_some()) + middle_parts + usize::from(split.tail.is_some());
 
         let compacted_len = self.count_merged_entries();
-        if !fits_after_replacement(compacted_len, 1, split.replacement_count(), ENTRIES) {
+        if !fits_after_replacement(compacted_len, 1, replacement_count, ENTRIES) {
             warn!(
                 "Memory map full ({} entries, {} after compaction), cannot split descriptor",
                 self.entries.len(),
@@ -500,20 +509,27 @@ impl<const ENTRIES: usize, const OWNERS: usize> MemoryMap<ENTRIES, OWNERS> {
         Ok(())
     }
 
-    /// Retype a range inside one descriptor while preserving its head and tail.
-    fn retype_range(
+    /// Replace `range` inside `descriptor_index` with `middle` descriptors
+    /// (which must partition `range` in ascending order) while preserving any
+    /// residual head and tail of the source descriptor.
+    ///
+    /// Evaluates capacity and compaction before mutating `self.entries`, so a
+    /// failure leaves the map completely unchanged.
+    fn replace_descriptor_middle(
         &mut self,
         mut descriptor_index: usize,
         range: PageRange,
-        memory_type: MemoryType,
-        attribute: u64,
+        middle: &[MemoryDescriptor],
     ) -> Result<(), efi::Status> {
         let mut split = self.descriptor_split(descriptor_index, range)?;
         let original = self.entries[descriptor_index];
         let original_type = original.get_memory_type().ok_or(efi::Status::NOT_FOUND)?;
+        let replacement_count = |s: RangeSplit| {
+            usize::from(s.head.is_some()) + middle.len() + usize::from(s.tail.is_some())
+        };
 
-        if !fits_after_replacement(self.entries.len(), 1, split.replacement_count(), ENTRIES) {
-            self.compact_for_split(descriptor_index, range)?;
+        if !fits_after_replacement(self.entries.len(), 1, replacement_count(split), ENTRIES) {
+            self.compact_for_split(descriptor_index, range, middle.len())?;
             descriptor_index = self
                 .find_descriptor(range, &[original_type])
                 .ok_or(efi::Status::NOT_FOUND)?;
@@ -521,26 +537,46 @@ impl<const ENTRIES: usize, const OWNERS: usize> MemoryMap<ENTRIES, OWNERS> {
             debug_assert!(fits_after_replacement(
                 self.entries.len(),
                 1,
-                split.replacement_count(),
+                replacement_count(split),
                 ENTRIES
             ));
         }
 
-        // The residual head and tail keep the original type and attributes;
-        // only the middle part takes the requested ones.
-        let retyped_index = descriptor_index + split.head.is_some() as usize;
+        let inserted = replacement_count(split);
         self.entries.remove(descriptor_index);
-        for (offset, part) in split.parts().enumerate() {
-            let descriptor = if part == split.middle {
-                descriptor_for_range(memory_type, part, attribute)
-            } else {
-                descriptor_for_range(original_type, part, original.attribute)
-            };
+        let mut offset = 0;
+        if let Some(head) = split.head {
+            self.insert_descriptor_prechecked(
+                descriptor_index + offset,
+                descriptor_for_range(original_type, head, original.attribute),
+            );
+            offset += 1;
+        }
+        for &descriptor in middle {
             self.insert_descriptor_prechecked(descriptor_index + offset, descriptor);
+            offset += 1;
+        }
+        if let Some(tail) = split.tail {
+            self.insert_descriptor_prechecked(
+                descriptor_index + offset,
+                descriptor_for_range(original_type, tail, original.attribute),
+            );
         }
 
-        self.merge_near(retyped_index);
+        self.merge_near(descriptor_index, inserted);
         Ok(())
+    }
+
+    /// Retype a range inside one descriptor while preserving its head and tail.
+    fn retype_range(
+        &mut self,
+        descriptor_index: usize,
+        range: PageRange,
+        memory_type: MemoryType,
+        attribute: u64,
+    ) -> Result<(), efi::Status> {
+        let middle = [descriptor_for_range(memory_type, range, attribute)];
+        self.replace_descriptor_middle(descriptor_index, range, &middle)
     }
 
     /// Initialize the allocator from a platform-provided memory map.
@@ -831,43 +867,6 @@ impl<const ENTRIES: usize, const OWNERS: usize> MemoryMap<ENTRIES, OWNERS> {
             memory_type,
             restore_attribute,
         })?;
-        self.map_key += 1;
-        Ok(())
-    }
-
-    /// Split the leading code pages from one newly allocated private runtime
-    /// image. Public AllocateAddress deliberately cannot claim runtime data.
-    fn retype_runtime_image_code(
-        &mut self,
-        image_range: PageRange,
-        code_range: PageRange,
-    ) -> Result<(), efi::Status> {
-        if code_range.start() != image_range.start() || !image_range.contains(code_range) {
-            return Err(efi::Status::INVALID_PARAMETER);
-        }
-        let (allocation_index, _) = self
-            .find_allocation(code_range)
-            .filter(|(_, allocation)| {
-                allocation.range == image_range
-                    && allocation.memory_type == MemoryType::RuntimeServicesData
-            })
-            .ok_or(efi::Status::NOT_FOUND)?;
-        let descriptor_index = self
-            .find_descriptor(code_range, &[MemoryType::RuntimeServicesData])
-            .ok_or(efi::Status::NOT_FOUND)?;
-        let descriptor = self.entries[descriptor_index];
-        let attribute =
-            Self::allocation_attribute(MemoryType::RuntimeServicesCode, descriptor.attribute);
-        self.retype_range(
-            descriptor_index,
-            code_range,
-            MemoryType::RuntimeServicesCode,
-            attribute,
-        )?;
-        // The mandatory image has firmware lifetime and is not a public page
-        // allocation. Drop its temporary ownership record after the private
-        // split so neither its code nor data can be independently FreePages'd.
-        self.allocations.swap_remove(allocation_index);
         self.map_key += 1;
         Ok(())
     }
@@ -1392,6 +1391,10 @@ impl<const ENTRIES: usize, const OWNERS: usize> MemoryMap<ENTRIES, OWNERS> {
     /// Allocate one contiguous runtime image and privately split its leading
     /// code domain without exposing RuntimeServicesData to public
     /// AllocateAddress claims.
+    ///
+    /// Performs the placement and code/data split as one atomic descriptor
+    /// replacement with no ownership record (firmware lifetime), so a failure
+    /// changes nothing—not even `map_key`.
     pub fn allocate_runtime_image_layout(
         &mut self,
         image_pages: u64,
@@ -1400,14 +1403,9 @@ impl<const ENTRIES: usize, const OWNERS: usize> MemoryMap<ENTRIES, OWNERS> {
         if image_pages == 0 || code_pages == 0 || code_pages > image_pages {
             return Err(efi::Status::INVALID_PARAMETER);
         }
-        if self.allocations.is_full() {
-            return Err(efi::Status::OUT_OF_RESOURCES);
+        if self.boot_services_exited {
+            return Err(efi::Status::UNSUPPORTED);
         }
-        // Preflight the exact layout so a failure changes nothing, not even
-        // the key: carving the image adds a descriptor for each residual of
-        // its free extent, and splitting off the code adds one more unless
-        // the image is all code. Merges only reduce the count, and retyping
-        // compacts the map when the unmerged table is full.
         let placement = self
             .find_free_pages(image_pages, 0, u64::MAX)
             .and_then(|address| PageRange::from_bytes(address, image_pages))
@@ -1415,35 +1413,31 @@ impl<const ENTRIES: usize, const OWNERS: usize> MemoryMap<ENTRIES, OWNERS> {
         let source = self
             .find_descriptor(placement, &[MemoryType::ConventionalMemory])
             .ok_or(efi::Status::OUT_OF_RESOURCES)?;
-        let residuals = self
-            .descriptor_split(source, placement)?
-            .replacement_count()
-            - 1;
-        let needed = residuals + usize::from(code_pages < image_pages);
-        if !fits_after_replacement(self.entries.len(), 0, needed, ENTRIES)
-            && !fits_after_replacement(self.count_merged_entries(), 0, needed, ENTRIES)
-        {
-            return Err(efi::Status::OUT_OF_RESOURCES);
-        }
-        let mut base = 0;
-        let status = self.allocate_pages(
-            AllocateType::AllocateAnyPages,
-            MemoryType::RuntimeServicesData,
-            image_pages,
-            &mut base,
-        );
-        if status != efi::Status::SUCCESS {
-            return Err(status);
-        }
-        let image_range =
-            PageRange::from_bytes(base, image_pages).ok_or(efi::Status::OUT_OF_RESOURCES)?;
+        let source_attr = self.entries[source].attribute;
+        let base = placement.start_bytes();
         let code_range =
             PageRange::from_bytes(base, code_pages).ok_or(efi::Status::OUT_OF_RESOURCES)?;
-        if let Err(status) = self.retype_runtime_image_code(image_range, code_range) {
-            debug_assert!(false, "runtime image split failed after preflight");
-            let _ = self.free_pages(base, image_pages);
-            return Err(status);
+        let code_desc = descriptor_for_range(
+            MemoryType::RuntimeServicesCode,
+            code_range,
+            Self::allocation_attribute(MemoryType::RuntimeServicesCode, source_attr),
+        );
+        if code_pages == image_pages {
+            self.replace_descriptor_middle(source, placement, &[code_desc])?;
+        } else {
+            let data_range = PageRange::from_bytes(
+                base + code_pages * PAGE_SIZE,
+                image_pages - code_pages,
+            )
+            .ok_or(efi::Status::OUT_OF_RESOURCES)?;
+            let data_desc = descriptor_for_range(
+                MemoryType::RuntimeServicesData,
+                data_range,
+                Self::allocation_attribute(MemoryType::RuntimeServicesData, source_attr),
+            );
+            self.replace_descriptor_middle(source, placement, &[code_desc, data_desc])?;
         }
+        self.map_key += 1;
         Ok(base)
     }
 
@@ -1584,15 +1578,16 @@ impl<const ENTRIES: usize, const OWNERS: usize> MemoryMap<ENTRIES, OWNERS> {
             .sort_unstable_by_key(|entry| entry.physical_start);
     }
 
-    /// Merge entries around a recently replaced descriptor while preserving sort order.
-    fn merge_near(&mut self, index: usize) {
+    /// Merge entries around `inserted` descriptors placed at `index` while
+    /// preserving sort order.
+    fn merge_near(&mut self, index: usize, inserted: usize) {
         if self.entries.len() < 2 {
             return;
         }
-        // A retype inserts at most three descriptors. Only the replacement's
-        // two internal boundaries and its immediate outer neighbours can merge.
+        // Check every internal boundary of the replacement plus its immediate
+        // outer neighbours.
         let mut current = index.saturating_sub(1);
-        let mut end = (index + 3).min(self.entries.len());
+        let mut end = (index + inserted + 1).min(self.entries.len());
         while current + 1 < end {
             if can_merge(&self.entries[current], &self.entries[current + 1]) {
                 self.entries[current].number_of_pages += self.entries[current + 1].number_of_pages;

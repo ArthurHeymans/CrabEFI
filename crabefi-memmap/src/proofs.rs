@@ -145,9 +145,9 @@ fn exact_cover_requires_an_exact_tiling() {
     kani::assume(range.is_some());
     let range = range.unwrap();
     let cover = exact_cover(owners, range);
-    // Completeness: records that tile the range exactly, in any table order,
-    // with one type and restore attribute, are always a cover. A tiling uses
-    // every record, so nothing else touches the range.
+    // Completeness: any prefix of a permutation of `owners` that tiles `range`
+    // with uniform type and restore attribute, while every remaining record is
+    // disjoint from `range`, must produce a cover.
     let order: [usize; 3] = match kani::any::<u8>() {
         0 => [0, 1, 2],
         1 => [0, 2, 1],
@@ -156,19 +156,38 @@ fn exact_cover_requires_an_exact_tiling() {
         4 => [2, 0, 1],
         _ => [2, 1, 0],
     };
-    let chain = order.iter().filter(|&&index| index < owners.len());
+    let mut perm = [0usize; 3];
+    let mut perm_len = 0usize;
+    for index in order {
+        if index < owners.len() {
+            perm[perm_len] = index;
+            perm_len += 1;
+        }
+    }
+    let chain_len: usize = kani::any();
+    kani::assume(chain_len <= perm_len);
     let mut cursor = range.start();
-    let mut tiles = !owners.is_empty();
-    for &index in chain {
-        tiles &= owners[index].range.start() == cursor;
-        cursor = owners[index].range.end();
+    let mut tiles = chain_len > 0;
+    let mut uniform = true;
+    let mut first_meta = None;
+    for &index in &perm[..chain_len] {
+        let owner = owners[index];
+        tiles &= owner.range.start() == cursor;
+        cursor = owner.range.end();
+        let meta = (owner.memory_type, owner.restore_attribute);
+        if let Some(expected) = first_meta {
+            uniform &= meta == expected;
+        } else {
+            first_meta = Some(meta);
+        }
     }
     tiles &= cursor == range.end();
-    let uniform = owners.windows(2).all(|pair| {
-        (pair[0].memory_type, pair[0].restore_attribute)
-            == (pair[1].memory_type, pair[1].restore_attribute)
-    });
-    if tiles && uniform {
+    let mut others_disjoint = true;
+    for &index in &perm[chain_len..perm_len] {
+        others_disjoint &= !owners[index].range.overlaps(range);
+    }
+    kani::cover!(tiles && uniform && others_disjoint && chain_len < perm_len);
+    if tiles && uniform && others_disjoint {
         assert!(cover.is_some());
     }
     let page = any_page();

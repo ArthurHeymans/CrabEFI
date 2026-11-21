@@ -250,6 +250,25 @@ pub fn exit_boot_services(map_key: usize) -> efi::Status {
     status
 }
 
+/// Commit ExitBootServices past the point of no return (after key validation
+/// and `EXIT_BOOT_SERVICES` notifications). If an exit callback mutated the
+/// memory map, log a warning and commit with the current key anyway.
+pub fn commit_exit_boot_services(validated_map_key: usize) {
+    let status = ALLOCATOR.with_mut(|alloc| {
+        let current = alloc.map_key();
+        if current != validated_map_key {
+            log::warn!(
+                "EXIT_BOOT_SERVICES callback changed map_key ({} -> {}); committing anyway",
+                validated_map_key,
+                current
+            );
+        }
+        alloc.exit_boot_services(current)
+    });
+    debug_assert_eq!(status, efi::Status::SUCCESS);
+    disable_pool_allocator();
+}
+
 /// Allocate one contiguous runtime image and privately split its leading code
 /// domain without exposing RuntimeServicesData to public AllocateAddress claims.
 pub fn allocate_runtime_image_layout(

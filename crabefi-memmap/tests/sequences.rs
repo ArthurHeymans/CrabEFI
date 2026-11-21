@@ -1,13 +1,15 @@
 //! Random operation sequences against a page-level oracle.
 //!
-//! The Kani harnesses prove one operation from any small well-formed map.
-//! These tests run long sequences at table sizes where compaction and
-//! capacity failures are frequent, and compare every page in a 64-page window
-//! before and after each operation.
+//! The Kani harnesses in `src/proofs.rs` (`range_split_preserves_every_page`,
+//! `allocation_split_preserves_ownership`, `exact_cover_requires_an_exact_tiling`)
+//! prove range-splitting and exact-cover arithmetic over all 64-bit inputs.
+//! These property tests exercise full [`MemoryMap`] operations at table sizes
+//! where compaction and capacity failures are frequent, comparing every page
+//! in a 64-page window before and after each step.
 
 use crabefi_memmap::{
-    AllocateType, MemoryDescriptor, MemoryMap, MemoryRegion, MemoryType, PAGE_SIZE, RegionType,
-    attributes,
+    AllocateType, MemoryDescriptor, MemoryMap, MemoryRegion, MemoryType, PAGE_SIZE,
+    PageAllocation, RegionType, attributes,
 };
 use proptest::prelude::*;
 use r_efi::efi::Status;
@@ -154,10 +156,38 @@ fn owner_at<const E: usize, const O: usize>(
         .map(|o| (o.memory_type, o.restore_attribute))
 }
 
-fn same_state<const E: usize, const O: usize>(a: &MemoryMap<E, O>, b: &MemoryMap<E, O>) -> bool {
-    a.descriptors() == b.descriptors()
-        && a.allocations() == b.allocations()
-        && a.map_key() == b.map_key()
+struct Snapshot {
+    descriptors: Vec<MemoryDescriptor>,
+    allocations: Vec<PageAllocation>,
+    map_key: usize,
+}
+
+impl Snapshot {
+    fn of<const E: usize, const O: usize>(map: &MemoryMap<E, O>) -> Self {
+        Self {
+            descriptors: map.descriptors().to_vec(),
+            allocations: map.allocations().to_vec(),
+            map_key: map.map_key(),
+        }
+    }
+
+    fn map_key(&self) -> usize {
+        self.map_key
+    }
+
+    fn owner_at(&self, page: u64) -> Option<(MemoryType, u64)> {
+        let address = BASE + page * PAGE_SIZE;
+        self.allocations
+            .iter()
+            .find(|o| o.range.start_bytes() <= address && address < o.range.end_bytes())
+            .map(|o| (o.memory_type, o.restore_attribute))
+    }
+}
+
+fn same_state<const E: usize, const O: usize>(a: &Snapshot, b: &MemoryMap<E, O>) -> bool {
+    a.descriptors.as_slice() == b.descriptors()
+        && a.allocations.as_slice() == b.allocations()
+        && a.map_key == b.map_key()
 }
 
 fn conventional(page: Page) -> bool {
@@ -209,13 +239,23 @@ fn check_exported<const E: usize, const O: usize>(map: &MemoryMap<E, O>) {
     }
 }
 
-fn run<const E: usize, const O: usize>(regions: &[MemoryRegion], ops: &[Op]) {
+fn run<const E: usize, const O: usize>(regions: &[MemoryRegion], ops: &[Op], unmerged: bool) {
     let mut map = MemoryMap::<E, O>::new();
-    map.init_from_platform(regions);
+    if unmerged {
+        for region in regions {
+            let mem_type = match region.region_type {
+                RegionType::Ram => MemoryType::ConventionalMemory,
+                _ => MemoryType::ReservedMemoryType,
+            };
+            let _ = map.force_add_region(region.base, region.size / PAGE_SIZE, mem_type);
+        }
+    } else {
+        map.init_from_platform(regions);
+    }
     map.check_well_formed().unwrap();
     for &op in ops {
-        let before = map.clone();
-        let old = pages(&before);
+        let before = Snapshot::of(&map);
+        let old = pages(&map);
         // (first page, page count, resulting type) when the op claims or
         // releases exactly one contiguous range.
         let (status, effect): (Status, Option<(u64, u64, MemoryType)>) = match op {
@@ -297,7 +337,7 @@ fn run<const E: usize, const O: usize>(regions: &[MemoryRegion], ops: &[Op]) {
                     } else {
                         (MemoryType::BootServicesCode, MemoryType::BootServicesData)
                     };
-                    let staged = map.clone();
+                    let staged = Snapshot::of(&map);
                     match map.retype_pe_image(base, pages, code_ty, data_ty, &ranges) {
                         Ok(()) => {
                             map.check_well_formed().unwrap();
@@ -392,12 +432,12 @@ fn run<const E: usize, const O: usize>(regions: &[MemoryRegion], ops: &[Op]) {
             if !inside {
                 assert_eq!(old[page as usize], new[page as usize], "{op:?} page {page}");
                 assert_eq!(
-                    owner_at(&before, page),
+                    before.owner_at(page),
                     owner_at(&map, page),
                     "{op:?} page {page}"
                 );
             } else if ty == MemoryType::ConventionalMemory {
-                let (_, restore) = owner_at(&before, page).expect("freed an unowned page");
+                let (_, restore) = before.owner_at(page).expect("freed an unowned page");
                 assert_eq!(new[page as usize], Some((ty as u32, restore)));
                 assert_eq!(owner_at(&map, page), None);
             } else {
@@ -408,8 +448,8 @@ fn run<const E: usize, const O: usize>(regions: &[MemoryRegion], ops: &[Op]) {
     }
 
     // ExitBootServices hands firmware memory to the OS and nothing else.
-    let before = map.clone();
-    let old = pages(&before);
+    let before = Snapshot::of(&map);
+    let old = pages(&map);
     assert_eq!(
         map.exit_boot_services(map.map_key().wrapping_add(1)),
         Status::INVALID_PARAMETER
@@ -437,12 +477,16 @@ proptest! {
 
     /// Tables so small that splits often need compaction or fail outright.
     #[test]
-    fn small_tables(regions in regions(), ops in proptest::collection::vec(op(), 1..48)) {
-        run::<6, 4>(&regions, &ops);
+    fn small_tables(
+        regions in regions(),
+        ops in proptest::collection::vec(op(), 1..48),
+        unmerged in any::<bool>(),
+    ) {
+        run::<6, 4>(&regions, &ops, unmerged);
     }
 
     #[test]
     fn roomy_tables(regions in regions(), ops in proptest::collection::vec(op(), 1..96)) {
-        run::<64, 64>(&regions, &ops);
+        run::<64, 64>(&regions, &ops, false);
     }
 }
