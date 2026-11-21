@@ -214,6 +214,7 @@ fn boot_menu(scenario: &str) -> BootMenu<DiskEntry> {
                 path: path.try_into().unwrap(),
                 format: PayloadFormat::Elf,
             },
+            BootCategory::Encrypted => BootEntryKind::Unlock,
         };
         menu.add_entry(DiskEntry {
             entry: BootEntry::new(&name, path, 1, kind, category),

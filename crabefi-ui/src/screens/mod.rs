@@ -546,6 +546,7 @@ fn kind_label(entry: &BootEntry) -> &'static str {
         BootEntryKind::BlsUki => "Linux UKI",
         BootEntryKind::GrubLinux { .. } => "GRUB",
         BootEntryKind::Payload { .. } => "Payload",
+        BootEntryKind::Unlock => "Locked",
     }
 }
 fn kind_detail(entry: &BootEntry) -> &'static str {
@@ -555,6 +556,7 @@ fn kind_detail(entry: &BootEntry) -> &'static str {
         BootEntryKind::BlsUki => "Unified kernel image",
         BootEntryKind::GrubLinux { .. } => "Linux (GRUB entry)",
         BootEntryKind::Payload { .. } => "coreboot payload",
+        BootEntryKind::Unlock => "Encrypted volume (asks for its passphrase)",
     }
 }
 fn disk_short(entry: &impl MenuEntry) -> String {

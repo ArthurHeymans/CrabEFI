@@ -18,6 +18,7 @@
 //! - EDK2 SecurityPkg/Tcg/Tcg2Dxe/Tcg2Dxe.c
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use super::types::*;
 
@@ -243,7 +244,9 @@ pub fn measure_secure_boot_variables_all() {
         );
     }
 
-    measure_separator_all(7);
+    // Recorded like the other pre-OS separators: firmware-only secrets
+    // depend on it.
+    measure_separators(1 << 7);
 }
 
 /// Measure BootOrder and referenced Boot#### variables into PCR 1.
@@ -382,8 +385,179 @@ pub fn measure_separator_all(pcr_index: u32) {
 
 /// Measure separator events into PCR 0 through 6 through all installed TCG protocols.
 pub fn measure_all_separators_all() {
-    for pcr in 0..7 {
-        measure_separator_all(pcr);
+    measure_separators(0x7F);
+}
+
+/// PCRs 0-7 whose separator was attempted, one bit each.
+static SEPARATORS_MEASURED: AtomicU8 = AtomicU8::new(0);
+/// PCRs 0-7 whose separator a hardware TPM recorded.
+static SEPARATORS_RECORDED: AtomicU8 = AtomicU8::new(0);
+/// The platform described a TPM 2.0, whether or not it came up.
+static TPM_EXPECTED: AtomicBool = AtomicBool::new(false);
+/// Earlier firmware measured in SHA-1 only: a TPM 2.0 unless the platform
+/// identifies a TPM 1.2.
+static SHA1_ONLY_MEASUREMENTS: AtomicBool = AtomicBool::new(false);
+/// The platform identified a TPM 1.2.
+static TPM12_IDENTIFIED: AtomicBool = AtomicBool::new(false);
+
+/// Every pre-OS separator, PCRs 0-7.
+pub const ALL_SEPARATORS: u8 = 0xFF;
+
+/// Measure the separators of the PCRs in `mask` (bit n for PCR n) that
+/// were not measured yet: each PCR gets one separator per boot.
+pub fn measure_separators(mask: u8) {
+    let mut measured = SEPARATORS_MEASURED.load(Ordering::SeqCst);
+    let mut recorded = SEPARATORS_RECORDED.load(Ordering::SeqCst);
+    let before = recorded;
+    plan_separators(mask, &mut measured, &mut recorded, separator);
+    SEPARATORS_MEASURED.store(measured, Ordering::SeqCst);
+    SEPARATORS_RECORDED.store(recorded, Ordering::SeqCst);
+    if recorded != before && recorded & mask == mask {
+        log::info!("Pre-OS separators measured (PCR mask {mask:#04x})");
+    }
+}
+
+/// End the pre-OS phase for every PCR 0-7 (see [`measure_separators`]).
+///
+/// Firmware-only TPM secrets (LUKS2 tokens sealed to pre-boot PCR values)
+/// depend on this: once these PCRs move, nothing the firmware starts can
+/// unseal them again.
+pub fn measure_pre_os_separators() {
+    measure_separators(ALL_SEPARATORS);
+}
+
+fn plan_separators(
+    mask: u8,
+    measured: &mut u8,
+    recorded: &mut u8,
+    mut measure: impl FnMut(u32) -> bool,
+) {
+    for pcr in 0..8 {
+        let bit = 1u8 << pcr;
+        if mask & bit == 0 || *measured & bit != 0 {
+            continue;
+        }
+        *measured |= bit;
+        if measure(pcr) {
+            *recorded |= bit;
+        }
+    }
+}
+
+/// Measure one separator; true when a hardware TPM 2.0 recorded it.
+fn separator(pcr: u32) -> bool {
+    let separator_data = 0u32.to_le_bytes();
+    #[cfg_attr(not(all(feature = "luks", target_arch = "x86_64")), allow(unused_mut))]
+    let mut tcg2 = crate::efi::protocols::tcg2::measure_event(
+        pcr,
+        EV_SEPARATOR,
+        &separator_data,
+        &separator_data,
+    );
+    // With `luks`, the PCR must move even when the log is full, or the TPM
+    // serves only for the separators: firmware-only TPM secrets depend on
+    // it more than the log does. Other builds keep logged-only separators,
+    // so PCRs keep matching their logs (and OS unlock policies).
+    #[cfg(all(feature = "luks", target_arch = "x86_64"))]
+    match tcg2 {
+        Some(Err(TcgError::LogFull | TcgError::EventTooLarge)) => {
+            log::warn!("Event log full: extending PCR {pcr}'s separator unlogged");
+            tcg2 = crate::efi::protocols::tcg2::extend_unlogged(pcr, &separator_data);
+        }
+        None => tcg2 = crate::efi::protocols::tcg2::extend_unlogged(pcr, &separator_data),
+        _ => {}
+    }
+    let recorded = matches!(tcg2, Some(Ok(())));
+    log_protocol_result("TCG2", "separator", tcg2);
+    log_protocol_result(
+        "TCG",
+        "separator",
+        crate::efi::protocols::tcg::measure_event(
+            pcr,
+            EV_SEPARATOR,
+            &separator_data,
+            &separator_data,
+        ),
+    );
+    recorded
+}
+
+/// Whether a TPM 2.0 recorded the separators of every PCR in `mask`.
+pub fn separators_recorded(mask: u8) -> bool {
+    SEPARATORS_RECORDED.load(Ordering::SeqCst) & mask == mask
+}
+
+/// Whether the separator of any PCR in `mask` was measured (or attempted).
+pub fn separators_measured(mask: u8) -> bool {
+    SEPARATORS_MEASURED.load(Ordering::SeqCst) & mask != 0
+}
+
+/// Note that the platform described a TPM 2.0, before bringing it up can
+/// fail: a TPM that failed to come up may still serve the next stage.
+pub fn expect_hardware_tpm() {
+    TPM_EXPECTED.store(true, Ordering::SeqCst);
+}
+
+/// Note what an earlier firmware's measurement log says about its TPM.
+pub fn note_log_evidence(evidence: super::event_log::LogEvidence) {
+    use super::event_log::LogEvidence;
+    match evidence {
+        LogEvidence::None => {}
+        LogEvidence::Sha1Only => SHA1_ONLY_MEASUREMENTS.store(true, Ordering::SeqCst),
+        LogEvidence::Tpm2 => expect_hardware_tpm(),
+    }
+}
+
+/// Note that the platform identified its TPM as a TPM 1.2, which cannot
+/// hold TPM 2.0 secrets. Firm TPM 2.0 evidence still wins.
+pub fn note_tpm12() {
+    TPM12_IDENTIFIED.store(true, Ordering::SeqCst);
+}
+
+/// Whether the platform has, or may have, a TPM 2.0: described, or
+/// measured into before CrabEFI. SHA-1-only measurements count unless the
+/// platform identified a TPM 1.2.
+pub fn hardware_tpm_expected() -> bool {
+    tpm2_expected(
+        TPM_EXPECTED.load(Ordering::SeqCst),
+        SHA1_ONLY_MEASUREMENTS.load(Ordering::SeqCst),
+        TPM12_IDENTIFIED.load(Ordering::SeqCst),
+    )
+}
+
+fn tpm2_expected(described: bool, sha1_only: bool, tpm12: bool) -> bool {
+    described || (sha1_only && !tpm12)
+}
+
+#[cfg(test)]
+mod separator_tests {
+    use super::{plan_separators, tpm2_expected};
+
+    #[test]
+    fn sha1_only_logs_fail_closed_unless_a_tpm12_is_identified() {
+        assert!(!tpm2_expected(false, false, false));
+        assert!(tpm2_expected(false, true, false));
+        assert!(!tpm2_expected(false, true, true));
+        // Firm TPM 2.0 evidence wins over a TPM 1.2 description.
+        assert!(tpm2_expected(true, true, true));
+    }
+
+    #[test]
+    fn each_pcr_gets_one_separator_and_masks_are_checked_per_pcr() {
+        let (mut measured, mut recorded) = (0, 0);
+        let mut calls = alloc::vec::Vec::new();
+        plan_separators(0x7F, &mut measured, &mut recorded, |pcr| {
+            calls.push(pcr);
+            true
+        });
+        // A later request for PCRs 0-7 measures only PCR 7, and a failed
+        // PCR 7 leaves 0-7 unrecorded even though 0-6 were.
+        plan_separators(0xFF, &mut measured, &mut recorded, |pcr| {
+            calls.push(pcr);
+            false
+        });
+        assert_eq!(calls, [0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!((measured, recorded), (0xFF, 0x7F));
     }
 }
 

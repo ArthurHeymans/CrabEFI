@@ -133,27 +133,12 @@ pub fn init_from_platform(config: &mut crate::platform::PlatformConfig) {
 
     // A described TPM backs measured boot unless the platform chose another.
     #[cfg(feature = "tpm")]
-    if let Some(tpm) = crate::peripheral::take_tpm() {
-        let tpm_config = config
-            .tpm_event_log
-            .get_or_insert(crate::platform::TpmEventLogConfig {
-                existing_log: None,
-                log_area: None,
-                format: crate::platform::TpmLogFormat::CryptoAgile,
-                tpm2_device: crate::platform::Tpm2DeviceConfig::None,
-                tpm1_tis_base: None,
-            });
-        if tpm_config.tpm2_device.is_some() {
-            log::warn!("Platform TPM configured; ignoring the TPM peripheral");
-        } else {
-            tpm_config.tpm2_device = crate::platform::Tpm2DeviceConfig::Driver(tpm);
-        }
-    }
+    adopt_tpm_peripheral(config);
 
     // Install TCG protocols for measured boot if the platform requested it.
     #[cfg(feature = "tpm")]
     if let Some(ref mut tpm_config) = config.tpm_event_log {
-        init_tcg_protocols(tpm_config);
+        init_tcg_protocols(tpm_config, true);
         system_table::update_crc32();
     }
 
@@ -198,14 +183,36 @@ fn install_standard_protocols_and_finalize() {
 /// Each protocol is initialized independently so a failure in one does
 /// not prevent the other from being installed.
 #[cfg(feature = "tpm")]
-fn init_tcg_protocols(config: &mut crate::platform::TpmEventLogConfig) {
+fn init_tcg_protocols(config: &mut crate::platform::TpmEventLogConfig, install: bool) {
     use crate::platform::{Tpm2DeviceConfig, TpmLogFormat};
 
-    let install_tcg2 = matches!(
-        config.format,
-        TpmLogFormat::CryptoAgile | TpmLogFormat::Both
-    );
-    let install_tcg1 = matches!(config.format, TpmLogFormat::Sha1Only | TpmLogFormat::Both);
+    // Native boot keeps TPM 2.0 measurement state without EFI protocols,
+    // and has no TPM 1.2 use.
+    let install_tcg2 = !install
+        || matches!(
+            config.format,
+            TpmLogFormat::CryptoAgile | TpmLogFormat::Both
+        );
+    let install_tcg1 =
+        install && matches!(config.format, TpmLogFormat::Sha1Only | TpmLogFormat::Both);
+    // Before anything can fail: a TPM that does not come up for CrabEFI may
+    // still come up for the next stage, in its pre-boot state.
+    if config.tpm2_device.is_some() {
+        tcg::measured_boot::expect_hardware_tpm();
+    }
+    if config.tpm1_tis_base.is_some() {
+        tcg::measured_boot::note_tpm12();
+    }
+    // Measurements earlier firmware logged show which TPM it used, even if
+    // no transport for it is configured.
+    let platform_log = config
+        .log_area
+        .as_ref()
+        .filter(|log| log.used != 0)
+        .map(|log| &log.area[..log.used.min(log.area.len())]);
+    for log in [platform_log, config.existing_log].into_iter().flatten() {
+        tcg::measured_boot::note_log_evidence(tcg::event_log::crypto_agile_log_evidence(log));
+    }
 
     // A platform log area is continued in place: `from_existing` copies the
     // log back to where it already is, so the area keeps the whole log.
@@ -219,6 +226,25 @@ fn init_tcg_protocols(config: &mut crate::platform::TpmEventLogConfig) {
             log.used,
             log.area.len()
         );
+        // Still bring up the TPM for the separators: without them, `luks`
+        // builds refuse every boot, and its PCRs would otherwise reach the
+        // next stage in their pre-boot state.
+        #[cfg(all(feature = "luks", target_arch = "x86_64"))]
+        match core::mem::replace(&mut config.tpm2_device, Tpm2DeviceConfig::None) {
+            Tpm2DeviceConfig::None => {}
+            // SAFETY: the platform describes a TPM no one else drives.
+            Tpm2DeviceConfig::TisMmio { base } => unsafe { protocols::tcg2::cap_only_tis(base) },
+            Tpm2DeviceConfig::Crb {
+                control_area,
+                start,
+            } => match unsafe { tcg::tpm_crb::TpmCrb::probe(control_area, start) } {
+                Ok(tpm) => protocols::tcg2::cap_only_driver(alloc::boxed::Box::leak(
+                    alloc::boxed::Box::new(tpm),
+                )),
+                Err(_) => log::error!("CRB TPM unavailable for the pre-OS separators"),
+            },
+            Tpm2DeviceConfig::Driver(driver) => protocols::tcg2::cap_only_driver(driver),
+        }
         return;
     }
     // An empty area holds no log yet: CrabEFI starts one there.
@@ -239,9 +265,11 @@ fn init_tcg_protocols(config: &mut crate::platform::TpmEventLogConfig) {
         let mut area = log_area.take().map(|log| log.area);
         let had_area = area.is_some();
         let tcg2_result = match tpm2_device {
+            // Without a TPM, native boot has nothing to measure into.
+            Tpm2DeviceConfig::None if !install => return,
             Tpm2DeviceConfig::None => init_tcg2_protocol(existing_log, area.take(), enable_sha1),
             Tpm2DeviceConfig::TisMmio { base } => {
-                init_tcg2_protocol_tis(existing_log, area.take(), base, enable_sha1)
+                init_tcg2_protocol_tis(existing_log, area.take(), base, enable_sha1, install)
             }
             Tpm2DeviceConfig::Crb {
                 control_area,
@@ -255,21 +283,30 @@ fn init_tcg_protocols(config: &mut crate::platform::TpmEventLogConfig) {
                         area.take(),
                         alloc::boxed::Box::leak(alloc::boxed::Box::new(tpm)),
                         enable_sha1,
+                        install,
                     ),
                     // The log area stays for the log-only fallback.
                     Err(_) => Err("CRB TPM probe failed"),
                 }
             }
-            Tpm2DeviceConfig::Driver(driver) => {
-                init_tcg2_protocol_platform_tpm(existing_log, area.take(), driver, enable_sha1)
-            }
+            Tpm2DeviceConfig::Driver(driver) => init_tcg2_protocol_platform_tpm(
+                existing_log,
+                area.take(),
+                driver,
+                enable_sha1,
+                install,
+            ),
         };
 
         if let Err(e) = tcg2_result {
             // If a requested hardware TPM is unavailable, keep the event log
             // discoverable but do not advertise an attestable TPM or accept
             // PCR-extending operations.
-            if has_hardware_tpm {
+            if !install {
+                // A platform log area keeps the log it was given: TCG2
+                // initialization leaves it untouched when it fails.
+                log::error!("TPM unavailable for native boot: {}", e);
+            } else if has_hardware_tpm {
                 log::warn!(
                     "Hardware TPM not available: {}; installing TCG2 log-only protocol",
                     e
@@ -301,6 +338,40 @@ fn init_tcg_protocols(config: &mut crate::platform::TpmEventLogConfig) {
         if let Err(e) = init_tcg1_protocol(existing, area, config.tpm1_tis_base) {
             log::error!("TCG protocol init failed: {}", e);
         }
+    }
+}
+
+/// Let a TPM a peripheral driver bound back measured boot, unless the
+/// platform configured one.
+#[cfg(feature = "tpm")]
+fn adopt_tpm_peripheral(config: &mut crate::platform::PlatformConfig) {
+    if let Some(tpm) = crate::peripheral::take_tpm() {
+        let tpm_config = config
+            .tpm_event_log
+            .get_or_insert(crate::platform::TpmEventLogConfig {
+                existing_log: None,
+                log_area: None,
+                format: crate::platform::TpmLogFormat::CryptoAgile,
+                tpm2_device: crate::platform::Tpm2DeviceConfig::None,
+                tpm1_tis_base: None,
+            });
+        if tpm_config.tpm2_device.is_some() {
+            log::warn!("Platform TPM configured; ignoring the TPM peripheral");
+        } else {
+            tpm_config.tpm2_device = crate::platform::Tpm2DeviceConfig::Driver(tpm);
+        }
+    }
+}
+
+/// Native boot: bring up the TPM 2.0 and continue the platform's event log
+/// without EFI protocols. Native boot measures only the pre-OS separators
+/// (see [`tcg::measured_boot::measure_pre_os_separators`]), which LUKS2
+/// TPM unlocking needs.
+#[cfg(feature = "tpm")]
+pub(crate) fn init_native_tpm(config: &mut crate::platform::PlatformConfig) {
+    adopt_tpm_peripheral(config);
+    if let Some(ref mut tpm_config) = config.tpm_event_log {
+        init_tcg_protocols(tpm_config, false);
     }
 }
 
@@ -360,12 +431,16 @@ fn init_tcg2_protocol_tis(
     area: Option<&'static mut [u8]>,
     tpm_base: u64,
     enable_sha1: bool,
+    install: bool,
 ) -> Result<(), &'static str> {
     let tcg2_buffer = event_log_buffer(area)?;
 
     unsafe {
         protocols::tcg2::init_state_with_hardware(tcg2_buffer, existing_log, tpm_base, enable_sha1)
             .map_err(|_| "failed to initialize TCG2 state with TIS hardware TPM")?;
+    }
+    if !install {
+        return Ok(());
     }
 
     let protocol = protocols::tcg2::create_protocol();
@@ -395,11 +470,15 @@ fn init_tcg2_protocol_platform_tpm(
     area: Option<&'static mut [u8]>,
     tpm: &'static mut dyn crate::platform::Tpm2Device,
     enable_sha1: bool,
+    install: bool,
 ) -> Result<(), &'static str> {
     let tcg2_buffer = event_log_buffer(area)?;
 
     protocols::tcg2::init_state_with_platform_tpm(tcg2_buffer, existing_log, tpm, enable_sha1)
         .map_err(|_| "failed to initialize TCG2 state with platform TPM")?;
+    if !install {
+        return Ok(());
+    }
 
     let protocol = protocols::tcg2::create_protocol();
     if protocol.is_null() {

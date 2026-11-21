@@ -277,6 +277,9 @@ impl<I: I2c> TpmTransport for GscI2c<I> {
 
 /// Bind a described Google security chip as the TPM for measured boot.
 pub(crate) fn bind(device: I2cPeripheral) {
+    // Described, so present: if bringing it up fails here, it may still work
+    // for the next stage, in its pre-boot state.
+    super::measured_boot::expect_hardware_tpm();
     match GscI2c::<I2cBus>::open(device.bus, device.address, device.interrupt)
         .and_then(super::Tpm2::new)
     {

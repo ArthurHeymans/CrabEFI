@@ -112,6 +112,11 @@ jobs:
         # Auth, graphical repaint and touchpad tests are feature-gated and
         # not built by the plain workspace test run above.
         run: cargo test -p crabefi-core --features secure-boot,ui,elan-i2c,hid-i2c
+      - name: Run LUKS2 unit tests against cryptsetup volumes
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cryptsetup-bin
+          CRABEFI_REQUIRE_CRYPTSETUP=1 cargo test -p crabefi-core --features luks,tpm --lib luks
       - name: Run runtime host tests
         run: |
           cd "$HOME"
@@ -141,6 +146,15 @@ jobs:
           cargo -Z build-std=core,compiler_builtins,alloc \
             -Z build-std-features=compiler-builtins-mem \
             clippy --workspace --release --target x86_64-unknown-none -- -D warnings
+          # LUKS2 is opt-in: lint it in both payload modes.
+          cargo -Z build-std=core,compiler_builtins,alloc \
+            -Z build-std-features=compiler-builtins-mem \
+            clippy -p crabefi-coreboot --release --target x86_64-unknown-none \
+            --features luks -- -D warnings
+          cargo -Z build-std=core,compiler_builtins,alloc \
+            -Z build-std-features=compiler-builtins-mem \
+            clippy -p crabefi-coreboot --release --target x86_64-unknown-none \
+            --no-default-features --features native-only,luks -- -D warnings
           cd "$HOME"
           cargo clippy --manifest-path "$GITHUB_WORKSPACE/crabefi-runtime-abi/Cargo.toml" -- -D warnings
           cd "$GITHUB_WORKSPACE/crabefi-runtime-image"
@@ -785,7 +799,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 mtools dosfstools zstd \
-            coreboot-utils e2fsprogs busybox-static cpio
+            coreboot-utils e2fsprogs busybox-static cpio \
+            cryptsetup-bin swtpm tpm2-tools systemd-cryptsetup
+          # systemd-cryptenroll reaches swtpm through this TCTI module.
+          sudo apt-get install -y "$(apt-cache search --names-only '^libtss2-tcti-swtpm0' | cut -d' ' -f1 | head -n1)"
       - name: Download CrabEFI ELF
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
@@ -802,6 +819,18 @@ jobs:
         run: |
           ./crabefi test --app ext4-linux --boot-assets-dir boot-assets/x86_64 \
             --disable-kvm --timeout 180
+      - name: Run LUKS2 passphrase Linux boot test
+        run: |
+          ./crabefi test --app luks-linux --boot-assets-dir boot-assets/x86_64 \
+            --disable-kvm --timeout 300
+      - name: Run LUKS2 TPM Linux boot test (UEFI payload)
+        run: |
+          ./crabefi test --app luks-tpm-linux --boot-assets-dir boot-assets/x86_64 \
+            --disable-kvm --timeout 300
+      - name: Run native-only LUKS2 TPM Linux boot test
+        run: |
+          ./crabefi test --app native-only-luks-tpm-linux --boot-assets-dir boot-assets/x86_64 \
+            --disable-kvm --timeout 300
       - name: Run native-only Linux boot smoke test (no UEFI)
         run: |
           ./crabefi test --app native-only-linux --disable-kvm --timeout 180

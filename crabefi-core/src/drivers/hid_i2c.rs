@@ -288,6 +288,10 @@ impl<I: I2c> KeyboardDevice for HidKeyboard<I> {
     fn stop(&mut self) {
         self.0.borrow_mut().stop();
     }
+
+    fn scrub(&mut self) {
+        self.0.borrow_mut().keys.scrub();
+    }
 }
 
 /// Bind a described HID-over-I2C device as pointer and/or keyboard.

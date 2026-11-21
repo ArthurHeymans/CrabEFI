@@ -481,15 +481,18 @@ pub(super) fn signal_event_group(group_guid: &Guid) {
 
 /// Measure the beginning of an EFI boot application attempt.
 ///
-/// The first attempt performs the ReadyToBoot measured-boot sequence and
-/// signals the ReadyToBoot event group. Subsequent attempts only add the boot
-/// action event so separators are not duplicated.
-pub(crate) fn measure_efi_application_start(is_application: bool) {
+/// The first attempt performs the ReadyToBoot measured-boot sequence;
+/// subsequent attempts only add the boot action event so separators are not
+/// duplicated. Returns true on the first attempt: the caller then ends the
+/// trusted phase ([`crate::preboot::end`]) and calls
+/// [`signal_ready_to_boot`].
+#[must_use]
+pub(crate) fn measure_efi_application_start(is_application: bool) -> bool {
     if !is_application {
-        return;
+        return false;
     }
 
-    let should_signal = with_tables_mut(|efi| {
+    let first = with_tables_mut(|efi| {
         if !efi.ready_to_boot_signaled {
             efi.ready_to_boot_signaled = true;
             true
@@ -498,7 +501,7 @@ pub(crate) fn measure_efi_application_start(is_application: bool) {
         }
     });
 
-    if should_signal {
+    if first {
         // TCG measured boot: measure pre-OS handoff state, boot variables,
         // boot action, and separators before the first boot attempt, per TCG
         // PFP / EDK2 ReadyToBoot ordering.
@@ -516,8 +519,6 @@ pub(crate) fn measure_efi_application_start(is_application: bool) {
         // PCR 7 already has its separator from Secure Boot variable measurement.
         #[cfg(feature = "tpm")]
         super::super::tcg::measured_boot::measure_all_separators_all();
-
-        signal_event_group(&EFI_EVENT_GROUP_READY_TO_BOOT);
     } else {
         #[cfg(feature = "tpm")]
         super::super::tcg::measured_boot::measure_action_all(
@@ -525,6 +526,13 @@ pub(crate) fn measure_efi_application_start(is_application: bool) {
             "Calling EFI Application from Boot Option",
         );
     }
+    first
+}
+
+/// Signal EFI_EVENT_GROUP_READY_TO_BOOT, after
+/// [`measure_efi_application_start`] reported the first attempt.
+pub(crate) fn signal_ready_to_boot() {
+    signal_event_group(&EFI_EVENT_GROUP_READY_TO_BOOT);
 }
 
 /// Measure return from an EFI boot application attempt.

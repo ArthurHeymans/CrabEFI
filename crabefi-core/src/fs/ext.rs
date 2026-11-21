@@ -4,7 +4,7 @@ use alloc::boxed::Box;
 use ext4_view::{Ext4, Ext4Read};
 use heapless::String;
 
-use super::boot::{BootFilesystem, Names, ReadError, check_path};
+use super::boot::{BootFilesystem, Names, ReadError, check_path, same_fixed_media};
 use super::gpt::Partition;
 use crate::drivers::block::{BlockDevice, BlockDeviceInfo, BlockError, BlockRange};
 use crate::drivers::storage::{self, StorageId};
@@ -15,14 +15,6 @@ const SUPERBLOCK_OFFSET: u64 = 1024;
 const MAX_BLOCK_GROUPS: u64 = 8192;
 const MAX_DISCOVERY_READS: usize = 16_384;
 const MAX_DIRENTS: usize = 1024;
-
-fn same_fixed_media(expected: BlockDeviceInfo, live: BlockDeviceInfo) -> bool {
-    !expected.removable
-        && !live.removable
-        && expected.media_id == live.media_id
-        && expected.block_size == live.block_size
-        && expected.num_blocks == live.num_blocks
-}
 
 // ext4-view allocates its cache and group descriptors from these fields before
 // it visits any files. Refuse oversized layouts and journal replay up front.
@@ -55,6 +47,9 @@ struct PartitionReader {
     range: BlockRange,
     media: BlockDeviceInfo,
     reads_left: Option<usize>,
+    /// Decrypt through this unlocked LUKS2 volume.
+    #[cfg(feature = "luks")]
+    volume: Option<crate::luks::VolumeId>,
 }
 
 impl PartitionReader {
@@ -70,7 +65,20 @@ impl PartitionReader {
         if let Some(left) = self.reads_left.as_mut() {
             *left = left.checked_sub(1).ok_or(BlockError::DeviceError)?;
         }
+        #[cfg(feature = "luks")]
+        if let Some(volume) = self.volume {
+            return crate::luks::read(volume, disk, &self.range, offset, out);
+        }
         self.range.read(disk, offset, out)
+    }
+
+    /// Bytes the filesystem may use: the partition, or the decrypted data.
+    fn byte_len(&self, disk: &dyn BlockDevice) -> Result<u64, BlockError> {
+        #[cfg(feature = "luks")]
+        if let Some(volume) = self.volume {
+            return crate::luks::data_len(volume).ok_or(BlockError::NoMedia);
+        }
+        self.range.byte_len(disk)
     }
 }
 
@@ -92,6 +100,7 @@ impl ExtFilesystem {
         partition: &Partition,
         media: BlockDeviceInfo,
         discovery: bool,
+        #[cfg(feature = "luks")] volume: Option<crate::luks::VolumeId>,
     ) -> Option<Self> {
         let reader = storage::with_disk(storage, |disk| {
             if !same_fixed_media(media, disk.info()) {
@@ -99,16 +108,21 @@ impl ExtFilesystem {
             }
             let range =
                 BlockRange::new(disk, partition.first_lba, partition.size_sectors()).ok()?;
+            let mut reader = PartitionReader {
+                storage,
+                range,
+                media,
+                reads_left: None,
+                #[cfg(feature = "luks")]
+                volume,
+            };
             let mut superblock = [0; 1024];
-            range.read(disk, SUPERBLOCK_OFFSET, &mut superblock).ok()?;
-            supported_superblock(&superblock, range.byte_len(disk).ok()?).then_some(
-                PartitionReader {
-                    storage,
-                    range,
-                    media,
-                    reads_left: discovery.then_some(MAX_DISCOVERY_READS),
-                },
-            )
+            reader
+                .read_from(disk, SUPERBLOCK_OFFSET, &mut superblock)
+                .ok()?;
+            let len = reader.byte_len(disk).ok()?;
+            reader.reads_left = discovery.then_some(MAX_DISCOVERY_READS);
+            supported_superblock(&superblock, len).then_some(reader)
         })
         .ok()??;
         match Ext4::load(Box::new(reader)) {
@@ -254,6 +268,8 @@ mod tests {
                 range: BlockRange::new(&disk, 5, 2).unwrap(),
                 media: disk.info(),
                 reads_left: Some(3),
+                #[cfg(feature = "luks")]
+                volume: None,
             };
             let mut bytes = [0; 3];
             reader

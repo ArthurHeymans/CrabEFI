@@ -63,6 +63,8 @@ pub mod heap;
 )]
 pub(crate) mod linux_boot;
 pub mod logger;
+#[cfg(all(feature = "luks", target_arch = "x86_64"))]
+pub(crate) mod luks;
 pub mod menu;
 #[allow(
     dead_code,
@@ -82,6 +84,8 @@ pub(crate) mod payload;
 pub(crate) mod pe;
 pub mod peripheral;
 pub mod platform;
+pub(crate) mod preboot;
+pub use preboot::emergency_wipe;
 #[cfg(feature = "secure-boot")]
 pub(crate) mod secure_boot_menu;
 #[cfg(test)]
@@ -94,6 +98,8 @@ pub mod ui;
 /// Perform a system reset using the platform handler when available.
 pub fn reset_system() -> ! {
     log::info!("System reset requested");
+    // A warm reset keeps DRAM.
+    preboot::dispose_secrets();
 
     if let Some(reset) = handoff::callbacks().reset {
         reset.reset(ResetType::Cold);
@@ -445,6 +451,7 @@ fn init_persistence_and_boot(
     log_stack_usage("after_boot_manager");
 
     log::info!("Boot manager finished — halting");
+    preboot::dispose_secrets();
 
     loop {
         arch::halt();
@@ -550,6 +557,9 @@ fn prepare_native_memory_inner(config: &mut PlatformConfig<'_>) {
 }
 
 fn init_platform_inner<const NATIVE: bool>(mut config: PlatformConfig) -> ! {
+    if NATIVE {
+        preboot::set_native();
+    }
     // ---- 1. Install exception / interrupt vectors ----
     //
     // On aarch64: without this, VBAR_ELx defaults to 0x0 and any exception
@@ -749,6 +759,10 @@ fn init_platform_inner<const NATIVE: bool>(mut config: PlatformConfig) -> ! {
             handoff::store_framebuffer(fb);
         }
         peripheral::bind(core::mem::take(&mut config.peripherals));
+        // Native boot measures only the pre-OS separators, which LUKS2
+        // TPM tokens depend on.
+        #[cfg(feature = "tpm")]
+        efi::init_native_tpm(&mut config);
     } else {
         efi::init_from_platform(&mut config);
         timestamp::record(timestamp::TS_CRABEFI_EFI_INIT);
@@ -829,6 +843,7 @@ fn init_platform_inner<const NATIVE: bool>(mut config: PlatformConfig) -> ! {
         log::info!("Native-only boot: UEFI services are disabled");
         boot_manager::run_native();
         log::info!("Boot manager finished — halting");
+        preboot::dispose_secrets();
         loop {
             arch::halt();
         }

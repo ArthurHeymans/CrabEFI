@@ -137,6 +137,9 @@ pub struct BootKeys {
     repeat_delay_timeout: Option<Timeout>,
     /// Timeout for repeat interval
     repeat_interval_timeout: Option<Timeout>,
+    /// After [`Self::scrub`]: ignore reports until every key is released,
+    /// so keys held across it do not count as new presses.
+    ignore_until_release: bool,
 }
 
 impl UsbHidKeyboard {
@@ -264,6 +267,12 @@ impl UsbHidKeyboard {
 impl BootKeys {
     /// Process a keyboard report
     pub fn process_report(&mut self, report: &KeyboardReport) {
+        if self.ignore_until_release {
+            if report.keys.iter().any(|&k| k != 0) {
+                return;
+            }
+            self.ignore_until_release = false;
+        }
         // Collect new keycodes first to avoid borrow conflict
         let new_keycodes: heapless::Vec<u8, 6> = report.new_keys(&self.prev_report).collect();
 
@@ -352,6 +361,9 @@ impl BootKeys {
             return None;
         }
         let key = self.key_buffer[self.read_idx];
+        // Consumed keys must not linger: they may be a passphrase.
+        self.key_buffer[self.read_idx] = 0;
+        self.key_states[self.read_idx] = Default::default();
         self.read_idx = (self.read_idx + 1) % self.key_buffer.len();
         Some(key)
     }
@@ -813,9 +825,32 @@ impl crate::drivers::keyboard_common::KeyboardDevice for UsbHidKeyboard {
     fn key_state(&mut self) -> crate::platform::KeyState {
         self.keys.efi_state()
     }
+
+    fn scrub(&mut self) {
+        self.keys.scrub();
+        self.report_buffer.fill(0);
+    }
 }
 
 impl BootKeys {
+    /// Drop queued keys, the key held for repeat and the previous report;
+    /// keys still held are ignored until released.
+    pub fn scrub(&mut self) {
+        // Only keys still held must not come back as new presses.
+        self.ignore_until_release = self.prev_report.keys.iter().any(|&k| k != 0);
+        self.prev_report = KeyboardReport {
+            modifiers: self.prev_report.modifiers,
+            ..KeyboardReport::default()
+        };
+        self.key_buffer = [0; 16];
+        self.key_states = Default::default();
+        self.read_idx = 0;
+        self.write_idx = 0;
+        self.last_key = 0;
+        self.repeat_delay_timeout = None;
+        self.repeat_interval_timeout = None;
+    }
+
     /// The next buffered key as an EFI key.
     pub fn read_key(&mut self) -> Option<crate::platform::Key> {
         let key = self.get_key()?;

@@ -455,6 +455,21 @@ Use `ext2-linux` or `ext3-linux` to test the other ext formats. Use
 `native-only-linux` to run the ext4 test with the native-only payload and
 verify that it boots without an EFI System Table.
 
+### Linux boot from LUKS2 tests
+
+`./crabefi build --luks` (with or without `--native-only`) adds LUKS2 below
+ext. `luks-linux` boots a UEFI payload after a wrong and a right passphrase;
+`native-only-luks-tpm-linux` unlocks with `systemd-tpm2` tokens enrolled
+into a fresh swtpm state. Both need `cryptsetup` and run without root; the
+TPM test also needs `swtpm`, `systemd-cryptenroll` and the tpm2-tss `swtpm`
+TCTI. See [LUKS2](LUKS.md).
+
+```sh
+./crabefi test --app luks-linux --disable-kvm --timeout 300
+./crabefi test --app luks-tpm-linux --disable-kvm --timeout 300
+./crabefi test --app native-only-luks-tpm-linux --disable-kvm --timeout 300
+```
+
 The `native-only-fat-linux` test requires `busybox-static` and `cpio` and uses
 USB storage by default. It checks
 that a disk's EFI fallback is ignored, a broken default BLS entry returns to an

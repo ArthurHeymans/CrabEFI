@@ -124,6 +124,10 @@ enum Commands {
         /// Enable experimental BLS boot from ext2/3/4 (x86-64 only)
         #[arg(long)]
         ext4: bool,
+
+        /// Also open ext volumes inside LUKS2 (implies --ext4)
+        #[arg(long)]
+        luks: bool,
     },
 
     /// Regenerate the checked-in Cargo runtime bundle for one architecture
@@ -179,6 +183,10 @@ enum Commands {
         #[arg(long, conflicts_with = "coreboot_rom")]
         ext4: bool,
 
+        /// Also open ext volumes inside LUKS2 (implies --ext4)
+        #[arg(long, conflicts_with = "coreboot_rom")]
+        luks: bool,
+
         /// Enable graphical UI with mouse support
         #[arg(long)]
         ui: bool,
@@ -195,6 +203,8 @@ enum Commands {
         /// Use "grub-linux" for the GRUB + Linux boot-chain test.
         /// Use "ext4-linux" (also "ext2-linux" or "ext3-linux") for native Linux boot.
         /// Use "native-only-linux" or "native-only-fat-linux" to test without UEFI.
+        /// Use "luks-linux" (passphrase), "luks-tpm-linux" or
+        /// "native-only-luks-tpm-linux" (systemd-tpm2 token) for ext inside LUKS2.
         /// Use "uefi-sct-smoke" for the UEFI SCT smoke subset.
         /// Use "windows-boot-smoke" for a Windows Boot Manager smoke test.
         #[arg(long, default_value = "hello")]
@@ -329,6 +339,7 @@ fn main() -> Result<()> {
             ui,
             entry64,
             ext4,
+            luks,
             native_only,
         } => cmd_build_payload(
             release,
@@ -336,7 +347,7 @@ fn main() -> Result<()> {
             arch,
             machine,
             entry64,
-            boot_features(native_only, ext4),
+            boot_features(native_only, ext4, luks),
         ),
         Commands::BundleRuntime { secure_boot } => runtime::bundle(arch, secure_boot),
         Commands::Run {
@@ -351,6 +362,7 @@ fn main() -> Result<()> {
             runtime_replay,
             ui,
             ext4,
+            luks,
             native_only,
         } => cmd_run(
             coreboot_rom,
@@ -365,7 +377,7 @@ fn main() -> Result<()> {
             ui,
             arch,
             machine,
-            boot_features(native_only, ext4),
+            boot_features(native_only, ext4, luks),
         ),
         Commands::Test {
             coreboot_rom,
@@ -418,12 +430,14 @@ fn main() -> Result<()> {
 }
 
 // Native coreboot run/test/screenshot commands always use the default entry.
-fn boot_features(native_only: bool, ext4: bool) -> &'static [&'static str] {
-    match (native_only, ext4) {
-        (false, false) => &[],
-        (false, true) => &["ext4"],
-        (true, false) => &["native-only"],
-        (true, true) => &["native-only", "ext4"],
+fn boot_features(native_only: bool, ext4: bool, luks: bool) -> &'static [&'static str] {
+    match (native_only, ext4 || luks, luks) {
+        (false, false, _) => &[],
+        (false, true, false) => &["ext4"],
+        (false, true, true) => &["ext4", "luks"],
+        (true, false, _) => &["native-only"],
+        (true, true, false) => &["native-only", "ext4"],
+        (true, true, true) => &["native-only", "ext4", "luks"],
     }
 }
 
@@ -440,6 +454,24 @@ fn ext_linux_filesystem(app: &str) -> Option<&'static str> {
     }
 }
 
+/// LUKS2 boot tests: whether the volume has TPM tokens.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LuksTest {
+    /// UEFI-mode payload, unlocked by passphrase.
+    Passphrase,
+    /// Unlocked by a systemd-tpm2 token, in a native-only or UEFI payload.
+    Tpm { native: bool },
+}
+
+pub(crate) fn luks_linux_test(app: &str) -> Option<LuksTest> {
+    match app {
+        "luks-linux" => Some(LuksTest::Passphrase),
+        "luks-tpm-linux" => Some(LuksTest::Tpm { native: false }),
+        "native-only-luks-tpm-linux" => Some(LuksTest::Tpm { native: true }),
+        _ => None,
+    }
+}
+
 /// Payload Cargo features a test app needs beyond the default build.
 fn test_payload_features(app: &str) -> Vec<&'static str> {
     let mut features = match app {
@@ -451,6 +483,9 @@ fn test_payload_features(app: &str) -> Vec<&'static str> {
         "boot-events-test" => vec!["boot-event-log"],
         "native-only-linux" => vec!["native-only", "ext4"],
         "native-only-fat-linux" => vec!["native-only"],
+        "luks-linux" => vec!["ext4", "luks"],
+        "luks-tpm-linux" => vec!["ext4", "luks", "luks-test-post-cap"],
+        "native-only-luks-tpm-linux" => vec!["native-only", "ext4", "luks", "luks-test-post-cap"],
         app if ext_linux_filesystem(app).is_some() => vec!["ext4"],
         _ => Vec::new(),
     };
@@ -499,7 +534,7 @@ fn cmd_build_payload(
         bail!("--native-only is incompatible with CRABEFI_PAYLOAD_MM");
     }
     if extra_features.contains(&"ext4") && arch != Arch::X86_64 {
-        bail!("--ext4 is only supported on x86-64");
+        bail!("--ext4 and --luks are only supported on x86-64");
     }
     let label = match (arch, machine) {
         (Arch::X86_64, _) => "x86_64".to_string(),
@@ -701,6 +736,7 @@ fn cmd_run(
         machine,
         extra_devices: Vec::new(),
         enable_tpm: app.as_deref() == Some("tcg-test") && matches!(arch, Arch::X86_64),
+        tpm_state: None,
     };
 
     // Add USB keyboard for UI testing.
@@ -765,6 +801,7 @@ fn cmd_screenshot(
         machine,
         extra_devices: vec!["-device".to_string(), "usb-kbd,bus=xhci.0".to_string()],
         enable_tpm: false,
+        tpm_state: None,
     };
 
     if let Some(disk_path) = disk {
@@ -828,8 +865,12 @@ fn cmd_test(
         bail!("runtime-replay-interrupt-test needs the retained journal, not payload MM");
     }
     let native_fat = app == "native-only-fat-linux";
-    if (app == "native-only-linux" || native_fat) && ui {
+    let luks_test = luks_linux_test(app);
+    if (app == "native-only-linux" || native_fat || luks_test.is_some()) && ui {
         bail!("{app} uses the text menu; omit --ui");
+    }
+    if luks_test.is_some() && (arch != Arch::X86_64 || sdhci) {
+        bail!("{app} needs x86-64 with AHCI or NVMe storage");
     }
     let ext_filesystem = ext_linux_filesystem(app);
     if native_fat && arch != Arch::X86_64 {
@@ -838,7 +879,7 @@ fn cmd_test(
     if ext_filesystem.is_some() && (arch != Arch::X86_64 || sdhci) {
         bail!("{app} needs x86-64 with AHCI or NVMe storage");
     }
-    let storage = if ahci || (ext_filesystem.is_some() && !nvme) {
+    let storage = if ahci || ((ext_filesystem.is_some() || luks_test.is_some()) && !nvme) {
         qemu::StorageType::Ahci
     } else if nvme {
         qemu::StorageType::Nvme
@@ -887,6 +928,8 @@ fn cmd_test(
         rom::prepare_rom(&crabefi_elf, temp_dir.path(), arch, machine)?
     };
 
+    let tpm_state =
+        matches!(luks_test, Some(LuksTest::Tpm { .. })).then(|| temp_dir.path().join("swtpm"));
     let config = qemu::QemuConfig {
         coreboot_rom: firmware.coreboot_rom.to_string_lossy().to_string(),
         tfa_flash: firmware.tfa_flash.map(|p| p.to_string_lossy().to_string()),
@@ -898,7 +941,8 @@ fn cmd_test(
         machine,
         extra_devices: Vec::new(),
         // Enable TPM emulation for TCG test app.
-        enable_tpm: app == "tcg-test" && matches!(arch, Arch::X86_64),
+        enable_tpm: (app == "tcg-test" && matches!(arch, Arch::X86_64)) || tpm_state.is_some(),
+        tpm_state: tpm_state.clone(),
     };
 
     let disk_path = temp_dir.path().join("test.img");
@@ -916,6 +960,30 @@ fn cmd_test(
         cmd_build_test_app("hello", arch)?;
         let efi_app = find_test_app_efi("hello", arch)?;
         disk::create_native_fat_disk(&disk_path, &efi_app, &kernel)?;
+    } else if let Some(test) = luks_test {
+        let assets_dir = boot_assets();
+        let kernel = assets_dir.join("vmlinuz");
+        let initramfs = assets_dir.join("initramfs.cpio");
+        require_boot_assets(
+            arch,
+            &assets_dir,
+            &[("vmlinuz", &kernel), ("initramfs.cpio", &initramfs)],
+        )?;
+        let unlock = match (test, &tpm_state) {
+            (LuksTest::Tpm { native }, Some(state)) => {
+                fs::create_dir_all(state)?;
+                disk::LuksUnlock::Tpm {
+                    swtpm_state: state,
+                    // Native boot measures nothing before the separators.
+                    // UEFI measures the S-CRTM version (PCR 0) and Secure
+                    // Boot state (PCR 7) at startup, but PCRs 2 and 4 only
+                    // when the first boot option starts.
+                    pcrs: if native { "0+7" } else { "2+4" },
+                }
+            }
+            _ => disk::LuksUnlock::Passphrase,
+        };
+        disk::create_luks_linux_disk(&disk_path, &kernel, &initramfs, unlock)?;
     } else if let Some(filesystem) = ext_filesystem {
         let assets_dir = boot_assets();
         let kernel = assets_dir.join("vmlinuz");

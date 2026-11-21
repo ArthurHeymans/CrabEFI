@@ -60,6 +60,9 @@ pub trait KeyboardDevice {
     /// Hand the device to the OS. Must not allocate or change the EFI memory
     /// map.
     fn stop(&mut self) {}
+
+    /// Forget buffered input and typing history, after a passphrase.
+    fn scrub(&mut self) {}
 }
 
 static DEVICES: Local<Vec<Box<dyn KeyboardDevice>>> = Local::new(Vec::new());
@@ -101,6 +104,12 @@ pub fn cleanup() {
     devices.iter_mut().for_each(|device| device.stop());
     // No deallocation during the handoff.
     core::mem::forget(devices);
+}
+
+/// Make every keyboard forget what was typed (a passphrase), including
+/// keys still queued.
+pub fn scrub() {
+    with_devices(|devices| devices.iter_mut().for_each(|device| device.scrub()));
 }
 
 /// Read a key from the first keyboard that has one.

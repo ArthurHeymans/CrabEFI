@@ -140,6 +140,22 @@ pub enum Peripheral {
     Mmio(MmioPeripheral),
 }
 
+impl Peripheral {
+    /// Whether this is a TPM 2.0 CrabEFI drives as a peripheral (and so
+    /// adopts for measured boot once bound).
+    pub fn is_tpm2(&self) -> bool {
+        #[cfg(feature = "tpm")]
+        if let Peripheral::I2c(device) = self {
+            return device
+                .ids
+                .iter()
+                .any(|id| crate::efi::tcg::gsc_i2c::IDS.contains(&id.as_str()));
+        }
+        let _ = self;
+        false
+    }
+}
+
 struct I2cDriver {
     ids: &'static [&'static str],
     /// Takes ownership of the device; logs its own failures.
@@ -271,6 +287,42 @@ mod tests {
     fn any_identifier_selects_a_driver() {
         assert!(super::i2c_supported(["VEND0001", "ELAN0000"]));
         assert!(!super::i2c_supported(["VEND9999"]));
+    }
+
+    #[cfg(feature = "tpm")]
+    #[test]
+    fn i2c_tpms_are_recognized_by_any_identifier() {
+        struct NoBus;
+        impl embedded_hal::i2c::ErrorType for NoBus {
+            type Error = embedded_hal::i2c::ErrorKind;
+        }
+        impl embedded_hal::i2c::I2c for NoBus {
+            fn transaction(
+                &mut self,
+                _: u8,
+                _: &mut [embedded_hal::i2c::Operation<'_>],
+            ) -> Result<(), Self::Error> {
+                Err(embedded_hal::i2c::ErrorKind::Other)
+            }
+        }
+        let i2c = |ids: &[&str]| {
+            super::Peripheral::I2c(super::I2cPeripheral {
+                ids: ids.iter().map(|id| (*id).into()).collect(),
+                bus: super::I2cBus::new(NoBus),
+                address: 0x50,
+                interrupt: None,
+                hid_descriptor_register: None,
+            })
+        };
+        // The TPM ID may be a _CID after a vendor _HID.
+        assert!(i2c(&["VEND0001", "GOOG0005"]).is_tpm2());
+        assert!(!i2c(&["ELAN0000"]).is_tpm2());
+        let mmio = super::Peripheral::Mmio(super::MmioPeripheral {
+            ids: alloc::vec!["GOOG0005".into()],
+            base: 0,
+            size: 0,
+        });
+        assert!(!mmio.is_tpm2());
     }
 
     #[test]

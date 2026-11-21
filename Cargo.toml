@@ -63,3 +63,10 @@ panic = "abort"
 lto = true
 opt-level = "z"
 codegen-units = 1
+
+# Key derivation runs at boot for every LUKS2 passphrase attempt: optimize
+# it for speed even though the payload is optimized for size.
+[profile.release.package.argon2]
+opt-level = 3
+[profile.release.package.blake2]
+opt-level = 3

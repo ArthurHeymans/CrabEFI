@@ -714,13 +714,9 @@ pub fn create_native_fat_disk(output: &Path, efi_app: &str, kernel: &Path) -> Re
     Ok(())
 }
 
-/// Create a test disk with no ESP, so the kernel and initramfs can only be read through ext.
-pub fn create_ext_linux_disk(
-    output: &Path,
-    kernel: &Path,
-    initramfs: &Path,
-    filesystem: &str,
-) -> Result<()> {
+/// Write the ext test tree: a BLS entry under `/boot`, and a stale root
+/// entry that must not hide it.
+fn ext_linux_tree(kernel: &Path, initramfs: &Path) -> Result<tempfile::TempDir> {
     let root = tempfile::tempdir().context("create ext test filesystem tree")?;
     let boot = root.path().join("boot");
     let entries = boot.join("loader/entries");
@@ -742,27 +738,152 @@ pub fn create_ext_linux_disk(
         loader.join("entries/stale.conf"),
         "title Stale entry\nlinux /boot/vmlinuz\ninitrd /missing.cpio\n",
     )?;
+    Ok(root)
+}
 
-    // Larger than the small FAT candidate heuristic. Explicitly bound mke2fs
-    // to whole filesystem blocks inside the partition; leave backup GPT intact.
-    const BLOCK_SIZE: u64 = 4096;
-    let geometry = DiskGeometry::new(546 * 1024 * 1024);
-    create_partitioned_disk(output, geometry, LINUX_TYPE_GUID, "Linux filesystem")?;
-    let offset = PARTITION_START_SECTOR * SECTOR_SIZE;
-    let blocks =
-        (geometry.partition_end_sector - PARTITION_START_SECTOR + 1) * SECTOR_SIZE / BLOCK_SIZE;
+/// The test disk: larger than the small FAT candidate heuristic.
+const EXT_DISK_SIZE: u64 = 546 * 1024 * 1024;
+const EXT_BLOCK_SIZE: u64 = 4096;
+
+/// Run mke2fs on `image` at byte `offset` with `blocks` filesystem blocks.
+fn mke2fs(image: &Path, offset: u64, blocks: u64, filesystem: &str, tree: &Path) -> Result<()> {
     let status = Command::new("mke2fs")
         .args(["-q", "-F", "-t", filesystem, "-b"])
-        .arg(BLOCK_SIZE.to_string())
+        .arg(EXT_BLOCK_SIZE.to_string())
         .arg("-d")
-        .arg(root.path())
+        .arg(tree)
         .arg("-E")
         .arg(format!("offset={offset},nodiscard"))
-        .arg(output)
+        .arg(image)
         .arg(blocks.to_string())
         .status()
         .context("run mke2fs (install e2fsprogs)")?;
     anyhow::ensure!(status.success(), "mke2fs exited with {status}");
+    Ok(())
+}
+
+/// Create a test disk with no ESP, so the kernel and initramfs can only be read through ext.
+pub fn create_ext_linux_disk(
+    output: &Path,
+    kernel: &Path,
+    initramfs: &Path,
+    filesystem: &str,
+) -> Result<()> {
+    let root = ext_linux_tree(kernel, initramfs)?;
+    // Explicitly bound mke2fs to whole filesystem blocks inside the
+    // partition; leave backup GPT intact.
+    let geometry = DiskGeometry::new(EXT_DISK_SIZE);
+    create_partitioned_disk(output, geometry, LINUX_TYPE_GUID, "Linux filesystem")?;
+    let offset = PARTITION_START_SECTOR * SECTOR_SIZE;
+    let blocks =
+        (geometry.partition_end_sector - PARTITION_START_SECTOR + 1) * SECTOR_SIZE / EXT_BLOCK_SIZE;
+    mke2fs(output, offset, blocks, filesystem, root.path())
+}
+
+/// Passphrase of the LUKS2 test volumes.
+pub const LUKS_PASSPHRASE: &str = "crabefi luks smoke";
+/// LUKS2 header and keyslot area that `cryptsetup reencrypt` prepends.
+const LUKS_RESERVED: u64 = 16 * 1024 * 1024;
+
+/// How a LUKS2 test volume is unlocked.
+pub enum LuksUnlock<'a> {
+    /// Passphrase only (Argon2id keyslot).
+    Passphrase,
+    /// Also two systemd-tpm2 tokens enrolled in this swtpm state: one bound
+    /// to a PCR 1 value the firmware never has, then one bound to `pcrs`
+    /// (systemd-cryptenroll syntax) as they are before CrabEFI measures
+    /// anything into them.
+    Tpm {
+        swtpm_state: &'a Path,
+        pcrs: &'a str,
+    },
+}
+
+/// Create the ext test disk inside LUKS2. cryptsetup encrypts the
+/// filesystem offline, so this needs no root and no device mapper.
+pub fn create_luks_linux_disk(
+    output: &Path,
+    kernel: &Path,
+    initramfs: &Path,
+    unlock: LuksUnlock<'_>,
+) -> Result<()> {
+    let root = ext_linux_tree(kernel, initramfs)?;
+    let geometry = DiskGeometry::new(EXT_DISK_SIZE);
+    create_partitioned_disk(output, geometry, LINUX_TYPE_GUID, "Linux LUKS")?;
+    let partition_len = (geometry.partition_end_sector - PARTITION_START_SECTOR + 1) * SECTOR_SIZE;
+
+    let work = tempfile::tempdir().context("create LUKS work directory")?;
+    let volume = work.path().join("volume.img");
+    let key = work.path().join("passphrase");
+    File::create(&volume)?.set_len(partition_len)?;
+    mke2fs(
+        &volume,
+        0,
+        (partition_len - LUKS_RESERVED) / EXT_BLOCK_SIZE,
+        "ext4",
+        root.path(),
+    )?;
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&key)?;
+        file.write_all(LUKS_PASSPHRASE.as_bytes())?;
+    }
+    // A small Argon2id cost keeps the unlock quick under TCG.
+    let status = Command::new("cryptsetup")
+        .args([
+            "reencrypt",
+            "--batch-mode",
+            "--disable-locks",
+            "--encrypt",
+            "--type",
+            "luks2",
+            "--label",
+            "crabefi-root",
+            "--reduce-device-size",
+            "16M",
+            "--pbkdf",
+            "argon2id",
+            "--pbkdf-memory",
+            "16384",
+            "--pbkdf-force-iterations",
+            "4",
+            "--pbkdf-parallel",
+            "1",
+            "--key-file",
+        ])
+        .arg(&key)
+        .arg(&volume)
+        .status()
+        .context("run cryptsetup (install cryptsetup)")?;
+    anyhow::ensure!(status.success(), "cryptsetup exited with {status}");
+
+    if let LuksUnlock::Tpm { swtpm_state, pcrs } = unlock {
+        let tpm = crate::qemu::SwtpmServer::start(swtpm_state)?;
+        let wrong_pcr1 = format!("1:sha256={}", "11".repeat(32));
+        for pcrs in [wrong_pcr1.as_str(), pcrs] {
+            let status = Command::new("systemd-cryptenroll")
+                .arg(format!(
+                    "--tpm2-device=swtpm:path={}",
+                    tpm.socket().display()
+                ))
+                .arg(format!("--tpm2-pcrs={pcrs}"))
+                .arg(format!("--unlock-key-file={}", key.display()))
+                .arg(&volume)
+                .status()
+                .context("run systemd-cryptenroll (install systemd and libtss2-tcti-swtpm)")?;
+            anyhow::ensure!(status.success(), "systemd-cryptenroll exited with {status}");
+        }
+    }
+
+    let mut source = File::open(&volume)?;
+    let mut disk = OpenOptions::new().write(true).open(output)?;
+    disk.seek(SeekFrom::Start(PARTITION_START_SECTOR * SECTOR_SIZE))?;
+    std::io::copy(&mut source, &mut disk)?;
+    disk.flush()?;
     Ok(())
 }
 

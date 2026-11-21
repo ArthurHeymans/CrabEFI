@@ -7,6 +7,8 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use core::alloc::{GlobalAlloc, Layout};
+
 use linked_list_allocator::LockedHeap;
 
 /// Heap size (2 MB should be sufficient for crypto operations and EFI state).
@@ -32,7 +34,40 @@ static HEAP_INITIALIZED: AtomicBool = AtomicBool::new(false);
     all(feature = "global-allocator", target_os = "none"),
     global_allocator
 )]
-pub static ALLOCATOR: LockedHeap = LockedHeap::empty();
+pub static ALLOCATOR: Heap = Heap(LockedHeap::empty());
+
+/// The firmware heap. With `luks` it clears every block when it is freed,
+/// so data freed earlier (decrypted file contents, filesystem caches,
+/// parsed key material) never lingers in free memory.
+pub struct Heap(LockedHeap);
+
+impl Heap {
+    /// Lock the underlying heap.
+    pub fn lock(&self) -> impl core::ops::DerefMut<Target = linked_list_allocator::Heap> + '_ {
+        self.0.lock()
+    }
+}
+
+// SAFETY: allocation is forwarded unchanged; deallocation only clears the
+// block, which the caller gives up, before forwarding. `realloc` uses the
+// default alloc-copy-dealloc, so moved-from blocks are cleared too.
+unsafe impl GlobalAlloc for Heap {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: forwarded with the caller's guarantees.
+        unsafe { self.0.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        #[cfg(all(feature = "luks", target_arch = "x86_64"))]
+        // SAFETY: the caller owns the whole block until this call returns;
+        // as MaybeUninit it need not be initialized (spare capacity, padding).
+        zeroize::Zeroize::zeroize(unsafe {
+            core::slice::from_raw_parts_mut(ptr.cast::<core::mem::MaybeUninit<u8>>(), layout.size())
+        });
+        // SAFETY: forwarded with the caller's guarantees.
+        unsafe { self.0.dealloc(ptr, layout) }
+    }
+}
 
 /// Failure to initialize the global allocator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

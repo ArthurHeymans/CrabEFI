@@ -97,8 +97,8 @@ impl super::XhciController {
             ) {
                 return Err(XhciError::TransferFailed(event.completion_code()));
             }
-            let poll = self.interrupt_polls.swap_remove(index);
-            let bounce = poll.bounce.as_ref().ok_or(XhciError::NotReady)?;
+            let mut poll = self.interrupt_polls.swap_remove(index);
+            let bounce = poll.bounce.as_mut().ok_or(XhciError::NotReady)?;
             bounce
                 .sync_for_cpu(0..bounce.len(), DmaDirection::FromDevice)
                 .map_err(|_| XhciError::NotReady)?;
@@ -107,6 +107,9 @@ impl super::XhciController {
                 .saturating_sub(event.trb_transfer_length() as usize);
             data[..transferred]
                 .copy_from_slice(&bounce.as_slice()[poll.offset..poll.offset + transferred]);
+            // The CPU owns the completed buffer: a keyboard report can be
+            // part of a passphrase, so do not leave it there.
+            bounce.as_mut_slice()[poll.offset..poll.offset + poll.len].fill(0);
             poll
         } else {
             let domain = pci::dma_domain(self.pci_address).ok_or(XhciError::NotReady)?;

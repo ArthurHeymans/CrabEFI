@@ -35,8 +35,9 @@ Boot discovery, the BLS/GRUB readers, and direct Linux loading use the small
 read-only `BootFilesystem` interface: size, offset reads and bounded directory
 listings. FAT borrows a storage device for the operation. `ext4-view` owns its
 reader, so its adapter retains a storage ID and borrows the device per read.
-A future layer such as LUKS would supply decrypted bytes below the filesystem,
-not add operations to `BootFilesystem`.
+The optional LUKS2 layer (`luks`) supplies decrypted bytes below the
+filesystem: the ext reader asks an unlocked volume for plaintext instead of
+the raw partition, and adds no operations to `BootFilesystem`.
 
 The experimental x86-64 `ext4` feature is opt-in and intended for trusted
 fixed disks. After FAT and El Torito discovery, it scans ext2/3/4 partitions
@@ -44,6 +45,20 @@ for BLS entries. BLS can use `/loader/entries` on a separate boot partition
 or `/boot/loader/entries` on an ext root; the latter resolves kernel and
 initrd paths relative to `/boot`. GRUB config discovery remains FAT-only.
 Direct boot remains disabled under Secure Boot.
+
+With `luks`, discovery first checks each ext candidate for a LUKS2 header.
+It tries `systemd-tpm2` tokens once per boot, before the pre-OS separators.
+A volume that stays locked becomes an *Unlock* menu entry that asks for its
+passphrase and rescans. Unlocked volume keys live in a registry.
+
+`preboot::end` closes the trusted pre-boot phase. Every transfer to code
+CrabEFI does not own calls it first: `StartImage` for any image type,
+direct Linux boot, EFI handover and payload chainloading. It measures
+`EV_SEPARATOR` into PCRs 0–7, so TPM secrets sealed to pre-boot PCR values
+cannot be unsealed again. It also wipes volume keys and scrubs freed heap
+and unused stack. After it, CrabEFI no longer prompts for passphrases or
+uses TPM tokens. Native-only payloads bring up TCG2 state without EFI
+protocols for this. See [LUKS2](LUKS.md).
 
 Ext discovery caps I/O and directory iteration, and rejects volumes that
 need journal replay or exceed its block-size or block-group limits. These

@@ -117,6 +117,46 @@ fn platform_driver_continues_the_original_area_in_place() {
     *guard = None;
 }
 
+struct TwoBankTpm(&'static AtomicUsize);
+
+impl Tpm2Device for TwoBankTpm {
+    fn active_pcr_banks(&self) -> TpmPcrBanks {
+        TpmPcrBanks::new(&[TPM_ALG_SHA1, TPM_ALG_SHA256])
+    }
+
+    fn pcr_extend(&mut self, _: u32, digests: &[TpmDigest<'_>]) -> Result<(), TpmError> {
+        // Separators must reach every active bank.
+        assert_eq!(digests.len(), 2);
+        self.0.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn submit_command(&mut self, _: &[u8], _: &mut [u8]) -> Result<usize, TpmError> {
+        Err(TpmError::Unsupported)
+    }
+}
+
+#[test]
+fn mismatched_banks_keep_the_published_log_and_a_cap_only_tpm() {
+    // A SHA-256-only coreboot log, already in the area ACPI publishes, and
+    // a TPM with SHA-1 and SHA-256 banks.
+    let prior = prior_log();
+    let area = buffer(1024);
+    area[..prior.len()].copy_from_slice(&prior);
+    let published: Vec<u8> = area.to_vec();
+    let ptr = area.as_ptr();
+    let extends = Box::leak(Box::new(AtomicUsize::new(0)));
+    let tpm = Box::leak(Box::new(TwoBankTpm(extends)));
+    assert!(init_state_with_platform_tpm(area, Some(&prior), tpm, false).is_err());
+    // SAFETY: the area outlives the test; nothing else holds it now.
+    let after = unsafe { core::slice::from_raw_parts(ptr, published.len()) };
+    assert_eq!(after, &published[..]);
+    assert!(has_hardware_tpm());
+    assert_eq!(extend_unlogged(0, &[0; 4]), Some(Ok(())));
+    assert_eq!(extends.load(Ordering::Relaxed), 1);
+    *CAP_ONLY_TPM.lock() = None;
+}
+
 #[test]
 fn full_existing_logs_are_rejected() {
     let prior = prior_log();

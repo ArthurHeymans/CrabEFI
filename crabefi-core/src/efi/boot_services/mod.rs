@@ -20,7 +20,7 @@ mod tests;
 pub use events::KEYBOARD_EVENT_ID;
 #[cfg(feature = "ui")]
 pub use events::POINTER_EVENT_ID;
-pub(crate) use events::measure_efi_application_start;
+pub(crate) use events::{measure_efi_application_start, signal_ready_to_boot};
 
 use super::allocator::{self, MemoryType};
 use super::guid_fmt::GuidFmt;

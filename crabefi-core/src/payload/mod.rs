@@ -78,6 +78,8 @@ pub enum PayloadError {
     TooLarge,
     /// Memory allocation failed
     MemoryError,
+    /// The firmware could not end its trusted phase (see `preboot`)
+    Refused,
 }
 
 impl From<ElfError> for PayloadError {
@@ -236,7 +238,15 @@ pub unsafe fn chainload_payload(
         }
     };
 
-    crate::efi::boot_services::measure_efi_application_start(true);
+    // Native boot has no EFI boot attempt to measure or signal.
+    let ready_to_boot = !crate::preboot::is_native()
+        && crate::efi::boot_services::measure_efi_application_start(true);
+    if !crate::preboot::end() {
+        return Err(PayloadError::Refused);
+    }
+    if ready_to_boot {
+        crate::efi::boot_services::signal_ready_to_boot();
+    }
     #[cfg(feature = "tpm")]
     crate::efi::tcg::measured_boot::measure_event_all(
         4,
