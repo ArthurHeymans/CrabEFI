@@ -14,6 +14,11 @@ external-runtime-image = ["crabefi/full"]
 native-only = ["crabefi/native-boot", "crabefi/xhci"]
 # Experimental native Linux boot from ext2/3/4 on x86-64.
 ext4 = ["crabefi/ext4"]
+# ext boot volumes inside LUKS2, unlocked by passphrase or a systemd-tpm2
+# token. Also brings up the TPM in native-only builds.
+luks = ["ext4", "crabefi/luks", "crabefi/tpm"]
+# Test only: check the TPM refuses the LUKS2 token after the separators.
+luks-test-post-cap = ["luks", "crabefi/luks-test-post-cap"]
 # Use the long-mode RDI entry for u-root/LinuxBoot instead of coreboot's
 # default 32-bit stack-argument entry. Only supported on x86-64.
 entry64 = []

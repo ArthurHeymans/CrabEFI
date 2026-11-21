@@ -31,6 +31,13 @@
             parted
             mtools
             dosfstools
+            e2fsprogs
+
+            # LUKS2 boot tests: offline encryption and TPM2 token enrollment
+            # (systemd-cryptenroll reaches swtpm through the tpm2-tss TCTI)
+            cryptsetup
+            systemd
+            tpm2-tss
 
             # coreboot tools for adding payload
             coreboot-utils

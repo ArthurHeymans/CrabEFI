@@ -80,6 +80,48 @@ mod tests {
     }
 }
 
+/// Overwrite the stack below the current frame, where callees that have
+/// returned left secrets (key schedules, derived keys, passphrases).
+///
+/// One `rep stosb` fills from the stack bottom up to the stack pointer,
+/// with no gap: it uses no stack itself, and the target has no red zone.
+/// Refills with the 0xA5 pattern the entry code writes, so stack usage
+/// reports stay meaningful.
+#[cfg(all(feature = "platform-entry", feature = "luks"))]
+pub(crate) fn scrub_unused_stack() {
+    unsafe extern "C" {
+        static _stack_bottom: u8;
+        static _stack_top: u8;
+    }
+    let bottom = (&raw const _stack_bottom) as usize;
+    let top = (&raw const _stack_top) as usize;
+    // SAFETY: everything below the stack pointer and above the stack bottom
+    // is unused, and nothing refers to it; x86_64-unknown-none has no red
+    // zone. The bounds check keeps another stack (an EFI image calling back)
+    // untouched.
+    unsafe {
+        core::arch::asm!(
+            "mov rcx, rsp",
+            "cmp rcx, {bottom}",
+            "jbe 2f",
+            "cmp rcx, {top}",
+            "ja 2f",
+            "sub rcx, {bottom}",
+            "mov rdi, {bottom}",
+            "mov al, 0xa5",
+            "cld",
+            "rep stosb",
+            "2:",
+            bottom = in(reg) bottom,
+            top = in(reg) top,
+            out("rcx") _,
+            out("rdi") _,
+            out("al") _,
+            options(nostack),
+        );
+    }
+}
+
 /// Read the Time Stamp Counter (TSC)
 ///
 /// Returns the current value of the processor's time-stamp counter,

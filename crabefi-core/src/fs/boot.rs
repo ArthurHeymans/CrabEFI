@@ -97,6 +97,19 @@ impl BootFilesystem for FatFilesystem<'_> {
     }
 }
 
+/// Whether `live` is still the fixed medium `expected` described.
+#[cfg(all(feature = "ext4", target_arch = "x86_64"))]
+pub(crate) fn same_fixed_media(
+    expected: crate::drivers::block::BlockDeviceInfo,
+    live: crate::drivers::block::BlockDeviceInfo,
+) -> bool {
+    !expected.removable
+        && !live.removable
+        && expected.media_id == live.media_id
+        && expected.block_size == live.block_size
+        && expected.num_blocks == live.num_blocks
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Kind {
     Fat,
@@ -104,6 +117,9 @@ pub(crate) enum Kind {
     Ext {
         media: crate::drivers::block::BlockDeviceInfo,
         discovery: bool,
+        /// The unlocked LUKS2 volume holding the filesystem.
+        #[cfg(feature = "luks")]
+        volume: Option<crate::luks::VolumeId>,
     },
 }
 
@@ -112,9 +128,16 @@ impl Kind {
         match self {
             Self::Fat => Self::Fat,
             #[cfg(all(feature = "ext4", target_arch = "x86_64"))]
-            Self::Ext { media, .. } => Self::Ext {
+            Self::Ext {
+                media,
+                #[cfg(feature = "luks")]
+                volume,
+                ..
+            } => Self::Ext {
                 media,
                 discovery: false,
+                #[cfg(feature = "luks")]
+                volume,
             },
         }
     }
@@ -137,8 +160,20 @@ pub(crate) fn with_filesystem<R>(
         })
         .ok()?,
         #[cfg(all(feature = "ext4", target_arch = "x86_64"))]
-        Kind::Ext { media, discovery } => {
-            let mut fs = super::ext::ExtFilesystem::mount(storage, partition, media, discovery)?;
+        Kind::Ext {
+            media,
+            discovery,
+            #[cfg(feature = "luks")]
+            volume,
+        } => {
+            let mut fs = super::ext::ExtFilesystem::mount(
+                storage,
+                partition,
+                media,
+                discovery,
+                #[cfg(feature = "luks")]
+                volume,
+            )?;
             Some(f(&mut fs))
         }
     }

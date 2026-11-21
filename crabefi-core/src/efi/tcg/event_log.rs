@@ -551,3 +551,237 @@ mod parse_tests {
         }
     }
 }
+
+/// What a measurement log from earlier firmware says about its TPM.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogEvidence {
+    /// No measurements, or not a log this recognizes.
+    None,
+    /// Measurements in SHA-1 only: a TPM 1.2, or a TPM 2.0 with only its
+    /// SHA-1 bank used.
+    Sha1Only,
+    /// Measurements in a bank only a TPM 2.0 has.
+    Tpm2,
+}
+
+/// Classify a TCG 2.0 crypto-agile log (`Spec ID Event03`).
+pub fn crypto_agile_log_evidence(log: &[u8]) -> LogEvidence {
+    let Some((count, algorithms)) = crate::efi::protocols::tcg2::parse_spec_id_algorithms(log)
+    else {
+        return LogEvidence::None;
+    };
+    if !crypto_agile_log_has_measurements(log) {
+        return LogEvidence::None;
+    }
+    if algorithms[..count]
+        .iter()
+        .any(|&algorithm| algorithm != super::types::TPM_ALG_SHA1)
+    {
+        LogEvidence::Tpm2
+    } else {
+        LogEvidence::Sha1Only
+    }
+}
+
+/// Classify coreboot's own log (`TPM_LOG_CB`, CBMEM `TPM_CB_LOG`): a
+/// `u16 max_entries`, a `u16 num_entries`, then 132-byte entries of PCR,
+/// digest name (`"SHA256"`), digest, digest length and event name.
+pub fn coreboot_log_evidence(log: &[u8]) -> LogEvidence {
+    const ENTRY: usize = 4 + 10 + 64 + 4 + 50;
+    let read_u16 = |at: usize| {
+        log.get(at..at + 2)
+            .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+    };
+    let (Some(max), Some(used)) = (read_u16(0), read_u16(2)) else {
+        return LogEvidence::None;
+    };
+    if used == 0 || used > max {
+        return LogEvidence::None;
+    }
+    let mut evidence = LogEvidence::None;
+    let (entries, _) = log.get(4..).unwrap_or(&[]).as_chunks::<ENTRY>();
+    for entry in entries.iter().take(used.into()) {
+        let name = &entry[4..14];
+        let name = &name[..name.iter().position(|&b| b == 0).unwrap_or(name.len())];
+        match name {
+            b"SHA1" => {
+                if evidence == LogEvidence::None {
+                    evidence = LogEvidence::Sha1Only;
+                }
+            }
+            b"SHA256" | b"SHA384" | b"SHA512" => return LogEvidence::Tpm2,
+            _ => {}
+        }
+    }
+    evidence
+}
+
+/// Whether a TCG 2.0 crypto-agile log records measurements after its
+/// SpecID header: evidence that earlier firmware measured this boot with a
+/// TPM 2.0, whether or not CrabEFI finds a way to drive it.
+pub fn crypto_agile_log_has_measurements(log: &[u8]) -> bool {
+    use super::types::EV_NO_ACTION;
+    // TCG_PCClientPCREvent: PCR, type, SHA-1 digest, event size, event.
+    const HEADER: usize = 4 + 4 + 20 + 4;
+    let read_u16 = |at: usize| {
+        log.get(at..at + 2)
+            .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+    };
+    let read_u32 = |at: usize| {
+        log.get(at..at + 4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+    };
+    if read_u32(4) != Some(EV_NO_ACTION) {
+        return false;
+    }
+    let Some(spec_size) = read_u32(HEADER - 4) else {
+        return false;
+    };
+    // Walk whole TCG_PCR_EVENT2 records: PCR index, event type, digest
+    // count, (algorithm, digest)*, event size, event. EV_NO_ACTION records
+    // extend no PCR; a truncated record proves nothing.
+    let mut at = HEADER + spec_size as usize;
+    for _ in 0..1024 {
+        let (Some(pcr), Some(event_type), Some(count)) =
+            (read_u32(at), read_u32(at + 4), read_u32(at + 8))
+        else {
+            return false;
+        };
+        if pcr >= 24 || event_type == 0 || !(1..=5).contains(&count) {
+            return false;
+        }
+        let mut next = at + 12;
+        for _ in 0..count {
+            let Some(size) = read_u16(next).and_then(digest_size_for_algorithm) else {
+                return false;
+            };
+            next += 2 + size;
+        }
+        let Some(event_size) = read_u32(next) else {
+            return false;
+        };
+        next += 4 + event_size as usize;
+        if next > log.len() {
+            return false;
+        }
+        if event_type != EV_NO_ACTION {
+            return true;
+        }
+        at = next;
+    }
+    false
+}
+
+#[cfg(test)]
+mod measurement_tests {
+    use super::*;
+    use crate::efi::tcg::measured_boot::EV_S_CRTM_VERSION;
+    use crate::efi::tcg::types::TPM_ALG_SHA256;
+
+    #[test]
+    fn only_logs_with_events_count_as_measured() {
+        let mut empty = CryptoAgileEventLog::new(
+            alloc::boxed::Box::leak(alloc::vec![0u8; 1024].into_boxed_slice()),
+            &[TPM_ALG_SHA256],
+        )
+        .unwrap();
+        assert!(!crypto_agile_log_has_measurements(empty.log_data()));
+        let mut buffer = empty.log_data().to_vec();
+        buffer.resize(1024, 0);
+        assert!(!crypto_agile_log_has_measurements(&buffer));
+        empty
+            .log_event(
+                0,
+                EV_S_CRTM_VERSION,
+                &[TaggedDigest::zeroed(TPM_ALG_SHA256)],
+                b"cb",
+            )
+            .unwrap();
+        assert!(crypto_agile_log_has_measurements(empty.log_data()));
+        assert!(!crypto_agile_log_has_measurements(&[0u8; 64]));
+        // A truncated record is no measurement.
+        let whole = empty.log_data().to_vec();
+        assert!(!crypto_agile_log_has_measurements(
+            &whole[..whole.len() - 1]
+        ));
+
+        // EV_NO_ACTION records (StartupLocality) are skipped, not counted.
+        let mut metadata = CryptoAgileEventLog::new(
+            alloc::boxed::Box::leak(alloc::vec![0u8; 1024].into_boxed_slice()),
+            &[TPM_ALG_SHA256],
+        )
+        .unwrap();
+        let none = [TaggedDigest::zeroed(TPM_ALG_SHA256)];
+        metadata
+            .log_event(
+                0,
+                crate::efi::tcg::types::EV_NO_ACTION,
+                &none,
+                b"StartupLocality",
+            )
+            .unwrap();
+        assert!(!crypto_agile_log_has_measurements(metadata.log_data()));
+        metadata
+            .log_event(0, EV_S_CRTM_VERSION, &none, b"cb")
+            .unwrap();
+        assert!(crypto_agile_log_has_measurements(metadata.log_data()));
+        assert_eq!(
+            crypto_agile_log_evidence(empty.log_data()),
+            LogEvidence::Tpm2
+        );
+        assert_eq!(crypto_agile_log_evidence(&buffer), LogEvidence::None);
+
+        let mut sha1 = CryptoAgileEventLog::new(
+            alloc::boxed::Box::leak(alloc::vec![0u8; 1024].into_boxed_slice()),
+            &[crate::efi::tcg::types::TPM_ALG_SHA1],
+        )
+        .unwrap();
+        sha1.log_event(
+            0,
+            EV_S_CRTM_VERSION,
+            &[TaggedDigest::zeroed(crate::efi::tcg::types::TPM_ALG_SHA1)],
+            b"cb",
+        )
+        .unwrap();
+        assert_eq!(
+            crypto_agile_log_evidence(sha1.log_data()),
+            LogEvidence::Sha1Only
+        );
+    }
+
+    fn coreboot_log(digests: &[&[u8]], max: u16) -> alloc::vec::Vec<u8> {
+        let mut log = alloc::vec::Vec::new();
+        log.extend_from_slice(&max.to_le_bytes());
+        log.extend_from_slice(&(digests.len() as u16).to_le_bytes());
+        for name in digests {
+            let mut entry = [0u8; 132];
+            entry[4..4 + name.len()].copy_from_slice(name);
+            log.extend_from_slice(&entry);
+        }
+        log
+    }
+
+    #[test]
+    fn coreboot_logs_tell_tpm2_banks_from_sha1() {
+        assert_eq!(
+            coreboot_log_evidence(&coreboot_log(&[], 8)),
+            LogEvidence::None
+        );
+        assert_eq!(
+            coreboot_log_evidence(&coreboot_log(&[b"SHA1"], 8)),
+            LogEvidence::Sha1Only
+        );
+        assert_eq!(
+            coreboot_log_evidence(&coreboot_log(&[b"SHA1", b"SHA256"], 8)),
+            LogEvidence::Tpm2
+        );
+        // More entries than the table holds, or than the bytes hold.
+        assert_eq!(
+            coreboot_log_evidence(&coreboot_log(&[b"SHA256"], 0)),
+            LogEvidence::None
+        );
+        let mut short = coreboot_log(&[b"SHA256"], 8);
+        short.truncate(100);
+        assert_eq!(coreboot_log_evidence(&short), LogEvidence::None);
+    }
+}

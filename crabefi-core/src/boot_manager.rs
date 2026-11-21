@@ -242,6 +242,10 @@ fn try_automatic_boot(boot_var_state: &boot_vars::BootVarState) {
         }
     }
 
+    if crate::preboot::refused() {
+        return;
+    }
+
     // ---- Phase 2: BootOrder ----
     if boot_var_state.boot_order.is_empty() {
         return;
@@ -269,7 +273,7 @@ fn try_boot_option_resolving_usb(
         boot_vars::BootAttemptResult::Failed => unbound,
         boot_vars::BootAttemptResult::NotFound => true,
     };
-    if !look_on_usb || usb_ready() {
+    if !look_on_usb || usb_ready() || crate::preboot::refused() {
         return result;
     }
     if !boot_policy::automatic_external_allowed() {
@@ -317,6 +321,10 @@ fn try_boot_order(boot_var_state: &boot_vars::BootVarState) -> bool {
         );
 
         let result = try_boot_option_resolving_usb(&load_option, &file_path);
+        // A refusal is final for the boot; the menu offers the reset.
+        if crate::preboot::refused() {
+            return false;
+        }
         match result {
             boot_vars::BootAttemptResult::Success => {
                 log::info!("Boot{:04X} succeeded", option_num);
@@ -342,9 +350,20 @@ fn show_boot_menu<const NATIVE: bool>(timeout_seconds: u32, firmware_ui_requeste
     // A choice the boot policy refuses (the setup menu may have tightened it
     // since the entries were listed) shows the menu again, rebuilt under the
     // current policy and waiting for the user.
-    let mut countdown = Some(timeout_seconds);
-    while show_boot_menu_once::<NATIVE>(countdown, firmware_ui_requested) == MenuOutcome::Retry {
-        countdown = None;
+    // After a refusal nothing may start automatically: wait for the user.
+    let mut countdown = (!crate::preboot::refused()).then_some(timeout_seconds);
+    loop {
+        match show_boot_menu_once::<NATIVE>(countdown, firmware_ui_requested) {
+            MenuOutcome::Done => break,
+            MenuOutcome::Retry => countdown = None,
+            // An unlock the countdown started keeps counting down, so the
+            // default entry inside the volume boots on its own.
+            MenuOutcome::Rescan { automatic } => {
+                if !automatic {
+                    countdown = None;
+                }
+            }
+        }
     }
 }
 
@@ -352,6 +371,11 @@ fn show_boot_menu<const NATIVE: bool>(timeout_seconds: u32, firmware_ui_requeste
 enum MenuOutcome {
     Done,
     Retry,
+    /// A volume was unlocked (or not): list the entries again.
+    #[cfg_attr(not(all(feature = "luks", target_arch = "x86_64")), allow(dead_code))]
+    Rescan {
+        automatic: bool,
+    },
 }
 
 /// `countdown` is the configured timeout, or `None` to wait for the user.
@@ -468,11 +492,45 @@ fn show_boot_menu_once<const NATIVE: bool>(
                 );
                 return MenuOutcome::Retry;
             }
+            if entry.is_unlock() {
+                // Setup may have turned Secure Boot on since the menu was
+                // built: then no direct boot may use the volume, so do not
+                // ask for its passphrase. The rebuilt menu omits it.
+                if !direct_boot_allowed::<NATIVE>() {
+                    log::info!("Secure Boot is on: not unlocking for direct boot");
+                    return MenuOutcome::Retry;
+                }
+                #[cfg(all(feature = "luks", target_arch = "x86_64"))]
+                let unlocked = match entry.filesystem {
+                    crate::fs::boot::Kind::Ext { media, .. } => crate::luks::unlock_interactive(
+                        entry.storage,
+                        &entry.partition,
+                        media,
+                        &crabefi_ui::MenuEntry::disk_detail(&entry),
+                    ),
+                    _ => false,
+                };
+                #[cfg(not(all(feature = "luks", target_arch = "x86_64")))]
+                let unlocked = false;
+                // Only a successful unlock the countdown started keeps
+                // counting down; Escape or failed attempts wait for the user.
+                return if unlocked {
+                    MenuOutcome::Rescan { automatic }
+                } else {
+                    MenuOutcome::Retry
+                };
+            }
             log::info!("Booting: {} from {}", entry.name, entry.path);
             log::info!("Entry kind: {:?}", entry.kind);
             log::info!("Storage: {:?}", entry.storage);
             boot_selected_entry::<NATIVE>(&entry);
             log::warn!("boot_selected_entry returned - boot failed!");
+            // The firmware refused to start anything for good: wait in the
+            // menu, which offers a reset, rather than halt or autoboot.
+            if crate::preboot::refused() {
+                log::error!("The firmware cannot start any boot entry before a restart");
+                return MenuOutcome::Retry;
+            }
             if NATIVE {
                 log::info!("Returning to native boot menu without autoboot");
                 return MenuOutcome::Retry;
@@ -599,6 +657,10 @@ fn try_boot_file_from_esps(
     });
     let mut result = boot_vars::BootAttemptResult::NotFound;
     for device in &devices {
+        // A refused start is final for this boot: try no other copy.
+        if crate::preboot::refused() {
+            return boot_vars::BootAttemptResult::Failed;
+        }
         match try_boot_file_on_device(device, &fat_path, target) {
             boot_vars::BootAttemptResult::NotFound => {}
             boot_vars::BootAttemptResult::Success => {
@@ -762,6 +824,9 @@ fn boot_selected_entry<const NATIVE: bool>(entry: &menu::BootEntry) {
             log::info!("Dispatching to payload chainload");
             boot_payload_entry(entry, path, *format);
         }
+
+        // The menu handles unlocking before it gets here.
+        menu::BootEntryKind::Unlock => {}
     }
 }
 
@@ -820,7 +885,7 @@ fn boot_linux_entry<const NATIVE: bool>(
     // when Secure Boot is active (filtered in scan_partition_for_entries), but
     // check here as well in case an entry somehow makes it through.
     // Direct boot bypasses signature verification which violates Secure Boot.
-    if !NATIVE && (cfg!(feature = "secure-boot-enforced") || efi::auth::is_secure_boot_enabled()) {
+    if !direct_boot_allowed::<NATIVE>() {
         log::warn!("Direct Linux boot disabled: Secure Boot is active");
         // Only FAT volumes can provide a fallback loader through EFI SFS.
         if matches!(entry.filesystem, crate::fs::boot::Kind::Fat) {
@@ -877,12 +942,18 @@ fn boot_linux_entry<const NATIVE: bool>(
             // ExitBootServices, but it can still reach payload MM through
             // the request buffer: end the firmware phase and switch MM to
             // the runtime view first.
+            // End the trusted phase here, where a refusal can still return
+            // to the menu: no volume key may remain, and nothing may later
+            // unseal a firmware-only TPM secret.
+            if !crate::preboot::end() {
+                return;
+            }
             if !NATIVE {
                 crate::efi::payload_mm::enter_runtime();
             }
-            unsafe {
-                loaded.boot_direct();
-            }
+            // Only returns on a refusal; dropping `loaded` clears it.
+            let Err(e) = unsafe { loaded.boot_direct() };
+            log::error!("Linux not started: {:?}", e);
         }
         Some(Err(e)) => log::error!("Failed to load Linux: {:?}", e),
         None => log::error!(
@@ -895,6 +966,13 @@ fn boot_linux_entry<const NATIVE: bool>(
     // If the user selected a direct Linux boot entry, they want Linux,
     // not a UEFI bootloader. If it fails, show an error and return to menu.
     log::error!("Direct Linux boot failed - returning to menu");
+}
+
+/// Whether direct Linux boot (and so unlocking for it) is allowed: it
+/// bypasses image verification, so not under Secure Boot. Discovery and
+/// dispatch use this same test.
+pub(crate) fn direct_boot_allowed<const NATIVE: bool>() -> bool {
+    NATIVE || !(cfg!(feature = "secure-boot-enforced") || efi::auth::is_secure_boot_enabled())
 }
 
 /// Boot a coreboot payload entry

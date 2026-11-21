@@ -84,6 +84,10 @@ struct SerialKeyParser {
     primary: u16,
     first_parameter: bool,
     pending: Option<u8>,
+    /// A UTF-8 character still arriving: its bytes so far and its length.
+    utf8: [u8; 4],
+    utf8_len: u8,
+    utf8_need: u8,
 }
 
 impl SerialKeyParser {
@@ -93,7 +97,58 @@ impl SerialKeyParser {
             primary: 0,
             first_parameter: true,
             pending: None,
+            utf8: [0; 4],
+            utf8_len: 0,
+            utf8_need: 0,
         }
+    }
+
+    /// Collect a UTF-8 character byte by byte: terminals send `é` as two
+    /// bytes, which must not become two characters. Invalid bytes are
+    /// dropped.
+    fn feed_utf8(&mut self, byte: u8) -> Option<KeyPress> {
+        if self.utf8_need == 0 {
+            self.utf8_need = match byte {
+                0xC2..=0xDF => 2,
+                0xE0..=0xEF => 3,
+                0xF0..=0xF4 => 4,
+                _ => return None,
+            };
+            self.utf8_len = 0;
+        } else if byte & 0xC0 != 0x80 {
+            self.clear_utf8();
+            return None;
+        }
+        self.utf8[usize::from(self.utf8_len)] = byte;
+        self.utf8_len += 1;
+        if self.utf8_len < self.utf8_need {
+            return None;
+        }
+        let key = core::str::from_utf8(&self.utf8[..usize::from(self.utf8_len)])
+            .ok()
+            .and_then(|text| text.chars().next())
+            .map(KeyPress::Char);
+        // A passphrase character must not stay behind in the decoder.
+        self.clear_utf8();
+        key
+    }
+
+    fn clear_utf8(&mut self) {
+        // Volatile, so the wipe of passphrase bytes is never optimized out.
+        for byte in &mut self.utf8 {
+            // SAFETY: a valid, aligned, exclusive reference to a byte.
+            unsafe { core::ptr::write_volatile(byte, 0) };
+        }
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        self.utf8_len = 0;
+        self.utf8_need = 0;
+    }
+
+    /// Drop all partial input, also an unfinished character or a byte
+    /// held back after an escape.
+    fn forget(&mut self) {
+        self.clear_utf8();
+        *self = Self::new();
     }
 
     fn feed(&mut self, byte: u8) -> Option<KeyPress> {
@@ -105,7 +160,11 @@ impl SerialKeyParser {
                 }
                 b'\t' => Some(KeyPress::Tab),
                 b'\r' | b'\n' => Some(KeyPress::Enter),
-                byte => Some(KeyPress::Char(byte as char)),
+                0x80.. => self.feed_utf8(byte),
+                byte => {
+                    self.clear_utf8();
+                    Some(KeyPress::Char(byte as char))
+                }
             },
             SerialState::Escape => {
                 self.state = match byte {
@@ -179,9 +238,17 @@ fn serial_navigation_key(byte: u8) -> Option<KeyPress> {
     }
 }
 
+static SERIAL: spin::Mutex<(SerialKeyParser, Option<Timeout>)> =
+    spin::Mutex::new((SerialKeyParser::new(), None));
+
+/// Forget partial serial input after a passphrase prompt, whatever ended it.
+pub fn scrub_serial_input() {
+    let mut serial = SERIAL.lock();
+    serial.0.forget();
+    serial.1 = None;
+}
+
 fn read_serial_key() -> Option<KeyPress> {
-    static SERIAL: spin::Mutex<(SerialKeyParser, Option<Timeout>)> =
-        spin::Mutex::new((SerialKeyParser::new(), None));
     let mut serial = SERIAL.lock();
     let (parser, deadline) = &mut *serial;
     poll_serial_key(parser, deadline, serial_driver::try_read)
@@ -255,6 +322,41 @@ mod serial_tests {
             poll_serial_key(&mut parser, &mut deadline, || input.next()),
             Some(KeyPress::Char('A'))
         );
+    }
+
+    #[test]
+    fn serial_utf8_arrives_as_one_character() {
+        let mut parser = SerialKeyParser::new();
+        let keys: alloc::vec::Vec<_> = "aé€\u{1F980}"
+            .bytes()
+            .chain([0xC3, b'x', 0xFF])
+            .filter_map(|b| parser.feed(b))
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                KeyPress::Char('a'),
+                KeyPress::Char('é'),
+                KeyPress::Char('€'),
+                KeyPress::Char('\u{1F980}'),
+                KeyPress::Char('x'),
+            ]
+        );
+    }
+
+    #[test]
+    fn serial_decoder_keeps_no_passphrase_bytes() {
+        let mut parser = SerialKeyParser::new();
+        for byte in "pé\r".bytes() {
+            parser.feed(byte);
+        }
+        assert_eq!(parser.utf8, [0; 4]);
+        // A character cut off by Escape or cancellation is dropped too.
+        parser.feed(0xE2);
+        parser.feed(0x82);
+        assert_ne!(parser.utf8, [0; 4]);
+        parser.forget();
+        assert_eq!((parser.utf8, parser.utf8_need), ([0; 4], 0));
     }
 
     #[test]

@@ -136,8 +136,19 @@ impl BlsEntry {
                             .map_err(|_| BlsParseError::Initrd)?;
                     }
                     "options" => {
-                        entry.options.clear();
-                        let _ = entry.options.push_str(value);
+                        // Repeated lines append, in order. A truncated or
+                        // dropped command line would boot something other
+                        // than what the entry says.
+                        if !entry.options.is_empty() {
+                            entry
+                                .options
+                                .push(' ')
+                                .map_err(|_| BlsParseError::Options)?;
+                        }
+                        entry
+                            .options
+                            .push_str(value)
+                            .map_err(|_| BlsParseError::Options)?;
                     }
                     "machine-id" => {
                         entry.machine_id.clear();
@@ -178,6 +189,8 @@ pub enum BlsParseError {
     MissingRequired,
     /// An initrd path longer than supported, or more than [`MAX_INITRDS`]
     Initrd,
+    /// A kernel command line longer than supported
+    Options,
 }
 
 /// Split a line into key and value
@@ -319,6 +332,14 @@ mod tests {
         assert!(matches!(with(&many), Err(BlsParseError::Initrd)));
         let long = format!("initrd /{}.img\n", "x".repeat(MAX_PATH_LEN));
         assert!(matches!(with(&long), Err(BlsParseError::Initrd)));
+        let options = alloc::format!("options {}\n", "x".repeat(600));
+        assert!(matches!(with(&options), Err(BlsParseError::Options)));
+        // Repeated lines append, and their combined length counts.
+        let entry =
+            BlsEntry::parse("title A\nlinux /v\noptions root=/dev/sda\noptions quiet\n").unwrap();
+        assert_eq!(entry.options.as_str(), "root=/dev/sda quiet");
+        let halves = alloc::format!("options {0}\noptions {0}\n", "x".repeat(300));
+        assert!(matches!(with(&halves), Err(BlsParseError::Options)));
         assert!(with(&"initrd /a.img\n".repeat(MAX_INITRDS)).is_ok());
     }
 }

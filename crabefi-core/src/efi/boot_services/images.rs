@@ -480,6 +480,30 @@ pub(super) extern "efiapi" fn start_image(
         return Status::SECURITY_VIOLATION;
     }
 
+    // Reserve the STARTED slot first: nothing may fail after the measurement
+    // and the end of the trusted phase, which cannot be undone.
+    let reserve_status = STARTED.with_mut(|started| {
+        if started.iter().any(|(handle, _)| *handle == image_handle) {
+            return Status::INVALID_PARAMETER;
+        }
+        if started.try_reserve(1).is_err() {
+            return Status::OUT_OF_RESOURCES;
+        }
+        Status::SUCCESS
+    });
+    if reserve_status != Status::SUCCESS {
+        return reserve_status;
+    }
+
+    // Every started image is code CrabEFI does not own: measure the boot
+    // attempt, then end the trusted phase before anything can run it,
+    // including ReadyToBoot callbacks.
+    let is_application = image_subsystem == 10;
+    let ready_to_boot = measure_efi_application_start(is_application);
+    if !crate::preboot::end() {
+        return Status::SECURITY_VIOLATION;
+    }
+
     let mark_status = STARTED.with_mut(|started| {
         if started.iter().any(|(handle, _)| *handle == image_handle) {
             return Status::INVALID_PARAMETER;
@@ -506,10 +530,10 @@ pub(super) extern "efiapi" fn start_image(
     #[cfg(target_arch = "x86_64")]
     crate::efi::payload_mm::ready_to_boot();
 
-    // Signal EFI_EVENT_GROUP_READY_TO_BOOT before the first image is started
-    // and measure boot-attempt action events without duplicating separators.
-    let is_application = image_subsystem == 10;
-    measure_efi_application_start(is_application);
+    // Signal EFI_EVENT_GROUP_READY_TO_BOOT before the first image is started.
+    if ready_to_boot {
+        super::signal_ready_to_boot();
+    }
 
     #[cfg(feature = "tpm")]
     let deferred_measurement = with_tables_mut(|efi_state| {

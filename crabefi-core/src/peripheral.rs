@@ -140,6 +140,22 @@ pub enum Peripheral {
     Mmio(MmioPeripheral),
 }
 
+impl Peripheral {
+    /// Whether this is a TPM 2.0 CrabEFI drives as a peripheral (and so
+    /// adopts for measured boot once bound).
+    pub fn is_tpm2(&self) -> bool {
+        // The driver binding picks, so a device another driver claims
+        // first (an ELAN touchpad that also lists GOOG0005) is no TPM.
+        #[cfg(feature = "tpm")]
+        if let Peripheral::I2c(device) = self {
+            return i2c_driver(device.ids.iter().map(String::as_str))
+                .is_some_and(|driver| driver.ids == crate::efi::tcg::gsc_i2c::IDS);
+        }
+        let _ = self;
+        false
+    }
+}
+
 struct I2cDriver {
     ids: &'static [&'static str],
     /// Takes ownership of the device; logs its own failures.
@@ -271,6 +287,45 @@ mod tests {
     fn any_identifier_selects_a_driver() {
         assert!(super::i2c_supported(["VEND0001", "ELAN0000"]));
         assert!(!super::i2c_supported(["VEND9999"]));
+    }
+
+    #[cfg(feature = "tpm")]
+    #[test]
+    fn i2c_tpms_are_recognized_by_any_identifier() {
+        struct NoBus;
+        impl embedded_hal::i2c::ErrorType for NoBus {
+            type Error = embedded_hal::i2c::ErrorKind;
+        }
+        impl embedded_hal::i2c::I2c for NoBus {
+            fn transaction(
+                &mut self,
+                _: u8,
+                _: &mut [embedded_hal::i2c::Operation<'_>],
+            ) -> Result<(), Self::Error> {
+                Err(embedded_hal::i2c::ErrorKind::Other)
+            }
+        }
+        let i2c = |ids: &[&str]| {
+            super::Peripheral::I2c(super::I2cPeripheral {
+                ids: ids.iter().map(|id| (*id).into()).collect(),
+                bus: super::I2cBus::new(NoBus),
+                address: 0x50,
+                interrupt: None,
+                hid_descriptor_register: None,
+            })
+        };
+        // The TPM ID may be a _CID after a vendor _HID.
+        assert!(i2c(&["VEND0001", "GOOG0005"]).is_tpm2());
+        assert!(!i2c(&["ELAN0000"]).is_tpm2());
+        // The driver that binds decides: an earlier ID can claim the device.
+        #[cfg(feature = "elan-i2c")]
+        assert!(!i2c(&["ELAN0000", "GOOG0005"]).is_tpm2());
+        let mmio = super::Peripheral::Mmio(super::MmioPeripheral {
+            ids: alloc::vec!["GOOG0005".into()],
+            base: 0,
+            size: 0,
+        });
+        assert!(!mmio.is_tpm2());
     }
 
     #[test]

@@ -28,6 +28,11 @@ use zerocopy::{
 
 mod connections;
 mod peripherals;
+
+/// ACPI identifiers of TPM 2.0 devices: the generic TPM2 ID and the Google
+/// security chip on I2C.
+#[cfg(any(not(feature = "native-only"), feature = "luks"))]
+const TPM2_IDS: &[&str] = &["MSFT0101", "GOOG0005"];
 #[cfg(test)]
 #[path = "acpi/tests.rs"]
 mod tests;
@@ -441,7 +446,10 @@ struct SdtHeader {
     creator_revision: U32,
 }
 
-#[cfg(all(target_arch = "x86_64", not(feature = "native-only")))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(not(feature = "native-only"), feature = "luks")
+))]
 #[repr(C)]
 #[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
 struct TcpaClientTable {
@@ -451,7 +459,10 @@ struct TcpaClientTable {
     log_area_start_address: U64,
 }
 
-#[cfg(all(target_arch = "x86_64", any(test, not(feature = "native-only"))))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(test, not(feature = "native-only"), feature = "luks")
+))]
 #[repr(C)]
 #[derive(FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
 struct Tpm2Prefix {
@@ -462,7 +473,10 @@ struct Tpm2Prefix {
     start_method: U32,
 }
 
-#[cfg(all(target_arch = "x86_64", any(test, not(feature = "native-only"))))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(test, not(feature = "native-only"), feature = "luks")
+))]
 #[repr(C)]
 #[derive(FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned)]
 struct Tpm2WithLogArea {
@@ -663,7 +677,10 @@ pub mod fbpt_offsets {
 /// # Safety
 /// `rsdp_addr` and all referenced ACPI/log memory must be identity mapped and
 /// remain valid for the firmware boot-services lifetime.
-#[cfg(all(target_arch = "x86_64", not(feature = "native-only")))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(not(feature = "native-only"), feature = "luks")
+))]
 pub unsafe fn find_tcpa_event_log(rsdp_addr: u64) -> Option<&'static [u8]> {
     let (address, length) = unsafe { find_table(rsdp_addr, b"TCPA") }?;
     if length < size_of::<TcpaClientTable>() {
@@ -692,7 +709,10 @@ pub unsafe fn find_tcpa_event_log(rsdp_addr: u64) -> Option<&'static [u8]> {
 }
 
 /// The TPM interface the ACPI TPM2 table describes.
-#[cfg(all(target_arch = "x86_64", any(test, not(feature = "native-only"))))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(test, not(feature = "native-only"), feature = "luks")
+))]
 pub struct Tpm2Table {
     pub start_method: u32,
     pub control_area: u64,
@@ -704,7 +724,10 @@ pub struct Tpm2Table {
 /// The RSDP, root table, and referenced SDT headers must be readable and
 /// identity mapped. The root table and TPM2 table must be readable for their
 /// advertised lengths.
-#[cfg(all(target_arch = "x86_64", any(test, not(feature = "native-only"))))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(test, not(feature = "native-only"), feature = "luks")
+))]
 pub unsafe fn find_tpm2_table(rsdp_addr: u64) -> Option<Tpm2Table> {
     let (address, length) = unsafe { find_table(rsdp_addr, b"TPM2") }?;
     if length < size_of::<Tpm2Prefix>() {
@@ -732,7 +755,10 @@ pub unsafe fn find_tpm2_table(rsdp_addr: u64) -> Option<Tpm2Table> {
 /// identity mapped. The root table must be readable for its advertised
 /// length, and the TPM2 table must be exclusively accessible and writable
 /// for its advertised length while this function runs.
-#[cfg(all(target_arch = "x86_64", not(feature = "native-only")))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(not(feature = "native-only"), feature = "luks")
+))]
 pub unsafe fn take_tpm2_log_area(rsdp_addr: u64, size: usize) -> Option<&'static mut [u8]> {
     use crabefi::efi::allocator::{AllocateType, MemoryType, allocate_pages};
 
@@ -772,7 +798,10 @@ pub unsafe fn take_tpm2_log_area(rsdp_addr: u64, size: usize) -> Option<&'static
     Some(area)
 }
 
-#[cfg(all(target_arch = "x86_64", any(test, not(feature = "native-only"))))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(test, not(feature = "native-only"), feature = "luks")
+))]
 fn set_tpm2_log_area(table: &mut [u8], length: u32, address: u64) -> Option<()> {
     let (fields, tail) = Tpm2WithLogArea::mut_from_prefix(table).ok()?;
     fields.log_area_minimum_length.set(length);
@@ -788,7 +817,10 @@ fn set_tpm2_log_area(table: &mut [u8], length: u32, address: u64) -> Option<()> 
     Some(())
 }
 
-#[cfg(all(target_arch = "x86_64", not(feature = "native-only")))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(not(feature = "native-only"), feature = "luks")
+))]
 fn tcpa_log_used_length(log: &[u8]) -> Option<usize> {
     const HEADER_SIZE: usize = 4 + 4 + 20 + 4;
     let mut offset = 0usize;
@@ -963,14 +995,37 @@ fn discover_namespace_devices(
                 e
             })?
             .resolve(path)?;
-        if let Ok(Some(sta_obj)) = interpreter.evaluate_if_present(sta_path, vec![])
-            && let Object::Integer(sta) = &*sta_obj
-            && (*sta & 0x0b) != 0x0b
-        {
+        let sta = match interpreter.evaluate_if_present(sta_path, vec![]) {
+            Ok(Some(sta_obj)) => match &*sta_obj {
+                Object::Integer(sta) => Some(*sta),
+                _ => None,
+            },
+            _ => None,
+        };
+        // Not present at all.
+        if sta.is_some_and(|sta| sta & 0x01 == 0) {
             return Ok(true);
         }
 
         let ids = peripherals::ids(interpreter, path);
+        // A present TPM 2.0 must be known before anything about its bus or
+        // resources can fail: firmware-only secrets must not reach a TPM in
+        // its pre-boot state uncapped, even one CrabEFI cannot drive, or one
+        // disabled now that the next stage may enable.
+        #[cfg(any(not(feature = "native-only"), feature = "luks"))]
+        if ids.iter().any(|id| TPM2_IDS.contains(&id.as_str())) {
+            crabefi::efi::tcg::measured_boot::expect_hardware_tpm();
+        }
+        // A TPM 1.2 by any of its IDs explains a SHA-1-only coreboot log;
+        // firm TPM 2.0 evidence still wins.
+        #[cfg(any(not(feature = "native-only"), feature = "luks"))]
+        if ids.iter().any(|id| id == "PNP0C31") {
+            crabefi::efi::tcg::measured_boot::note_tpm12();
+        }
+        // Drivers bind only present, enabled and functioning devices.
+        if sta.is_some_and(|sta| (sta & 0x0b) != 0x0b) {
+            return Ok(true);
+        }
         if crabefi::peripheral::i2c_supported(ids.iter().map(String::as_str)) {
             connections.extend(peripherals::connection(interpreter, path, ids));
             return Ok(true);

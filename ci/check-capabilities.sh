@@ -9,7 +9,7 @@ trap 'rm -rf "$TMP"' EXIT
 
 cargo tree --locked -p crabefi-core --target x86_64-unknown-none --no-default-features \
     --features bundled-runtime-image,variable-store --edges normal --prefix none > "$TMP/core-tree"
-if grep -E '^(xhci |rflasher-|rsa |x509-cert |cms |der |const-oid |signature |noto-sans-mono-bitmap )' "$TMP/core-tree"; then
+if grep -E '^(xhci |rflasher-|rsa |x509-cert |cms |der |const-oid |signature |noto-sans-mono-bitmap |argon2 |p256 |serde_json |xts-mode )' "$TMP/core-tree"; then
     echo 'Unexpected optional capability dependency in the basic core' >&2
     exit 1
 fi
@@ -22,6 +22,18 @@ fi
 # The core's additive TPM feature may also be enabled by another consumer.
 cargo check --locked -p crabefi-coreboot --target x86_64-unknown-none --release \
     --no-default-features --features native-only,crabefi/tpm
+# LUKS2 brings the TPM into native-only payloads, but no UEFI capability.
+cargo tree --locked -p crabefi-coreboot --target x86_64-unknown-none \
+    --no-default-features --features native-only,luks --edges normal --prefix none > "$TMP/native-luks-tree"
+if grep -E '^(crabefi-runtime-bundle |crabefi-pkcs7 |rflasher-)' "$TMP/native-luks-tree"; then
+    echo 'Unexpected UEFI capability dependency in the native-only LUKS2 payload' >&2
+    exit 1
+fi
+cargo check --locked -p crabefi-coreboot --target x86_64-unknown-none --release \
+    --no-default-features --features native-only,luks
+# Without the TPM, LUKS2 keeps passphrase unlocking only.
+cargo check --locked -p crabefi-core --target x86_64-unknown-none --release \
+    --no-default-features --features luks,global-allocator,platform-entry
 cargo tree --locked --manifest-path crabefi-runtime-image/Cargo.toml --target x86_64-unknown-none \
     --no-default-features --edges normal --prefix none > "$TMP/runtime-tree"
 if grep -E '^(rsa |crypto-bigint |allocator-api2 |sha2 )' "$TMP/runtime-tree"; then

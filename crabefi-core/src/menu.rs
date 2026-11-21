@@ -279,7 +279,7 @@ pub(crate) fn discover_entries<const NATIVE: bool>() -> BootMenu {
 
     // Keep FAT volumes and El Torito images ahead of ext boot entries.
     #[cfg(all(feature = "ext4", target_arch = "x86_64"))]
-    if NATIVE || !crate::efi::auth::is_secure_boot_enabled() {
+    if crate::boot_manager::direct_boot_allowed::<NATIVE>() {
         discover_ext_entries(&devices, &mut menu);
     }
 
@@ -304,7 +304,7 @@ fn discover_entries_on_disk<const NATIVE: bool>(
 ) {
     // Read the policy before borrowing the disk: the variable read calls into
     // the runtime image, and no firmware borrow may be live across it.
-    let direct_linux = NATIVE || !crate::efi::auth::is_secure_boot_enabled();
+    let direct_linux = crate::boot_manager::direct_boot_allowed::<NATIVE>();
     if !direct_linux {
         log::debug!("Secure Boot active: skipping direct Linux boot entry discovery");
     }
@@ -356,11 +356,39 @@ fn discover_ext_entries(devices: &[StorageDevice], menu: &mut BootMenu) {
             }
             _ => continue,
         };
-        let kind = FilesystemKind::Ext {
-            media: device.info,
-            discovery: true,
-        };
         for partition in partitions.iter().filter(|partition| !partition.is_esp) {
+            #[cfg_attr(not(feature = "luks"), allow(unused_mut))]
+            let mut kind = FilesystemKind::Ext {
+                media: device.info,
+                discovery: true,
+                #[cfg(feature = "luks")]
+                volume: None,
+            };
+            #[cfg(feature = "luks")]
+            match crate::luks::probe(device, partition) {
+                crate::luks::Probe::Plain => {}
+                crate::luks::Probe::Unlocked(id) => {
+                    if let FilesystemKind::Ext { volume, .. } = &mut kind {
+                        *volume = Some(id);
+                    }
+                }
+                crate::luks::Probe::Locked { name } => {
+                    let title = crate::luks::unlock_title(&name, device, partition);
+                    let mut entry = BootEntry::new_with_kind(
+                        &title,
+                        "",
+                        device,
+                        partition.number,
+                        partition.clone(),
+                        BootEntryKind::Unlock,
+                        BootCategory::Encrypted,
+                    );
+                    entry.filesystem = kind.for_boot();
+                    menu.add_entry(entry);
+                    continue;
+                }
+                crate::luks::Probe::Unsupported => continue,
+            }
             boot_fs::with_filesystem(device.id, partition, kind, |fs| {
                 if !scan_bls_from(fs, kind, device, partition, "", menu) {
                     // On a root volume, BLS paths are relative to /boot.
@@ -594,6 +622,14 @@ fn scan_bls_from(
             BootCategory::Bls,
         );
         entry.filesystem = filesystem.for_boot();
+        #[cfg(all(feature = "luks", target_arch = "x86_64"))]
+        if let FilesystemKind::Ext {
+            volume: Some(volume),
+            ..
+        } = filesystem
+        {
+            entry.cmdline_locked = crate::luks::unlocked_unattended(volume);
+        }
         if !menu.add_entry(entry) {
             break;
         }

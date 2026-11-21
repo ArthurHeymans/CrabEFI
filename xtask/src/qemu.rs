@@ -16,6 +16,7 @@ mod boot_events;
 pub(crate) mod boot_policy;
 mod filesystem;
 mod fwui;
+mod luks;
 mod native_fat;
 pub(crate) mod sct;
 mod secure_boot_auth;
@@ -228,6 +229,9 @@ pub struct QemuConfig {
     pub extra_devices: Vec<String>,
     /// Enable TPM 2.0 emulation via swtpm (x86_64 only).
     pub enable_tpm: bool,
+    /// Keep the swtpm state here instead of a fresh temporary directory,
+    /// for objects created before the boot (LUKS2 TPM tokens).
+    pub tpm_state: Option<std::path::PathBuf>,
 }
 
 /// Manages a swtpm process lifetime for TPM emulation.
@@ -235,7 +239,7 @@ pub struct QemuConfig {
 /// The swtpm process is killed when this struct is dropped.
 pub struct SwtpmProcess {
     child: Child,
-    _state_dir: tempfile::TempDir,
+    _state_dir: Option<tempfile::TempDir>,
 }
 
 impl Drop for SwtpmProcess {
@@ -251,21 +255,26 @@ fn cleanup_child(child: &mut Child) {
 }
 
 /// Spawn a swtpm process and return the QEMU arguments to connect to it.
-fn spawn_swtpm() -> Result<(SwtpmProcess, Vec<String>)> {
+fn spawn_swtpm(state: Option<&Path>) -> Result<(SwtpmProcess, Vec<String>)> {
     // CRABEFI_TPM=crb: the CRB interface of firmware TPMs instead of TIS.
     let interface = match std::env::var("CRABEFI_TPM").as_deref() {
         Ok("crb") => "tpm-crb",
         Ok("tis") | Err(_) => "tpm-tis",
         Ok(other) => bail!("CRABEFI_TPM must be tis or crb, not {other}"),
     };
-    let state_dir = tempfile::tempdir().context("failed to create swtpm state dir")?;
-    let sock_path = state_dir.path().join("swtpm-sock");
+    let temp_state = match state {
+        Some(_) => None,
+        None => Some(tempfile::tempdir().context("failed to create swtpm state dir")?),
+    };
+    let state_path = state.unwrap_or_else(|| temp_state.as_ref().unwrap().path());
+    let sock_path = state_path.join("swtpm-sock");
+    let _ = fs::remove_file(&sock_path);
 
     let mut child = Command::new("swtpm")
         .args([
             "socket",
             "--tpmstate",
-            &format!("dir={}", state_dir.path().display()),
+            &format!("dir={}", state_path.display()),
             "--ctrl",
             &format!("type=unixio,path={}", sock_path.display()),
             "--tpm2",
@@ -316,10 +325,61 @@ fn spawn_swtpm() -> Result<(SwtpmProcess, Vec<String>)> {
     Ok((
         SwtpmProcess {
             child,
-            _state_dir: state_dir,
+            _state_dir: temp_state,
         },
         qemu_args,
     ))
+}
+
+/// An swtpm with a command socket for host tools (the `swtpm` TCTI), used
+/// to provision a TPM state before QEMU boots with it.
+pub struct SwtpmServer {
+    child: Child,
+    socket: std::path::PathBuf,
+}
+
+impl SwtpmServer {
+    pub fn start(state: &Path) -> Result<Self> {
+        let socket = state.join("server-sock");
+        // The swtpm TCTI finds the control channel at "<socket>.ctrl".
+        let control = state.join("server-sock.ctrl");
+        let _ = fs::remove_file(&socket);
+        let _ = fs::remove_file(&control);
+        let mut child = Command::new("swtpm")
+            .args(["socket", "--tpm2", "--flags", "startup-clear,not-need-init"])
+            .arg("--tpmstate")
+            .arg(format!("dir={}", state.display()))
+            .arg("--server")
+            .arg(format!("type=unixio,path={}", socket.display()))
+            .arg("--ctrl")
+            .arg(format!("type=unixio,path={}", control.display()))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .context("failed to start swtpm (is it installed?)")?;
+        for _ in 0..100 {
+            if socket.exists() && control.exists() {
+                return Ok(Self { child, socket });
+            }
+            if let Some(status) = child.try_wait()? {
+                bail!("swtpm exited before creating its sockets: {status}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        cleanup_child(&mut child);
+        bail!("swtpm did not create {}", socket.display())
+    }
+
+    pub fn socket(&self) -> &Path {
+        &self.socket
+    }
+}
+
+impl Drop for SwtpmServer {
+    fn drop(&mut self) {
+        cleanup_child(&mut self.child);
+    }
 }
 
 /// Test result from QEMU run
@@ -762,7 +822,7 @@ pub fn run_qemu(config: &QemuConfig, disk_path: Option<&Path>, runtime_replay: b
 
     // Start swtpm for TPM emulation if requested.
     let _swtpm = if config.enable_tpm {
-        match spawn_swtpm() {
+        match spawn_swtpm(config.tpm_state.as_deref()) {
             Ok((swtpm, tpm_args)) => {
                 for arg in &tpm_args {
                     cmd.arg(arg);
@@ -1000,6 +1060,9 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
     }
     if app_name == "native-only-fat-linux" {
         return native_fat::run(config, disk_path);
+    }
+    if crate::luks_linux_test(app_name).is_some() {
+        return luks::run(config, disk_path, app_name);
     }
     if app_name == "boot-policy-test" {
         return boot_policy::run(config, disk_path);
@@ -2122,7 +2185,7 @@ fn run_qemu_with_capture_x86_64(
     // early if swtpm cannot start; otherwise the TCG test could silently pass
     // in software-only mode and never exercise the TIS/SubmitCommand path.
     let _swtpm = if config.enable_tpm {
-        let (swtpm, tpm_args) = spawn_swtpm()?;
+        let (swtpm, tpm_args) = spawn_swtpm(config.tpm_state.as_deref())?;
         for arg in &tpm_args {
             cmd.arg(arg);
         }
@@ -2470,6 +2533,7 @@ mod tests {
             machine: Machine::Sbsa,
             extra_devices: Vec::new(),
             enable_tpm: false,
+            tpm_state: None,
         };
         let (default, flash) =
             build_qemu_command(&config, Path::new("runtime-image-test.img"), false).unwrap();

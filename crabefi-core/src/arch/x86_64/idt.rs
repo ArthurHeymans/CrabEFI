@@ -309,6 +309,7 @@ unsafe extern "C" fn exception_handler(frame: *const ExceptionFrame) -> ! {
 
     log::error!("========================================================");
     log::error!("System halted.");
+    crate::preboot::emergency_wipe();
 
     interrupts::disable();
     loop {

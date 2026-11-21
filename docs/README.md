@@ -15,6 +15,7 @@ scratch allocation used on every architecture.
 - [x86 Entry ABIs](X86_ENTRY_ABI.md) — default coreboot entry and opt-in entry64 for u-root
 - [Memory Management](MEMORY.md) — boot/runtime ownership and EFI memory map
 - [Separate Runtime Image Architecture](RUNTIME_IMAGE_PLAN.md) — implemented runtime boundary, loader, SVAM transaction, and current platform limitations
+- [Encrypted boot volumes](LUKS.md) — LUKS2 passphrase and TPM2 unlocking for direct Linux boot
 - [Platform Compatibility](COMPATIBILITY.md) — QEMU CI coverage per platform, time/authentication policy, and known limitations
 
 Use `./crabefi build --arch <arch>` to build, audit, normalize and bind a fresh

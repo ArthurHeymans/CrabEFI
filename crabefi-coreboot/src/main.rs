@@ -83,6 +83,77 @@ impl memory_map::Region for crabefi::MemoryRegion {
     }
 }
 
+/// Copy the inherited log to the start of a new log area; returns its length.
+/// The caller checked that it fits.
+#[cfg(any(not(feature = "native-only"), feature = "luks"))]
+fn prefill_log_area(area: &mut [u8], log: Option<&[u8]>) -> usize {
+    let Some(log) = log else {
+        return 0;
+    };
+    area[..log.len()].copy_from_slice(log);
+    log.len()
+}
+
+/// Measured boot state to continue from coreboot's CBMEM log. The TPM
+/// transport is selected after ACPI namespace discovery: coreboot's log
+/// record does not describe it.
+#[cfg(any(not(feature = "native-only"), feature = "luks"))]
+fn tpm_event_log_config(
+    tpm_log: Option<&tables::TpmLogInfo>,
+) -> crabefi::TpmEventLogConfig<'static> {
+    let (existing_log, format) = match tpm_log {
+        Some(tpm_log) => match tpm_log.cbmem_id {
+            // TCG 2.0 crypto-agile log — continue with EFI_TCG2_PROTOCOL.
+            0x54504d32 => {
+                // SAFETY: coreboot's CBMEM region persists for the entire boot.
+                let log_data = unsafe {
+                    core::slice::from_raw_parts(tpm_log.address as *const u8, tpm_log.size as usize)
+                };
+                // Classify it now: transport selection may later drop it
+                // (an ACPI PNP0C31 device), and its SHA-256 measurements
+                // must still count as TPM 2.0 evidence.
+                crabefi::efi::tcg::measured_boot::note_log_evidence(
+                    crabefi::efi::tcg::event_log::crypto_agile_log_evidence(log_data),
+                );
+                (Some(log_data), crabefi::TpmLogFormat::CryptoAgile)
+            }
+            // TCG 1.2 SHA1-only log — continue with EFI_TCG_PROTOCOL.
+            0x54445041 => {
+                // SAFETY: coreboot's CBMEM region persists for the entire boot.
+                let log_data = unsafe {
+                    core::slice::from_raw_parts(tpm_log.address as *const u8, tpm_log.size as usize)
+                };
+                (Some(log_data), crabefi::TpmLogFormat::Sha1Only)
+            }
+            // coreboot-specific format — start fresh (not directly
+            // compatible with either TCG log format).
+            _ => {
+                // CrabEFI cannot continue this log, but its digests show
+                // whether coreboot measured into a TPM 2.0.
+                // SAFETY: coreboot's CBMEM region persists for the entire boot.
+                let log_data = unsafe {
+                    core::slice::from_raw_parts(tpm_log.address as *const u8, tpm_log.size as usize)
+                };
+                crabefi::efi::tcg::measured_boot::note_log_evidence(
+                    crabefi::efi::tcg::event_log::coreboot_log_evidence(log_data),
+                );
+                log::info!("Coreboot TPM log is in CB-specific format, starting fresh");
+                (None, crabefi::TpmLogFormat::Both)
+            }
+        },
+        None => (None, crabefi::TpmLogFormat::Both),
+    };
+    crabefi::TpmEventLogConfig {
+        existing_log,
+        log_area: None,
+        format,
+        // Hardware TPM transport is selected after ACPI namespace discovery.
+        // Coreboot's TPM log record does not describe the transport.
+        tpm2_device: crabefi::Tpm2DeviceConfig::None,
+        tpm1_tis_base: None,
+    }
+}
+
 /// Whether `start..start + length` lies in one region coreboot reserved
 /// (CBMEM tables or reserved memory).
 fn in_table_memory(map: &[memory::MemoryRegion], start: u64, length: u64) -> bool {
@@ -829,6 +900,7 @@ fn panic(info: &PanicInfo) -> ! {
     } else {
         log::error!("PANIC: {}", info.message());
     }
+    crabefi::emergency_wipe();
 
     loop {
         crabefi::arch::halt();
@@ -1416,6 +1488,12 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         config.framebuffer = framebuffer;
         config.acpi_rsdp = cb_info.acpi_rsdp;
         config.fdt = fdt_slice;
+        // LUKS2 TPM tokens need the TPM, and the separators that end the
+        // pre-OS phase need the measured boot log.
+        #[cfg(feature = "luks")]
+        {
+            config.tpm_event_log = Some(tpm_event_log_config(cb_info.tpm_log.as_ref()));
+        }
         config
     };
 
@@ -1460,50 +1538,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         // If coreboot provided a standard TPM event log in CBMEM, continue
         // using that log's protocol family. Without an existing standard log,
         // start fresh and install both TCG protocol families for compatibility.
-        tpm_event_log: Some({
-            let (existing_log, format) = match cb_info.tpm_log {
-                Some(ref tpm_log) => match tpm_log.cbmem_id {
-                    // TCG 2.0 crypto-agile log — continue with EFI_TCG2_PROTOCOL.
-                    0x54504d32 => {
-                        // SAFETY: coreboot's CBMEM region persists for the entire boot.
-                        let log_data = unsafe {
-                            core::slice::from_raw_parts(
-                                tpm_log.address as *const u8,
-                                tpm_log.size as usize,
-                            )
-                        };
-                        (Some(log_data), crabefi::TpmLogFormat::CryptoAgile)
-                    }
-                    // TCG 1.2 SHA1-only log — continue with EFI_TCG_PROTOCOL.
-                    0x54445041 => {
-                        // SAFETY: coreboot's CBMEM region persists for the entire boot.
-                        let log_data = unsafe {
-                            core::slice::from_raw_parts(
-                                tpm_log.address as *const u8,
-                                tpm_log.size as usize,
-                            )
-                        };
-                        (Some(log_data), crabefi::TpmLogFormat::Sha1Only)
-                    }
-                    // coreboot-specific format — start fresh (not directly
-                    // compatible with either TCG log format).
-                    _ => {
-                        log::info!("Coreboot TPM log is in CB-specific format, starting fresh");
-                        (None, crabefi::TpmLogFormat::Both)
-                    }
-                },
-                None => (None, crabefi::TpmLogFormat::Both),
-            };
-            crabefi::TpmEventLogConfig {
-                existing_log,
-                log_area: None,
-                format,
-                // Hardware TPM transport is selected after ACPI namespace discovery.
-                // Coreboot's TPM log record does not describe the transport.
-                tpm2_device: crabefi::Tpm2DeviceConfig::None,
-                tpm1_tis_base: None,
-            }
-        }),
+        tpm_event_log: Some(tpm_event_log_config(cb_info.tpm_log.as_ref())),
         boot_policy: boot_policy(),
         heap_pre_initialized: false, // Set to true after Phase 6
     };
@@ -1563,7 +1598,7 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
         // its _CRS names the command buffers, not the registers.
         #[cfg(target_arch = "x86_64")]
         // SAFETY: coreboot identity maps its ACPI tables.
-        #[cfg(not(feature = "native-only"))]
+        #[cfg(any(not(feature = "native-only"), feature = "luks"))]
         let crb = unsafe { acpi::find_tpm2_table(rsdp) }.and_then(|tpm2| {
             let start = match tpm2.start_method {
                 7 => crabefi::CrbStart::Crb,
@@ -1572,8 +1607,17 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
             };
             (tpm2.control_area != 0).then_some((tpm2.control_area, start))
         });
+        // A TPM2 table or TPM device describes a TPM 2.0, even one CrabEFI
+        // cannot drive: firmware-only secrets must not reach it uncapped.
         #[cfg(target_arch = "x86_64")]
-        #[cfg(not(feature = "native-only"))]
+        #[cfg(any(not(feature = "native-only"), feature = "luks"))]
+        if unsafe { acpi::find_tpm2_table(rsdp) }.is_some()
+            || acpi_info.find_device("MSFT0101").is_some()
+        {
+            crabefi::efi::tcg::measured_boot::expect_hardware_tpm();
+        }
+        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(not(feature = "native-only"), feature = "luks"))]
         if let Some((control_area, start)) = crb {
             log::info!("ACPI TPM2 table describes a CRB TPM at {:#x}", control_area);
             if let Some(ref mut tpm) = config.tpm_event_log {
@@ -1616,17 +1660,38 @@ pub extern "C" fn rust_main(coreboot_table_ptr: u64) -> ! {
             log::info!("No ACPI MMIO TIS TPM resource; skipping unsafe probe");
         }
 
+        // An I2C TPM is adopted later, when its peripheral binds: it needs
+        // the published area too. The area holds the inherited log from the
+        // start, so moving it is harmless if that TPM never comes up.
+        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(not(feature = "native-only"), feature = "luks"))]
+        let peripheral_tpm2 = config
+            .peripherals
+            .iter()
+            .any(crabefi::peripheral::Peripheral::is_tpm2);
         // Linux reads the TPM2 table's log area before the EFI log.
         #[cfg(target_arch = "x86_64")]
-        #[cfg(not(feature = "native-only"))]
+        #[cfg(any(not(feature = "native-only"), feature = "luks"))]
         if let Some(ref mut tpm) = config.tpm_event_log
-            && tpm.tpm2_device.is_some()
+            && (tpm.tpm2_device.is_some() || peripheral_tpm2)
         {
-            // SAFETY: coreboot's ACPI tables are identity mapped RAM.
-            tpm.log_area = unsafe {
-                acpi::take_tpm2_log_area(rsdp, crabefi::efi::tcg::event_log::DEFAULT_EVENT_LOG_SIZE)
+            // The new area holds coreboot's crypto-agile log from the moment
+            // the table points at it, whatever CrabEFI then manages to do with
+            // the TPM (it may only cap the PCRs). A log that does not fit, with
+            // room to append, keeps coreboot's own area.
+            let inherited = tpm
+                .existing_log
+                .filter(|_| tpm.format == crabefi::TpmLogFormat::CryptoAgile);
+            let size = crabefi::efi::tcg::event_log::DEFAULT_EVENT_LOG_SIZE;
+            if inherited.is_none_or(|log| log.len() < size) {
+                // SAFETY: coreboot's ACPI tables are identity mapped RAM.
+                tpm.log_area = unsafe { acpi::take_tpm2_log_area(rsdp, size) }.map(|area| {
+                    crabefi::PlatformEventLog {
+                        used: prefill_log_area(area, inherited),
+                        area,
+                    }
+                });
             }
-            .map(|area| crabefi::PlatformEventLog { area, used: 0 });
         }
     }
 

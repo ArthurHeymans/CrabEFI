@@ -49,6 +49,62 @@ use crate::platform::{Tpm2Device, TpmDigest, TpmError};
 /// but we still want to be safe with the global.
 static TCG2_STATE: Mutex<Option<Tcg2State>> = Mutex::new(None);
 
+/// A hardware TPM 2.0 that works but whose banks the inherited event log
+/// cannot replay (coreboot logs one bank; the TPM may have two). It never
+/// backs measured boot or the protocol, which stay log-only; it only takes
+/// the pre-OS separators, in every active bank, so PCRs never reach the
+/// next stage in their pre-boot state.
+struct CapOnlyTpm {
+    backend: Tpm2Backend,
+    banks: PcrBanks,
+}
+
+static CAP_ONLY_TPM: Mutex<Option<CapOnlyTpm>> = Mutex::new(None);
+
+/// Keep a TPM whose log could not be continued for the separators, if
+/// CrabEFI can hash every one of its active banks.
+fn keep_cap_only(backend: Tpm2Backend, active: &[u16]) {
+    // Every active bank, and at least one: never extend a bank the TPM
+    // did not report.
+    if active.is_empty() || unsupported_active_algorithm(active).is_some() {
+        log::error!("TPM banks {active:?} cannot take the pre-OS separators");
+        return;
+    }
+    let (count, algorithms) = supported_algorithm_array(active);
+    if let Ok(banks) = PcrBanks::from_algorithms(&algorithms[..count]) {
+        log::warn!("TPM kept for the pre-OS separators only: its banks differ from the log");
+        *CAP_ONLY_TPM.lock() = Some(CapOnlyTpm { backend, banks });
+    }
+}
+
+/// Bring up a TIS TPM for the separators only, with no event log: the
+/// platform's log cannot be continued.
+///
+/// # Safety
+/// `base` must be a TIS MMIO region nothing else drives.
+#[cfg(all(feature = "luks", target_arch = "x86_64"))]
+pub(crate) unsafe fn cap_only_tis(base: u64) {
+    match unsafe { TpmTis::probe(base) } {
+        Ok(tpm) => {
+            let active = heapless::Vec::<u16, 5>::from_slice(
+                &tpm.active_algorithms()[..tpm.active_algorithms().len().min(5)],
+            )
+            .unwrap_or_default();
+            keep_cap_only(Tpm2Backend::Tis(tpm), &active);
+        }
+        Err(err) => log::error!("TPM unavailable for the pre-OS separators: {:?}", err),
+    }
+}
+
+/// [`cap_only_tis`] for a platform or CRB TPM driver.
+#[cfg(all(feature = "luks", target_arch = "x86_64"))]
+pub(crate) fn cap_only_driver(tpm: &'static mut dyn Tpm2Device) {
+    let active = tpm.active_pcr_banks();
+    if !active.is_truncated() {
+        keep_cap_only(Tpm2Backend::Driver(tpm), active.algorithms());
+    }
+}
+
 enum Tpm2Backend {
     Tis(TpmTis),
     Driver(&'static mut dyn Tpm2Device),
@@ -223,16 +279,37 @@ pub unsafe fn init_state_with_hardware(
     // exactly matches the TPM's active banks. Otherwise no event log can replay
     // every active PCR consistently, so hardware-backed measured boot is rejected.
     let (alg_count, algorithms, existing_log) =
-        hardware_log_selection(existing_log, tpm.active_algorithms())?;
+        match hardware_log_selection(existing_log, tpm.active_algorithms()) {
+            Ok(selection) => selection,
+            Err(err) => {
+                let active = heapless::Vec::<u16, 5>::from_slice(
+                    &tpm.active_algorithms()[..tpm.active_algorithms().len().min(5)],
+                )
+                .unwrap_or_default();
+                keep_cap_only(Tpm2Backend::Tis(tpm), &active);
+                return Err(err);
+            }
+        };
     let algorithms = &algorithms[..alg_count];
 
-    let event_log = if let Some(existing) = existing_log {
-        CryptoAgileEventLog::from_existing(buffer, existing, algorithms)?
-    } else {
-        CryptoAgileEventLog::new(buffer, algorithms)?
+    let built = match existing_log {
+        Some(existing) => CryptoAgileEventLog::from_existing(buffer, existing, algorithms),
+        None => CryptoAgileEventLog::new(buffer, algorithms),
+    }
+    .and_then(|log| Ok((log, PcrBanks::from_algorithms(algorithms)?)));
+    let (event_log, pcr_banks) = match built {
+        Ok(built) => built,
+        Err(err) => {
+            // The log cannot go on (a full inherited log), but the TPM can
+            // still take the separators.
+            let active = heapless::Vec::<u16, 5>::from_slice(
+                &tpm.active_algorithms()[..tpm.active_algorithms().len().min(5)],
+            )
+            .unwrap_or_default();
+            keep_cap_only(Tpm2Backend::Tis(tpm), &active);
+            return Err(err);
+        }
     };
-
-    let pcr_banks = PcrBanks::from_algorithms(algorithms)?;
 
     let state = Tcg2State {
         pcr_banks,
@@ -275,16 +352,29 @@ pub fn init_state_with_platform_tpm(
     // Continue a previous firmware log only when its SpecID algorithm set
     // exactly matches the platform TPM's active banks.
     let (alg_count, algorithms, existing_log) =
-        hardware_log_selection(existing_log, active_banks.algorithms())?;
+        match hardware_log_selection(existing_log, active_banks.algorithms()) {
+            Ok(selection) => selection,
+            Err(err) => {
+                keep_cap_only(backend, active_banks.algorithms());
+                return Err(err);
+            }
+        };
     let algorithms = &algorithms[..alg_count];
 
-    let event_log = if let Some(existing) = existing_log {
-        CryptoAgileEventLog::from_existing(buffer, existing, algorithms)?
-    } else {
-        CryptoAgileEventLog::new(buffer, algorithms)?
+    let built = match existing_log {
+        Some(existing) => CryptoAgileEventLog::from_existing(buffer, existing, algorithms),
+        None => CryptoAgileEventLog::new(buffer, algorithms),
+    }
+    .and_then(|log| Ok((log, PcrBanks::from_algorithms(algorithms)?)));
+    let (event_log, pcr_banks) = match built {
+        Ok(built) => built,
+        Err(err) => {
+            // The log cannot go on (a full inherited log), but the TPM can
+            // still take the separators.
+            keep_cap_only(backend, active_banks.algorithms());
+            return Err(err);
+        }
     };
-
-    let pcr_banks = PcrBanks::from_algorithms(algorithms)?;
 
     let state = Tcg2State {
         pcr_banks,
@@ -432,7 +522,7 @@ fn unsupported_active_algorithm(algorithms: &[u16]) -> Option<u16> {
         .find(|alg| !is_supported_hash_algorithm(*alg))
 }
 
-fn parse_spec_id_algorithms(existing_log: &[u8]) -> Option<(usize, [u16; 5])> {
+pub(crate) fn parse_spec_id_algorithms(existing_log: &[u8]) -> Option<(usize, [u16; 5])> {
     let legacy_header_size = core::mem::size_of::<TcgPcrEventHdr>();
     if existing_log.len() < legacy_header_size {
         return None;
@@ -513,6 +603,88 @@ fn extend_and_maybe_log(
     }
 
     Ok(())
+}
+
+/// Whether TCG2 state drives a hardware TPM 2.0.
+pub fn has_hardware_tpm() -> bool {
+    TCG2_STATE
+        .lock()
+        .as_ref()
+        .is_some_and(|state| state.hardware_tpm.is_some())
+        || CAP_ONLY_TPM.lock().is_some()
+}
+
+/// Extend a PCR in hardware without logging the event, for an event the
+/// log cannot take. The log no longer replays that PCR afterwards.
+pub fn extend_unlogged(pcr_index: u32, data_to_hash: &[u8]) -> Option<Result<(), TcgError>> {
+    if let Some(cap) = CAP_ONLY_TPM.lock().as_mut() {
+        let (count, digests) = cap.banks.hash_data(data_to_hash);
+        return Some(cap.backend.pcr_extend(pcr_index, &digests[..count]));
+    }
+    let mut guard = TCG2_STATE.lock();
+    let state = guard.as_mut()?;
+    state.hardware_tpm.as_ref()?;
+    let (count, digests) = state.pcr_banks.hash_data(data_to_hash);
+    Some(extend_and_maybe_log(
+        state,
+        pcr_index,
+        0,
+        &digests[..count],
+        &[],
+        false,
+    ))
+}
+
+/// Extend a pre-OS separator. With `unlogged_fallback`, a separator the log
+/// has no room for, or a TPM kept only for separators, is extended without
+/// logging. That is decided before anything reaches the TPM: after a failed
+/// extend the PCR state is unknown, and it is never extended twice.
+///
+/// Returns `None` without a hardware TPM 2.0.
+pub fn measure_separator(
+    pcr_index: u32,
+    event_type: u32,
+    data: &[u8],
+    unlogged_fallback: bool,
+) -> Option<Result<(), TcgError>> {
+    if unlogged_fallback && let Some(cap) = CAP_ONLY_TPM.lock().as_mut() {
+        let (count, digests) = cap.banks.hash_data(data);
+        return Some(cap.backend.pcr_extend(pcr_index, &digests[..count]));
+    }
+    let mut guard = TCG2_STATE.lock();
+    let state = guard.as_mut()?;
+    state.hardware_tpm.as_ref()?;
+    let (count, digests) = state.pcr_banks.hash_data(data);
+    let digests = &digests[..count];
+    let log_event = match state.event_log.check_event(digests, data) {
+        Ok(()) => true,
+        Err(TcgError::LogFull | TcgError::EventTooLarge) if unlogged_fallback => {
+            log::warn!("Event log full: extending PCR {pcr_index}'s separator unlogged");
+            false
+        }
+        Err(err) => return Some(Err(err)),
+    };
+    Some(extend_and_maybe_log(
+        state, pcr_index, event_type, digests, data, log_event,
+    ))
+}
+
+/// Send a raw command to the hardware TPM 2.0 behind TCG2 state.
+///
+/// Returns `None` without a hardware TPM.
+#[cfg(all(feature = "luks", feature = "tpm", target_arch = "x86_64"))]
+pub(crate) fn submit_raw_command(
+    command: &[u8],
+    response: &mut [u8],
+) -> Option<Result<usize, TcgError>> {
+    // Firmware-private: a TPM kept for the separators also serves LUKS2
+    // token unsealing before them. EFI passthrough never sees it.
+    if let Some(cap) = CAP_ONLY_TPM.lock().as_mut() {
+        return Some(cap.backend.submit_command(command, response));
+    }
+    let mut guard = TCG2_STATE.lock();
+    let tpm = guard.as_mut()?.hardware_tpm.as_mut()?;
+    Some(tpm.submit_command(command, response))
 }
 
 /// Measure a non-PE event through TCG2 state.

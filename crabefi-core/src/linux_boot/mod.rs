@@ -99,6 +99,8 @@ pub enum LinuxBootError {
     InitrdTooLarge,
     /// Effective firmware memory map exceeds the Linux E820 table
     MemoryMapTooLarge,
+    /// The firmware could not end its trusted phase (see `preboot`)
+    Refused,
 }
 
 impl From<BzImageError> for LinuxBootError {
@@ -141,6 +143,16 @@ impl BootPages {
 
 impl Drop for BootPages {
     fn drop(&mut self) {
+        // An abandoned kernel or initrd may hold plaintext from an encrypted
+        // volume (an initrd key file): never leave it for the next entry.
+        // SAFETY: these pages were claimed for this loader and are unused.
+        unsafe {
+            core::ptr::write_bytes(
+                self.base as *mut u8,
+                0,
+                (self.count * allocator::PAGE_SIZE) as usize,
+            );
+        }
         let status = allocator::free_pages(self.base, self.count);
         if status != Status::SUCCESS {
             log::warn!(
@@ -179,7 +191,11 @@ impl LoadedLinux {
     /// callbacks and measurement reads variables through the runtime image,
     /// and no firmware borrow may be live across either.
     pub fn measure_start(&self, cmdline: &str) {
-        crate::efi::boot_services::measure_efi_application_start(true);
+        // Firmware code only runs until the caller ends the trusted phase
+        // before the jump, so ReadyToBoot callbacks are the firmware's own.
+        if crate::efi::boot_services::measure_efi_application_start(true) {
+            crate::efi::boot_services::signal_ready_to_boot();
+        }
         #[cfg(feature = "tpm")]
         {
             use crate::efi::tcg::{measured_boot::measure_event_all, types::EV_IPL};
@@ -211,12 +227,20 @@ impl LoadedLinux {
 
     /// Boot the loaded Linux kernel using direct boot protocol
     ///
-    /// This function does not return on success.
+    /// This function does not return on success. It returns
+    /// [`LinuxBootError::Refused`] when the firmware cannot end its trusted
+    /// phase (a TPM did not record the pre-OS separators); dropping `self`
+    /// then clears the loaded kernel and initrd.
     ///
     /// # Safety
     ///
     /// The kernel and boot parameters must be properly set up.
-    pub unsafe fn boot_direct(&mut self) -> ! {
+    pub unsafe fn boot_direct(&mut self) -> Result<core::convert::Infallible, LinuxBootError> {
+        // The kernel must not start with firmware secrets or a TPM in its
+        // pre-boot state.
+        if !crate::preboot::end() {
+            return Err(LinuxBootError::Refused);
+        }
         log::info!(
             "Booting Linux via direct 64-bit entry at {:#x}",
             self.entry_point
@@ -288,15 +312,18 @@ impl LoadedLinux {
     /// # Safety
     ///
     /// The kernel, boot parameters, and EFI structures must be valid.
+    /// Returns an error instead of booting as [`Self::boot_direct`] does.
     pub unsafe fn boot_efi_handover(
         &mut self,
         image_handle: *mut core::ffi::c_void,
         system_table: *mut core::ffi::c_void,
-    ) -> ! {
-        let entry = match self.efi_handover_entry {
-            Some(e) => e,
-            None => panic!("Kernel does not support EFI handover"),
-        };
+    ) -> Result<core::convert::Infallible, LinuxBootError> {
+        let entry = self
+            .efi_handover_entry
+            .ok_or(LinuxBootError::NoEfiHandover)?;
+        if !crate::preboot::end() {
+            return Err(LinuxBootError::Refused);
+        }
 
         log::info!("Booting Linux via EFI handover at {:#x}", entry);
 

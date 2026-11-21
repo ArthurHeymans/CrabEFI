@@ -56,6 +56,9 @@ pub enum BootEntryKind {
         /// Payload format
         format: PayloadFormat,
     },
+    /// A locked encrypted volume: choosing it asks for its passphrase and
+    /// then lists the boot entries inside.
+    Unlock,
 }
 
 /// Category for menu grouping
@@ -70,6 +73,8 @@ pub enum BootCategory {
     Grub,
     /// Coreboot payload entries
     Payload,
+    /// Locked encrypted volumes
+    Encrypted,
 }
 
 impl BootCategory {
@@ -80,6 +85,7 @@ impl BootCategory {
             BootCategory::Bls => "Boot Loader Spec",
             BootCategory::Grub => "GRUB Entries",
             BootCategory::Payload => "Coreboot Payloads",
+            BootCategory::Encrypted => "Encrypted Volumes",
         }
     }
 }
@@ -97,6 +103,10 @@ pub struct BootEntry {
     pub kind: BootEntryKind,
     /// Boot category (for menu grouping)
     pub category: BootCategory,
+    /// The command line must boot as configured: the entry comes from a
+    /// volume unlocked without a person (a TPM), and an edit such as
+    /// `init=/bin/sh` would hand that unlock to whoever is at the keyboard.
+    pub cmdline_locked: bool,
 }
 
 impl BootEntry {
@@ -137,9 +147,14 @@ impl BootEntry {
         matches!(self.kind, BootEntryKind::Payload { .. })
     }
 
+    /// Check if this entry unlocks an encrypted volume
+    pub fn is_unlock(&self) -> bool {
+        matches!(self.kind, BootEntryKind::Unlock)
+    }
+
     /// Check if this entry has an editable command line
     pub fn has_cmdline(&self) -> bool {
-        self.is_linux_boot()
+        self.is_linux_boot() && !self.cmdline_locked
     }
 
     /// Get a reference to the command line, if any
@@ -332,6 +347,7 @@ impl<E: MenuEntry> BootMenu<E> {
     {
         let mut entry = self.entries.get(index)?.clone();
         if let Some(edited) = self.edited_cmdline(index)
+            && entry.has_cmdline()
             && let Some(cmdline) = entry.get_cmdline_mut()
         {
             cmdline.clear();
