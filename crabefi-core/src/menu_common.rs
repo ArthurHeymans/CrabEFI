@@ -134,8 +134,12 @@ impl SerialKeyParser {
     }
 
     fn clear_utf8(&mut self) {
-        // The parser lives in a static, so this store is not elided.
-        self.utf8 = [0; 4];
+        // Volatile, so the wipe of passphrase bytes is never optimized out.
+        for byte in &mut self.utf8 {
+            // SAFETY: a valid, aligned, exclusive reference to a byte.
+            unsafe { core::ptr::write_volatile(byte, 0) };
+        }
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
         self.utf8_len = 0;
         self.utf8_need = 0;
     }
