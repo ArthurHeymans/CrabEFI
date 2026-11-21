@@ -24,8 +24,9 @@ const SERVICES: [&str; 14] = [
 struct Node {
     frame: Option<u64>,
     targets: BTreeSet<u64>,
-    /// Direct calls immediately preceded by an SP write (`mov rsp, ...`).
-    sp_switched_calls: BTreeSet<u64>,
+    /// Targets reached by at least one transfer that was NOT an unbypassed
+    /// direct call immediately preceded by a non-noop `mov rsp, <reg>` write.
+    unswitched_targets: BTreeSet<u64>,
     unknown: BTreeSet<String>,
     /// Calls into another image whose stack use this image cannot bound.
     external: BTreeSet<String>,
@@ -73,7 +74,7 @@ fn path(name: &str) -> String {
 /// into boot firmware. Seal zeroes its address, so the call is unreachable
 /// once the OS owns the machine. It must remain a distinct symbol; inlined
 /// into a caller, its call fails the audit as an ordinary indirect call.
-const BOOT_BRIDGE: &str = "crabefi_runtime_image::services::call_boot_bridge";
+const BOOT_BRIDGE: &str = "crabefi_runtime_image::services::variables::bridge::call_boot_bridge";
 
 fn decoder(arch: Arch) -> Result<Capstone> {
     let cs = match arch {
@@ -127,6 +128,7 @@ fn decode(cs: &Capstone, arch: Arch, start: u64, bytes: &[u8], frame: Option<u64
     let mut previous = None;
     let mut prev_set_rsp = false;
     let mut pairs = Vec::new();
+    let mut switched_calls = Vec::new();
     let mut destinations = BTreeSet::new();
     for insn in instructions.iter() {
         let pc = insn.address();
@@ -141,8 +143,11 @@ fn decode(cs: &Capstone, arch: Arch, start: u64, bytes: &[u8], frame: Option<u64
         let has = |group: u32| d.groups().iter().any(|g| u32::from(g.0) == group);
         let op = insn.mnemonic().unwrap_or("");
         let args = insn.op_str().unwrap_or("");
-        prev_set_rsp = arch == Arch::X86_64 && op == "mov" && args.starts_with("rsp,");
-        let ret = matches!((op, args), ("ret", "") | ("c.jr", "ra"));
+        prev_set_rsp =
+            arch == Arch::X86_64 && op == "mov" && args.starts_with("rsp,") && args != "rsp, rsp";
+        // Resolve matching RISC-V AUIPC+JALR pairs before the return shortcut:
+        // Capstone prints `jalr zero, 0(ra)` as `ret` even when paired with `auipc ra, ...`.
+        let ret = pair.is_none() && matches!((op, args), ("ret", "") | ("c.jr", "ra"));
         // Disassemblers may spell a non-linking RV tail transfer as JALR.
         // The encoded destination, not the mnemonic or CALL group, determines
         // whether it pushes another logical activation.
@@ -216,10 +221,17 @@ fn decode(cs: &Capstone, arch: Arch, start: u64, bytes: &[u8], frame: Option<u64
                 if call || !starts.contains(&addr) {
                     node.targets.insert(addr);
                     if call && was_set_rsp {
-                        node.sp_switched_calls.insert(addr);
+                        switched_calls.push((pc, addr));
+                    } else {
+                        node.unswitched_targets.insert(addr);
                     }
                 }
             }
+        }
+    }
+    for (pc, target) in switched_calls {
+        if destinations.contains(&pc) {
+            node.unswitched_targets.insert(target);
         }
     }
     for (pc, target) in pairs {
@@ -227,12 +239,14 @@ fn decode(cs: &Capstone, arch: Arch, start: u64, bytes: &[u8], frame: Option<u64
             node.unknown.insert(format!("indirect transfer at {pc:#x}"));
         } else {
             node.targets.insert(target);
+            node.unswitched_targets.insert(target);
         }
     }
     if next != end || bytes.is_empty() {
         node.unknown.insert(format!("undecoded bytes at {next:#x}"));
     } else if falls_through && !last_is_call {
         node.targets.insert(end);
+        node.unswitched_targets.insert(end);
     }
     // LLVM's static frame excludes the return address pushed by x86 CALL.
     // Charge it even for tail transfers (safe overestimate).
@@ -397,7 +411,7 @@ pub(super) fn audit(
         let entry: &mut Node = nodes.entry(addr).or_default();
         entry.frame = n.frame;
         entry.targets.extend(n.targets);
-        entry.sp_switched_calls.extend(n.sp_switched_calls);
+        entry.unswitched_targets.extend(n.unswitched_targets);
         entry.unknown.extend(n.unknown);
         entry.external.extend(n.external);
     }
@@ -410,9 +424,9 @@ pub(super) fn audit(
             arch.dir_name(),
         );
     }
-    // A call into a trampoline continues on the private stack only when the
-    // preceding instruction actually switched SP: charge it there, not to the
-    // caller's stack.
+    // A call into a trampoline continues on the private stack only when every
+    // transfer to it is an unbypassed direct call immediately preceded by a
+    // non-noop SP write: charge it to the private stack, not the caller's.
     for node in nodes.values_mut() {
         let switches: BTreeSet<u64> = node
             .targets
@@ -421,8 +435,8 @@ pub(super) fn audit(
             .collect();
         for &target in &switches {
             anyhow::ensure!(
-                node.sp_switched_calls.contains(&target),
-                "call to private stack trampoline at {target:#x} was not immediately preceded by an SP write"
+                !node.unswitched_targets.contains(&target),
+                "transfer to private stack trampoline at {target:#x} was not an unbypassed call immediately preceded by an SP write"
             );
         }
         node.targets.retain(|target| !switches.contains(target));
@@ -525,17 +539,6 @@ pub(super) fn audit(
             "excluded_external_calls": excluded,
         }));
     }
-    let complete = SERVICES.len() - incomplete.len();
-    match private_budget {
-        Some(budget) => println!(
-            "EFI stack audit: {complete}/{} entries bounded within {caller_budget} caller and {budget} private bytes ({PRIVATE_STACK_HEADROOM} IRQ headroom; see stack-chains.json)",
-            SERVICES.len()
-        ),
-        None => println!(
-            "EFI stack audit: {complete}/{} entries bounded within {caller_budget} caller bytes (no private stack; see stack-chains.json)",
-            SERVICES.len()
-        ),
-    }
     write_json(
         output.join("stack-chains.json"),
         &json!({
@@ -552,6 +555,17 @@ pub(super) fn audit(
         incomplete.is_empty(),
         "new unbounded EFI stack chains: {incomplete:?}"
     );
+    let complete = SERVICES.len() - incomplete.len();
+    match private_budget {
+        Some(budget) => println!(
+            "EFI stack audit: {complete}/{} entries bounded within {caller_budget} caller and {budget} private bytes ({PRIVATE_STACK_HEADROOM} IRQ headroom; see stack-chains.json)",
+            SERVICES.len()
+        ),
+        None => println!(
+            "EFI stack audit: {complete}/{} entries bounded within {caller_budget} caller bytes (no private stack; see stack-chains.json)",
+            SERVICES.len()
+        ),
+    }
     Ok(())
 }
 

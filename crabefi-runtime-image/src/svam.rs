@@ -640,8 +640,10 @@ fn sign_extended(address: u64, top: u32) -> bool {
 
 /// Whether five-level paging (CR4.LA57) is active.
 ///
-/// Bare-metal runtime services run at CPL0 and read CR4. Host tests and Miri
-/// run in user mode and default to 4-level paging; both widths are tested
+/// Bare-metal runtime services run at CPL0 and read CR4. The separately linked
+/// runtime image is also executed in Linux user mode by the lifecycle host test
+/// (CPL3), where reading CR4 faults; at CPL3 (and in host tests/Miri) default
+/// deterministically to 4-level paging, while unit tests exercise both widths
 /// directly through [`x86_canonical_virtual`].
 #[cfg(target_arch = "x86_64")]
 fn x86_la57_active() -> bool {
@@ -651,8 +653,16 @@ fn x86_la57_active() -> bool {
     }
     #[cfg(all(target_os = "none", not(kani)))]
     {
+        let cs: u16;
+        // SAFETY: reading CS is allowed at every privilege level.
+        unsafe {
+            core::arch::asm!("mov {0:x}, cs", out(reg) cs, options(nomem, nostack, preserves_flags))
+        };
+        if cs & 3 != 0 {
+            return false;
+        }
         let cr4: u64;
-        // SAFETY: at CPL0 in bare-metal firmware, reading CR4 has no side effects.
+        // SAFETY: at CPL0, reading CR4 has no side effects.
         unsafe {
             core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags))
         };
