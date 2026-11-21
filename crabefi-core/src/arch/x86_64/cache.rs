@@ -53,7 +53,12 @@ pub fn clean_invalidate_cache_range(_addr: u64, _size: usize) {
 /// order this core's stores ahead of the first fetch from the new code.
 #[inline]
 pub fn sync_instruction_cache(_addr: u64, _size: usize) {
+    // Miri cannot run assembly; a sequentially consistent fence orders the
+    // same stores for the interpreter.
+    #[cfg(miri)]
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
     // SAFETY: mfence/lfence take no operands and cannot fault at CPL0.
+    #[cfg(not(miri))]
     unsafe {
         core::arch::asm!("mfence", "lfence", options(nostack, preserves_flags));
     }

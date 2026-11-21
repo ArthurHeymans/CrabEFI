@@ -4,7 +4,7 @@
 //! subrange out to complete cache lines cannot touch unrelated allocations.
 
 use crate::arch::{DmaCacheOperation, DmaSyncError};
-use crate::efi::dma_range::cache_line_range;
+use crabefi_bounds::dma::cache_line_range;
 
 /// Discover the minimum data-cache line size from `CTR_EL0.DminLine`.
 #[inline]

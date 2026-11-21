@@ -57,12 +57,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "crabefi-bounds"
+version = "0.1.0"
+
+[[package]]
 name = "crabefi-core"
 version = "0.1.0"
 dependencies = [
  "atomic_refcell",
  "bitflags",
+ "crabefi-bounds",
  "crabefi-efi-types",
+ "crabefi-pkcs7",
  "crabefi-runtime-abi",
  "crabefi-runtime-bundle",
  "crabefi-ui",
@@ -70,6 +76,7 @@ dependencies = [
  "embedded-hal",
  "fdt",
  "heapless",
+ "hidreport",
  "linked_list_allocator",
  "log",
  "mem-barrier",
@@ -96,6 +103,13 @@ version = "0.0.0"
 dependencies = [
  "crabefi-core",
  "linked_list_allocator",
+]
+
+[[package]]
+name = "crabefi-pkcs7"
+version = "0.1.0"
+dependencies = [
+ "sha2",
 ]
 
 [[package]]
@@ -168,6 +182,14 @@ checksum = "25ba4bd83f9415b58b4ed8dc5714c76e626a105be4646c02630ad730ad3b5aa4"
 dependencies = [
  "hash32",
  "stable_deref_trait",
+]
+
+[[package]]
+name = "hidreport"
+version = "0.6.0"
+source = "git+https://github.com/ArthurHeymans/hidreport?rev=d25ffa58a92201c5387d564c933180cdd48f4398#d25ffa58a92201c5387d564c933180cdd48f4398"
+dependencies = [
+ "thiserror",
 ]
 
 [[package]]
@@ -326,6 +348,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "syn"
+version = "3.0.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ae9ccbea3a7b0b09443036490c8f34a8b1b760fd345e5c0dae0aac718faea79"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
+]
+
+[[package]]
+name = "thiserror"
+version = "2.0.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09e52cb86a36cede5cb101bf8908837b3e4c6e5e59fe7fd85c23fb56200d189e"
+dependencies = [
+ "thiserror-impl",
+]
+
+[[package]]
+name = "thiserror-impl"
+version = "2.0.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe5197923287db20a58125f0bc85c062f7f2c892de97b18c356f9efb14b28524"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.10",
+]
+
+[[package]]
 name = "tock-registers"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -379,5 +432,5 @@ checksum = "0fe976fb70c78cd64cccfe3a6fc142244e8a77b70959b30faf9d0ac37ee228eb"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.119",
 ]

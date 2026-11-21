@@ -4,7 +4,6 @@
 //! Services, in a single cell owned by this module.
 
 use alloc::vec::Vec;
-use core::cell::Ref;
 
 use r_efi::efi::{self, Guid, Handle};
 
@@ -18,7 +17,7 @@ static TABLES: Local<Tables> = Local::new(Tables::new());
 /// Borrow the tables.
 #[inline]
 #[track_caller]
-pub fn tables() -> Ref<'static, Tables> {
+pub fn tables() -> crate::cell::Borrowed<'static, Tables> {
     TABLES.borrow()
 }
 

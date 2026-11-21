@@ -10,7 +10,7 @@ use r_efi::efi::Status;
 
 use crate::arch::{DmaCacheOperation, DmaSyncError};
 use crate::efi::allocator::{self, AllocateType, MemoryType, PAGE_SIZE, PAGE_SIZE_USIZE};
-use crate::efi::dma_range::{
+use crabefi_bounds::dma::{
     allocation_fits_mask, checked_subrange, pages_for_len, translate_dma_range,
 };
 

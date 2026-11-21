@@ -2,7 +2,9 @@
 //! This pool performs no device I/O. Deleted records remain tombstoned until
 //! their last handle closes, even when FAT reuses the on-disk directory slot.
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::cell::UnsafeCell;
 use core::ops::{Index, IndexMut};
 use r_efi::efi::Status;
 use r_efi::protocols::file as efi_file;
@@ -48,8 +50,28 @@ struct FileHandle {
     cluster_hint: FileClusterHint,
     /// Zero means a reserved slot whose protocol has not been published.
     open_mode: u64,
-    protocol: efi_file::Protocol,
 }
+
+/// The published interface of every slot. It never changes, and it lives
+/// apart from the mutable bookkeeping above, so updating a handle never
+/// reborrows the memory a caller's protocol pointer refers to.
+const FILE_PROTOCOL: efi_file::Protocol = efi_file::Protocol {
+    revision: efi_file::REVISION,
+    open: file_open,
+    close: file_close,
+    delete: file_delete,
+    read: file_read,
+    write: file_write,
+    get_position: file_get_position,
+    set_position: file_set_position,
+    get_info: file_get_info,
+    set_info: file_set_info,
+    flush: file_flush,
+    open_ex: file_open_ex,
+    read_ex: file_read_ex,
+    write_ex: file_write_ex,
+    flush_ex: file_flush_ex,
+};
 
 impl FileHandle {
     const fn empty() -> Self {
@@ -61,23 +83,6 @@ impl FileHandle {
             position: 0,
             cluster_hint: FileClusterHint::new(0),
             open_mode: 0,
-            protocol: efi_file::Protocol {
-                revision: efi_file::REVISION,
-                open: file_open,
-                close: file_close,
-                delete: file_delete,
-                read: file_read,
-                write: file_write,
-                get_position: file_get_position,
-                set_position: file_set_position,
-                get_info: file_get_info,
-                set_info: file_set_info,
-                flush: file_flush,
-                open_ex: file_open_ex,
-                read_ex: file_read_ex,
-                write_ex: file_write_ex,
-                flush_ex: file_flush_ex,
-            },
         }
     }
 }
@@ -103,22 +108,35 @@ const SLOTS_PER_SLAB: usize = 16;
 // during reallocation are not counted.
 const POOL_BUDGET: usize = 1024 * 1024;
 const SLOT_COST: usize = core::mem::size_of::<FileHandle>()
+    + core::mem::size_of::<UnsafeCell<efi_file::Protocol>>()
     + core::mem::size_of::<OpenFile>()
-    + core::mem::size_of::<Vec<FileHandle>>().div_ceil(SLOTS_PER_SLAB);
+    + (core::mem::size_of::<Vec<FileHandle>>()
+        + core::mem::size_of::<Box<[UnsafeCell<efi_file::Protocol>]>>())
+    .div_ceil(SLOTS_PER_SLAB);
 
 /// Inner buffers never resize or move after insertion. Growing the outer Vec
 /// moves only Vec headers, never published EFI protocol objects. Closing/reset
 /// reuses slots; it does not deallocate their published addresses.
 struct StableHandles {
     slabs: Vec<Vec<FileHandle>>,
+    /// Callers write through published pointers as well as read them (uefi-rs
+    /// forms `&mut` from a file handle), so each object sits in an
+    /// `UnsafeCell` and its pointer carries write provenance.
+    protocols: Vec<Box<[UnsafeCell<efi_file::Protocol>]>>,
     len: usize,
 }
 impl StableHandles {
     const fn new() -> Self {
         Self {
             slabs: Vec::new(),
+            protocols: Vec::new(),
             len: 0,
         }
+    }
+    /// The published protocol of slot `index`. Firmware only compares its
+    /// address and never reads or writes through it.
+    fn protocol(&self, index: usize) -> *mut efi_file::Protocol {
+        self.protocols[index / SLOTS_PER_SLAB][index % SLOTS_PER_SLAB].get()
     }
     fn len(&self) -> usize {
         self.len
@@ -157,8 +175,11 @@ impl FilePool {
     pub(super) fn index(&self, protocol: *mut efi_file::Protocol) -> Option<HandleId> {
         self.handles
             .iter()
-            .position(|handle| {
-                handle.in_use && handle.open_mode != 0 && core::ptr::eq(&handle.protocol, protocol)
+            .enumerate()
+            .position(|(index, handle)| {
+                handle.in_use
+                    && handle.open_mode != 0
+                    && core::ptr::eq(self.handles.protocol(index), protocol)
             })
             .map(HandleId)
     }
@@ -179,8 +200,19 @@ impl FilePool {
         slab.try_reserve_exact(SLOTS_PER_SLAB)
             .map_err(|_| Status::OUT_OF_RESOURCES)?;
         slab.resize_with(SLOTS_PER_SLAB, FileHandle::empty);
+        let mut protocols = Vec::new();
+        protocols
+            .try_reserve_exact(SLOTS_PER_SLAB)
+            .map_err(|_| Status::OUT_OF_RESOURCES)?;
+        protocols.resize_with(SLOTS_PER_SLAB, || UnsafeCell::new(FILE_PROTOCOL));
+        // Exact capacity: converting to a boxed slice does not reallocate.
+        let protocols = protocols.into_boxed_slice();
         self.handles
             .slabs
+            .try_reserve_exact(1)
+            .map_err(|_| Status::OUT_OF_RESOURCES)?;
+        self.handles
+            .protocols
             .try_reserve_exact(1)
             .map_err(|_| Status::OUT_OF_RESOURCES)?;
         self.nodes
@@ -190,6 +222,7 @@ impl FilePool {
         // slab, consume a reservation or retag a live record/address.
         self.nodes.resize(count, OpenFile::empty());
         self.handles.slabs.push(slab);
+        self.handles.protocols.push(protocols);
         self.handles.len = count;
         Ok(())
     }
@@ -309,7 +342,7 @@ impl FilePool {
         handle.cluster_hint =
             FileClusterHint::new(self.nodes[node].file.unwrap().entry().first_cluster());
         handle.open_mode = mode & !FILE_MODE_CREATE;
-        Ok(&raw mut handle.protocol)
+        Ok(self.handles.protocol(index.0))
     }
 
     pub(super) fn update_file(&mut self, index: HandleId, file: FatFile) {

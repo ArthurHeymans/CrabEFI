@@ -125,11 +125,16 @@ mod tests {
             ctx: (i + 100) as u32,
             next: core::ptr::null_mut(),
         });
-        for instance in &mut instances {
-            registry.register(instance);
+        // The registry keeps raw pointers, so derive every access from one
+        // base pointer instead of fresh `&mut` borrows that invalidate them.
+        let count = instances.len();
+        let base = instances.as_mut_ptr();
+        for i in 0..count {
+            registry.register(unsafe { base.add(i) });
         }
-        for (i, instance) in instances.iter_mut().enumerate() {
-            assert_eq!(registry.get(&mut instance.protocol), Some((i + 100) as u32));
+        for i in 0..count {
+            let protocol = unsafe { &raw mut (*base.add(i)).protocol };
+            assert_eq!(registry.get(protocol), Some((i + 100) as u32));
         }
         let mut foreign = 0;
         assert_eq!(registry.get(&mut foreign), None);
