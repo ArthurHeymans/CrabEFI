@@ -442,3 +442,32 @@ fn handle_database_grows_past_old_fixed_limits() {
     assert!(tables().handles.is_empty());
     with_tables_mut(|state| *state = Tables::new());
 }
+
+#[test]
+#[cfg(debug_assertions)]
+fn foreign_calls_reject_a_live_firmware_borrow() {
+    let _state = crate::efi::boot_services::IMAGE_EXECUTION_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Unwind inside the lock so the shared test lock is not poisoned.
+    let panic = std::panic::catch_unwind(|| {
+        let _tables = tables();
+        with_image_callback(|| ());
+    })
+    .unwrap_err();
+    let message = panic
+        .downcast_ref::<std::string::String>()
+        .map(|message| message.as_str())
+        .unwrap_or_default();
+    assert!(message.contains("live across a foreign call"), "{message}");
+}
+
+#[test]
+fn foreign_calls_accept_released_borrows() {
+    let _state = crate::efi::boot_services::IMAGE_EXECUTION_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    drop(tables());
+    with_tables_mut(|_| ());
+    assert_eq!(with_image_callback(|| 7), 7);
+}

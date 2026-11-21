@@ -6,14 +6,121 @@
 //! source location instead of silently aliasing.
 //!
 //! Never hold a borrow across a call into foreign code: a loaded image entry
-//! point, an event notify function, or a platform trait object. Copy what is
-//! needed out of the cell, drop the borrow, then call.
+//! point, an event notify function, or a protocol another image installed.
+//! Foreign code may call any Boot Service, which may borrow the same cell.
+//! Copy what is needed out of the cell, drop the borrow, then call. In debug
+//! builds, including host tests, every `Local` borrow is counted, and
+//! `boot_services::with_image_callback` and `StartImage` check
+//! [`assert_no_live_borrows`] before entering foreign code. A violation then
+//! fails the first test that reaches the call instead of only the rare
+//! reentrant path that would hit the conflicting borrow.
+//!
+//! The check covers `Local` borrows at those boundaries only: a wrapper that
+//! makes several foreign calls checks once, on entry, so code that takes
+//! borrows between the calls, like the `LoadImage` file reader, must check
+//! before each call.
 //!
 //! [`StaticMut`] covers the remaining case: firmware-lifetime singletons
 //! (EFI protocol tables, the Boot Services table) that are shared with EFI
 //! callers as `*mut` and therefore cannot go through borrow-checked `Local`.
 
 use core::cell::{Cell, Ref, RefCell, RefMut, UnsafeCell};
+use core::ops::{Deref, DerefMut};
+
+// Firmware runs on one hart. Unit tests run on many threads, so each test
+// thread counts only its own borrows. Integration tests link the library as
+// firmware does and share one counter; they must not overlap borrows of
+// unrelated cells with a foreign call on another thread.
+#[cfg(all(debug_assertions, not(test)))]
+static LIVE_BORROWS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+#[cfg(all(debug_assertions, test))]
+std::thread_local! {
+    static LIVE_BORROWS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(debug_assertions)]
+fn live_borrows(change: isize) -> usize {
+    #[cfg(not(test))]
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        let old = LIVE_BORROWS.fetch_add(change as usize, Relaxed);
+        old.wrapping_add(change as usize)
+    }
+    #[cfg(test)]
+    LIVE_BORROWS.with(|live| {
+        live.set(live.get().wrapping_add(change as usize));
+        live.get()
+    })
+}
+
+/// Counts one live `Local` borrow in debug builds.
+struct Live;
+
+impl Live {
+    #[inline]
+    fn new() -> Self {
+        #[cfg(debug_assertions)]
+        live_borrows(1);
+        Self
+    }
+}
+
+impl Drop for Live {
+    #[inline]
+    fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        live_borrows(-1);
+    }
+}
+
+/// Panic in debug builds if a [`Local`] borrow is live.
+#[inline]
+#[track_caller]
+pub fn assert_no_live_borrows() {
+    #[cfg(debug_assertions)]
+    {
+        let live = live_borrows(0);
+        assert!(
+            live == 0,
+            "{live} firmware cell borrow(s) live across a foreign call"
+        );
+    }
+}
+
+/// A shared borrow of a [`Local`].
+pub struct Borrowed<'a, T> {
+    value: Ref<'a, T>,
+    _live: Live,
+}
+
+impl<T> Deref for Borrowed<'_, T> {
+    type Target = T;
+    #[inline]
+    fn deref(&self) -> &T {
+        &self.value
+    }
+}
+
+/// An exclusive borrow of a [`Local`].
+pub struct BorrowedMut<'a, T> {
+    value: RefMut<'a, T>,
+    _live: Live,
+}
+
+impl<T> Deref for BorrowedMut<'_, T> {
+    type Target = T;
+    #[inline]
+    fn deref(&self) -> &T {
+        &self.value
+    }
+}
+
+impl<T> DerefMut for BorrowedMut<'_, T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.value
+    }
+}
 
 /// Interior-mutable cell for single-hart firmware.
 ///
@@ -34,21 +141,30 @@ impl<T> Local<T> {
     /// Borrow the value immutably. Panics if it is mutably borrowed.
     #[inline]
     #[track_caller]
-    pub fn borrow(&self) -> Ref<'_, T> {
-        self.0.borrow()
+    pub fn borrow(&self) -> Borrowed<'_, T> {
+        Borrowed {
+            value: self.0.borrow(),
+            _live: Live::new(),
+        }
     }
 
     /// Borrow the value mutably. Panics if it is already borrowed.
     #[inline]
     #[track_caller]
-    pub fn borrow_mut(&self) -> RefMut<'_, T> {
-        self.0.borrow_mut()
+    pub fn borrow_mut(&self) -> BorrowedMut<'_, T> {
+        BorrowedMut {
+            value: self.0.borrow_mut(),
+            _live: Live::new(),
+        }
     }
 
     /// Borrow the value mutably, or `None` if it is already borrowed.
     #[inline]
-    pub fn try_borrow_mut(&self) -> Option<RefMut<'_, T>> {
-        self.0.try_borrow_mut().ok()
+    pub fn try_borrow_mut(&self) -> Option<BorrowedMut<'_, T>> {
+        Some(BorrowedMut {
+            value: self.0.try_borrow_mut().ok()?,
+            _live: Live::new(),
+        })
     }
 
     /// Run `f` on a mutable borrow that ends when `f` returns.

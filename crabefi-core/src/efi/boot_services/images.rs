@@ -561,6 +561,8 @@ pub(super) extern "efiapi" fn start_image(
     // Get the system table
     let system_table = super::super::get_system_table();
 
+    // The image may call any Boot Service, which may borrow any cell.
+    crate::cell::assert_no_live_borrows();
     let mut context = execution::Context::new(image_handle);
     execution::CURRENT.set(core::ptr::addr_of_mut!(context));
     // SAFETY: entry_point is the validated PE entry; context stays at a stable
