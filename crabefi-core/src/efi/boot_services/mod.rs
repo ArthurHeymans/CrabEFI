@@ -56,6 +56,7 @@ pub(crate) fn image_callback_depth() -> usize {
 /// # Returns
 /// The callback's return value. A nested StartImage establishes its own boundary
 /// at this depth and can still Exit normally.
+#[track_caller]
 pub(crate) fn with_image_callback<R>(callback: impl FnOnce() -> R) -> R {
     struct RestoreDepth(usize);
     impl Drop for RestoreDepth {
@@ -63,6 +64,8 @@ pub(crate) fn with_image_callback<R>(callback: impl FnOnce() -> R) -> R {
             IMAGE_CALLBACK_DEPTH.set(self.0);
         }
     }
+    // Foreign code may call any Boot Service, which may borrow any cell.
+    crate::cell::assert_no_live_borrows();
     let previous = image_callback_depth();
     let _restore = RestoreDepth(previous);
     IMAGE_CALLBACK_DEPTH.set(

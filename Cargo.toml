@@ -3,6 +3,7 @@
 
 [workspace]
 members = [
+  "crabefi-bounds",
   "crabefi-core",
   "crabefi-coreboot",
   "crabefi-efi-types",

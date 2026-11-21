@@ -302,6 +302,12 @@ fn discover_entries_on_disk<const NATIVE: bool>(
     partitions: &[gpt::Partition],
     menu: &mut BootMenu,
 ) {
+    // Read the policy before borrowing the disk: the variable read calls into
+    // the runtime image, and no firmware borrow may be live across it.
+    let direct_linux = NATIVE || !crate::efi::auth::is_secure_boot_enabled();
+    if !direct_linux {
+        log::debug!("Secure Boot active: skipping direct Linux boot entry discovery");
+    }
     for partition in partitions {
         let partition_num = partition.number;
 
@@ -321,14 +327,16 @@ fn discover_entries_on_disk<const NATIVE: bool>(
                         return;
                     }
                 }
-                scan_partition_for_entries::<NATIVE>(
-                    fs,
-                    FilesystemKind::Fat,
-                    device,
-                    partition_num,
-                    partition,
-                    menu,
-                );
+                if direct_linux {
+                    scan_partition_for_entries::<NATIVE>(
+                        fs,
+                        FilesystemKind::Fat,
+                        device,
+                        partition_num,
+                        partition,
+                        menu,
+                    );
+                }
             });
         }
     }
@@ -464,6 +472,8 @@ fn check_bootloader_exists(disk: &mut dyn BlockDevice, partition_start: u64) -> 
 }
 
 /// Scan a mounted volume for same-volume BLS and GRUB direct Linux entries.
+/// Direct Linux boot skips signature checks: callers skip this under Secure
+/// Boot.
 fn scan_partition_for_entries<const NATIVE: bool>(
     fs: &mut dyn BootFilesystem,
     filesystem: FilesystemKind,
@@ -472,11 +482,6 @@ fn scan_partition_for_entries<const NATIVE: bool>(
     partition: &gpt::Partition,
     menu: &mut BootMenu,
 ) {
-    if !NATIVE && crate::efi::auth::is_secure_boot_enabled() {
-        log::debug!("Secure Boot active: skipping direct Linux boot entry discovery");
-        return;
-    }
-
     scan_bls_from(fs, filesystem, device, partition, "", menu);
 
     // 2. Scan for GRUB config entries - only if Secure Boot is off

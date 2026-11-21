@@ -156,20 +156,59 @@ pub struct LoadedLinux {
     /// Boot parameters (zero page)
     pub boot_params: BootParams,
     /// Address where kernel is loaded
-    pub kernel_addr: u64,
+    kernel_addr: u64,
     /// Kernel entry point (64-bit)
     pub entry_point: u64,
     /// EFI handover entry point (if available)
     pub efi_handover_entry: Option<u64>,
     /// Initrd address (if loaded)
-    pub initrd_addr: Option<u64>,
+    initrd_addr: Option<u64>,
     /// Initrd size
-    pub initrd_size: u32,
+    initrd_size: u32,
+    /// Bytes of protected-mode kernel loaded at `kernel_addr`. Private like
+    /// the address fields: [`Self::measure_start`] reads memory through them.
+    kernel_size: usize,
     // Retain the reservations across the filesystem borrow and DMA shutdown.
     _boot_pages: [Option<BootPages>; 4],
 }
 
 impl LoadedLinux {
+    /// Signal ReadyToBoot and measure the kernel, initrd and command line.
+    ///
+    /// Call this after the filesystem borrow ends: ReadyToBoot runs image
+    /// callbacks and measurement reads variables through the runtime image,
+    /// and no firmware borrow may be live across either.
+    pub fn measure_start(&self, cmdline: &str) {
+        crate::efi::boot_services::measure_efi_application_start(true);
+        #[cfg(feature = "tpm")]
+        {
+            use crate::efi::tcg::{measured_boot::measure_event_all, types::EV_IPL};
+
+            // SAFETY: the loader filled these ranges, and the boot pages it
+            // retains keep them reserved until handoff.
+            let kernel = unsafe {
+                core::slice::from_raw_parts(self.kernel_addr as *const u8, self.kernel_size)
+            };
+            measure_event_all(4, EV_IPL, kernel, b"linux kernel", "linux kernel");
+            if let Some(addr) = self.initrd_addr {
+                // SAFETY: as above.
+                let initrd = unsafe {
+                    core::slice::from_raw_parts(addr as *const u8, self.initrd_size as usize)
+                };
+                measure_event_all(4, EV_IPL, initrd, b"linux initrd", "linux initrd");
+            }
+            measure_event_all(
+                4,
+                EV_IPL,
+                cmdline.as_bytes(),
+                b"linux command line",
+                "linux command line",
+            );
+        }
+        #[cfg(not(feature = "tpm"))]
+        let _ = cmdline;
+    }
+
     /// Boot the loaded Linux kernel using direct boot protocol
     ///
     /// This function does not return on success.
@@ -307,7 +346,8 @@ impl LoadedLinux {
 ///
 /// # Returns
 ///
-/// `LoadedLinux` ready to boot
+/// `LoadedLinux` ready to boot. Call [`LoadedLinux::measure_start`] after
+/// releasing the disk.
 // Boot inputs span disk, kernel, and platform concerns; callers pass them
 // straight through from handoff data, so a parameter struct adds no clarity.
 #[allow(clippy::too_many_arguments)]
@@ -548,29 +588,6 @@ pub(crate) fn load_linux_from_fs<const NATIVE: bool>(
         log::info!("Initrd loaded successfully");
     }
 
-    if !NATIVE {
-        crate::efi::boot_services::measure_efi_application_start(true);
-        #[cfg(feature = "tpm")]
-        {
-            use crate::efi::tcg::{measured_boot::measure_event_all, types::EV_IPL};
-
-            measure_event_all(4, EV_IPL, kernel_dest, b"linux kernel", "linux kernel");
-            if let Some(addr) = initrd_addr {
-                // SAFETY: The loader only sets these values after filling the RAM range.
-                let initrd =
-                    unsafe { core::slice::from_raw_parts(addr as *const u8, initrd_size as usize) };
-                measure_event_all(4, EV_IPL, initrd, b"linux initrd", "linux initrd");
-            }
-            measure_event_all(
-                4,
-                EV_IPL,
-                cmdline.as_bytes(),
-                b"linux command line",
-                "linux command line",
-            );
-        }
-    }
-
     log::info!("Linux kernel loaded successfully");
     log::info!("  Kernel address: {:#x}", DEFAULT_KERNEL_ADDR);
     log::info!("  Entry point: {:#x}", entry_point);
@@ -589,6 +606,7 @@ pub(crate) fn load_linux_from_fs<const NATIVE: bool>(
         efi_handover_entry,
         initrd_addr,
         initrd_size,
+        kernel_size: pm_kernel_size,
         _boot_pages: boot_pages,
     })
 }
