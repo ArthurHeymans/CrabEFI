@@ -18,7 +18,7 @@ use core::ptr::NonNull;
 use tock_registers::interfaces::{Readable, Writeable};
 use tock_registers::registers::{ReadOnly, ReadWrite, WriteOnly};
 
-use crate::drivers::mmio_bounds::{checked_access, checked_region};
+use crabefi_bounds::mmio::{checked_access, checked_region};
 
 /// Failure to construct or narrow an [`MmioRegion`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

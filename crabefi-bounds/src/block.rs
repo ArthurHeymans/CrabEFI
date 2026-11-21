@@ -9,8 +9,8 @@
 /// * `total_blocks` - Number of blocks exposed by the protocol instance.
 ///
 /// # Returns
-/// The absolute starting LBA, or `None` when either addition overflows or the
-/// requested range extends beyond the exposed device.
+/// The absolute starting LBA, or `None` when the absolute range does not fit
+/// in a `u64` or the requested range extends beyond the exposed device.
 pub fn checked_absolute_lba(
     start_lba: u64,
     lba: u64,
@@ -21,7 +21,13 @@ pub fn checked_absolute_lba(
     if end_lba > total_blocks {
         return None;
     }
-    start_lba.checked_add(lba)
+    let absolute = start_lba.checked_add(lba)?;
+    // The last requested block must be addressable, not only the first. The
+    // exclusive end may be 2^64: a range can end at the last LBA.
+    if num_blocks > 0 {
+        absolute.checked_add(num_blocks - 1)?;
+    }
+    Some(absolute)
 }
 
 #[cfg(test)]
@@ -41,6 +47,12 @@ mod tests {
     #[test]
     fn rejects_absolute_lba_overflow() {
         assert_eq!(checked_absolute_lba(u64::MAX - 4, 8, 1, 16), None);
+    }
+
+    #[test]
+    fn accepts_the_last_addressable_block() {
+        assert_eq!(checked_absolute_lba(u64::MAX, 0, 1, 1), Some(u64::MAX));
+        assert_eq!(checked_absolute_lba(u64::MAX, 0, 2, 2), None);
     }
 
     #[test]
