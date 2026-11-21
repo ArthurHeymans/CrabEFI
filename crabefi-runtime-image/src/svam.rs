@@ -673,11 +673,7 @@ fn x86_canonical_virtual(address: u64, la57: bool) -> bool {
 
 /// Whether every address from `first` to `last` is canonical: both ends are,
 /// and they lie in the same half, so the range cannot span the hole between.
-fn canonical_extent(
-    first: u64,
-    last: u64,
-    #[cfg(target_arch = "x86_64")] la57: bool,
-) -> bool {
+fn canonical_extent(first: u64, last: u64, #[cfg(target_arch = "x86_64")] la57: bool) -> bool {
     #[cfg(target_arch = "x86_64")]
     {
         x86_canonical_virtual(first, la57)
