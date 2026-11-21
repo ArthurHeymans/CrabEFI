@@ -63,8 +63,10 @@ cryptsetup config --key-slot <new slot> --priority prefer /dev/nvme0n1p2
 CrabEFI tries preferred keyslots first; without `prefer` the original,
 slower keyslot may still run first on every boot.
 
-The keyboard is read as a US layout. Characters other than ASCII depend on
-the keyboard driver and are best avoided in a passphrase used at boot.
+A serial console sends UTF-8, which CrabEFI decodes. A keyboard is read as a
+US layout, so characters other than ASCII are best avoided in a passphrase
+typed on one. After the third failed attempt, CrabEFI shows why it failed
+before returning to the menu.
 
 ## Unlocking with the TPM
 

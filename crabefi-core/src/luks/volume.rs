@@ -67,7 +67,9 @@ impl Layout {
         // with larger encryption sectors: cryptsetup never sets
         // iv_large_sectors for LUKS. Every sector's IV must fit plain64.
         let tweak = header::parse_u64(&segment.iv_tweak)?;
-        if tweak.checked_add(len / 512).is_none() {
+        // The last sector's IV, not the one after it.
+        let last = len.saturating_sub(u64::from(sector_size)) / 512;
+        if tweak.checked_add(last).is_none() {
             return Err(LuksError::Unsupported("IV tweak"));
         }
         // Validate the cipher name and key sizes before any key is derived.
@@ -118,11 +120,14 @@ impl Volume {
         })
     }
 
-    /// Clear the key schedule in place, for [`super::emergency_wipe`]. The
-    /// volume must not be used or dropped afterwards.
-    pub(crate) fn wipe_in_place(&mut self) {
+    /// Clear the key schedule in place, for [`super::emergency_wipe`].
+    ///
+    /// # Safety
+    /// The volume must not be used or dropped afterwards: the caller must
+    /// forget it, or its cipher is dropped twice.
+    pub(crate) unsafe fn wipe_in_place(&mut self) {
         // SAFETY: drops the cipher (zeroizing its keys) without freeing its
-        // memory; the caller forgets the volume, so it is not dropped twice.
+        // memory; the caller's contract keeps it from being dropped again.
         unsafe { core::ptr::drop_in_place(&mut *self.cipher) };
     }
 
@@ -142,7 +147,8 @@ impl Volume {
         {
             return Err(BlockError::OutOfRange);
         }
-        let mut scratch = [0u8; 4096];
+        // Cleared on every return, also after a failed read.
+        let mut scratch = zeroize::Zeroizing::new([0u8; 4096]);
         let mut done = 0;
         while done < out.len() {
             let position = offset + done as u64;
@@ -169,7 +175,6 @@ impl Volume {
                 done += len;
             }
         }
-        zeroize::Zeroize::zeroize(&mut scratch);
         Ok(())
     }
 }
@@ -341,12 +346,14 @@ fn verify(
             continue;
         }
         let expected = crypto::base64(&digest.digest)?;
-        if expected.is_empty() || expected.len() > 64 {
+        // As cryptsetup: 20 bytes (the LUKS1 size) or the hash's own size.
+        let hash = Hash::parse(&digest.hash)?;
+        if expected.len() != 20 && expected.len() != hash.output_size() {
             return Err(LuksError::Corrupt("digest"));
         }
         let mut actual = crypto::secret(expected.len())?;
         crypto::pbkdf2(
-            Hash::parse(&digest.hash)?,
+            hash,
             key,
             &crypto::base64(&digest.salt)?,
             digest.iterations,

@@ -447,26 +447,16 @@ fn plan_separators(
 /// Measure one separator; true when a hardware TPM 2.0 recorded it.
 fn separator(pcr: u32) -> bool {
     let separator_data = 0u32.to_le_bytes();
-    #[cfg_attr(not(all(feature = "luks", target_arch = "x86_64")), allow(unused_mut))]
-    let mut tcg2 = crate::efi::protocols::tcg2::measure_event(
-        pcr,
-        EV_SEPARATOR,
-        &separator_data,
-        &separator_data,
-    );
     // With `luks`, the PCR must move even when the log is full, or the TPM
     // serves only for the separators: firmware-only TPM secrets depend on
     // it more than the log does. Other builds keep logged-only separators,
     // so PCRs keep matching their logs (and OS unlock policies).
-    #[cfg(all(feature = "luks", target_arch = "x86_64"))]
-    match tcg2 {
-        Some(Err(TcgError::LogFull | TcgError::EventTooLarge)) => {
-            log::warn!("Event log full: extending PCR {pcr}'s separator unlogged");
-            tcg2 = crate::efi::protocols::tcg2::extend_unlogged(pcr, &separator_data);
-        }
-        None => tcg2 = crate::efi::protocols::tcg2::extend_unlogged(pcr, &separator_data),
-        _ => {}
-    }
+    let tcg2 = crate::efi::protocols::tcg2::measure_separator(
+        pcr,
+        EV_SEPARATOR,
+        &separator_data,
+        cfg!(all(feature = "luks", target_arch = "x86_64")),
+    );
     let recorded = matches!(tcg2, Some(Ok(())));
     log_protocol_result("TCG2", "separator", tcg2);
     log_protocol_result(

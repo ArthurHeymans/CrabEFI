@@ -118,6 +118,23 @@ pub(super) fn show_progress(message: &str) {
     menu_common::draw_status_message(PROMPT_ROW as usize + 2, message, true, &mut fb);
 }
 
+/// Show why the last attempt failed, until a key press.
+pub(super) fn show_failure(error: &str) {
+    let config = crate::handoff::framebuffer();
+    let mut fb = config.as_ref().map(FramebufferConsole::new);
+    let cols = fb.as_ref().map(|c| c.cols() as usize).unwrap_or(80);
+    menu_common::draw_status_message(PROMPT_ROW as usize + 2, error, false, &mut fb);
+    menu_common::draw_help(
+        PROMPT_ROW as usize + 4,
+        "No attempts left. Press any key to return to the boot menu",
+        &mut fb,
+        cols,
+    );
+    while menu_common::read_key().is_none() {
+        delay_ms(10);
+    }
+}
+
 /// Explain why the firmware no longer unlocks volumes, until a key press.
 pub(super) fn show_refusal() {
     let config = crate::handoff::framebuffer();

@@ -144,12 +144,12 @@ impl Peripheral {
     /// Whether this is a TPM 2.0 CrabEFI drives as a peripheral (and so
     /// adopts for measured boot once bound).
     pub fn is_tpm2(&self) -> bool {
+        // The driver binding picks, so a device another driver claims
+        // first (an ELAN touchpad that also lists GOOG0005) is no TPM.
         #[cfg(feature = "tpm")]
         if let Peripheral::I2c(device) = self {
-            return device
-                .ids
-                .iter()
-                .any(|id| crate::efi::tcg::gsc_i2c::IDS.contains(&id.as_str()));
+            return i2c_driver(device.ids.iter().map(String::as_str))
+                .is_some_and(|driver| core::ptr::eq(driver.ids, crate::efi::tcg::gsc_i2c::IDS));
         }
         let _ = self;
         false
@@ -317,6 +317,9 @@ mod tests {
         // The TPM ID may be a _CID after a vendor _HID.
         assert!(i2c(&["VEND0001", "GOOG0005"]).is_tpm2());
         assert!(!i2c(&["ELAN0000"]).is_tpm2());
+        // The driver that binds decides: an earlier ID can claim the device.
+        #[cfg(feature = "elan-i2c")]
+        assert!(!i2c(&["ELAN0000", "GOOG0005"]).is_tpm2());
         let mmio = super::Peripheral::Mmio(super::MmioPeripheral {
             ids: alloc::vec!["GOOG0005".into()],
             base: 0,

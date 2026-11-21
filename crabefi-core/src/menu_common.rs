@@ -84,6 +84,10 @@ struct SerialKeyParser {
     primary: u16,
     first_parameter: bool,
     pending: Option<u8>,
+    /// A UTF-8 character still arriving: its bytes so far and its length.
+    utf8: [u8; 4],
+    utf8_len: u8,
+    utf8_need: u8,
 }
 
 impl SerialKeyParser {
@@ -93,7 +97,38 @@ impl SerialKeyParser {
             primary: 0,
             first_parameter: true,
             pending: None,
+            utf8: [0; 4],
+            utf8_len: 0,
+            utf8_need: 0,
         }
+    }
+
+    /// Collect a UTF-8 character byte by byte: terminals send `é` as two
+    /// bytes, which must not become two characters. Invalid bytes are
+    /// dropped.
+    fn feed_utf8(&mut self, byte: u8) -> Option<KeyPress> {
+        if self.utf8_need == 0 {
+            self.utf8_need = match byte {
+                0xC2..=0xDF => 2,
+                0xE0..=0xEF => 3,
+                0xF0..=0xF4 => 4,
+                _ => return None,
+            };
+            self.utf8_len = 0;
+        } else if byte & 0xC0 != 0x80 {
+            self.utf8_need = 0;
+            return None;
+        }
+        self.utf8[usize::from(self.utf8_len)] = byte;
+        self.utf8_len += 1;
+        if self.utf8_len < self.utf8_need {
+            return None;
+        }
+        self.utf8_need = 0;
+        core::str::from_utf8(&self.utf8[..usize::from(self.utf8_len)])
+            .ok()
+            .and_then(|text| text.chars().next())
+            .map(KeyPress::Char)
     }
 
     fn feed(&mut self, byte: u8) -> Option<KeyPress> {
@@ -105,7 +140,11 @@ impl SerialKeyParser {
                 }
                 b'\t' => Some(KeyPress::Tab),
                 b'\r' | b'\n' => Some(KeyPress::Enter),
-                byte => Some(KeyPress::Char(byte as char)),
+                0x80.. => self.feed_utf8(byte),
+                byte => {
+                    self.utf8_need = 0;
+                    Some(KeyPress::Char(byte as char))
+                }
             },
             SerialState::Escape => {
                 self.state = match byte {
@@ -254,6 +293,26 @@ mod serial_tests {
         assert_eq!(
             poll_serial_key(&mut parser, &mut deadline, || input.next()),
             Some(KeyPress::Char('A'))
+        );
+    }
+
+    #[test]
+    fn serial_utf8_arrives_as_one_character() {
+        let mut parser = SerialKeyParser::new();
+        let keys: alloc::vec::Vec<_> = "aé€\u{1F980}"
+            .bytes()
+            .chain([0xC3, b'x', 0xFF])
+            .filter_map(|b| parser.feed(b))
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                KeyPress::Char('a'),
+                KeyPress::Char('é'),
+                KeyPress::Char('€'),
+                KeyPress::Char('\u{1F980}'),
+                KeyPress::Char('x'),
+            ]
         );
     }
 

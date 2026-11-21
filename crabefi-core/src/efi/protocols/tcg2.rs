@@ -64,7 +64,10 @@ static CAP_ONLY_TPM: Mutex<Option<CapOnlyTpm>> = Mutex::new(None);
 /// Keep a TPM whose log could not be continued for the separators, if
 /// CrabEFI can hash every one of its active banks.
 fn keep_cap_only(backend: Tpm2Backend, active: &[u16]) {
-    if unsupported_active_algorithm(active).is_some() {
+    // Every active bank, and at least one: never extend a bank the TPM
+    // did not report.
+    if active.is_empty() || unsupported_active_algorithm(active).is_some() {
+        log::error!("TPM banks {active:?} cannot take the pre-OS separators");
         return;
     }
     let (count, algorithms) = supported_algorithm_array(active);
@@ -629,6 +632,40 @@ pub fn extend_unlogged(pcr_index: u32, data_to_hash: &[u8]) -> Option<Result<(),
         &digests[..count],
         &[],
         false,
+    ))
+}
+
+/// Extend a pre-OS separator. With `unlogged_fallback`, a separator the log
+/// has no room for, or a TPM kept only for separators, is extended without
+/// logging. That is decided before anything reaches the TPM: after a failed
+/// extend the PCR state is unknown, and it is never extended twice.
+///
+/// Returns `None` without a hardware TPM 2.0.
+pub fn measure_separator(
+    pcr_index: u32,
+    event_type: u32,
+    data: &[u8],
+    unlogged_fallback: bool,
+) -> Option<Result<(), TcgError>> {
+    if unlogged_fallback && let Some(cap) = CAP_ONLY_TPM.lock().as_mut() {
+        let (count, digests) = cap.banks.hash_data(data);
+        return Some(cap.backend.pcr_extend(pcr_index, &digests[..count]));
+    }
+    let mut guard = TCG2_STATE.lock();
+    let state = guard.as_mut()?;
+    state.hardware_tpm.as_ref()?;
+    let (count, digests) = state.pcr_banks.hash_data(data);
+    let digests = &digests[..count];
+    let log_event = match state.event_log.check_event(digests, data) {
+        Ok(()) => true,
+        Err(TcgError::LogFull | TcgError::EventTooLarge) if unlogged_fallback => {
+            log::warn!("Event log full: extending PCR {pcr_index}'s separator unlogged");
+            false
+        }
+        Err(err) => return Some(Err(err)),
+    };
+    Some(extend_and_maybe_log(
+        state, pcr_index, event_type, digests, data, log_event,
     ))
 }
 

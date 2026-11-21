@@ -623,6 +623,10 @@ pub fn crypto_agile_log_has_measurements(log: &[u8]) -> bool {
     use super::types::EV_NO_ACTION;
     // TCG_PCClientPCREvent: PCR, type, SHA-1 digest, event size, event.
     const HEADER: usize = 4 + 4 + 20 + 4;
+    let read_u16 = |at: usize| {
+        log.get(at..at + 2)
+            .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+    };
     let read_u32 = |at: usize| {
         log.get(at..at + 4)
             .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
@@ -633,14 +637,39 @@ pub fn crypto_agile_log_has_measurements(log: &[u8]) -> bool {
     let Some(spec_size) = read_u32(HEADER - 4) else {
         return false;
     };
-    let first = HEADER + spec_size as usize;
-    // TCG_PCR_EVENT2: PCR index, event type, digest count, ...
-    match (read_u32(first), read_u32(first + 4), read_u32(first + 8)) {
-        (Some(pcr), Some(event_type), Some(digests)) => {
-            pcr < 24 && event_type != 0 && (1..=5).contains(&digests)
+    // Walk whole TCG_PCR_EVENT2 records: PCR index, event type, digest
+    // count, (algorithm, digest)*, event size, event. EV_NO_ACTION records
+    // extend no PCR; a truncated record proves nothing.
+    let mut at = HEADER + spec_size as usize;
+    for _ in 0..1024 {
+        let (Some(pcr), Some(event_type), Some(count)) =
+            (read_u32(at), read_u32(at + 4), read_u32(at + 8))
+        else {
+            return false;
+        };
+        if pcr >= 24 || event_type == 0 || !(1..=5).contains(&count) {
+            return false;
         }
-        _ => false,
+        let mut next = at + 12;
+        for _ in 0..count {
+            let Some(size) = read_u16(next).and_then(digest_size_for_algorithm) else {
+                return false;
+            };
+            next += 2 + size;
+        }
+        let Some(event_size) = read_u32(next) else {
+            return false;
+        };
+        next += 4 + event_size as usize;
+        if next > log.len() {
+            return false;
+        }
+        if event_type != EV_NO_ACTION {
+            return true;
+        }
+        at = next;
     }
+    false
 }
 
 #[cfg(test)]
@@ -670,6 +699,32 @@ mod measurement_tests {
             .unwrap();
         assert!(crypto_agile_log_has_measurements(empty.log_data()));
         assert!(!crypto_agile_log_has_measurements(&[0u8; 64]));
+        // A truncated record is no measurement.
+        let whole = empty.log_data().to_vec();
+        assert!(!crypto_agile_log_has_measurements(
+            &whole[..whole.len() - 1]
+        ));
+
+        // EV_NO_ACTION records (StartupLocality) are skipped, not counted.
+        let mut metadata = CryptoAgileEventLog::new(
+            alloc::boxed::Box::leak(alloc::vec![0u8; 1024].into_boxed_slice()),
+            &[TPM_ALG_SHA256],
+        )
+        .unwrap();
+        let none = [TaggedDigest::zeroed(TPM_ALG_SHA256)];
+        metadata
+            .log_event(
+                0,
+                crate::efi::tcg::types::EV_NO_ACTION,
+                &none,
+                b"StartupLocality",
+            )
+            .unwrap();
+        assert!(!crypto_agile_log_has_measurements(metadata.log_data()));
+        metadata
+            .log_event(0, EV_S_CRTM_VERSION, &none, b"cb")
+            .unwrap();
+        assert!(crypto_agile_log_has_measurements(metadata.log_data()));
         assert_eq!(
             crypto_agile_log_evidence(empty.log_data()),
             LogEvidence::Tpm2

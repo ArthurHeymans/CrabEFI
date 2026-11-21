@@ -433,7 +433,18 @@ fn init_tcg2_protocol_tis(
     enable_sha1: bool,
     install: bool,
 ) -> Result<(), &'static str> {
-    let tcg2_buffer = event_log_buffer(area)?;
+    let tcg2_buffer = match event_log_buffer(area) {
+        Ok(buffer) => buffer,
+        Err(err) => {
+            // No log, but the TPM can still take the separators.
+            // SAFETY: the platform describes a TIS TPM nothing else drives.
+            #[cfg(all(feature = "luks", target_arch = "x86_64"))]
+            unsafe {
+                protocols::tcg2::cap_only_tis(tpm_base)
+            };
+            return Err(err);
+        }
+    };
 
     unsafe {
         protocols::tcg2::init_state_with_hardware(tcg2_buffer, existing_log, tpm_base, enable_sha1)
@@ -472,7 +483,15 @@ fn init_tcg2_protocol_platform_tpm(
     enable_sha1: bool,
     install: bool,
 ) -> Result<(), &'static str> {
-    let tcg2_buffer = event_log_buffer(area)?;
+    let tcg2_buffer = match event_log_buffer(area) {
+        Ok(buffer) => buffer,
+        Err(err) => {
+            // No log, but the TPM can still take the separators.
+            #[cfg(all(feature = "luks", target_arch = "x86_64"))]
+            protocols::tcg2::cap_only_driver(tpm);
+            return Err(err);
+        }
+    };
 
     protocols::tcg2::init_state_with_platform_tpm(tcg2_buffer, existing_log, tpm, enable_sha1)
         .map_err(|_| "failed to initialize TCG2 state with platform TPM")?;

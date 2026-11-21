@@ -66,8 +66,9 @@ impl Budget {
         }
     }
 
-    fn pbkdf2(&mut self, iterations: u32) -> Result<(), LuksError> {
-        let cost = u64::from(iterations);
+    /// PBKDF2 runs `iterations` HMACs for each output block.
+    fn pbkdf2(&mut self, iterations: u32, blocks: usize) -> Result<(), LuksError> {
+        let cost = u64::from(iterations).saturating_mul(blocks as u64);
         if iterations > self.limits.pbkdf2_iterations || cost > self.pbkdf2_left {
             log::warn!("LUKS2: PBKDF2 with {iterations} iterations exceeds the limits");
             return Err(LuksError::Unsupported("PBKDF2 cost"));
@@ -119,6 +120,13 @@ impl Hash {
         }
     }
 
+    pub(crate) fn output_size(self) -> usize {
+        match self {
+            Self::Sha256 => 32,
+            Self::Sha512 => 64,
+        }
+    }
+
     fn pbkdf2(self, password: &[u8], salt: &[u8], rounds: u32, out: &mut [u8]) {
         match self {
             Self::Sha256 => pbkdf2::pbkdf2_hmac::<Sha256>(password, salt, rounds, out),
@@ -139,7 +147,7 @@ pub(crate) fn pbkdf2(
     if iterations == 0 {
         return Err(LuksError::Corrupt("PBKDF2 iteration count"));
     }
-    budget.pbkdf2(iterations)?;
+    budget.pbkdf2(iterations, out.len().div_ceil(hash.output_size()))?;
     hash.pbkdf2(password, salt, iterations, out);
     Ok(())
 }
@@ -443,8 +451,30 @@ mod tests {
         let mut budget = Budget::new(Limits::UNATTENDED);
         let mut out = [0u8; 32];
         for _ in 0..4 {
-            budget.pbkdf2(4_000_000).unwrap();
+            budget.pbkdf2(4_000_000, 1).unwrap();
         }
+        assert!(pbkdf2(Hash::Sha256, b"x", b"salt", 1, &mut out, &mut budget).is_err());
+        // Every output block costs the full iteration count.
+        let mut budget = Budget::new(Limits::UNATTENDED);
+        let mut long = [0u8; 64];
+        pbkdf2(
+            Hash::Sha256,
+            b"x",
+            b"salt",
+            4_000_000,
+            &mut long,
+            &mut budget,
+        )
+        .unwrap();
+        pbkdf2(
+            Hash::Sha256,
+            b"x",
+            b"salt",
+            4_000_000,
+            &mut long,
+            &mut budget,
+        )
+        .unwrap();
         assert!(pbkdf2(Hash::Sha256, b"x", b"salt", 1, &mut out, &mut budget).is_err());
     }
 

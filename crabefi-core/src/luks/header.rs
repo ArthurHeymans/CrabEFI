@@ -72,7 +72,10 @@ fn bounded<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Objects,
                 if objects.len() == MAX_OBJECTS {
                     return Err(serde::de::Error::custom("too many members"));
                 }
-                objects.insert(key, value);
+                // A repeated ID would silently replace the first definition.
+                if objects.insert(key, value).is_some() {
+                    return Err(serde::de::Error::custom("duplicate member"));
+                }
             }
             Ok(objects)
         }
@@ -310,20 +313,27 @@ pub(crate) fn read(part: &mut dyn RawPartition) -> Result<Header, LuksError> {
     // uses when the primary does not say where.
     let secondary_at = primary.as_ref().map(|(_, bytes)| bytes.len() as u64);
     consider(primary, 0);
-    match secondary_at {
-        Some(offset) => consider(read_one(part, offset, MAGIC_SECONDARY)?, offset),
-        None => {
-            for offset in SECONDARY_OFFSETS {
-                if let Some(copy) = read_one(part, offset, MAGIC_SECONDARY)? {
+    let secondary = match secondary_at {
+        Some(offset) => read_one(part, offset, MAGIC_SECONDARY).map(|copy| consider(copy, offset)),
+        None => SECONDARY_OFFSETS
+            .iter()
+            .find_map(|&offset| match read_one(part, offset, MAGIC_SECONDARY) {
+                Ok(Some(copy)) => {
                     log::warn!("LUKS2: primary header damaged, using the copy at {offset:#x}");
                     consider(Some(copy), offset);
-                    break;
+                    Some(Ok(()))
                 }
-            }
-        }
+                Ok(None) => None,
+                Err(err) => Some(Err(err)),
+            })
+            .unwrap_or(Ok(())),
+    };
+    match (best, secondary) {
+        // A usable primary stays usable when the secondary cannot be read.
+        (Some((_, header)), _) => Ok(header),
+        (None, Err(err)) => Err(err),
+        (None, Ok(())) => Err(LuksError::Corrupt("no usable LUKS2 header")),
     }
-    best.map(|(_, header)| header)
-        .ok_or(LuksError::Corrupt("no usable LUKS2 header"))
 }
 
 fn cstr(bytes: &[u8]) -> Option<&str> {
@@ -410,6 +420,9 @@ mod tests {
             r#"{{"keyslots":{{{many}}},"segments":{{}},"digests":{{}},"config":{{"json_size":"1","keyslots_size":"1"}}}}"#
         );
         assert!(serde_json::from_str::<Metadata>(&json).is_err());
+        let duplicate = r#"{"keyslots":{"0":{},"0":{}},"segments":{},"digests":{},
+            "config":{"json_size":"1","keyslots_size":"1"}}"#;
+        assert!(serde_json::from_str::<Metadata>(duplicate).is_err());
         let json = r#"{"keyslots":{"0":{"type":"x"}},"segments":{},"digests":{},
             "config":{"json_size":"1","keyslots_size":"1","flags":["a"]},"unknown":[1,2,{"deep":[]}]}"#;
         let metadata: Metadata = serde_json::from_str(json).unwrap();

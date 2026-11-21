@@ -35,7 +35,7 @@ pub(super) fn run(config: &QemuConfig, disk: &Path, app: &str) -> Result<()> {
         .spawn()
         .context("start QEMU for the LUKS2 test")?;
 
-    let result = (|| -> Result<String> {
+    let result = (|| -> Result<(String, usize)> {
         let start = Instant::now();
         let timeout = Duration::from_secs(config.timeout_secs.unwrap_or(120));
         let mut answered = 0;
@@ -46,7 +46,7 @@ pub(super) fn run(config: &QemuConfig, disk: &Path, app: &str) -> Result<()> {
                 .lines()
                 .any(|line| line.trim() == crate::disk::EXT_BOOT_SUCCESS)
             {
-                return Ok(text);
+                return Ok((text, answered));
             }
             let prompts = text.matches(PROMPT).count();
             if matches!(test, LuksTest::Tpm { .. }) {
@@ -74,8 +74,8 @@ pub(super) fn run(config: &QemuConfig, disk: &Path, app: &str) -> Result<()> {
         }
     })();
     cleanup_child(&mut child);
-    let text = match result {
-        Ok(text) => text,
+    let (text, answered) = match result {
+        Ok(found) => found,
         Err(err) => {
             eprintln!("{}", String::from_utf8_lossy(&fs::read(log.path())?));
             return Err(err);
@@ -100,6 +100,12 @@ pub(super) fn run(config: &QemuConfig, disk: &Path, app: &str) -> Result<()> {
             anyhow::ensure!(
                 text.contains("EFI System Table at:"),
                 "expected a UEFI payload"
+            );
+            // Proof of the rejection: the firmware reported the wrong
+            // passphrase and asked again before the right one opened it.
+            anyhow::ensure!(
+                answered == 2 && text.contains(WRONG_KEY),
+                "the wrong passphrase was not rejected before the right one"
             );
             println!("[PASS] luks_passphrase: Rejected a wrong passphrase, then booted Linux");
         }

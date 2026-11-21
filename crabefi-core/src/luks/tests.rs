@@ -157,18 +157,40 @@ fn check(extra: &[&str]) {
         volume.read(&mut disk, &range, len as u64, &mut out),
         Err(BlockError::OutOfRange)
     );
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
-fn tempfile_dir() -> std::path::PathBuf {
+/// A directory this test created exclusively, removed when dropped (also
+/// after a failed assertion).
+struct TempDir(std::path::PathBuf);
+
+impl core::ops::Deref for TempDir {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn tempfile_dir() -> TempDir {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
-    let dir = std::env::temp_dir().join(std::format!(
-        "crabefi-luks-{}-{}",
-        std::process::id(),
-        COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+    loop {
+        let dir = std::env::temp_dir().join(std::format!(
+            "crabefi-luks-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        // `create_dir` fails if the path exists: never adopt another's.
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return TempDir(dir),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => panic!("create {}: {err}", dir.display()),
+        }
+    }
 }
 
 #[test]
@@ -233,7 +255,6 @@ fn damaged_primary_header_falls_back_to_the_secondary() {
     let mut out = [0u8; 4096];
     volume.read(&mut disk, &range, 0, &mut out).unwrap();
     assert_eq!(out[..], plain[..4096]);
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
@@ -261,7 +282,6 @@ fn production_detection_survives_a_missing_primary_header() {
         &mut crypto::Budget::new(crypto::Limits::INTERACTIVE),
     );
     assert!(key.is_ok());
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
@@ -293,7 +313,6 @@ fn iv_tweak_must_keep_every_iv_in_range() {
         Layout::check(&header, len),
         Err(LuksError::Unsupported("IV tweak"))
     ));
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]

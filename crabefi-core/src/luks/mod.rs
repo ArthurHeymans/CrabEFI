@@ -378,6 +378,10 @@ pub(crate) fn unlock_interactive(
             }
         }
     }
+    // Say why the last attempt failed before going back to the menu.
+    if let Some(error) = error {
+        prompt::show_failure(error);
+    }
     false
 }
 
@@ -433,7 +437,8 @@ pub(crate) use tpm::check_refused_after_cap;
 pub(crate) fn emergency_wipe() {
     if let Some(mut volumes) = VOLUMES.try_borrow_mut() {
         for unlocked in volumes.iter_mut() {
-            unlocked.volume.wipe_in_place();
+            // SAFETY: every volume is forgotten right below.
+            unsafe { unlocked.volume.wipe_in_place() };
         }
         // The cleared ciphers must not be dropped again.
         core::mem::forget(core::mem::take(&mut *volumes));

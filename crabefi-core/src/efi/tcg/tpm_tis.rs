@@ -830,15 +830,24 @@ impl<T: TpmTransport> Tpm2<T> {
         // Fill in total command size
         cmd[2..6].copy_from_slice(&(offset as u32).to_be_bytes());
 
-        // Send command
+        // Send the command. RETRY, YIELDED and TESTING say the TPM did not
+        // run it, so it is safe to send again; any other failure is not.
+        const NOT_EXECUTED: [u32; 3] = [0x922, 0x908, 0x90A];
         let mut resp = [0u8; 64];
-        let n = self.send_command(&cmd[..offset], &mut resp)?;
-
-        if n < 10 {
-            return Err(TcgError::InternalError);
-        }
-
-        let rc = u32::from_be_bytes([resp[6], resp[7], resp[8], resp[9]]);
+        let mut attempts = 0;
+        let rc = loop {
+            let n = self.send_command(&cmd[..offset], &mut resp)?;
+            if n < 10 {
+                return Err(TcgError::InternalError);
+            }
+            let rc = u32::from_be_bytes([resp[6], resp[7], resp[8], resp[9]]);
+            if NOT_EXECUTED.contains(&rc) && attempts < 50 {
+                attempts += 1;
+                crate::time::delay_ms(20);
+                continue;
+            }
+            break rc;
+        };
         if rc != TPM_RC_SUCCESS {
             log::error!("TPM2_PCR_Extend(pcr={}) failed: rc={:#x}", pcr_index, rc);
             return Err(TcgError::InternalError);

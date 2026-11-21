@@ -837,7 +837,8 @@ impl BootKeys {
     /// keys still held are ignored until released.
     pub fn scrub(&mut self) {
         // Only keys still held must not come back as new presses.
-        self.ignore_until_release = self.prev_report.keys.iter().any(|&k| k != 0);
+        // A second scrub before the release must not lift the suppression.
+        self.ignore_until_release |= self.prev_report.keys.iter().any(|&k| k != 0);
         self.prev_report = KeyboardReport {
             modifiers: self.prev_report.modifiers,
             ..KeyboardReport::default()
