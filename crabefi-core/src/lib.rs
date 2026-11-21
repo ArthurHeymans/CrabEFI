@@ -49,6 +49,8 @@ pub mod fdt;
 )]
 pub(crate) mod framebuffer_console;
 pub mod fs;
+#[cfg(feature = "fuzzing")]
+pub mod fuzzing;
 #[allow(
     dead_code,
     reason = "discovery parses grub.cfg directly rather than probing first"

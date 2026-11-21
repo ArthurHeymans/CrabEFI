@@ -33,6 +33,28 @@ jobs:
           for manifest in "$GITHUB_WORKSPACE"/test-apps/*/Cargo.toml; do
             cargo fmt --manifest-path "$manifest" -- --check
           done
+  fuzz:
+    name: Fuzz parsers
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: ./.github/actions/setup-rust
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
+        with:
+          tool: cargo-fuzz
+      - name: Fuzz each parser for one minute
+        run: ci/fuzz.sh 60
+      - name: Upload crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
   kani:
     name: Kani proofs
     runs-on: ubuntu-latest

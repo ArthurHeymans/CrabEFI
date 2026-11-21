@@ -51,7 +51,13 @@ const IMAGE_FILE_MACHINE_NATIVE: u16 = IMAGE_FILE_MACHINE_RISCV64;
 
 /// Relocation types
 const IMAGE_REL_BASED_ABSOLUTE: u16 = 0;
+const IMAGE_REL_BASED_HIGHLOW: u16 = 3;
 const IMAGE_REL_BASED_DIR64: u16 = 10;
+/// COFF characteristic claiming the image has no base relocations. GNU
+/// objcopy sets it on position-independent RISC-V images too, so it does not
+/// mean an image is fixed-base, and the loader ignores it (as U-Boot does).
+#[cfg(test)]
+const IMAGE_FILE_RELOCS_STRIPPED: u16 = 0x0001;
 
 /// Data directory index for the Certificate Table (Security Directory)
 pub const IMAGE_DIRECTORY_ENTRY_SECURITY: usize = 4;
@@ -173,15 +179,6 @@ pub struct SectionHeader {
     pub number_of_relocations: u16,
     pub number_of_linenumbers: u16,
     pub characteristics: u32,
-}
-
-/// Base Relocation Block
-#[repr(C, packed)]
-#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
-struct BaseRelocation {
-    virtual_address: u32,
-    size_of_block: u32,
-    // Followed by array of u16 type/offset values
 }
 
 /// Parsed PE headers information (for reading PE metadata without loading)
@@ -521,6 +518,112 @@ fn plan_section_copies(
 }
 
 pub fn load_image(data: &[u8]) -> Result<LoadedImage, Status> {
+    let layout = image_layout(data)?;
+    let num_pages = layout.allocation_pages();
+    let mut alloc_base = 0u64;
+
+    let status = allocator::allocate_pages(
+        AllocateType::AllocateAnyPages,
+        MemoryType::LoaderCode,
+        num_pages,
+        &mut alloc_base,
+    );
+
+    if status != Status::SUCCESS {
+        log::error!("PE: Failed to allocate memory: {:?}", status);
+        return Err(status);
+    }
+
+    let load_addr = layout.load_address(alloc_base);
+    log::debug!(
+        "PE: Allocated {} pages at {:#x}, load_addr={:#x} (section_align={:#x})",
+        num_pages,
+        alloc_base,
+        load_addr,
+        layout.section_alignment
+    );
+
+    let image_size = layout.image_size();
+    // SAFETY: AllocatePages returned `num_pages` exclusively owned pages at
+    // `alloc_base`, and `allocation_pages` reserves room for aligning the
+    // whole image upward within them. Nothing else references them yet.
+    // Fresh pages hold arbitrary bytes, so initialize them before forming a
+    // slice over them.
+    let image = unsafe {
+        core::ptr::write_bytes(load_addr as *mut u8, 0, image_size as usize);
+        core::slice::from_raw_parts_mut(load_addr as *mut u8, image_size as usize)
+    };
+    if let Err(status) = layout.build(image, load_addr) {
+        let _ = allocator::free_pages(alloc_base, num_pages);
+        return Err(status);
+    }
+
+    let entry_point = load_addr + layout.entry_point_rva as u64;
+    let (code_type, data_type) = image_memory_types(layout.subsystem);
+    if code_type != MemoryType::LoaderCode {
+        // Stage as LoaderCode until all copying and relocations succeed. Then
+        // publish a matching code/data map, including EFI_MEMORY_RUNTIME for
+        // runtime drivers, before a LoadedImage protocol can expose the image.
+        let layout = (|| {
+            let code = image_code_pages(layout.section_data, image_size, load_addr - alloc_base)?;
+            let entry_page = (entry_point - alloc_base) / PAGE_SIZE;
+            if !code.iter().any(|range| range.contains(&entry_page)) {
+                return Err(Status::INVALID_PARAMETER);
+            }
+            allocator::retype_pe_image(alloc_base, num_pages, code_type, data_type, &code)
+        })();
+        if let Err(status) = layout {
+            let freed = allocator::free_pe_image(alloc_base, num_pages);
+            if freed != Status::SUCCESS {
+                log::error!(
+                    "PE: staging allocation at {:#x} leaked: free failed with {:?}",
+                    alloc_base,
+                    freed
+                );
+            }
+            return Err(status);
+        }
+    }
+
+    // All stores to the image are complete (headers, sections,
+    // relocations); make them visible to instruction fetch before the
+    // image can be started.
+    crate::arch::sync_instruction_cache(load_addr, image_size as usize);
+
+    log::info!(
+        "PE: Loaded image at {:#x}, entry point at {:#x}",
+        load_addr,
+        entry_point
+    );
+
+    Ok(LoadedImage {
+        image_base: load_addr,
+        image_size: image_size as u64,
+        entry_point,
+        alloc_base,
+        num_pages,
+    })
+}
+
+/// A validated PE32+ file and the plan for loading it, made before any
+/// memory is allocated.
+pub struct ImageLayout<'a> {
+    data: &'a [u8],
+    image_size: u32,
+    preferred_base: u64,
+    entry_point_rva: u32,
+    size_of_headers: u32,
+    section_alignment: u64,
+    subsystem: u16,
+    section_data: &'a [u8],
+    copies: Vec<SectionCopy>,
+    /// The base relocation directory. Only an image loaded away from its
+    /// preferred base needs it, so a malformed one is only an error then.
+    relocations: Result<Option<(u32, u32)>, Status>,
+}
+
+/// Validate a PE32+ file and plan where each part of it goes.
+pub fn image_layout(data: &[u8]) -> Result<ImageLayout<'_>, Status> {
     // Parse DOS header using zerocopy
     let dos_header = match DosHeader::ref_from_prefix(data) {
         Ok((h, _)) => h,
@@ -684,80 +787,13 @@ pub fn load_image(data: &[u8]) -> Result<LoadedImage, Status> {
     let section_data = &data[sections_offset..sections_end];
     let section_copies = plan_section_copies(section_data, data.len(), image_size as usize)?;
 
-    // Allocate memory for the image, respecting section alignment.
-    // ARM64 PE images (e.g. Linux) typically require 64k alignment
-    // (section_alignment = 0x10000).  Over-allocate so we can align
-    // the load address upward within the allocation.
     let section_alignment = opt_header.section_alignment as u64;
     if !section_alignment.is_power_of_two() {
         return Err(Status::INVALID_PARAMETER);
     }
-    let extra_align = if section_alignment > PAGE_SIZE {
-        section_alignment
-    } else {
-        0
-    };
-    let num_pages = (image_size as u64 + extra_align).div_ceil(PAGE_SIZE);
-    let mut alloc_base = 0u64;
 
-    let status = allocator::allocate_pages(
-        AllocateType::AllocateAnyPages,
-        MemoryType::LoaderCode,
-        num_pages,
-        &mut alloc_base,
-    );
-
-    if status != Status::SUCCESS {
-        log::error!("PE: Failed to allocate memory: {:?}", status);
-        return Err(status);
-    }
-
-    // Align the load address up to section_alignment within the allocation
-    let load_addr = if section_alignment > PAGE_SIZE {
-        (alloc_base + section_alignment - 1) & !(section_alignment - 1)
-    } else {
-        alloc_base
-    };
-
-    log::debug!(
-        "PE: Allocated {} pages at {:#x}, load_addr={:#x} (section_align={:#x})",
-        num_pages,
-        alloc_base,
-        load_addr,
-        section_alignment
-    );
-
-    // Zero the image region (load_addr may be offset from alloc_base due to
-    // section alignment, so we must not zero more than image_size bytes here).
-    // Safety: load_addr..load_addr+image_size is within the allocated region
-    // [alloc_base..alloc_base + num_pages * PAGE_SIZE].
-    unsafe { core::slice::from_raw_parts_mut(load_addr as *mut u8, image_size as usize).fill(0) };
-
-    // Copy headers (already validated size_of_headers fits in both source and dest)
-    // Safety: We validated size_of_headers <= data.len() and <= image_size
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            data.as_ptr(),
-            load_addr as *mut u8,
-            size_of_headers as usize,
-        );
-    }
-
-    // Copy the sections planned above.
-    for copy in &section_copies {
-        // SAFETY: plan_section_copies validated src within `data` and dst
-        // within image_size at load_addr, with no overlapping destinations.
-        unsafe {
-            let src = data.as_ptr().add(copy.src);
-            let dst = (load_addr as *mut u8).add(copy.dst);
-            core::ptr::copy_nonoverlapping(src, dst, copy.len);
-        }
-    }
-
-    // Apply relocations if we loaded at a different address
-    let delta = load_addr as i64 - image_base_preferred as i64;
-    if delta != 0 {
-        // Validate data directories fit within optional header
+    let relocations = (|| {
+        // Validate data directories fit within the file.
         let data_dirs_offset = opt_offset
             .checked_add(core::mem::size_of::<OptionalHeader64>())
             .ok_or(Status::INVALID_PARAMETER)?;
@@ -767,151 +803,142 @@ pub fn load_image(data: &[u8]) -> Result<LoadedImage, Status> {
         let data_dirs_end = data_dirs_offset
             .checked_add(data_dirs_size)
             .ok_or(Status::INVALID_PARAMETER)?;
-
-        if data_dirs_end > data.len() {
+        let Some(data_dirs_data) = data.get(data_dirs_offset..data_dirs_end) else {
             log::error!("PE: Data directories extend beyond file");
-            let _ = allocator::free_pages(alloc_base, num_pages);
             return Err(Status::INVALID_PARAMETER);
+        };
+        if num_data_dirs as usize <= IMAGE_DIRECTORY_ENTRY_BASERELOC {
+            return Ok(None);
         }
+        let reloc_dir_offset =
+            IMAGE_DIRECTORY_ENTRY_BASERELOC * core::mem::size_of::<DataDirectory>();
+        let (reloc_dir, _) = DataDirectory::ref_from_prefix(&data_dirs_data[reloc_dir_offset..])
+            .map_err(|_| Status::INVALID_PARAMETER)?;
+        let (rva, size) = (reloc_dir.virtual_address, reloc_dir.size);
+        Ok((rva > 0 && size > 0).then_some((rva, size)))
+    })();
 
-        // Parse data directories using zerocopy
-        let data_dirs_data = &data[data_dirs_offset..data_dirs_end];
-
-        // Apply relocations if the relocation directory exists
-        if num_data_dirs as usize > IMAGE_DIRECTORY_ENTRY_BASERELOC {
-            let reloc_dir_offset =
-                IMAGE_DIRECTORY_ENTRY_BASERELOC * core::mem::size_of::<DataDirectory>();
-            let reloc_dir =
-                match DataDirectory::ref_from_prefix(&data_dirs_data[reloc_dir_offset..]) {
-                    Ok((d, _)) => d,
-                    Err(_) => {
-                        let _ = allocator::free_pages(alloc_base, num_pages);
-                        return Err(Status::INVALID_PARAMETER);
-                    }
-                };
-            let reloc_rva = reloc_dir.virtual_address;
-            let reloc_size = reloc_dir.size;
-
-            if reloc_rva > 0
-                && reloc_size > 0
-                && let Err(e) =
-                    apply_relocations(load_addr, image_size, reloc_rva, reloc_size, delta)
-            {
-                log::error!("PE: Failed to apply relocations");
-                let _ = allocator::free_pages(alloc_base, num_pages);
-                return Err(e);
-            }
-        }
-    }
-
-    let entry_point = load_addr + entry_point_rva as u64;
-    let (code_type, data_type) = image_memory_types(opt_header.subsystem);
-    if code_type != MemoryType::LoaderCode {
-        // Stage as LoaderCode until all copying and relocations succeed. Then
-        // publish a matching code/data map, including EFI_MEMORY_RUNTIME for
-        // runtime drivers, before a LoadedImage protocol can expose the image.
-        let layout = (|| {
-            let code = image_code_pages(section_data, image_size, load_addr - alloc_base)?;
-            let entry_page = (entry_point - alloc_base) / PAGE_SIZE;
-            if !code.iter().any(|range| range.contains(&entry_page)) {
-                return Err(Status::INVALID_PARAMETER);
-            }
-            allocator::retype_pe_image(alloc_base, num_pages, code_type, data_type, &code)
-        })();
-        if let Err(status) = layout {
-            let _ = allocator::free_pe_image(alloc_base, num_pages);
-            return Err(status);
-        }
-    }
-
-    // All stores to the image are complete (headers, sections,
-    // relocations); make them visible to instruction fetch before the
-    // image can be started.
-    crate::arch::sync_instruction_cache(load_addr, image_size as usize);
-
-    log::info!(
-        "PE: Loaded image at {:#x}, entry point at {:#x}",
-        load_addr,
-        entry_point
-    );
-
-    Ok(LoadedImage {
-        image_base: load_addr,
-        image_size: image_size as u64,
-        entry_point,
-        alloc_base,
-        num_pages,
+    Ok(ImageLayout {
+        data,
+        image_size,
+        preferred_base: image_base_preferred,
+        entry_point_rva,
+        size_of_headers,
+        section_alignment,
+        subsystem: opt_header.subsystem,
+        section_data,
+        copies: section_copies,
+        relocations,
     })
 }
 
-/// Apply base relocations with full bounds validation
+impl ImageLayout<'_> {
+    /// Size of the loaded image in bytes.
+    pub fn image_size(&self) -> u32 {
+        self.image_size
+    }
+
+    /// Pages to allocate so the image can be aligned upward within them.
+    ///
+    /// ARM64 PE images (e.g. Linux) typically require 64k alignment.
+    pub fn allocation_pages(&self) -> u64 {
+        let extra_align = if self.section_alignment > PAGE_SIZE {
+            self.section_alignment
+        } else {
+            0
+        };
+        (self.image_size as u64 + extra_align).div_ceil(PAGE_SIZE)
+    }
+
+    /// The load address inside an allocation at `alloc_base`.
+    pub fn load_address(&self, alloc_base: u64) -> u64 {
+        if self.section_alignment > PAGE_SIZE {
+            (alloc_base + self.section_alignment - 1) & !(self.section_alignment - 1)
+        } else {
+            alloc_base
+        }
+    }
+
+    /// Write the image, relocated to run at `load_address`, into `image`,
+    /// which must be exactly `image_size` bytes.
+    pub fn build(&self, image: &mut [u8], load_address: u64) -> Result<(), Status> {
+        if image.len() != self.image_size as usize {
+            return Err(Status::INVALID_PARAMETER);
+        }
+        image.fill(0);
+        // image_layout checked size_of_headers against the file and image.
+        let headers = self.size_of_headers as usize;
+        image[..headers].copy_from_slice(&self.data[..headers]);
+        // plan_section_copies checked both ranges and that no copies overlap.
+        for copy in &self.copies {
+            image[copy.dst..copy.dst + copy.len]
+                .copy_from_slice(&self.data[copy.src..copy.src + copy.len]);
+        }
+
+        let delta = load_address.wrapping_sub(self.preferred_base) as i64;
+        if delta == 0 {
+            return Ok(());
+        }
+        if let Some((reloc_rva, reloc_size)) = self.relocations?
+            && let Err(e) = apply_relocations(image, reloc_rva, reloc_size, delta)
+        {
+            log::error!("PE: Failed to apply relocations");
+            return Err(e);
+        }
+        Ok(())
+    }
+}
+
+/// Apply base relocations to a loaded image.
+///
+/// The relocation table lives inside the image, and an entry may patch the
+/// table itself, so every header and entry is read from the image as it is
+/// reached.
 ///
 /// # Arguments
-/// * `image_base` - Base address where image is loaded
-/// * `image_size` - Size of the loaded image
+/// * `image` - The loaded image
 /// * `reloc_rva` - RVA of the relocation directory
 /// * `reloc_size` - Size of the relocation directory
 /// * `delta` - Difference between preferred and actual load address
 fn apply_relocations(
-    image_base: u64,
-    image_size: u32,
+    image: &mut [u8],
     reloc_rva: u32,
     reloc_size: u32,
     delta: i64,
 ) -> Result<(), Status> {
-    // Validate relocation directory is within image bounds
-    let reloc_end = reloc_rva.checked_add(reloc_size).ok_or_else(|| {
-        log::error!("PE: Relocation directory size overflow");
-        Status::INVALID_PARAMETER
-    })?;
-    if reloc_end > image_size {
-        log::error!(
-            "PE: Relocation directory extends beyond image (rva={}, size={}, image_size={})",
-            reloc_rva,
-            reloc_size,
-            image_size
-        );
-        return Err(Status::INVALID_PARAMETER);
-    }
-
-    let mut offset = 0u32;
-    // Create a slice from the relocation data in the loaded image
-    let reloc_slice = unsafe {
-        core::slice::from_raw_parts(
-            (image_base + reloc_rva as u64) as *const u8,
-            reloc_size as usize,
-        )
+    let reloc_start = reloc_rva as usize;
+    let reloc_end = reloc_start
+        .checked_add(reloc_size as usize)
+        .filter(|&end| end <= image.len())
+        .ok_or_else(|| {
+            log::error!(
+                "PE: Relocation directory extends beyond image (rva={}, size={}, image_size={})",
+                reloc_rva,
+                reloc_size,
+                image.len()
+            );
+            Status::INVALID_PARAMETER
+        })?;
+    let read_u32 = |image: &[u8], at: usize| {
+        u32::from_le_bytes(image[at..at + 4].try_into().expect("four bytes"))
     };
 
-    while offset < reloc_size {
-        // Validate we can read the block header
-        let remaining = reloc_size - offset;
-        if (remaining as usize) < BASE_RELOCATION_HEADER_SIZE {
+    let mut block = reloc_start;
+    while block < reloc_end {
+        let remaining = reloc_end - block;
+        if remaining < BASE_RELOCATION_HEADER_SIZE {
             log::warn!("PE: Truncated relocation block header");
             break;
         }
-
-        // Parse relocation block using zerocopy
-        let block = match BaseRelocation::ref_from_prefix(&reloc_slice[offset as usize..]) {
-            Ok((b, _)) => b,
-            Err(_) => {
-                log::warn!("PE: Failed to parse relocation block");
-                break;
-            }
-        };
-        let block_rva = block.virtual_address;
-        let block_size = block.size_of_block;
-
+        let block_rva = read_u32(image, block);
+        let block_size = read_u32(image, block + 4) as usize;
         if block_size == 0 {
             break;
         }
-
-        // Validate block size is reasonable
-        if block_size < BASE_RELOCATION_HEADER_SIZE as u32 {
+        if block_size < BASE_RELOCATION_HEADER_SIZE {
             log::error!("PE: Relocation block size too small: {}", block_size);
             return Err(Status::INVALID_PARAMETER);
         }
-
         if block_size > remaining {
             log::error!(
                 "PE: Relocation block extends beyond directory (size={}, remaining={})",
@@ -921,18 +948,9 @@ fn apply_relocations(
             return Err(Status::INVALID_PARAMETER);
         }
 
-        let num_entries = (block_size as usize - BASE_RELOCATION_HEADER_SIZE) / 2;
-
-        // Safety: We verified the block fits within the relocation directory
-        let entries_start = offset as usize + BASE_RELOCATION_HEADER_SIZE;
-        let entries = unsafe {
-            core::slice::from_raw_parts(
-                reloc_slice[entries_start..].as_ptr() as *const u16,
-                num_entries,
-            )
-        };
-
-        for &entry in entries {
+        let entries = block + BASE_RELOCATION_HEADER_SIZE..block + block_size - 1;
+        for at in entries.step_by(2) {
+            let entry = u16::from_le_bytes([image[at], image[at + 1]]);
             let reloc_type = entry >> 12;
             let reloc_offset = (entry & 0x0FFF) as u32;
 
@@ -940,43 +958,45 @@ fn apply_relocations(
                 IMAGE_REL_BASED_ABSOLUTE => {
                     // Padding entry, skip
                 }
-                IMAGE_REL_BASED_DIR64 => {
-                    // Calculate target address and validate it's within image bounds
-                    let target_rva = block_rva.checked_add(reloc_offset).ok_or_else(|| {
-                        log::error!("PE: Relocation target RVA overflow");
-                        Status::INVALID_PARAMETER
-                    })?;
-
-                    // Ensure the 8-byte value we're modifying is within bounds
-                    let target_end = target_rva.checked_add(8).ok_or_else(|| {
-                        log::error!("PE: Relocation target end overflow");
-                        Status::INVALID_PARAMETER
-                    })?;
-
-                    if target_end > image_size {
-                        log::error!(
-                            "PE: Relocation target outside image bounds (rva={}, image_size={})",
-                            target_rva,
-                            image_size
-                        );
-                        return Err(Status::INVALID_PARAMETER);
-                    }
-
-                    let addr = image_base + target_rva as u64;
-                    // Safety: We validated addr + 8 is within the image
-                    unsafe {
-                        let ptr = addr as *mut u64;
-                        let value = ptr.read_unaligned();
-                        ptr.write_unaligned((value as i64 + delta) as u64);
+                IMAGE_REL_BASED_DIR64 | IMAGE_REL_BASED_HIGHLOW => {
+                    let width = if reloc_type == IMAGE_REL_BASED_DIR64 {
+                        8
+                    } else {
+                        4
+                    };
+                    let target = block_rva
+                        .checked_add(reloc_offset)
+                        .map(|rva| rva as usize)
+                        .filter(|&rva| rva.checked_add(width).is_some_and(|end| end <= image.len()))
+                        .ok_or_else(|| {
+                            log::error!(
+                                "PE: Relocation target outside image bounds (block_rva={}, offset={}, image_size={})",
+                                block_rva,
+                                reloc_offset,
+                                image.len()
+                            );
+                            Status::INVALID_PARAMETER
+                        })?;
+                    let field = &mut image[target..target + width];
+                    if width == 8 {
+                        let value = u64::from_le_bytes((&*field).try_into().expect("eight bytes"));
+                        field.copy_from_slice(&value.wrapping_add_signed(delta).to_le_bytes());
+                    } else {
+                        let value = u32::from_le_bytes((&*field).try_into().expect("four bytes"));
+                        // HIGHLOW adds the low 32 bits of the delta.
+                        field.copy_from_slice(&value.wrapping_add(delta as u32).to_le_bytes());
                     }
                 }
                 _ => {
-                    log::warn!("PE: Unknown relocation type: {}", reloc_type);
+                    // Skipping a fixup the image needs would publish an image
+                    // with stale absolute addresses.
+                    log::error!("PE: Unsupported relocation type: {}", reloc_type);
+                    return Err(Status::UNSUPPORTED);
                 }
             }
         }
 
-        offset += block_size;
+        block += block_size;
     }
 
     Ok(())
@@ -1192,5 +1212,98 @@ mod tests {
             put_u32(&mut data, num_data_dirs_offset, 6);
             assert!(parse_headers(&data).is_err());
         }
+    }
+
+    fn relocation_block(image: &mut [u8], at: usize, page_rva: u32, entries: &[u16]) -> usize {
+        let size = BASE_RELOCATION_HEADER_SIZE + entries.len() * 2;
+        put_u32(image, at, page_rva);
+        put_u32(image, at + 4, size as u32);
+        for (i, entry) in entries.iter().enumerate() {
+            put_u16(image, at + BASE_RELOCATION_HEADER_SIZE + i * 2, *entry);
+        }
+        size
+    }
+
+    #[test]
+    fn relocations_patch_targets_from_an_unaligned_table() {
+        let mut image = alloc::vec![0u8; 0x200];
+        image[0x10..0x18].copy_from_slice(&0x1000u64.to_le_bytes());
+        image[0x28..0x30].copy_from_slice(&u64::MAX.to_le_bytes());
+        // An odd table offset: entries are not 2-byte aligned in memory.
+        let size = relocation_block(&mut image, 0x101, 0, &[0xa010, 0x0000, 0xa028, 0x3000]);
+        apply_relocations(&mut image, 0x101, size as u32, -0x800).unwrap();
+        assert_eq!(&image[0x10..0x18], &0x800u64.to_le_bytes());
+        // Patched values wrap like the hardware address they describe.
+        assert_eq!(&image[0x28..0x30], &(u64::MAX - 0x800).to_le_bytes());
+    }
+
+    #[test]
+    fn relocations_read_entries_patched_by_earlier_entries() {
+        let mut image = alloc::vec![0u8; 0x200];
+        image[0x20..0x28].copy_from_slice(&0x1000u64.to_le_bytes());
+        // The first entry patches the eight bytes holding entries 4 to 7.
+        // After adding the delta, entry 4 reads as a DIR64 fixup of 0x20.
+        let size = relocation_block(&mut image, 0x100, 0, &[0xa110, 0, 0, 0, 0xa000, 0, 0, 0]);
+        apply_relocations(&mut image, 0x100, size as u32, 0x20).unwrap();
+        assert_eq!(&image[0x110..0x112], &0xa020u16.to_le_bytes());
+        assert_eq!(&image[0x20..0x28], &0x1020u64.to_le_bytes());
+    }
+
+    #[test]
+    fn highlow_fixups_apply_and_unknown_types_fail() {
+        let mut image = alloc::vec![0u8; 0x200];
+        put_u32(&mut image, 0x10, 0x1000);
+        let size = relocation_block(&mut image, 0x100, 0, &[0x3010]);
+        apply_relocations(&mut image, 0x100, size as u32, 0x20).unwrap();
+        assert_eq!(&image[0x10..0x14], &0x1020u32.to_le_bytes());
+        // A fixup type the loader cannot apply must not be skipped silently.
+        let size = relocation_block(&mut image, 0x100, 0, &[0x5010]);
+        assert_eq!(
+            apply_relocations(&mut image, 0x100, size as u32, 0x20),
+            Err(Status::UNSUPPORTED)
+        );
+    }
+
+    #[test]
+    fn position_independent_images_marked_stripped_still_load() {
+        let mut data = minimal_pe(true);
+        let coff = 0x84;
+        let opt = coff + core::mem::size_of::<CoffHeader>();
+        put_u16(&mut data, coff, IMAGE_FILE_MACHINE_NATIVE);
+        put_u16(&mut data, coff + 18, IMAGE_FILE_RELOCS_STRIPPED);
+        put_u32(&mut data, opt + 32, 0x1000); // section alignment
+        put_u32(&mut data, opt + 56, 0x2000); // image size
+        let layout = image_layout(&data).expect("valid minimal image");
+        let mut image = alloc::vec![0u8; layout.image_size() as usize];
+        let preferred = 0x1122_3344_5566_7788;
+        assert_eq!(layout.build(&mut image, preferred), Ok(()));
+        assert_eq!(layout.build(&mut image, 0x4000_0000), Ok(()));
+    }
+
+    #[test]
+    fn relocations_reject_targets_and_blocks_outside_the_image() {
+        let mut image = alloc::vec![0u8; 0x100];
+        // The last eight bytes are patchable, one byte later is not.
+        let size = relocation_block(&mut image, 0x40, 0, &[0xa0f8]);
+        assert_eq!(apply_relocations(&mut image, 0x40, size as u32, 1), Ok(()));
+        let size = relocation_block(&mut image, 0x40, 0, &[0xa0f9]);
+        assert_eq!(
+            apply_relocations(&mut image, 0x40, size as u32, 1),
+            Err(Status::INVALID_PARAMETER)
+        );
+        // A block that claims more bytes than the directory has.
+        put_u32(&mut image, 0x44, 0x40);
+        assert_eq!(
+            apply_relocations(&mut image, 0x40, 0x10, 1),
+            Err(Status::INVALID_PARAMETER)
+        );
+        assert_eq!(
+            apply_relocations(&mut image, 0xf8, 0x10, 1),
+            Err(Status::INVALID_PARAMETER)
+        );
+        assert_eq!(
+            apply_relocations(&mut image, u32::MAX, 2, 1),
+            Err(Status::INVALID_PARAMETER)
+        );
     }
 }
