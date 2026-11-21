@@ -8,6 +8,7 @@ use super::super::image_loader;
 use super::super::protocols::loaded_image::{
     LOADED_IMAGE_PROTOCOL_GUID, create_loaded_image_protocol,
 };
+use super::super::runtime_image::RuntimeImageClient;
 use super::super::system_table;
 use super::super::tables::{LoadedImageEntry, MAX_EVENTS, Tables, tables, with_tables_mut};
 use super::events::signal_event_group;
@@ -23,10 +24,22 @@ use r_efi::efi::{self, Boolean, Guid, Handle, Status};
 
 #[path = "image_execution.rs"]
 mod execution;
+#[path = "exit_order.rs"]
+mod exit_order;
 pub(super) use execution::exit;
 
 static STARTED: crate::cell::Local<Vec<(Handle, bool)>> = crate::cell::Local::new(Vec::new());
 use r_efi::protocols::device_path::Protocol as DevicePathProtocol;
+
+/// EFI_EVENT_GROUP_BEFORE_EXIT_BOOT_SERVICES GUID (UEFI 2.8+)
+const EFI_EVENT_GROUP_BEFORE_EXIT_BOOT_SERVICES: Guid = Guid::from_fields(
+    0x8be0e274,
+    0x3970,
+    0x4b44,
+    0x80,
+    0xc5,
+    &[0x1a, 0xb9, 0x50, 0x2f, 0x3b, 0xfc],
+);
 
 /// EFI_EVENT_GROUP_EXIT_BOOT_SERVICES GUID
 const EFI_EVENT_GROUP_EXIT_BOOT_SERVICES: Guid = Guid::from_fields(
@@ -897,25 +910,40 @@ pub(super) extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: 
         map_key
     );
 
-    // Reject a stale key before callbacks, measurements, or any irreversible
-    // transition. The allocator repeats this check at the actual commit point
-    // in case an EBS callback changes the map.
-    let key_status = allocator::validate_map_key(map_key);
-    if key_status != Status::SUCCESS {
-        return key_status;
-    }
-    let Some(runtime_image) = crate::efi::runtime_image::installed() else {
-        log::error!("ExitBootServices refused: runtime image client is missing");
-        return Status::DEVICE_ERROR;
-    };
+    exit_order::attempt(
+        map_key,
+        allocator::validate_map_key,
+        prepare_boot_handoff,
+        record_exit_failure,
+        notify_exit_boot_services,
+        crate::drivers::quiesce_dma_for_os_handoff,
+        allocator::commit_exit_boot_services,
+        finish_exit,
+    )
+}
 
-    // TCG measured boot: measure ExitBootServices action into PCR 5.
+static BEFORE_EXIT_SIGNALED: crate::cell::LocalCell<bool> = crate::cell::LocalCell::new(false);
+
+fn signal_before_exit_boot_services_once() {
+    // UEFI 2.8+ orders the before-exit group ahead of key validation and the
+    // exit group, while handoff preparation can still allocate. Latch it once
+    // (matching EDK2 DxeMain) so a callback that allocates does not invalidate
+    // the map key on every retry and break loaders (like Linux) that retry once.
+    if !BEFORE_EXIT_SIGNALED.get() {
+        BEFORE_EXIT_SIGNALED.set(true);
+        signal_event_group(&EFI_EVENT_GROUP_BEFORE_EXIT_BOOT_SERVICES);
+    }
+}
+
+fn notify_exit_boot_services() {
+    // TCG measured boot: measure ExitBootServices action into PCR 5 at the
+    // point of no return (matching EDK2's invocation/success measurement).
     #[cfg(feature = "tpm")]
     super::super::tcg::measured_boot::measure_action_all(5, "Exit Boot Services Invocation");
 
-    // Signal EXIT_BOOT_SERVICES event group BEFORE finalizing the memory map.
-    // Windows Boot Manager registers callbacks that must run before we lock
-    // the memory map.
+    // Signal EXIT_BOOT_SERVICES event group after the map key has been
+    // validated (so a stale-key retry never tears down drivers early) and
+    // before finalizing the allocator so handlers still have Boot Services.
     signal_event_group(&EFI_EVENT_GROUP_EXIT_BOOT_SERVICES);
 
     // Also signal any legacy EVT_SIGNAL_EXIT_BOOT_SERVICES events
@@ -945,6 +973,15 @@ pub(super) extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: 
             }
         }
     }
+}
+
+fn prepare_boot_handoff() -> Result<RuntimeImageClient, Status> {
+    let Some(runtime_image) = crate::efi::runtime_image::installed() else {
+        log::error!("ExitBootServices refused: runtime image client is missing");
+        return Err(Status::DEVICE_ERROR);
+    };
+
+    signal_before_exit_boot_services_once();
 
     // Rebuild the Memory Attributes Table in-place BEFORE locking the allocator.
     // Runtime image and retained-buffer regions are registered after the
@@ -954,86 +991,73 @@ pub(super) extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: 
     // calling allocate_pages(), so the map_key stays valid for the caller.
     let prepare_status = system_table::rebuild_memory_attributes_table_in_place();
     if prepare_status != Status::SUCCESS {
-        return prepare_status;
+        return Err(prepare_status);
     }
+    Ok(runtime_image)
+}
 
-    // Event callbacks and MAT rebuilding may have changed the memory map. Do a
-    // final key check before any irreversible hardware quiescence.
-    let key_status = allocator::validate_map_key(map_key);
-    if key_status != Status::SUCCESS {
-        return key_status;
-    }
+fn record_exit_failure(status: Status) {
+    #[cfg(feature = "tpm")]
+    super::super::tcg::measured_boot::measure_action_all(
+        5,
+        "Exit Boot Services Returned with Failure",
+    );
+    log::warn!("ExitBootServices FAILED: {:?}", status);
+}
 
-    // Stop every firmware-owned DMA engine while BootServices allocations are
-    // still typed and cannot yet be reused by the OS. Clearing BME is the final
-    // safety net for devices without complete driver shutdown coverage.
-    crate::drivers::quiesce_dma_for_os_handoff();
+fn finish_exit(runtime_image: RuntimeImageClient) {
+    // TCG measured boot: measure ExitBootServices success into PCR 5.
+    #[cfg(feature = "tpm")]
+    super::super::tcg::measured_boot::measure_action_all(
+        5,
+        "Exit Boot Services Returned with Success",
+    );
 
-    let status = allocator::exit_boot_services(map_key);
+    log::info!("ExitBootServices SUCCESS - transitioning to OS");
 
-    if status == Status::SUCCESS {
-        // TCG measured boot: measure ExitBootServices success into PCR 5.
-        #[cfg(feature = "tpm")]
-        super::super::tcg::measured_boot::measure_action_all(
-            5,
-            "Exit Boot Services Returned with Success",
+    // Clean up hardware state for OS handoff.
+    // Re-enable keyboard interrupts so Linux's i8042 driver works.
+    crate::drivers::keyboard_common::cleanup();
+    #[cfg(feature = "ui")]
+    crate::drivers::pointer::stop();
+
+    // Seal only after the allocator accepted the map key, while boot-time
+    // diagnostics are still reachable. A failed seal leaves no safe way to
+    // return to the OS after allocator EBS, so report it and halt explicitly.
+    if let Err(seal_status) = runtime_image.seal() {
+        log::error!(
+            "FATAL: runtime image seal failed after allocator ExitBootServices: {:?}",
+            seal_status
         );
-
-        log::info!("ExitBootServices SUCCESS - transitioning to OS");
-
-        // Clean up hardware state for OS handoff.
-        // Re-enable keyboard interrupts so Linux's i8042 driver works.
-        crate::drivers::keyboard_common::cleanup();
-        #[cfg(feature = "ui")]
-        crate::drivers::pointer::stop();
-
-        // Seal only after the allocator accepted the map key, while boot-time
-        // diagnostics are still reachable. A failed seal leaves no safe way to
-        // return to the OS after allocator EBS, so report it and halt explicitly.
-        if let Err(seal_status) = runtime_image.seal() {
-            log::error!(
-                "FATAL: runtime image seal failed after allocator ExitBootServices: {:?}",
-                seal_status
-            );
-            loop {
-                crate::arch::halt();
-            }
+        loop {
+            crate::arch::halt();
         }
-        #[cfg(feature = "variable-store")]
-        crate::efi::varstore::persistence::detach_backend();
-        log::info!("Runtime image sealed successfully");
+    }
+    #[cfg(feature = "variable-store")]
+    crate::efi::varstore::persistence::detach_backend();
+    log::info!("Runtime image sealed successfully");
 
-        // Let platform glue clean up integration-specific handoff state only
-        // after the final fallible step; hooks may disable non-runtime log
-        // buffers needed to diagnose a seal failure.
-        if let Some(hooks) = crate::handoff::callbacks().hooks {
-            hooks.on_exit_boot_services();
-        }
-
-        // The OS gets control right after this: everything above is part of
-        // ExitBootServices.
-        crate::timestamp::record(crate::timestamp::TS_CRABEFI_EXIT_BOOT_SERVICES);
-
-        // CRITICAL: Disable logging only after the final fallible runtime-image
-        // transition. The OS generally does not map firmware log devices as
-        // runtime memory.
-        log::set_max_level(log::LevelFilter::Off);
-
-        // Security-state transitions are platform-owned. In particular,
-        // coreboot/TF-A already entered Non-Secure EL2. A PSCI version does
-        // not identify fstart or authorize its vendor-specific NS-switch SMC.
-        // Platforms needing that service must opt in through their own
-        // on_exit_boot_services hook, with the matching EL3 ABI.
-    } else {
-        #[cfg(feature = "tpm")]
-        super::super::tcg::measured_boot::measure_action_all(
-            5,
-            "Exit Boot Services Returned with Failure",
-        );
-        log::warn!("ExitBootServices FAILED: {:?}", status);
+    // Let platform glue clean up integration-specific handoff state only
+    // after the final fallible step; hooks may disable non-runtime log
+    // buffers needed to diagnose a seal failure.
+    if let Some(hooks) = crate::handoff::callbacks().hooks {
+        hooks.on_exit_boot_services();
     }
 
-    status
+    // The OS gets control right after this: everything above is part of
+    // ExitBootServices.
+    crate::timestamp::record(crate::timestamp::TS_CRABEFI_EXIT_BOOT_SERVICES);
+
+    // CRITICAL: Disable logging only after the final fallible runtime-image
+    // transition. The OS generally does not map firmware log devices as
+    // runtime memory.
+    log::set_max_level(log::LevelFilter::Off);
+
+    // Security-state transitions are platform-owned. In particular,
+    // coreboot/TF-A already entered Non-Secure EL2. A PSCI version does
+    // not identify fstart or authorize its vendor-specific NS-switch SMC.
+    // Platforms needing that service must opt in through their own
+    // on_exit_boot_services hook, with the matching EL3 ABI.
 }
 
 #[derive(Clone, Copy)]
@@ -1138,4 +1162,107 @@ fn measure_pe_image_for_tcg(
         event_data: event_data_ptr,
         event_data_size,
     })
+}
+
+#[cfg(test)]
+mod exit_notification_tests {
+    use super::*;
+    use crate::efi::boot_services::events::create_event_ex;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    static ORDER: AtomicUsize = AtomicUsize::new(0);
+    static BEFORE: AtomicUsize = AtomicUsize::new(0);
+    static EXIT: AtomicUsize = AtomicUsize::new(0);
+
+    extern "efiapi" fn record(_event: efi::Event, context: *mut c_void) {
+        let slot = unsafe { &*(context as *const AtomicUsize) };
+        slot.store(ORDER.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn exit_groups_are_notified_once_in_order() {
+        crate::efi::allocator::with_host_pages(check_exit_groups);
+    }
+
+    fn check_exit_groups() {
+        with_tables_mut(|state| *state = Tables::new());
+        crate::efi::tables::init_caches().unwrap();
+        BEFORE_EXIT_SIGNALED.set(false);
+        ORDER.store(0, Ordering::SeqCst);
+        BEFORE.store(0, Ordering::SeqCst);
+        EXIT.store(0, Ordering::SeqCst);
+        for (group, slot) in [
+            (EFI_EVENT_GROUP_EXIT_BOOT_SERVICES, &EXIT),
+            (EFI_EVENT_GROUP_BEFORE_EXIT_BOOT_SERVICES, &BEFORE),
+        ] {
+            let mut event = core::ptr::null_mut();
+            assert_eq!(
+                create_event_ex(
+                    efi::EVT_NOTIFY_SIGNAL,
+                    efi::TPL_CALLBACK,
+                    Some(record),
+                    (slot as *const AtomicUsize).cast(),
+                    &group,
+                    &mut event,
+                ),
+                Status::SUCCESS
+            );
+        }
+        let valid_attempt = core::cell::Cell::new(false);
+        // First attempt: BEFORE_EXIT runs once, second validation fails -> EXIT does not run.
+        let status = exit_order::attempt(
+            1,
+            |_| {
+                let ok = !valid_attempt.replace(true);
+                if ok {
+                    Status::SUCCESS
+                } else {
+                    Status::INVALID_PARAMETER
+                }
+            },
+            || {
+                signal_before_exit_boot_services_once();
+                Ok(())
+            },
+            |_| {},
+            notify_exit_boot_services,
+            || {},
+            |_| {},
+            |()| {},
+        );
+        assert_eq!(status, Status::INVALID_PARAMETER);
+        assert_eq!(
+            BEFORE.load(Ordering::SeqCst),
+            1,
+            "before-exit ran on attempt 1"
+        );
+        assert_eq!(
+            EXIT.load(Ordering::SeqCst),
+            0,
+            "exit group held back on stale key"
+        );
+
+        // Second attempt with fresh key: BEFORE_EXIT is latched (does not re-run
+        // and mutate the map again), then EXIT runs once.
+        let status = exit_order::attempt(
+            2,
+            |_| Status::SUCCESS,
+            || {
+                signal_before_exit_boot_services_once();
+                Ok(())
+            },
+            |_| {},
+            notify_exit_boot_services,
+            || {},
+            |_| {},
+            |()| {},
+        );
+        assert_eq!(status, Status::SUCCESS);
+        let (before, exit) = (BEFORE.load(Ordering::SeqCst), EXIT.load(Ordering::SeqCst));
+        assert!(before != 0 && exit != 0, "both groups notified");
+        assert!(before < exit, "before-exit group before exit group");
+        assert_eq!(ORDER.load(Ordering::SeqCst), 2, "each group notified once");
+        BEFORE_EXIT_SIGNALED.set(false);
+        with_tables_mut(|state| *state = Tables::new());
+    }
 }

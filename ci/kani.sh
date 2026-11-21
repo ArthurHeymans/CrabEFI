@@ -13,6 +13,9 @@ harnesses=(
     crabefi-bounds:proofs::block_range_stays_inside_the_device
     crabefi-bounds:proofs::mmio_access_is_aligned_and_inside_the_region
     crabefi-bounds:proofs::mmio_region_is_nonempty_nonnull_and_does_not_wrap
+    crabefi-memmap:proofs::descriptor_and_owner_splits_agree
+    crabefi-memmap:proofs::owner_split_keeps_every_page_owned_once
+    crabefi-memmap:proofs::exact_cover_requires_an_exact_tiling
 )
 
 for entry in "${harnesses[@]}"; do
