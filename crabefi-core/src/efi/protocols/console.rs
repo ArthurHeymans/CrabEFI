@@ -150,7 +150,7 @@ static CONSOLE: Local<ConsoleState> = Local::new(ConsoleState::new());
 /// Borrow console state.
 #[inline]
 #[track_caller]
-pub fn state() -> core::cell::Ref<'static, ConsoleState> {
+pub fn state() -> crate::cell::Borrowed<'static, ConsoleState> {
     CONSOLE.borrow()
 }
 

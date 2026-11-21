@@ -176,7 +176,7 @@ fn test_device_path_utilities(dpu: &device_path_utilities::Protocol) -> (usize, 
 
     // Test 1: CreateDeviceNode
     {
-        let node = (dpu.create_device_node)(0x01, 0x01, 6); // PCI node: type=HW, sub=PCI, len=6
+        let node = unsafe { (dpu.create_device_node)(0x01, 0x01, 6) }; // PCI node: type=HW, sub=PCI, len=6
         if !node.is_null() {
             let ntype = unsafe { node_type(node as *const u8) };
             let nlen = unsafe { node_len(node as *const u8) };
@@ -200,7 +200,7 @@ fn test_device_path_utilities(dpu: &device_path_utilities::Protocol) -> (usize, 
 
     // Test 2: CreateDeviceNode with too-small length should fail
     {
-        let node = (dpu.create_device_node)(0x01, 0x01, 2); // len < 4 = invalid
+        let node = unsafe { (dpu.create_device_node)(0x01, 0x01, 2) }; // len < 4 = invalid
         if node.is_null() {
             println("[PASS] create_device_node_invalid: Rejected length < 4");
             passed += 1;
@@ -213,7 +213,7 @@ fn test_device_path_utilities(dpu: &device_path_utilities::Protocol) -> (usize, 
 
     // Test 3: GetDevicePathSize on NULL
     {
-        let size = (dpu.get_device_path_size)(core::ptr::null());
+        let size = unsafe { (dpu.get_device_path_size)(core::ptr::null()) };
         if size == 0 {
             println("[PASS] get_size_null: Returns 0 for NULL input");
             passed += 1;
@@ -228,7 +228,7 @@ fn test_device_path_utilities(dpu: &device_path_utilities::Protocol) -> (usize, 
     // Test 4: Build a device path and check its size
     // Create ACPI node (12 bytes) -> we need a full path with End node
     {
-        let acpi = (dpu.create_device_node)(0x02, 0x01, 12); // ACPI node
+        let acpi = unsafe { (dpu.create_device_node)(0x02, 0x01, 12) }; // ACPI node
         if !acpi.is_null() {
             unsafe {
                 core::ptr::copy_nonoverlapping(
@@ -238,9 +238,9 @@ fn test_device_path_utilities(dpu: &device_path_utilities::Protocol) -> (usize, 
                 );
             }
             // AppendDeviceNode(NULL, acpi) should create a path: acpi + end(4) = 16 bytes
-            let path = (dpu.append_device_node)(core::ptr::null(), acpi);
+            let path = unsafe { (dpu.append_device_node)(core::ptr::null(), acpi) };
             if !path.is_null() {
-                let size = (dpu.get_device_path_size)(path);
+                let size = unsafe { (dpu.get_device_path_size)(path) };
                 if size == 16 && unsafe { bytes_match(path, &PCI_ROOT_PATH) } {
                     // Check node contents and the terminal End Entire node too.
                     println("[PASS] get_size: ACPI+End path is 16 bytes");
@@ -253,9 +253,9 @@ fn test_device_path_utilities(dpu: &device_path_utilities::Protocol) -> (usize, 
                 }
 
                 // Test 5: DuplicateDevicePath
-                let dup = (dpu.duplicate_device_path)(path);
+                let dup = unsafe { (dpu.duplicate_device_path)(path) };
                 if !dup.is_null() {
-                    let dup_size = (dpu.get_device_path_size)(dup);
+                    let dup_size = unsafe { (dpu.get_device_path_size)(dup) };
                     if dup_size == PCI_ROOT_PATH.len()
                         && dup != path
                         && unsafe { bytes_match(dup, &PCI_ROOT_PATH) }
@@ -289,30 +289,30 @@ fn test_device_path_utilities(dpu: &device_path_utilities::Protocol) -> (usize, 
     // Test 6: AppendDevicePath with two paths
     {
         // Create path1: PCI(dev=1,func=0) + End
-        let pci = (dpu.create_device_node)(0x01, 0x01, 6);
+        let pci = unsafe { (dpu.create_device_node)(0x01, 0x01, 6) };
         if !pci.is_null() {
             unsafe {
                 *(pci as *mut u8).add(5) = 1;
             }
         }
-        let path1 = (dpu.append_device_node)(core::ptr::null(), pci);
+        let path1 = unsafe { (dpu.append_device_node)(core::ptr::null(), pci) };
         free_pool(pci as *mut c_void);
 
         // Create path2: USB(port=1,iface=0) + End
-        let usb = (dpu.create_device_node)(0x03, 0x05, 6);
+        let usb = unsafe { (dpu.create_device_node)(0x03, 0x05, 6) };
         if !usb.is_null() {
             unsafe {
                 *(usb as *mut u8).add(4) = 1;
             }
         }
-        let path2 = (dpu.append_device_node)(core::ptr::null(), usb);
+        let path2 = unsafe { (dpu.append_device_node)(core::ptr::null(), usb) };
         free_pool(usb as *mut c_void);
 
         if !path1.is_null() && !path2.is_null() {
-            let combined = (dpu.append_device_path)(path1, path2);
+            let combined = unsafe { (dpu.append_device_path)(path1, path2) };
             if !combined.is_null() {
                 // Expected: PCI(6) + USB(6) + End(4) = 16
-                let size = (dpu.get_device_path_size)(combined);
+                let size = unsafe { (dpu.get_device_path_size)(combined) };
                 if size == 16
                     && unsafe {
                         bytes_match(
@@ -344,9 +344,9 @@ fn test_device_path_utilities(dpu: &device_path_utilities::Protocol) -> (usize, 
 
     // Test 7: AppendDevicePath with both NULL
     {
-        let result = (dpu.append_device_path)(core::ptr::null(), core::ptr::null());
+        let result = unsafe { (dpu.append_device_path)(core::ptr::null(), core::ptr::null()) };
         if !result.is_null() {
-            let size = (dpu.get_device_path_size)(result);
+            let size = unsafe { (dpu.get_device_path_size)(result) };
             if size == 4 && unsafe { bytes_match(result, &[0x7f, 0xff, 4, 0]) } {
                 // Exactly one End Entire node.
                 println("[PASS] append_both_null: Returns end-only path (4 bytes)");
@@ -366,12 +366,12 @@ fn test_device_path_utilities(dpu: &device_path_utilities::Protocol) -> (usize, 
 
     // Test 8: IsDevicePathMultiInstance (single instance)
     {
-        let node = (dpu.create_device_node)(0x01, 0x01, 6);
-        let path = (dpu.append_device_node)(core::ptr::null(), node);
+        let node = unsafe { (dpu.create_device_node)(0x01, 0x01, 6) };
+        let path = unsafe { (dpu.append_device_node)(core::ptr::null(), node) };
         free_pool(node as *mut c_void);
 
         if !path.is_null() {
-            let multi = (dpu.is_device_path_multi_instance)(path);
+            let multi = unsafe { (dpu.is_device_path_multi_instance)(path) };
             if multi == Boolean::FALSE {
                 println("[PASS] is_multi_instance_single: Single instance returns FALSE");
                 passed += 1;
@@ -385,28 +385,28 @@ fn test_device_path_utilities(dpu: &device_path_utilities::Protocol) -> (usize, 
 
     // Test 9: AppendDevicePathInstance + IsDevicePathMultiInstance
     {
-        let node1 = (dpu.create_device_node)(0x01, 0x01, 6);
+        let node1 = unsafe { (dpu.create_device_node)(0x01, 0x01, 6) };
         if !node1.is_null() {
             unsafe {
                 *(node1 as *mut u8).add(5) = 1;
             }
         }
-        let path1 = (dpu.append_device_node)(core::ptr::null(), node1);
+        let path1 = unsafe { (dpu.append_device_node)(core::ptr::null(), node1) };
         free_pool(node1 as *mut c_void);
 
-        let node2 = (dpu.create_device_node)(0x03, 0x05, 6);
+        let node2 = unsafe { (dpu.create_device_node)(0x03, 0x05, 6) };
         if !node2.is_null() {
             unsafe {
                 *(node2 as *mut u8).add(4) = 1;
             }
         }
-        let path2 = (dpu.append_device_node)(core::ptr::null(), node2);
+        let path2 = unsafe { (dpu.append_device_node)(core::ptr::null(), node2) };
         free_pool(node2 as *mut c_void);
 
         if !path1.is_null() && !path2.is_null() {
-            let multi_path = (dpu.append_device_path_instance)(path1, path2);
+            let multi_path = unsafe { (dpu.append_device_path_instance)(path1, path2) };
             if !multi_path.is_null() {
-                let is_multi = (dpu.is_device_path_multi_instance)(multi_path);
+                let is_multi = unsafe { (dpu.is_device_path_multi_instance)(multi_path) };
                 if is_multi != Boolean::FALSE {
                     println("[PASS] is_multi_instance_multi: Multi-instance returns TRUE");
                     passed += 1;
@@ -418,7 +418,8 @@ fn test_device_path_utilities(dpu: &device_path_utilities::Protocol) -> (usize, 
                 // Test 10: GetNextDevicePathInstance
                 let mut iter = multi_path as *mut device_path::Protocol;
                 let mut inst_size: usize = 0;
-                let inst1 = (dpu.get_next_device_path_instance)(&mut iter, &mut inst_size);
+                let inst1 =
+                    unsafe { (dpu.get_next_device_path_instance)(&mut iter, &mut inst_size) };
                 if !inst1.is_null() && inst_size == 10 && unsafe { bytes_match(inst1, &PCI_PATH) } {
                     // First instance: PCI(6) + End(4) = 10
                     println("[PASS] get_next_instance_1: First instance is 10 bytes");
@@ -432,7 +433,8 @@ fn test_device_path_utilities(dpu: &device_path_utilities::Protocol) -> (usize, 
                 }
 
                 if !iter.is_null() {
-                    let inst2 = (dpu.get_next_device_path_instance)(&mut iter, &mut inst_size);
+                    let inst2 =
+                        unsafe { (dpu.get_next_device_path_instance)(&mut iter, &mut inst_size) };
                     if !inst2.is_null()
                         && inst_size == 10
                         && unsafe { bytes_match(inst2, &USB_PATH) }
@@ -493,18 +495,20 @@ fn test_device_path_to_text(
 
     // Test 1: Convert a PCI node to text
     {
-        let pci = (dpu.create_device_node)(0x01, 0x01, 6);
+        let pci = unsafe { (dpu.create_device_node)(0x01, 0x01, 6) };
         if !pci.is_null() {
             // Set function=0, device=0x1F at offsets 4,5
             unsafe {
                 *(pci as *mut u8).add(4) = 0; // function
                 *(pci as *mut u8).add(5) = 0x1F; // device
             }
-            let text = (dpt.convert_device_node_to_text)(
-                pci,
-                Boolean::FALSE, // not display_only
-                Boolean::FALSE,
-            );
+            let text = unsafe {
+                (dpt.convert_device_node_to_text)(
+                    pci,
+                    Boolean::FALSE, // not display_only
+                    Boolean::FALSE,
+                )
+            };
             if !text.is_null() {
                 // Should be "Pci(0x1F,0x0)"
                 print("[    ] node_to_text_pci: \"");
@@ -529,7 +533,7 @@ fn test_device_path_to_text(
     // Test 2: Convert a full device path (ACPI/PCI) to text
     {
         // Build ACPI(PNP0A03,0)/PCI(1,0)/End
-        let acpi = (dpu.create_device_node)(0x02, 0x01, 12);
+        let acpi = unsafe { (dpu.create_device_node)(0x02, 0x01, 12) };
         if !acpi.is_null() {
             // HID = 0x0a0341d0 (PNP0A03) at offset 4, UID = 0 at offset 8
             unsafe {
@@ -538,25 +542,23 @@ fn test_device_path_to_text(
                 let uid_bytes = 0u32.to_le_bytes();
                 core::ptr::copy_nonoverlapping(uid_bytes.as_ptr(), (acpi as *mut u8).add(8), 4);
             }
-            let path = (dpu.append_device_node)(core::ptr::null(), acpi);
+            let path = unsafe { (dpu.append_device_node)(core::ptr::null(), acpi) };
             free_pool(acpi as *mut c_void);
 
-            let pci = (dpu.create_device_node)(0x01, 0x01, 6);
+            let pci = unsafe { (dpu.create_device_node)(0x01, 0x01, 6) };
             if !pci.is_null() {
                 unsafe {
                     *(pci as *mut u8).add(4) = 0; // function
                     *(pci as *mut u8).add(5) = 1; // device
                 }
-                let full_path = (dpu.append_device_node)(path, pci);
+                let full_path = unsafe { (dpu.append_device_node)(path, pci) };
                 free_pool(pci as *mut c_void);
                 free_pool(path as *mut c_void);
 
                 if !full_path.is_null() {
-                    let text = (dpt.convert_device_path_to_text)(
-                        full_path,
-                        Boolean::FALSE,
-                        Boolean::FALSE,
-                    );
+                    let text = unsafe {
+                        (dpt.convert_device_path_to_text)(full_path, Boolean::FALSE, Boolean::FALSE)
+                    };
                     if !text.is_null() {
                         // Should be "PciRoot(0x0)/Pci(0x1,0x0)"
                         print("[    ] path_to_text_pci_root: \"");
@@ -584,7 +586,7 @@ fn test_device_path_to_text(
 
     // Test 3: Convert a generic EISA ACPI node using EDK2-compatible PNPxxxx text
     {
-        let acpi = (dpu.create_device_node)(0x02, 0x01, 12);
+        let acpi = unsafe { (dpu.create_device_node)(0x02, 0x01, 12) };
         if !acpi.is_null() {
             unsafe {
                 let hid_bytes = 0xb0c041d0u32.to_le_bytes(); // PNPB0C0
@@ -592,7 +594,8 @@ fn test_device_path_to_text(
                 let uid_bytes = 1u32.to_le_bytes();
                 core::ptr::copy_nonoverlapping(uid_bytes.as_ptr(), (acpi as *mut u8).add(8), 4);
             }
-            let text = (dpt.convert_device_node_to_text)(acpi, Boolean::FALSE, Boolean::FALSE);
+            let text =
+                unsafe { (dpt.convert_device_node_to_text)(acpi, Boolean::FALSE, Boolean::FALSE) };
             if !text.is_null() {
                 if ucs2_equals_ascii(text, "Acpi(PNPB0C0,0x1)") {
                     println("[PASS] node_to_text_acpi_pnp: ACPI PNP node converted to text");
@@ -614,11 +617,9 @@ fn test_device_path_to_text(
 
     // Test 4: Convert NULL should return NULL
     {
-        let text = (dpt.convert_device_path_to_text)(
-            core::ptr::null_mut(),
-            Boolean::FALSE,
-            Boolean::FALSE,
-        );
+        let text = unsafe {
+            (dpt.convert_device_path_to_text)(core::ptr::null_mut(), Boolean::FALSE, Boolean::FALSE)
+        };
         if text.is_null() {
             println("[PASS] path_to_text_null: NULL input returns NULL");
             passed += 1;
@@ -664,7 +665,7 @@ fn test_device_path_from_text(
             b')' as u16,
             0,
         ];
-        let node = (dpft.convert_text_to_device_node)(text.as_ptr() as *const Char16);
+        let node = unsafe { (dpft.convert_text_to_device_node)(text.as_ptr() as *const Char16) };
         if !node.is_null() {
             let ntype = unsafe { node_type(node as *const u8) };
             let nlen = unsafe { node_len(node as *const u8) };
@@ -708,7 +709,7 @@ fn test_device_path_from_text(
             b')' as u16,
             0,
         ];
-        let node = (dpft.convert_text_to_device_node)(text.as_ptr() as *const Char16);
+        let node = unsafe { (dpft.convert_text_to_device_node)(text.as_ptr() as *const Char16) };
         if !node.is_null() {
             let hid = unsafe {
                 u32::from_le_bytes([
@@ -766,9 +767,9 @@ fn test_device_path_from_text(
             0,
             0, // Extra null for safety
         ];
-        let path = (dpft.convert_text_to_device_path)(text.as_ptr() as *const Char16);
+        let path = unsafe { (dpft.convert_text_to_device_path)(text.as_ptr() as *const Char16) };
         if !path.is_null() {
-            let size = (dpu.get_device_path_size)(path);
+            let size = unsafe { (dpu.get_device_path_size)(path) };
             // ACPI(12) + PCI(6) + End(4) = 22
             if size == 22 && unsafe { bytes_match(path, &PCI_ROOT_PCI_PATH) } {
                 println("[PASS] text_to_path_pci: Path is 22 bytes (ACPI+PCI+End)");
@@ -781,7 +782,8 @@ fn test_device_path_from_text(
             }
 
             // Test 3: Round-trip: text->path->text should produce equivalent text
-            let text_out = (dpt.convert_device_path_to_text)(path, Boolean::FALSE, Boolean::FALSE);
+            let text_out =
+                unsafe { (dpt.convert_device_path_to_text)(path, Boolean::FALSE, Boolean::FALSE) };
             if !text_out.is_null() {
                 print("[    ] round_trip: \"");
                 ucs2_to_ascii_print(text_out);
@@ -824,7 +826,7 @@ fn test_device_path_from_text(
             b'e' as u16,
             0,
         ];
-        let node = (dpft.convert_text_to_device_node)(text.as_ptr() as *const Char16);
+        let node = unsafe { (dpft.convert_text_to_device_node)(text.as_ptr() as *const Char16) };
         if !node.is_null() {
             let ntype = unsafe { node_type(node as *const u8) };
             let nsub = unsafe { *(node as *const u8).add(1) };
@@ -856,7 +858,7 @@ fn test_device_path_from_text(
 
     // Test 5: NULL input returns NULL
     {
-        let node = (dpft.convert_text_to_device_node)(core::ptr::null());
+        let node = unsafe { (dpft.convert_text_to_device_node)(core::ptr::null()) };
         if node.is_null() {
             println("[PASS] text_to_node_null: NULL input returns NULL");
             passed += 1;

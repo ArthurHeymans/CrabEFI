@@ -321,6 +321,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "image entry is a naked-assembly trampoline")]
     fn nested_image_exit_returns_to_matching_invocation() {
         let _guard = crate::efi::boot_services::IMAGE_EXECUTION_TEST_LOCK
             .lock()

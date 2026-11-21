@@ -589,19 +589,7 @@ fn load_variables_from_storage() -> Result<(), VarStoreError> {
     })
     .ok_or(VarStoreError::NotInitialized)?;
 
-    // Filter to only VAR_ADDED records and deduplicate (keep latest)
-    // Build a list of active variables
-    let mut active_vars: Vec<&edk2::FvVariable> = Vec::new();
-    for var in &vars {
-        if !edk2::is_var_added(var.state) {
-            continue;
-        }
-        // Remove any existing entry with same GUID + name
-        active_vars.retain(|existing| {
-            !(existing.guid == var.guid && edk2::name_matches(&existing.name, &var.name))
-        });
-        active_vars.push(var);
-    }
+    let active_vars = live_records(&vars);
 
     let client = crate::efi::runtime_image::installed().ok_or(VarStoreError::NotInitialized)?;
     for variable in &active_vars {
@@ -636,6 +624,32 @@ fn load_variables_from_storage() -> Result<(), VarStoreError> {
         active_vars.len()
     );
     Ok(())
+}
+
+/// The visible value of each variable: the last VAR_ADDED record for each
+/// GUID and name. A write commits its new record before retiring the old one,
+/// so after a power loss between the two the newer record wins.
+fn live_records(records: &[edk2::FvVariable]) -> Vec<&edk2::FvVariable> {
+    live_record_indices(records)
+        .into_iter()
+        .map(|index| &records[index])
+        .collect()
+}
+
+/// Indices of the records [`live_records`] selects, in the same order.
+fn live_record_indices(records: &[edk2::FvVariable]) -> Vec<usize> {
+    let mut live: Vec<usize> = Vec::new();
+    for (index, record) in records.iter().enumerate() {
+        if !edk2::is_var_added(record.state) {
+            continue;
+        }
+        live.retain(|&existing| {
+            let existing = &records[existing];
+            !(existing.guid == record.guid && edk2::name_matches(&existing.name, &record.name))
+        });
+        live.push(index);
+    }
+    live
 }
 
 /// Get the latest durable authenticated timestamp, including deletion floors.
@@ -808,20 +822,27 @@ fn compact_variable_store() -> Result<(), VarStoreError> {
     if !vs.initialized || !vs.auth_format {
         return Err(VarStoreError::StoreFull);
     }
+    // Compaction erases the only copy, so it needs the complete inventory: a
+    // read failure partway through must not drop every record after it.
     let vars = with_storage_mut(|storage| {
         let mut read_fn = |offset: u32, buf: &mut [u8]| storage.read(offset, buf).is_ok();
-        edk2::walk_variables(&mut read_fn, vs.auth_format, vs.data_size)
+        edk2::walk_variables_checked(&mut read_fn, vs.auth_format, vs.data_size)
     })
-    .ok_or(VarStoreError::NotInitialized)?;
-    let mut active = Vec::new();
-    for variable in vars
-        .into_iter()
-        .filter(|variable| edk2::is_var_added(variable.state))
-    {
-        active.retain(|existing: &edk2::FvVariable| {
-            !(existing.guid == variable.guid && edk2::name_matches(&existing.name, &variable.name))
-        });
-        active.push(variable);
+    .ok_or(VarStoreError::NotInitialized)?
+    .ok_or_else(|| {
+        log::error!("Variable store inventory incomplete; refusing to compact");
+        VarStoreError::StorageFailure
+    })?;
+    // Keep only live records, so superseded payloads are freed before the
+    // rewrite.
+    let live = live_record_indices(&vars);
+    let mut active: Vec<edk2::FvVariable> = Vec::new();
+    let mut live = live.into_iter().peekable();
+    for (index, record) in vars.into_iter().enumerate() {
+        if live.peek() == Some(&index) {
+            live.next();
+            active.push(record);
+        }
     }
     let storage_size =
         with_storage_mut(|storage| storage.size()).ok_or(VarStoreError::NotInitialized)?;
@@ -1160,6 +1181,10 @@ pub(crate) fn persist_firmware_variable(
 #[cfg(test)]
 #[path = "backend_tests.rs"]
 mod backend_tests;
+
+#[cfg(test)]
+#[path = "power_loss_tests.rs"]
+mod power_loss_tests;
 
 #[cfg(test)]
 mod tests {

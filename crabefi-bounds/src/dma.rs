@@ -44,7 +44,18 @@ pub const fn translate_dma_range(
     if byte_len == 0 || end > window_size {
         return None;
     }
-    device_base.checked_add(offset)
+    // The last byte must be addressable on both sides of the window, not
+    // only the first: the CPU range and its device translation.
+    if cpu_address.checked_add(byte_len - 1).is_none() {
+        return None;
+    }
+    let Some(device) = device_base.checked_add(offset) else {
+        return None;
+    };
+    match device.checked_add(byte_len - 1) {
+        Some(_) => Some(device),
+        None => None,
+    }
 }
 
 /// Validate a half-open subrange against a buffer length.
@@ -57,7 +68,6 @@ pub const fn checked_subrange(range: &Range<usize>, len: usize) -> Option<(usize
 }
 
 /// Round a nonempty address range out to complete cache lines.
-#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub const fn cache_line_range(addr: u64, size: usize, line_size: usize) -> Option<Range<u64>> {
     if size == 0 || line_size == 0 || !line_size.is_power_of_two() {
         return None;
@@ -120,7 +130,7 @@ mod tests {
         assert_eq!(checked_subrange(&(0..4096), 4096), Some((0, 4096)));
         assert_eq!(checked_subrange(&(4096..4096), 4096), Some((4096, 0)));
         assert_eq!(checked_subrange(&(4096..4097), 4096), None);
-        assert_eq!(checked_subrange(&(2..1), 4096), None);
+        assert_eq!(checked_subrange(&Range { start: 2, end: 1 }, 4096), None);
     }
 
     #[test]

@@ -97,7 +97,7 @@ extern "efiapi" fn block_io_read_blocks(
 
     let num_blocks = buffer_size / block_size;
 
-    let Some(absolute_lba) = crate::efi::block_range::checked_absolute_lba(
+    let Some(absolute_lba) = crabefi_bounds::block::checked_absolute_lba(
         ctx.start_lba,
         lba,
         num_blocks as u64,

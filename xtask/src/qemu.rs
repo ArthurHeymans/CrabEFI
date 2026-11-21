@@ -327,6 +327,8 @@ fn spawn_swtpm() -> Result<(SwtpmProcess, Vec<String>)> {
 pub struct TestResult {
     /// Captured serial output
     pub output: String,
+    /// QEMU exited by itself with status 0, not killed by the timeout
+    pub exited_cleanly: bool,
 }
 
 /// Build QEMU command with the given configuration
@@ -1312,8 +1314,17 @@ pub fn run_tests(config: &QemuConfig, disk_path: &Path, app_name: &str) -> Resul
             }
         }
         "image-exit-test" => {
+            // On x86-64 the test also exits Boot Services from an image whose
+            // notify function writes to the console, then resets, which ends
+            // QEMU before the timeout.
+            let exit_notified = config.arch != Arch::X86_64
+                || (result
+                    .output
+                    .contains("ExitBootServices notify wrote to the console")
+                    && result.exited_cleanly);
             if result.output.contains("All image exit tests passed!")
                 && !result.output.contains("[FAIL] image_exit")
+                && exit_notified
             {
                 println!("[PASS] image_exit: Nested Exit, exit data, and image cleanup");
                 passed += 1;
@@ -1843,10 +1854,8 @@ pub fn run_uefi_sct_smoke_tests(
         .context("SCT Summary.log was not produced")
         .and_then(|summary| sct::validate(&result.output, summary, sequence));
     use sha2::Digest;
-    let firmware_sha256 = format!(
-        "{:x}",
-        sha2::Sha256::digest(fs::read(&config.coreboot_rom)?)
-    );
+    let firmware_sha256 =
+        crate::runtime::hex(&sha2::Sha256::digest(fs::read(&config.coreboot_rom)?));
     fs::write(
         report_dir.join("result.json"),
         serde_json::to_vec_pretty(&serde_json::json!({
@@ -2373,6 +2382,8 @@ fn parse_qemu_output(output: &std::process::Output) -> Result<TestResult> {
 
     Ok(TestResult {
         output: clean_output,
+        // A timeout kills QEMU with SIGKILL: no status, or a nonzero one.
+        exited_cleanly: output.status.success(),
     })
 }
 

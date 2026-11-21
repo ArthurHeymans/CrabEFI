@@ -5,13 +5,11 @@
 
 pub mod allocator;
 pub mod auth;
-pub(crate) mod block_range;
 pub mod boot_services;
 pub mod capsule;
 #[cfg(any(feature = "secure-boot", feature = "tpm"))]
 pub mod digest;
 pub mod dma;
-pub(crate) mod dma_range;
 pub mod esrt;
 pub mod guid_fmt;
 pub mod image_loader;

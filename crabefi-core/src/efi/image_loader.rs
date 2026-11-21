@@ -109,6 +109,22 @@ pub(crate) fn load_image_from_device_path(
     boot_services::with_image_callback(|| read_image_file(device_path))
 }
 
+/// Call a filesystem method. It may belong to an image and call any Boot
+/// Service, which may borrow any firmware cell, so no borrow may be live.
+#[inline]
+#[track_caller]
+fn foreign<R>(call: impl FnOnce() -> R) -> R {
+    crate::cell::assert_no_live_borrows();
+    call()
+}
+
+/// Close an opened file and its volume root, each as its own foreign call.
+fn close_both(file: *mut FileProtocol, root: *mut FileProtocol) {
+    // SAFETY: both handles were opened by this reader and are closed once.
+    foreign(|| unsafe { ((*file).close)(file) });
+    foreign(|| unsafe { ((*root).close)(root) });
+}
+
 /// Read through the selected filesystem inside a protected callback boundary.
 fn read_image_file(
     device_path: *mut DevicePathProtocol,
@@ -162,7 +178,7 @@ fn read_image_file(
 
     // Open the volume (root directory)
     let mut root: *mut FileProtocol = core::ptr::null_mut();
-    let status = unsafe { ((*sfs).open_volume)(sfs, &mut root) };
+    let status = foreign(|| unsafe { ((*sfs).open_volume)(sfs, &mut root) });
 
     if status != Status::SUCCESS || root.is_null() {
         log::error!("BS.LoadImage: Failed to open volume: {:?}", status);
@@ -171,7 +187,7 @@ fn read_image_file(
 
     // Open the file
     let mut file: *mut FileProtocol = core::ptr::null_mut();
-    let status = unsafe {
+    let status = foreign(|| unsafe {
         ((*root).open)(
             root,
             &mut file,
@@ -179,11 +195,11 @@ fn read_image_file(
             r_efi::protocols::file::MODE_READ,
             0,
         )
-    };
+    });
 
     if status != Status::SUCCESS || file.is_null() {
         log::error!("BS.LoadImage: Failed to open file: {:?}", status);
-        unsafe { ((*root).close)(root) };
+        foreign(|| unsafe { ((*root).close)(root) });
         return Err(status);
     }
 
@@ -191,14 +207,14 @@ fn read_image_file(
     let mut info_buffer = [0u8; 256];
     let mut info_size = info_buffer.len();
 
-    let status = unsafe {
+    let status = foreign(|| unsafe {
         ((*file).get_info)(
             file,
             &r_efi::protocols::file::INFO_ID as *const Guid as *mut Guid,
             &mut info_size,
             info_buffer.as_mut_ptr() as *mut c_void,
         )
-    };
+    });
 
     if status != Status::SUCCESS || info_size < 16 {
         log::error!(
@@ -206,10 +222,7 @@ fn read_image_file(
             status,
             info_size
         );
-        unsafe {
-            ((*file).close)(file);
-            ((*root).close)(root);
-        }
+        close_both(file, root);
         return Err(Status::DEVICE_ERROR);
     }
 
@@ -220,10 +233,7 @@ fn read_image_file(
     if file_size == 0 || file_size > 256 * 1024 * 1024 {
         // Sanity check: reject empty files or files > 256MB
         log::error!("BS.LoadImage: Invalid file size: {}", file_size);
-        unsafe {
-            ((*file).close)(file);
-            ((*root).close)(root);
-        }
+        close_both(file, root);
         return Err(Status::INVALID_PARAMETER);
     }
 
@@ -232,23 +242,17 @@ fn read_image_file(
         Ok(ptr) => ptr,
         Err(status) => {
             log::error!("BS.LoadImage: Failed to allocate {} bytes", file_size);
-            unsafe {
-                ((*file).close)(file);
-                ((*root).close)(root);
-            }
+            close_both(file, root);
             return Err(status);
         }
     };
 
     // Read the file
     let mut read_size = file_size as usize;
-    let status = unsafe { ((*file).read)(file, &mut read_size, buffer as *mut c_void) };
+    let status = foreign(|| unsafe { ((*file).read)(file, &mut read_size, buffer as *mut c_void) });
 
     // Close file handles
-    unsafe {
-        ((*file).close)(file);
-        ((*root).close)(root);
-    }
+    close_both(file, root);
 
     if status != Status::SUCCESS {
         log::error!("BS.LoadImage: Failed to read file: {:?}", status);

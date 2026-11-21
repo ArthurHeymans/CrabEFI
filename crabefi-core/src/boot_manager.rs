@@ -868,6 +868,11 @@ fn boot_linux_entry<const NATIVE: bool>(
             // The disk/controller borrow must be released before shutdown:
             // direct boot quiesces every firmware-owned DMA engine.
             log::info!("Linux loaded successfully, booting...");
+            // After the filesystem borrow: ReadyToBoot and measurement call
+            // foreign code.
+            if !NATIVE {
+                loaded.measure_start(cmdline.as_str());
+            }
             // The kernel gets no EFI runtime services and never calls
             // ExitBootServices, but it can still reach payload MM through
             // the request buffer: end the firmware phase and switch MM to

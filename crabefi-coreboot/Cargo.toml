@@ -61,7 +61,7 @@ crabefi = { package = "crabefi-core", path = "../crabefi-core", features = [
 ] }
 # Needed for coreboot table parsing and early setup
 log = "0.4"
-r-efi = "7.1"
+r-efi = { workspace = true }
 heapless = "0.9"
 zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
 
@@ -98,7 +98,7 @@ fdt = "0.1.5"
 [build-dependencies]
 cc = "1"
 crabefi-runtime-abi = { path = "../crabefi-runtime-abi" }
-sha2 = "0.10"
+sha2 = { version = "0.11", default-features = false }
 
 # A test-only library exercises the real payload modules without linking its entry point.
 [lib]

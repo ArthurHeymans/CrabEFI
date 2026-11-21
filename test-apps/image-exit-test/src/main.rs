@@ -1,10 +1,14 @@
 //! Reload this application from the same disk as a child and grandchild.
 //! Each child exits from a helper; its parent checks status, copied UTF-16 data,
 //! and removal of the child's Loaded Image protocol before continuing.
+//! On x86-64 the parent then exits Boot Services with a notify function that
+//! writes to the console, reports on COM1 and resets, which ends the run.
 
 #![no_std]
 #![no_main]
 
+#[cfg(target_arch = "x86_64")]
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::{ffi::c_void, panic::PanicInfo, ptr};
 
 use r_efi::efi::{self, BootServices, Handle, Status, SystemTable};
@@ -39,7 +43,7 @@ fn fail(st: *mut SystemTable, reason: &str) -> Status {
 fn loaded(bs: &BootServices, handle: Handle) -> Result<*mut loaded_image::Protocol, Status> {
     let mut interface = ptr::null_mut();
     let mut guid = loaded_image::PROTOCOL_GUID;
-    let status = (bs.handle_protocol)(handle, &mut guid, &mut interface);
+    let status = unsafe { (bs.handle_protocol)(handle, &mut guid, &mut interface) };
     if status != Status::SUCCESS || interface.is_null() {
         Err(Status::NOT_FOUND)
     } else {
@@ -90,7 +94,9 @@ fn self_path(bs: &BootServices, image: &loaded_image::Protocol) -> Option<PathBu
     let prefix = if file_only {
         let mut device: *mut c_void = ptr::null_mut();
         let mut guid = device_path::PROTOCOL_GUID;
-        if (bs.handle_protocol)(image.device_handle, &mut guid, &mut device) != Status::SUCCESS {
+        if unsafe { (bs.handle_protocol)(image.device_handle, &mut guid, &mut device) }
+            != Status::SUCCESS
+        {
             return None;
         }
         let prefix = unsafe { path_size(device.cast()) }?.checked_sub(4)?;
@@ -114,21 +120,23 @@ fn run_child(handle: Handle, st: *mut SystemTable, depth: u32) -> Result<(), &'s
     let image = loaded(bs, handle).map_err(|_| "parent protocol missing")?;
     let mut path = self_path(bs, unsafe { &*image }).ok_or("self path unavailable")?;
     let mut child = ptr::null_mut();
-    let status = (bs.load_image)(
-        efi::Boolean::FALSE,
-        handle,
-        path.0.as_mut_ptr().cast(),
-        ptr::null_mut(),
-        0,
-        &mut child,
-    );
+    let status = unsafe {
+        (bs.load_image)(
+            efi::Boolean::FALSE,
+            handle,
+            path.0.as_mut_ptr().cast(),
+            ptr::null_mut(),
+            0,
+            &mut child,
+        )
+    };
     if status != Status::SUCCESS || child.is_null() {
         return Err("LoadImage from disk failed");
     }
     let child_protocol = match loaded(bs, child) {
         Ok(protocol) => protocol,
         Err(_) => {
-            (bs.unload_image)(child);
+            unsafe { (bs.unload_image)(child) };
             return Err("child protocol missing before StartImage");
         }
     };
@@ -139,7 +147,7 @@ fn run_child(handle: Handle, st: *mut SystemTable, depth: u32) -> Result<(), &'s
     }
     let mut size = 0usize;
     let mut data = ptr::null_mut();
-    let status = (bs.start_image)(child, &mut size, &mut data);
+    let status = unsafe { (bs.start_image)(child, &mut size, &mut data) };
     let (expected_status, expected_data) = expected(depth);
     let correct = status == expected_status
         && size == size_of_val(expected_data)
@@ -149,7 +157,7 @@ fn run_child(handle: Handle, st: *mut SystemTable, depth: u32) -> Result<(), &'s
     let free_status = if data.is_null() {
         Status::SUCCESS
     } else {
-        (bs.free_pool)(data.cast())
+        unsafe { (bs.free_pool)(data.cast()) }
     };
     if !correct {
         return Err("StartImage status or UTF16 exit data mismatch");
@@ -159,7 +167,7 @@ fn run_child(handle: Handle, st: *mut SystemTable, depth: u32) -> Result<(), &'s
     }
     let mut stale = ptr::null_mut();
     let mut guid = loaded_image::PROTOCOL_GUID;
-    if (bs.handle_protocol)(child, &mut guid, &mut stale) == Status::SUCCESS {
+    if unsafe { (bs.handle_protocol)(child, &mut guid, &mut stale) } == Status::SUCCESS {
         return Err("unloaded child protocol remains accessible");
     }
     Ok(())
@@ -179,7 +187,7 @@ fn expected(depth: u32) -> (Status, &'static [u16]) {
 fn exit_from_helper(handle: Handle, st: *mut SystemTable, depth: u32) -> Status {
     let (status, data) = expected(depth);
     let bs = unsafe { &*(*st).boot_services };
-    (bs.exit)(handle, status, size_of_val(data), data.as_ptr().cast_mut());
+    unsafe { (bs.exit)(handle, status, size_of_val(data), data.as_ptr().cast_mut()) };
     fail(st, "Exit returned to its helper")
 }
 
@@ -212,8 +220,16 @@ pub unsafe extern "efiapi" fn efi_main(handle: Handle, st: *mut SystemTable) -> 
                 return fail(st, reason);
             }
         }
-        print(st, "All image exit tests passed!\r\n");
-        Status::SUCCESS
+        // On x86-64 the exit test reports the result itself and resets.
+        #[cfg(target_arch = "x86_64")]
+        {
+            fail(st, exit_boot_services(handle, st))
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            print(st, "All image exit tests passed!\r\n");
+            Status::SUCCESS
+        }
     } else {
         if depth == 1
             && let Err(reason) = run_child(handle, st, 2)
@@ -222,6 +238,132 @@ pub unsafe extern "efiapi" fn efi_main(handle: Handle, st: *mut SystemTable) -> 
         }
         exit_from_helper(handle, st, depth)
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+static EXIT_NOTIFIED: AtomicBool = AtomicBool::new(false);
+
+/// Runs inside ExitBootServices. Console output from here re-enters the
+/// firmware while it is signalling the exit event group.
+#[cfg(target_arch = "x86_64")]
+extern "efiapi" fn on_exit_boot_services(_event: efi::Event, context: *mut c_void) {
+    print(
+        context.cast(),
+        "ExitBootServices notify wrote to the console\r\n",
+    );
+    EXIT_NOTIFIED.store(true, Ordering::Relaxed);
+}
+
+/// Write to COM1 directly; ConOut is gone after ExitBootServices. Waits for
+/// the transmitter before each byte and drains it at the end, so a reset
+/// right after cannot drop the message.
+#[cfg(target_arch = "x86_64")]
+fn serial(text: &str) {
+    const DATA: u16 = 0x3f8;
+    const LINE_STATUS: u16 = DATA + 5;
+    const HOLDING_EMPTY: u8 = 1 << 5;
+    const TRANSMITTER_EMPTY: u8 = 1 << 6;
+    fn wait(mask: u8) {
+        loop {
+            let status: u8;
+            // SAFETY: reading the 16550 line status register has no side effects.
+            unsafe {
+                core::arch::asm!("in al, dx", out("al") status, in("dx") LINE_STATUS, options(nomem, nostack, preserves_flags));
+            }
+            if status & mask != 0 {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+    }
+    for byte in text.bytes() {
+        wait(HOLDING_EMPTY);
+        // SAFETY: QEMU's 16550 at 0x3f8 accepts writes without setup.
+        unsafe {
+            core::arch::asm!("out dx, al", in("dx") DATA, in("al") byte, options(nomem, nostack, preserves_flags));
+        }
+    }
+    wait(TRANSMITTER_EMPTY);
+}
+
+/// Report on COM1 and reset. QEMU runs with `-no-reboot`, so the reset ends
+/// the run. Used once ExitBootServices has been attempted: the firmware may
+/// have torn down Boot Services, so returning to it is not an option.
+#[cfg(target_arch = "x86_64")]
+fn report_and_reset(st: *mut SystemTable, message: &str) -> ! {
+    serial(message);
+    let rt = unsafe { &*(*st).runtime_services };
+    unsafe { (rt.reset_system)(efi::RESET_COLD, Status::SUCCESS, 0, ptr::null_mut()) };
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// Exit Boot Services with an image-owned notify function registered, report
+/// the result on COM1, then reset. Returns the reason only on a failure before
+/// the first exit attempt, with the notify event closed again.
+#[cfg(target_arch = "x86_64")]
+fn exit_boot_services(handle: Handle, st: *mut SystemTable) -> &'static str {
+    let bs = unsafe { &*(*st).boot_services };
+    let mut event = ptr::null_mut();
+    let status = unsafe {
+        (bs.create_event)(
+            efi::EVT_SIGNAL_EXIT_BOOT_SERVICES,
+            efi::TPL_NOTIFY,
+            Some(on_exit_boot_services),
+            st.cast(),
+            &mut event,
+        )
+    };
+    if status != Status::SUCCESS {
+        return "CreateEvent for ExitBootServices failed";
+    }
+    #[repr(C, align(8))]
+    struct MapBuffer([u8; 64 * 1024]);
+    static mut MAP: MapBuffer = MapBuffer([0; 64 * 1024]);
+    let mut attempted = false;
+    // The map key changes once the notify function runs, so retry once.
+    for _ in 0..2 {
+        let mut size = size_of::<MapBuffer>();
+        let (mut key, mut descriptor_size, mut version) = (0, 0, 0);
+        let status = unsafe {
+            (bs.get_memory_map)(
+                &mut size,
+                (&raw mut MAP).cast(),
+                &mut key,
+                &mut descriptor_size,
+                &mut version,
+            )
+        };
+        if status != Status::SUCCESS {
+            if attempted {
+                report_and_reset(
+                    st,
+                    "[FAIL] image_exit: GetMemoryMap failed after ExitBootServices\r\n",
+                );
+            }
+            // The firmware frees this image when it returns: never leave its
+            // notify function registered.
+            unsafe { (bs.close_event)(event) };
+            return "GetMemoryMap failed";
+        }
+        attempted = true;
+        match unsafe { (bs.exit_boot_services)(handle, key) } {
+            Status::SUCCESS if EXIT_NOTIFIED.load(Ordering::Relaxed) => {
+                report_and_reset(st, "All image exit tests passed!\r\n")
+            }
+            Status::SUCCESS => report_and_reset(
+                st,
+                "[FAIL] image_exit: ExitBootServices notify did not run\r\n",
+            ),
+            Status::INVALID_PARAMETER => {}
+            _ => report_and_reset(st, "[FAIL] image_exit: ExitBootServices failed\r\n"),
+        }
+    }
+    report_and_reset(
+        st,
+        "[FAIL] image_exit: ExitBootServices kept rejecting the map key\r\n",
+    )
 }
 
 #[panic_handler]

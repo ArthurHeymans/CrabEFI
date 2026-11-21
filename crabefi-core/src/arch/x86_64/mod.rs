@@ -84,6 +84,7 @@ mod tests {
 ///
 /// Returns the current value of the processor's time-stamp counter,
 /// which increments at a constant rate (typically the processor's base frequency).
+#[cfg(not(miri))]
 #[inline]
 pub fn rdtsc() -> u64 {
     let lo: u32;
@@ -97,6 +98,15 @@ pub fn rdtsc() -> u64 {
         );
     }
     ((hi as u64) << 32) | (lo as u64)
+}
+
+/// Miri cannot run inline assembly. Host tests under Miri get a counter that
+/// advances on every read, like a running TSC.
+#[cfg(miri)]
+pub fn rdtsc() -> u64 {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static TSC: AtomicU64 = AtomicU64::new(0);
+    TSC.fetch_add(1_000, Ordering::Relaxed)
 }
 
 /// Halt the CPU until the next interrupt

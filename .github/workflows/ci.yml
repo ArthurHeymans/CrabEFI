@@ -33,6 +33,34 @@ jobs:
           for manifest in "$GITHUB_WORKSPACE"/test-apps/*/Cargo.toml; do
             cargo fmt --manifest-path "$manifest" -- --check
           done
+  kani:
+    name: Kani proofs
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: model-checking/kani-github-action@69d357bade1eb7b32bc3fc3d5c3d173c5bfa5237 # v1
+        with:
+          kani-version: '0.68.0'
+          command: bash ci/kani.sh
+  miri:
+    name: Miri (host tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: ./.github/actions/setup-rust
+      - name: Install Miri
+        run: |
+          rustup component add miri
+          cargo miri setup
+      - name: Run host tests under Miri
+        run: ci/miri.sh
   audit:
     name: Dependency audit
     runs-on: ubuntu-latest
@@ -200,6 +228,27 @@ jobs:
       - name: Test USB filesystem mutations and on-disk consistency
         run: >-
           ./crabefi test --app directory-test --disable-kvm --timeout 180
+  test-debug-assertions:
+    name: Test x86_64 (payload debug assertions)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchains
+        uses: ./.github/actions/setup-rust
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 mtools dosfstools zstd coreboot-utils
+      # Release firmware drops the check that no firmware borrow is live
+      # across a foreign call. Keep it in the payload for nested StartImage,
+      # LoadImage from disk and an image's ExitBootServices console output.
+      - name: Test nested images and ExitBootServices with debug assertions
+        env:
+          CRABEFI_DEBUG_ASSERTIONS: "1"
+        run: ./crabefi test --app image-exit-test --disable-kvm --timeout 180
   test-runtime-image:
     name: Test x86_64 (separate runtime image)
     runs-on: ubuntu-latest

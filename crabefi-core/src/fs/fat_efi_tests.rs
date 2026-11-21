@@ -77,6 +77,39 @@ fn truncate(handle: *mut ef::Protocol, size: u64) {
         Status::SUCCESS
     );
 }
+/// A short open, write, read and close sequence through published
+/// EFI_FILE_PROTOCOL pointers, for Miri. The full suite below takes too long
+/// under Miri; ordinary runs cover these scenarios there, so this is ignored.
+#[test]
+#[cfg_attr(
+    not(miri),
+    ignore = "covered by efi_file_identity_metadata_and_durability"
+)]
+fn protocol_round_trip_under_miri() {
+    truncate_regrow_invalidates_read_hint();
+    two_handles_observe_the_same_file_size_and_cluster();
+    handle_reborrowed_mutably_survives_pool_growth();
+}
+
+/// Callers such as uefi-rs turn a returned handle into `&mut`. That reborrow
+/// must stay valid, and calls through it must work, after later opens grow the
+/// handle pool. Under Miri this checks the handle's write provenance.
+fn handle_reborrowed_mutably_survives_pool_growth() {
+    let root = mount();
+    let handle = open(root, "A.BIN", true);
+    // SAFETY: the firmware keeps published protocols alive and in place.
+    let protocol: &mut ef::Protocol = unsafe { &mut *handle };
+    let handle: *mut ef::Protocol = protocol;
+    write(handle, &[0x5a]);
+    let aliases: Vec<_> = (0..40).map(|_| open(root, "A.BIN", false)).collect();
+    seek(handle, 0);
+    assert_eq!(read_byte(handle), (1, 0x5a));
+    for alias in aliases {
+        assert_eq!(unsafe { ((*alias).close)(alias) }, Status::SUCCESS);
+    }
+    assert_eq!(unsafe { ((*handle).close)(handle) }, Status::SUCCESS);
+}
+
 // These scenarios share the firmware's single-volume globals. Run them in one
 // host test rather than racing registrations on parallel harness threads.
 #[test]
@@ -94,6 +127,8 @@ fn efi_file_identity_metadata_and_durability() {
     volume_label_rejects_changed_media();
     opens_are_relative_to_the_source_location_not_its_access_mode();
     allocator_failures_do_not_create_a_file();
+    // After the allocator sweep, which needs the pool at a slab boundary.
+    handle_reborrowed_mutably_survives_pool_growth();
     many_aliases_keep_identity_and_cursors_across_pool_growth();
     many_distinct_files_keep_metadata_across_pool_growth();
     exhausted_handle_pool_does_not_create_a_file();

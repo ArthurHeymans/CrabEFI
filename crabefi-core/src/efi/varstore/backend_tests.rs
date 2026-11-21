@@ -129,6 +129,9 @@ fn protection_is_not_cleared_and_partial_program_failure_is_preserved() {
 
 #[test]
 fn detaching_removes_access_to_the_boot_owned_backend() {
+    let _state = crate::efi::boot_services::IMAGE_EXECUTION_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let backend = Region::new();
     let calls = backend.calls.clone();
     *super::STORAGE.borrow_mut() = Some(Storage::Platform(Box::leak(Box::new(backend))));
