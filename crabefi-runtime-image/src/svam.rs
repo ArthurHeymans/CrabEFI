@@ -126,6 +126,8 @@ fn validate_descriptor_stream(
     stride: usize,
     count: usize,
 ) -> Result<(), efi::Status> {
+    #[cfg(target_arch = "x86_64")]
+    let la57 = x86_la57_active();
     (0..count).try_for_each(|index| {
         let descriptor = read_descriptor(map, stride, index)?;
         let byte_len = descriptor
@@ -141,6 +143,8 @@ fn validate_descriptor_stream(
                     || !canonical_extent(
                         descriptor.virtual_start,
                         descriptor.virtual_start + byte_len - 1,
+                        #[cfg(target_arch = "x86_64")]
+                        la57,
                     )))
         {
             return Err(efi::Status::INVALID_PARAMETER);
@@ -636,47 +640,58 @@ fn sign_extended(address: u64, top: u32) -> bool {
 
 /// Whether five-level paging (CR4.LA57) is active.
 ///
-/// Runtime services run at CPL0 and read CR4. Host tests run this image in
-/// user mode, where reading CR4 faults; there the CPU's support for LA57 is
-/// the best available answer.
+/// Bare-metal runtime services run at CPL0 and read CR4. Host tests and Miri
+/// run in user mode and default to 4-level paging; both widths are tested
+/// directly through [`x86_canonical_virtual`].
 #[cfg(target_arch = "x86_64")]
 fn x86_la57_active() -> bool {
     #[cfg(kani)]
     {
         kani::any()
     }
-    #[cfg(not(kani))]
+    #[cfg(all(target_os = "none", not(kani)))]
     {
-        let cs: u16;
-        // SAFETY: reading CS is allowed at every privilege level.
-        unsafe {
-            core::arch::asm!("mov {0:x}, cs", out(reg) cs, options(nomem, nostack, preserves_flags))
-        };
-        if cs & 3 != 0 {
-            return core::arch::x86_64::__cpuid_count(7, 0).ecx & (1 << 16) != 0;
-        }
         let cr4: u64;
-        // SAFETY: at CPL0, reading CR4 has no side effects.
+        // SAFETY: at CPL0 in bare-metal firmware, reading CR4 has no side effects.
         unsafe {
             core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags))
         };
         cr4 & (1 << 12) != 0
     }
+    #[cfg(not(any(target_os = "none", kani)))]
+    {
+        false
+    }
+}
+
+/// Whether `address` is canonical on x86-64 under 4-level (`la57 == false`)
+/// or 5-level (`la57 == true`) paging.
+#[cfg(target_arch = "x86_64")]
+fn x86_canonical_virtual(address: u64, la57: bool) -> bool {
+    sign_extended(address, if la57 { 56 } else { 47 })
 }
 
 /// Whether every address from `first` to `last` is canonical: both ends are,
 /// and they lie in the same half, so the range cannot span the hole between.
-fn canonical_extent(first: u64, last: u64) -> bool {
-    canonical_virtual(first) && canonical_virtual(last) && first >> 63 == last >> 63
-}
-
-fn canonical_virtual(address: u64) -> bool {
-    // x86-64 requires every bit above the active width to copy its top bit;
-    // checking only bits 63..48 accepted addresses with bit 47 set.
+fn canonical_extent(
+    first: u64,
+    last: u64,
+    #[cfg(target_arch = "x86_64")] la57: bool,
+) -> bool {
     #[cfg(target_arch = "x86_64")]
     {
-        sign_extended(address, if x86_la57_active() { 56 } else { 47 })
+        x86_canonical_virtual(first, la57)
+            && x86_canonical_virtual(last, la57)
+            && first >> 63 == last >> 63
     }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        canonical_virtual(first) && canonical_virtual(last) && first >> 63 == last >> 63
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn canonical_virtual(address: u64) -> bool {
     #[cfg(target_arch = "aarch64")]
     {
         let high = address >> 48;
@@ -684,16 +699,10 @@ fn canonical_virtual(address: u64) -> bool {
     }
     #[cfg(target_arch = "riscv64")]
     {
-        let satp: u64;
-        // SAFETY: reading SATP is side-effect free in supervisor mode.
-        unsafe { core::arch::asm!("csrr {}, satp", out(reg) satp, options(nomem, nostack)) };
-        let bit = match satp >> 60 {
-            8 => 38,
-            9 => 47,
-            10 => 56,
-            _ => return true,
-        };
-        sign_extended(address, bit)
+        // SetVirtualAddressMap runs from the EFI stub under the loader's
+        // translation, not necessarily the kernel's final satp mode; validate
+        // against Sv57 so valid higher-half kernel mappings are not rejected.
+        sign_extended(address, 56)
     }
 }
 
@@ -808,23 +817,26 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn x86_canonical_addresses_sign_extend_bit_47() {
-        assert!(canonical_virtual(0x0000_7fff_ffff_f000));
-        assert!(canonical_virtual(0xffff_8000_0000_0000));
-        // Noncanonical at either width.
-        assert!(!canonical_virtual(0x0100_0000_0000_0000));
-        assert!(!canonical_virtual(0xfeff_ffff_ffff_f000));
-        // Bit 47 set without sign extension is valid only with five-level paging.
-        let la57 = x86_la57_active();
-        assert_eq!(canonical_virtual(0x0000_8000_0000_0000), la57);
-        assert_eq!(canonical_virtual(0xffff_7fff_ffff_f000), la57);
+        for la57 in [false, true] {
+            assert!(x86_canonical_virtual(0x0000_7fff_ffff_f000, la57));
+            assert!(x86_canonical_virtual(0xffff_8000_0000_0000, la57));
+            // Noncanonical at either width.
+            assert!(!x86_canonical_virtual(0x0100_0000_0000_0000, la57));
+            assert!(!x86_canonical_virtual(0xfeff_ffff_ffff_f000, la57));
+            // Bit 47 set without sign extension is valid only with five-level paging.
+            assert_eq!(x86_canonical_virtual(0x0000_8000_0000_0000, la57), la57);
+            assert_eq!(x86_canonical_virtual(0xffff_7fff_ffff_f000, la57), la57);
+        }
         // Canonical ends cannot hide the hole between the two halves.
         assert!(!canonical_extent(
             0x0000_7fff_ffff_f000,
-            0xffff_8000_0000_0fff
+            0xffff_8000_0000_0fff,
+            false,
         ));
         assert!(canonical_extent(
             0xffff_8000_0000_0000,
-            0xffff_8000_0000_0fff
+            0xffff_8000_0000_0fff,
+            false,
         ));
     }
 

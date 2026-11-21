@@ -24,6 +24,8 @@ const SERVICES: [&str; 14] = [
 struct Node {
     frame: Option<u64>,
     targets: BTreeSet<u64>,
+    /// Direct calls immediately preceded by an SP write (`mov rsp, ...`).
+    sp_switched_calls: BTreeSet<u64>,
     unknown: BTreeSet<String>,
     /// Calls into another image whose stack use this image cannot bound.
     external: BTreeSet<String>,
@@ -32,6 +34,10 @@ struct Node {
     /// Calls that switch to the private runtime stack ([`PRIVATE_ENTRY`]).
     switches: BTreeSet<u64>,
 }
+
+/// Headroom reserved on the x86-64 private stack for OS interrupt frames
+/// arriving while a runtime service runs with interrupts enabled.
+const PRIVATE_STACK_HEADROOM: u64 = 16 * 1024;
 
 /// The audited functions allowed to call PSCI (SMC/HVC) or SBI (ECALL), by
 /// demangled path. The handler runs at a higher privilege level on its own
@@ -119,12 +125,14 @@ fn decode(cs: &Capstone, arch: Arch, start: u64, bytes: &[u8], frame: Option<u64
     // is a call that does not return, not a fall-through into the next symbol.
     let mut last_is_call = false;
     let mut previous = None;
+    let mut prev_set_rsp = false;
     let mut pairs = Vec::new();
     let mut destinations = BTreeSet::new();
     for insn in instructions.iter() {
         let pc = insn.address();
         next = pc + insn.bytes().len() as u64;
         last_is_call = false;
+        let was_set_rsp = prev_set_rsp;
         let pair = (arch == Arch::Riscv64)
             .then(|| riscv_pair(pc, previous, insn.bytes()))
             .flatten();
@@ -133,6 +141,7 @@ fn decode(cs: &Capstone, arch: Arch, start: u64, bytes: &[u8], frame: Option<u64
         let has = |group: u32| d.groups().iter().any(|g| u32::from(g.0) == group);
         let op = insn.mnemonic().unwrap_or("");
         let args = insn.op_str().unwrap_or("");
+        prev_set_rsp = arch == Arch::X86_64 && op == "mov" && args.starts_with("rsp,");
         let ret = matches!((op, args), ("ret", "") | ("c.jr", "ra"));
         // Disassemblers may spell a non-linking RV tail transfer as JALR.
         // The encoded destination, not the mnemonic or CALL group, determines
@@ -206,6 +215,9 @@ fn decode(cs: &Capstone, arch: Arch, start: u64, bytes: &[u8], frame: Option<u64
             (Some(addr), _) => {
                 if call || !starts.contains(&addr) {
                     node.targets.insert(addr);
+                    if call && was_set_rsp {
+                        node.sp_switched_calls.insert(addr);
+                    }
                 }
             }
         }
@@ -385,26 +397,50 @@ pub(super) fn audit(
         let entry: &mut Node = nodes.entry(addr).or_default();
         entry.frame = n.frame;
         entry.targets.extend(n.targets);
+        entry.sp_switched_calls.extend(n.sp_switched_calls);
         entry.unknown.extend(n.unknown);
         entry.external.extend(n.external);
     }
     anyhow::ensure!(bridges <= 1, "{bridges} symbols named {BOOT_BRIDGE}");
-    // A call into a trampoline continues on the private stack: charge it
-    // there, not to the caller's stack.
+    if arch != Arch::X86_64 {
+        anyhow::ensure!(
+            private_entries.is_empty(),
+            "private stack switching is only permitted on x86_64 (found {} trampoline(s) on {})",
+            private_entries.len(),
+            arch.dir_name(),
+        );
+    }
+    // A call into a trampoline continues on the private stack only when the
+    // preceding instruction actually switched SP: charge it there, not to the
+    // caller's stack.
     for node in nodes.values_mut() {
         let switches: BTreeSet<u64> = node
             .targets
             .intersection(&private_entries)
             .copied()
             .collect();
+        for &target in &switches {
+            anyhow::ensure!(
+                node.sp_switched_calls.contains(&target),
+                "call to private stack trampoline at {target:#x} was not immediately preceded by an SP write"
+            );
+        }
         node.targets.retain(|target| !switches.contains(target));
         node.switches = switches;
     }
-    let private_budget = file
-        .symbols()
-        .find(|sym| sym.name().is_ok_and(|name| path(name) == PRIVATE_STACK))
-        .context("missing private runtime stack")?
-        .size();
+    let (private_stack_size, private_budget) = if arch == Arch::X86_64 {
+        let size = file
+            .symbols()
+            .find(|sym| sym.name().is_ok_and(|name| path(name) == PRIVATE_STACK))
+            .context("missing private runtime stack")?
+            .size();
+        let budget = size
+            .checked_sub(PRIVATE_STACK_HEADROOM)
+            .context("private runtime stack smaller than reserved IRQ headroom")?;
+        (Some(size), Some(budget))
+    } else {
+        (None, None)
+    };
     let caller_budget = caller_budget(arch);
     // LLVM may merge EFI entries. Resolve all 14 slots by relocation, rather
     // than guessing which Rust names survived LTO.
@@ -444,27 +480,34 @@ pub(super) fn audit(
         );
         let caller = usage(addr, &nodes, &mut BTreeSet::new(), &mut cache);
         // The private stack carries whatever any trampoline reachable from
-        // this entry on the caller's stack runs.
+        // this entry on the caller's stack runs. Entries that fit within the
+        // UEFI caller budget do not switch.
         let mut private = Usage::default();
         let switches = switches_from(addr, &nodes);
-        anyhow::ensure!(
-            !switches.is_empty(),
-            "{name} does not switch to the private stack"
-        );
-        for switch in switches {
-            let u = usage(switch, &nodes, &mut BTreeSet::new(), &mut cache);
+        for switch in &switches {
+            anyhow::ensure!(
+                switches_from(*switch, &nodes).is_empty(),
+                "{name} private stack trampoline at {switch:#x} reaches a nested switch"
+            );
+            let u = usage(*switch, &nodes, &mut BTreeSet::new(), &mut cache);
             private.modeled = private.modeled.max(u.modeled);
             private.unknown.extend(u.unknown);
             private.external.extend(u.external);
         }
-        private.bound = private.unknown.is_empty().then_some(private.modeled);
+        private.bound = if switches.is_empty() {
+            Some(0)
+        } else {
+            private.unknown.is_empty().then_some(private.modeled)
+        };
         // Every entry must retain a complete static bound on both stacks in
         // every release profile. Only the BootActive bridge is excluded, and
         // reported.
         if caller.bound.is_none() || private.bound.is_none() {
             incomplete.push(name);
         }
-        if caller.modeled > caller_budget || private.modeled > private_budget {
+        if caller.modeled > caller_budget
+            || private_budget.is_some_and(|budget| private.modeled > budget)
+        {
             over.push(name);
         }
         let mut excluded = caller.external.clone();
@@ -476,20 +519,33 @@ pub(super) fn audit(
             "address": addr,
             "caller_bound_bytes": caller.bound,
             "caller_modeled_bytes": caller.modeled,
-            "private_bound_bytes": private.bound,
-            "private_modeled_bytes": private.modeled,
+            "private_bound_bytes": (!switches.is_empty()).then_some(private.bound).flatten(),
+            "private_modeled_bytes": (!switches.is_empty()).then_some(private.modeled),
             "unknown": unknown,
             "excluded_external_calls": excluded,
         }));
     }
     let complete = SERVICES.len() - incomplete.len();
-    println!(
-        "EFI stack audit: {complete}/{} entries bounded within {caller_budget} caller and {private_budget} private bytes (see stack-chains.json)",
-        SERVICES.len()
-    );
+    match private_budget {
+        Some(budget) => println!(
+            "EFI stack audit: {complete}/{} entries bounded within {caller_budget} caller and {budget} private bytes ({PRIVATE_STACK_HEADROOM} IRQ headroom; see stack-chains.json)",
+            SERVICES.len()
+        ),
+        None => println!(
+            "EFI stack audit: {complete}/{} entries bounded within {caller_budget} caller bytes (no private stack; see stack-chains.json)",
+            SERVICES.len()
+        ),
+    }
     write_json(
         output.join("stack-chains.json"),
-        &json!({"model":"Sealed-phase, image-local bounds from LLVM static frames; tail edges charged as calls. The caller bound covers each entry up to its switch to the private stack and is checked against the UEFI minimum for the architecture; the private bound covers what runs on the private stack and is checked against its size. Excludes interrupts and asynchronous reentry. Assumes the PSCI/SBI handlers called from the audited reset stubs run on their own stack, and excludes the BootActive boot bridge, which runs boot firmware and is disabled at seal. Each entry lists the calls it excludes.", "caller_budget_bytes":caller_budget,"private_budget_bytes":private_budget,"entries": report}),
+        &json!({
+            "model": "Sealed-phase, image-local bounds from LLVM static frames; tail edges charged as calls. The caller bound covers each entry up to any x86-64 private stack switch and is checked against the UEFI minimum for the architecture; on x86-64 the private bound covers what runs on the private stack and is checked against its size minus reserved OS IRQ headroom. AArch64 and RISC-V never switch stacks. Assumes the PSCI/SBI handlers called from the audited reset stubs run on their own stack, and excludes the BootActive boot bridge, which runs boot firmware and is disabled at seal. Each entry lists the calls it excludes.",
+            "caller_budget_bytes": caller_budget,
+            "private_stack_size_bytes": private_stack_size,
+            "private_headroom_bytes": private_stack_size.map(|_| PRIVATE_STACK_HEADROOM),
+            "private_budget_bytes": private_budget,
+            "entries": report,
+        }),
     )?;
     anyhow::ensure!(over.is_empty(), "EFI stack-chain budget exceeded: {over:?}");
     anyhow::ensure!(

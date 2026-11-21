@@ -92,8 +92,12 @@ pub fn verify_pkcs7_signature_hash(
             continue;
         };
         let content_digest = signed_attributes_digest(signer.signed_attributes, content_hash)?;
-        if verify_rsa_signature(signer_certificate, signer.signature, &content_digest)
-            && certificate_authorized(signer_certificate, trusted, certificates)?
+        if verify_rsa_signature(&signer_certificate, signer.signature, &content_digest)
+            && certificate_authorized(
+                signer_certificate.certificate.encoded,
+                trusted.certificate.encoded,
+                certificates,
+            )?
         {
             return Ok(true);
         }
@@ -157,7 +161,7 @@ pub fn private_signer(pkcs7_data: &[u8]) -> Result<PrivateSigner<'_>, AuthError>
     let mut top = signer;
     let mut depth = 0usize;
     while top.certificate.issuer != top.certificate.subject {
-        let Some(issuer) = find_issuer(top, certificates)? else {
+        let Some(issuer) = find_issuer(&top, certificates)? else {
             break;
         };
         depth += 1;
@@ -178,14 +182,14 @@ pub fn private_signer(pkcs7_data: &[u8]) -> Result<PrivateSigner<'_>, AuthError>
 
 /// A certificate in `certificates` that issued and signed `certificate`.
 fn find_issuer<'a>(
-    certificate: PolicyCertificate<'_>,
+    certificate: &PolicyCertificate<'_>,
     certificates: &[&'a [u8]],
 ) -> Result<Option<PolicyCertificate<'a>>, AuthError> {
     for raw in certificates {
         let candidate = parse_certificate(raw)?;
         if candidate.certificate.encoded != certificate.certificate.encoded
             && candidate.certificate.subject == certificate.certificate.issuer
-            && verify_certificate(certificate, candidate)
+            && verify_certificate(certificate, &candidate)
         {
             return Ok(Some(candidate));
         }
@@ -312,6 +316,12 @@ fn validate_sha256_algorithm(algorithm: Tlv<'_>) -> Result<(), AuthError> {
     Ok(())
 }
 
+#[inline(never)]
+fn sha256(data: &[u8]) -> [u8; 32] {
+    Sha256::digest(data).into()
+}
+
+#[inline(never)]
 fn signed_attributes_digest(
     attributes: Option<SignedAttributes<'_>>,
     content_hash: &[u8; 32],
@@ -375,72 +385,93 @@ fn find_signer<'a>(
     Ok(None)
 }
 
+/// Accept `cert_raw` if it equals or is directly signed by `trusted_raw`,
+/// reject an over-deep chain, or return `None` to search for its issuers.
+#[inline(never)]
+fn decide_direct_trust(
+    cert_raw: &[u8],
+    trusted_raw: &[u8],
+    depth: usize,
+) -> Result<Option<bool>, AuthError> {
+    if cert_raw == trusted_raw {
+        return Ok(Some(true));
+    }
+    if depth >= MAX_CHAIN_DEPTH {
+        return Err(AuthError::ChainTooDeep);
+    }
+    let certificate = parse_certificate(cert_raw)?;
+    let trusted = parse_certificate(trusted_raw)?;
+    if certificate.certificate.issuer == trusted.certificate.subject
+        && verify_certificate(&certificate, &trusted)
+    {
+        return Ok(Some(true));
+    }
+    Ok(None)
+}
+
+/// Validate `issuer_raw` as a CA certificate that issued and signed `cert_raw`.
+#[inline(never)]
+fn verify_issuer_link(cert_raw: &[u8], issuer_raw: &[u8]) -> Result<bool, AuthError> {
+    let issuer = parse_certificate(issuer_raw)?;
+    if issuer.certificate.encoded == cert_raw || !issuer.can_sign_certificates {
+        return Ok(false);
+    }
+    let certificate = parse_certificate(cert_raw)?;
+    Ok(certificate.certificate.issuer == issuer.certificate.subject
+        && verify_certificate(&certificate, &issuer))
+}
+
+#[inline(never)]
 fn certificate_authorized(
-    signer: PolicyCertificate<'_>,
-    trusted: PolicyCertificate<'_>,
+    signer_raw: &[u8],
+    trusted_raw: &[u8],
     certificates: &[&[u8]],
 ) -> Result<bool, AuthError> {
-    /// One certificate on the current issuer path and the next candidate
-    /// issuer to try for it.
+    /// One certificate on the current issuer path (`None` = `signer_raw`,
+    /// `Some(index)` = `certificates[index]`) and the next candidate issuer
+    /// index to try for it. Keeping only indices here and parsing inside the
+    /// non-nested leaf helpers keeps `SetVariable` well within the 8 KiB
+    /// AArch64/RISC-V UEFI caller stack floor.
     #[derive(Clone, Copy)]
-    struct Step<'a> {
-        certificate: PolicyCertificate<'a>,
+    struct Step {
+        certificate: Option<usize>,
         next: usize,
-    }
-
-    /// Accept a certificate on the path, reject an over-deep chain, or
-    /// return `None` to search for its issuers.
-    fn decide(
-        certificate: PolicyCertificate<'_>,
-        trusted: PolicyCertificate<'_>,
-        depth: usize,
-    ) -> Result<Option<bool>, AuthError> {
-        if certificate.certificate.encoded == trusted.certificate.encoded {
-            return Ok(Some(true));
-        }
-        if depth >= MAX_CHAIN_DEPTH {
-            return Err(AuthError::ChainTooDeep);
-        }
-        if certificate.certificate.issuer == trusted.certificate.subject
-            && verify_certificate(certificate, trusted)
-        {
-            return Ok(Some(true));
-        }
-        Ok(None)
     }
 
     // Depth-first search over issuer links, in the order a recursive search
     // would try them. The explicit path keeps the stack depth static, so the
     // link-time audit can bound SetVariable.
-    let mut path = heapless::Vec::<Step<'_>, MAX_CHAIN_DEPTH>::new();
-    if let Some(accepted) = decide(signer, trusted, 0)? {
+    let mut path = heapless::Vec::<Step, MAX_CHAIN_DEPTH>::new();
+    if let Some(accepted) = decide_direct_trust(signer_raw, trusted_raw, 0)? {
         return Ok(accepted);
     }
     path.push(Step {
-        certificate: signer,
+        certificate: None,
         next: 0,
     })
     .map_err(|_| AuthError::ChainTooDeep)?;
     while let Some(step) = path.last_mut() {
-        let certificate = step.certificate;
-        let Some(raw) = certificates.get(step.next) else {
+        let current_index = step.certificate;
+        let candidate_index = step.next;
+        let Some(&issuer_raw) = certificates.get(candidate_index) else {
             path.pop();
             continue;
         };
         step.next += 1;
-        let issuer = parse_certificate(raw)?;
-        if issuer.certificate.encoded == certificate.certificate.encoded
-            || certificate.certificate.issuer != issuer.certificate.subject
-            || !issuer.can_sign_certificates
-            || !verify_certificate(certificate, issuer)
-        {
+        let cert_raw = match current_index {
+            None => signer_raw,
+            Some(index) => *certificates
+                .get(index)
+                .ok_or(AuthError::CertificateParseError)?,
+        };
+        if !verify_issuer_link(cert_raw, issuer_raw)? {
             continue;
         }
-        match decide(issuer, trusted, path.len())? {
+        match decide_direct_trust(issuer_raw, trusted_raw, path.len())? {
             Some(accepted) => return Ok(accepted),
             None => path
                 .push(Step {
-                    certificate: issuer,
+                    certificate: Some(candidate_index),
                     next: 0,
                 })
                 .map_err(|_| AuthError::ChainTooDeep)?,
@@ -449,13 +480,14 @@ fn certificate_authorized(
     Ok(false)
 }
 
-fn verify_certificate(certificate: PolicyCertificate<'_>, issuer: PolicyCertificate<'_>) -> bool {
-    let digest: [u8; 32] = Sha256::digest(certificate.certificate.tbs).into();
+#[inline(never)]
+fn verify_certificate(certificate: &PolicyCertificate<'_>, issuer: &PolicyCertificate<'_>) -> bool {
+    let digest = sha256(certificate.certificate.tbs);
     verify_rsa_signature(issuer, certificate.certificate.signature, &digest)
 }
 
 fn verify_rsa_signature(
-    certificate: PolicyCertificate<'_>,
+    certificate: &PolicyCertificate<'_>,
     signature: &[u8],
     digest: &[u8; 32],
 ) -> bool {
