@@ -133,6 +133,13 @@ enum Commands {
         secure_boot: bool,
     },
 
+    /// Verify all checked-in runtime image/digest pairs and their target profiles
+    CheckRuntimeBundle {
+        /// Also rebuild all six images and check freshness against current sources.
+        #[arg(long)]
+        rebuild: bool,
+    },
+
     /// Run CrabEFI in QEMU
     Run {
         /// Path to coreboot ROM (default: ~/src/coreboot/build/coreboot.rom)
@@ -339,6 +346,7 @@ fn main() -> Result<()> {
             boot_features(native_only, ext4),
         ),
         Commands::BundleRuntime { secure_boot } => runtime::bundle(arch, secure_boot),
+        Commands::CheckRuntimeBundle { rebuild } => runtime::check_bundle(rebuild),
         Commands::Run {
             coreboot_rom,
             ahci,

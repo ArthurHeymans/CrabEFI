@@ -1,8 +1,8 @@
 //! Runtime policy checks without UEFI authentication support.
 
+use super::{VariableContext, VariableRequest, apply_variable};
 use crate::{
     efi::{self, VariableAttributes},
-    services::{VariableContext, VariableRequest, apply_variable},
     state::Phase,
     store::{VariableStore, VariableTransaction},
 };
