@@ -376,7 +376,7 @@ fn apply_to_inactive_slot(
     version: u32,
 ) -> CapsuleResult {
     let fail = |status| CapsuleResult::failure(status, version);
-    if super::trial::pending() {
+    if !backend.platform_owns_trial() && super::trial::pending() {
         log::error!("The last firmware update is not confirmed yet; refusing another one");
         return fail(CapsuleResultStatus::Error);
     }
@@ -431,7 +431,7 @@ fn apply_to_inactive_slot(
         }
     }
 
-    if !super::trial::start(&slots.inactive, version) {
+    if !backend.platform_owns_trial() && !super::trial::start(&slots.inactive, version) {
         log::error!(
             "Cannot store the trial record; slot '{}' stays inactive",
             slots.inactive.name

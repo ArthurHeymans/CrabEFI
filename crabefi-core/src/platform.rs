@@ -562,6 +562,14 @@ pub trait CapsuleBackend {
     fn activate_slot(&mut self, _slot: &FmapRegion) -> Result<(), StorageError> {
         Err(StorageError::NotSupported)
     }
+
+    /// Whether the platform (for example an immutable RO boot selector with a
+    /// dedicated flash journal) owns A/B trial tracking and rollback. When
+    /// `true`, CrabEFI skips its EFI-variable trial (`CrabEFIFirmwareTrial`)
+    /// and delegates admission and trial activation to the backend.
+    fn platform_owns_trial(&self) -> bool {
+        false
+    }
 }
 
 // ============================================================================

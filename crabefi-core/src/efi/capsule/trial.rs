@@ -117,6 +117,9 @@ pub fn start(slot: &FmapRegion, version: u32) -> bool {
 /// Count this boot of a trial slot, finish a confirmed or failed trial, or
 /// roll back. Returns `true` if the system must reset now.
 pub fn check(backend: &mut dyn CapsuleBackend) -> bool {
+    if backend.platform_owns_trial() {
+        return false;
+    }
     let Some(mut trial) = load() else {
         return false;
     };
