@@ -68,6 +68,7 @@ dependencies = [
  "bitflags",
  "crabefi-bounds",
  "crabefi-efi-types",
+ "crabefi-memmap",
  "crabefi-pkcs7",
  "crabefi-runtime-abi",
  "crabefi-runtime-bundle",
@@ -103,6 +104,16 @@ version = "0.0.0"
 dependencies = [
  "crabefi-core",
  "linked_list_allocator",
+]
+
+[[package]]
+name = "crabefi-memmap"
+version = "0.1.0"
+dependencies = [
+ "crabefi-runtime-abi",
+ "heapless",
+ "log",
+ "r-efi",
 ]
 
 [[package]]

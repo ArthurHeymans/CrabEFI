@@ -24,11 +24,6 @@ rustc --edition=2024 --test \
 "$TMPDIR/memory_map_tests"
 
 rustc --edition=2024 --test \
-    "$ROOT/crabefi-core/src/efi/page_ownership.rs" \
-    -o "$TMPDIR/page_ownership_tests"
-"$TMPDIR/page_ownership_tests"
-
-rustc --edition=2024 --test \
     "$ROOT/crabefi-core/src/efi/pool_free_list.rs" \
     -o "$TMPDIR/pool_free_list_tests"
 "$TMPDIR/pool_free_list_tests"

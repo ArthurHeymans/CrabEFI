@@ -60,6 +60,9 @@ impl From<&MemoryRegion> for E820Entry {
             }
             MemoryType::AcpiReclaimable => E820Entry::ACPI_RECLAIMABLE_TYPE,
             MemoryType::AcpiNvs => E820Entry::ACPI_NVS_TYPE,
+            // The region type is non-exhaustive. Never report a future kind
+            // as usable RAM.
+            _ => E820Entry::RESERVED_TYPE,
         };
 
         Self {
