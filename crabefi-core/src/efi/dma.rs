@@ -310,7 +310,7 @@ impl DmaBuffer {
 
 impl Drop for DmaBuffer {
     fn drop(&mut self) {
-        let status = allocator::free_pages(self.address, self.pages);
+        let status = allocator::release_boot_services_pages(self.address, self.pages);
         if status != Status::SUCCESS {
             log::warn!(
                 "Failed to free DMA allocation at {:#x} ({} pages): {:?}",

@@ -144,6 +144,10 @@ pub(super) extern "efiapi" fn allocate_pool(
         }
     };
 
+    if allocator::exit_in_progress() {
+        return Status::UNSUPPORTED;
+    }
+
     match allocator::allocate_pool(mem_type, size) {
         Ok(ptr) => {
             unsafe { *buffer = ptr as *mut c_void };
@@ -157,6 +161,10 @@ pub(super) extern "efiapi" fn free_pool(buffer: *mut c_void) -> Status {
     log::trace!("BS.FreePool({:?})", buffer);
     if buffer.is_null() {
         return Status::INVALID_PARAMETER;
+    }
+
+    if allocator::exit_in_progress() {
+        return Status::UNSUPPORTED;
     }
 
     allocator::free_pool(buffer as *mut u8)

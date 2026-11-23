@@ -120,6 +120,7 @@ dependencies = [
  "bitflags",
  "crabefi-bounds",
  "crabefi-efi-types",
+ "crabefi-memmap",
  "crabefi-pkcs7",
  "crabefi-runtime-abi",
  "crabefi-runtime-bundle",
@@ -180,6 +181,17 @@ version = "0.1.0"
 dependencies = [
  "embedded-hal",
  "tock-registers",
+]
+
+[[package]]
+name = "crabefi-memmap"
+version = "0.1.0"
+dependencies = [
+ "crabefi-runtime-abi",
+ "heapless 0.9.3",
+ "log",
+ "proptest",
+ "r-efi 7.1.0",
 ]
 
 [[package]]

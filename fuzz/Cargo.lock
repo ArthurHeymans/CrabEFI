@@ -86,6 +86,7 @@ dependencies = [
  "bitflags",
  "crabefi-bounds",
  "crabefi-efi-types",
+ "crabefi-memmap",
  "crabefi-pkcs7",
  "crabefi-runtime-abi",
  "crabefi-ui",
@@ -121,6 +122,16 @@ dependencies = [
  "crabefi-core",
  "crabefi-pkcs7",
  "libfuzzer-sys",
+]
+
+[[package]]
+name = "crabefi-memmap"
+version = "0.1.0"
+dependencies = [
+ "crabefi-runtime-abi",
+ "heapless",
+ "log",
+ "r-efi 7.2.0",
 ]
 
 [[package]]
