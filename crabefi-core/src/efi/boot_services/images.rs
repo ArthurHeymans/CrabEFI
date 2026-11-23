@@ -8,6 +8,7 @@ use super::super::image_loader;
 use super::super::protocols::loaded_image::{
     LOADED_IMAGE_PROTOCOL_GUID, create_loaded_image_protocol,
 };
+use super::super::runtime_image::RuntimeImageClient;
 use super::super::system_table;
 use super::super::tables::{LoadedImageEntry, MAX_EVENTS, Tables, tables, with_tables_mut};
 use super::events::signal_event_group;
@@ -27,6 +28,16 @@ pub(super) use execution::exit;
 
 static STARTED: crate::cell::Local<Vec<(Handle, bool)>> = crate::cell::Local::new(Vec::new());
 use r_efi::protocols::device_path::Protocol as DevicePathProtocol;
+
+/// EFI_EVENT_GROUP_BEFORE_EXIT_BOOT_SERVICES GUID (UEFI 2.8+)
+const EFI_EVENT_GROUP_BEFORE_EXIT_BOOT_SERVICES: Guid = Guid::from_fields(
+    0x8be0e274,
+    0x3970,
+    0x4b44,
+    0x80,
+    0xc5,
+    &[0x1a, 0xb9, 0x50, 0x2f, 0x3b, 0xfc],
+);
 
 /// EFI_EVENT_GROUP_EXIT_BOOT_SERVICES GUID
 const EFI_EVENT_GROUP_EXIT_BOOT_SERVICES: Guid = Guid::from_fields(
@@ -897,25 +908,75 @@ pub(super) extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: 
         map_key
     );
 
-    // Reject a stale key before callbacks, measurements, or any irreversible
-    // transition. The allocator repeats this check at the actual commit point
-    // in case an EBS callback changes the map.
-    let key_status = allocator::validate_map_key(map_key);
-    if key_status != Status::SUCCESS {
-        return key_status;
+    match attempt_exit_boot_services(
+        map_key,
+        prepare_boot_handoff,
+        crate::drivers::quiesce_dma_for_os_handoff,
+        finish_exit,
+    ) {
+        Ok(()) => Status::SUCCESS,
+        Err(status) => status,
     }
-    let Some(runtime_image) = crate::efi::runtime_image::installed() else {
-        log::error!("ExitBootServices refused: runtime image client is missing");
-        return Status::DEVICE_ERROR;
-    };
+}
 
-    // TCG measured boot: measure ExitBootServices action into PCR 5.
+static EXIT_ATTEMPT_ACTIVE: crate::cell::LocalCell<bool> = crate::cell::LocalCell::new(false);
+static BEFORE_EXIT_SIGNALED: crate::cell::LocalCell<bool> = crate::cell::LocalCell::new(false);
+
+fn attempt_exit_boot_services<T>(
+    key: usize,
+    prepare: impl FnOnce() -> Result<T, Status>,
+    quiesce_dma: impl FnOnce(),
+    finish: impl FnOnce(T),
+) -> Result<(), Status> {
+    // Both event groups call foreign code. A nested attempt must not signal
+    // the next group or commit while an outer callback is still running.
+    if EXIT_ATTEMPT_ACTIVE.get() {
+        return Err(Status::INVALID_PARAMETER);
+    }
+    struct ExitAttempt;
+    impl Drop for ExitAttempt {
+        fn drop(&mut self) {
+            EXIT_ATTEMPT_ACTIVE.set(false);
+        }
+    }
+    EXIT_ATTEMPT_ACTIVE.set(true);
+    let _attempt = ExitAttempt;
+
     #[cfg(feature = "tpm")]
     super::super::tcg::measured_boot::measure_action_all(5, "Exit Boot Services Invocation");
+    signal_before_exit_boot_services_once();
 
-    // Signal EXIT_BOOT_SERVICES event group BEFORE finalizing the memory map.
-    // Windows Boot Manager registers callbacks that must run before we lock
-    // the memory map.
+    let status = allocator::validate_map_key(key);
+    if status != Status::SUCCESS {
+        record_exit_failure(status);
+        return Err(status);
+    }
+    let prepared = prepare().inspect_err(|&status| record_exit_failure(status))?;
+    allocator::begin_exit_boot_services(key).inspect_err(|&status| record_exit_failure(status))?;
+
+    // The accepted map is frozen. Callbacks cannot change it, and firmware
+    // pages keep their Boot Services types until DMA has been quiesced.
+    notify_exit_boot_services();
+    quiesce_dma();
+    allocator::finish_exit_boot_services();
+    finish(prepared);
+    Ok(())
+}
+
+fn signal_before_exit_boot_services_once() {
+    // UEFI 2.8+ orders the before-exit group ahead of key validation and the
+    // exit group, while handoff preparation can still allocate. Latch it once
+    // (matching EDK2 DxeMain) so a callback that allocates does not invalidate
+    // the map key on every retry and break loaders (like Linux) that retry once.
+    if !BEFORE_EXIT_SIGNALED.get() {
+        BEFORE_EXIT_SIGNALED.set(true);
+        signal_event_group(&EFI_EVENT_GROUP_BEFORE_EXIT_BOOT_SERVICES);
+    }
+}
+
+fn notify_exit_boot_services() {
+    // The key has been accepted and the map frozen, but firmware memory
+    // has not been reclaimed yet. Exit handlers may not allocate or free.
     signal_event_group(&EFI_EVENT_GROUP_EXIT_BOOT_SERVICES);
 
     // Also signal any legacy EVT_SIGNAL_EXIT_BOOT_SERVICES events
@@ -945,6 +1006,13 @@ pub(super) extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: 
             }
         }
     }
+}
+
+fn prepare_boot_handoff() -> Result<RuntimeImageClient, Status> {
+    let Some(runtime_image) = crate::efi::runtime_image::installed() else {
+        log::error!("ExitBootServices refused: runtime image client is missing");
+        return Err(Status::DEVICE_ERROR);
+    };
 
     // Rebuild the Memory Attributes Table in-place BEFORE locking the allocator.
     // Runtime image and retained-buffer regions are registered after the
@@ -954,86 +1022,73 @@ pub(super) extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: 
     // calling allocate_pages(), so the map_key stays valid for the caller.
     let prepare_status = system_table::rebuild_memory_attributes_table_in_place();
     if prepare_status != Status::SUCCESS {
-        return prepare_status;
+        return Err(prepare_status);
     }
+    Ok(runtime_image)
+}
 
-    // Event callbacks and MAT rebuilding may have changed the memory map. Do a
-    // final key check before any irreversible hardware quiescence.
-    let key_status = allocator::validate_map_key(map_key);
-    if key_status != Status::SUCCESS {
-        return key_status;
-    }
+fn record_exit_failure(status: Status) {
+    #[cfg(feature = "tpm")]
+    super::super::tcg::measured_boot::measure_action_all(
+        5,
+        "Exit Boot Services Returned with Failure",
+    );
+    log::warn!("ExitBootServices FAILED: {:?}", status);
+}
 
-    // Stop every firmware-owned DMA engine while BootServices allocations are
-    // still typed and cannot yet be reused by the OS. Clearing BME is the final
-    // safety net for devices without complete driver shutdown coverage.
-    crate::drivers::quiesce_dma_for_os_handoff();
+fn finish_exit(runtime_image: RuntimeImageClient) {
+    // TCG measured boot: measure ExitBootServices success into PCR 5.
+    #[cfg(feature = "tpm")]
+    super::super::tcg::measured_boot::measure_action_all(
+        5,
+        "Exit Boot Services Returned with Success",
+    );
 
-    let status = allocator::exit_boot_services(map_key);
+    log::info!("ExitBootServices SUCCESS - transitioning to OS");
 
-    if status == Status::SUCCESS {
-        // TCG measured boot: measure ExitBootServices success into PCR 5.
-        #[cfg(feature = "tpm")]
-        super::super::tcg::measured_boot::measure_action_all(
-            5,
-            "Exit Boot Services Returned with Success",
+    // Clean up hardware state for OS handoff.
+    // Re-enable keyboard interrupts so Linux's i8042 driver works.
+    crate::drivers::keyboard_common::cleanup();
+    #[cfg(feature = "ui")]
+    crate::drivers::pointer::stop();
+
+    // Seal only after the allocator accepted the map key, while boot-time
+    // diagnostics are still reachable. A failed seal leaves no safe way to
+    // return to the OS after allocator EBS, so report it and halt explicitly.
+    if let Err(seal_status) = runtime_image.seal() {
+        log::error!(
+            "FATAL: runtime image seal failed after allocator ExitBootServices: {:?}",
+            seal_status
         );
-
-        log::info!("ExitBootServices SUCCESS - transitioning to OS");
-
-        // Clean up hardware state for OS handoff.
-        // Re-enable keyboard interrupts so Linux's i8042 driver works.
-        crate::drivers::keyboard_common::cleanup();
-        #[cfg(feature = "ui")]
-        crate::drivers::pointer::stop();
-
-        // Seal only after the allocator accepted the map key, while boot-time
-        // diagnostics are still reachable. A failed seal leaves no safe way to
-        // return to the OS after allocator EBS, so report it and halt explicitly.
-        if let Err(seal_status) = runtime_image.seal() {
-            log::error!(
-                "FATAL: runtime image seal failed after allocator ExitBootServices: {:?}",
-                seal_status
-            );
-            loop {
-                crate::arch::halt();
-            }
+        loop {
+            crate::arch::halt();
         }
-        #[cfg(feature = "variable-store")]
-        crate::efi::varstore::persistence::detach_backend();
-        log::info!("Runtime image sealed successfully");
+    }
+    #[cfg(feature = "variable-store")]
+    crate::efi::varstore::persistence::detach_backend();
+    log::info!("Runtime image sealed successfully");
 
-        // Let platform glue clean up integration-specific handoff state only
-        // after the final fallible step; hooks may disable non-runtime log
-        // buffers needed to diagnose a seal failure.
-        if let Some(hooks) = crate::handoff::callbacks().hooks {
-            hooks.on_exit_boot_services();
-        }
-
-        // The OS gets control right after this: everything above is part of
-        // ExitBootServices.
-        crate::timestamp::record(crate::timestamp::TS_CRABEFI_EXIT_BOOT_SERVICES);
-
-        // CRITICAL: Disable logging only after the final fallible runtime-image
-        // transition. The OS generally does not map firmware log devices as
-        // runtime memory.
-        log::set_max_level(log::LevelFilter::Off);
-
-        // Security-state transitions are platform-owned. In particular,
-        // coreboot/TF-A already entered Non-Secure EL2. A PSCI version does
-        // not identify fstart or authorize its vendor-specific NS-switch SMC.
-        // Platforms needing that service must opt in through their own
-        // on_exit_boot_services hook, with the matching EL3 ABI.
-    } else {
-        #[cfg(feature = "tpm")]
-        super::super::tcg::measured_boot::measure_action_all(
-            5,
-            "Exit Boot Services Returned with Failure",
-        );
-        log::warn!("ExitBootServices FAILED: {:?}", status);
+    // Let platform glue clean up integration-specific handoff state only
+    // after the final fallible step; hooks may disable non-runtime log
+    // buffers needed to diagnose a seal failure.
+    if let Some(hooks) = crate::handoff::callbacks().hooks {
+        hooks.on_exit_boot_services();
     }
 
-    status
+    // The OS gets control right after this: everything above is part of
+    // ExitBootServices.
+    crate::timestamp::record(crate::timestamp::TS_CRABEFI_EXIT_BOOT_SERVICES);
+
+    // CRITICAL: Disable logging only after the final fallible runtime-image
+    // transition. The OS generally does not map firmware log devices as
+    // runtime memory.
+    log::set_max_level(log::LevelFilter::Off);
+
+    // Security-state transitions are platform-owned. In particular,
+    // coreboot/TF-A already entered Non-Secure EL2. A PSCI version does
+    // not identify fstart or authorize its vendor-specific NS-switch SMC.
+    // Platforms needing that service must opt in through their own
+    // on_exit_boot_services hook, with the matching EL3 ABI.
 }
 
 #[derive(Clone, Copy)]
@@ -1138,4 +1193,155 @@ fn measure_pe_image_for_tcg(
         event_data: event_data_ptr,
         event_data_size,
     })
+}
+
+#[cfg(test)]
+mod exit_notification_tests {
+    use super::*;
+    use crate::efi::boot_services::{events::create_event_ex, memory};
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+
+    const RAM: u64 = 0x10_0000;
+    static BEFORE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static EXIT_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static EXIT_BLOCKED_CHANGES: AtomicBool = AtomicBool::new(false);
+
+    extern "efiapi" fn before(_event: efi::Event, _context: *mut c_void) {
+        BEFORE_CALLS.fetch_add(1, Relaxed);
+        let mut address = RAM;
+        let _ = memory::allocate_pages(
+            efi::ALLOCATE_ADDRESS,
+            efi::BOOT_SERVICES_DATA,
+            1,
+            &mut address,
+        );
+    }
+
+    extern "efiapi" fn exit(_event: efi::Event, _context: *mut c_void) {
+        EXIT_CALLS.fetch_add(1, Relaxed);
+        let mut address = 0;
+        let mut pool = core::ptr::null_mut();
+        let rejected = memory::allocate_pages(
+            efi::ALLOCATE_ANY_PAGES,
+            efi::RUNTIME_SERVICES_DATA,
+            1,
+            &mut address,
+        ) == Status::UNSUPPORTED
+            && memory::free_pages(RAM, 1) == Status::UNSUPPORTED
+            && memory::allocate_pool(efi::BOOT_SERVICES_DATA, 32, &mut pool) == Status::UNSUPPORTED
+            && attempt_exit_boot_services(allocator::get_map_key(), || Ok(()), || {}, |()| {})
+                == Err(Status::INVALID_PARAMETER);
+        EXIT_BLOCKED_CHANGES.store(rejected, Relaxed);
+    }
+
+    #[test]
+    fn preparation_that_changes_the_key_cannot_freeze_the_map() {
+        allocator::with_exit_test_allocator(|| {
+            // Skip notification here; the other test covers it with real events.
+            BEFORE_EXIT_SIGNALED.set(true);
+            let key = allocator::get_map_key();
+            let result = attempt_exit_boot_services(
+                key,
+                || allocator::force_add_region(RAM, 4, allocator::MemoryType::ConventionalMemory),
+                || panic!("DMA was quiesced after preparation changed the map"),
+                |()| panic!("exit finished after preparation changed the map"),
+            );
+            BEFORE_EXIT_SIGNALED.set(false);
+            assert_eq!(result, Err(Status::INVALID_PARAMETER));
+            assert_eq!(allocator::get_map_key(), key + 1);
+            assert!(!allocator::exit_in_progress());
+            assert_eq!(allocator::validate_map_key(key + 1), Status::SUCCESS);
+        });
+    }
+
+    #[test]
+    fn stale_first_exit_with_allocating_before_callback_needs_only_one_retry() {
+        allocator::with_exit_test_allocator(|| {
+            struct ResetEvents;
+            impl Drop for ResetEvents {
+                fn drop(&mut self) {
+                    BEFORE_EXIT_SIGNALED.set(false);
+                    with_tables_mut(|state| *state = Tables::new());
+                }
+            }
+            let _reset = ResetEvents;
+            with_tables_mut(|state| *state = Tables::new());
+            crate::efi::tables::init_caches().unwrap();
+            BEFORE_CALLS.store(0, Relaxed);
+            EXIT_CALLS.store(0, Relaxed);
+            EXIT_BLOCKED_CHANGES.store(false, Relaxed);
+            allocator::force_add_region(RAM, 4, allocator::MemoryType::ConventionalMemory).unwrap();
+            for (group, callback) in [
+                (EFI_EVENT_GROUP_EXIT_BOOT_SERVICES, exit as efi::EventNotify),
+                (EFI_EVENT_GROUP_BEFORE_EXIT_BOOT_SERVICES, before),
+            ] {
+                let mut event = core::ptr::null_mut();
+                assert_eq!(
+                    create_event_ex(
+                        efi::EVT_NOTIFY_SIGNAL,
+                        efi::TPL_CALLBACK,
+                        Some(callback),
+                        core::ptr::null(),
+                        &group,
+                        &mut event,
+                    ),
+                    Status::SUCCESS
+                );
+            }
+            let initial = allocator::get_map_key();
+            assert_eq!(
+                attempt_exit_boot_services(
+                    initial - 1,
+                    || panic!("MAT preparation ran on a stale key"),
+                    || panic!("DMA was quiesced on a stale key"),
+                    |()| panic!("handoff finished on a stale key"),
+                ),
+                Err(Status::INVALID_PARAMETER)
+            );
+            assert_eq!(BEFORE_CALLS.load(Relaxed), 1);
+            assert_eq!(EXIT_CALLS.load(Relaxed), 0);
+            let fresh = allocator::get_map_key();
+            assert_eq!(fresh, initial + 1);
+
+            let quiesced = core::cell::Cell::new(false);
+            assert_eq!(
+                attempt_exit_boot_services(
+                    fresh,
+                    || {
+                        assert_eq!(BEFORE_CALLS.load(Relaxed), 1);
+                        assert_eq!(EXIT_CALLS.load(Relaxed), 0);
+                        assert!(!allocator::exit_in_progress());
+                        Ok(())
+                    },
+                    || {
+                        assert_eq!(EXIT_CALLS.load(Relaxed), 1);
+                        assert!(EXIT_BLOCKED_CHANGES.load(Relaxed));
+                        assert!(allocator::exit_in_progress());
+                        assert_eq!(allocator::get_map_key(), fresh);
+                        assert_eq!(
+                            allocator::release_boot_services_pages(RAM, 1),
+                            Status::SUCCESS
+                        );
+                        assert_eq!(allocator::get_map_key(), fresh);
+                        assert_eq!(
+                            allocator::get_memory_type_at(RAM),
+                            Some(allocator::MemoryType::BootServicesData)
+                        );
+                        quiesced.set(true);
+                    },
+                    |()| {
+                        assert!(quiesced.get());
+                        assert_eq!(allocator::get_map_key(), fresh + 1);
+                        assert_eq!(
+                            allocator::get_memory_type_at(RAM),
+                            Some(allocator::MemoryType::ConventionalMemory)
+                        );
+                    },
+                ),
+                Ok(())
+            );
+            assert_eq!(BEFORE_CALLS.load(Relaxed), 1);
+            assert_eq!(EXIT_CALLS.load(Relaxed), 1);
+        });
+    }
 }

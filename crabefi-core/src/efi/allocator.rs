@@ -243,11 +243,41 @@ pub fn validate_map_key(map_key: usize) -> efi::Status {
 
 /// Exit directly when the caller has no exit callbacks or DMA to quiesce.
 pub fn exit_boot_services(key: usize) -> efi::Status {
-    let status = ALLOCATOR.with_mut(|alloc| alloc.exit_boot_services(key));
-    if status == efi::Status::SUCCESS {
-        disable_pool_allocator();
+    match begin_exit_boot_services(key) {
+        Ok(()) => {
+            finish_exit_boot_services();
+            efi::Status::SUCCESS
+        }
+        Err(status) => status,
     }
-    status
+}
+
+/// Accept the loader's key and prevent further edits while drivers shut down.
+pub(crate) fn begin_exit_boot_services(key: usize) -> Result<(), efi::Status> {
+    ALLOCATOR.with_mut(|alloc| alloc.begin_exit_boot_services(key))
+}
+
+/// Reclaim Boot Services memory only after DMA has stopped.
+pub(crate) fn finish_exit_boot_services() {
+    ALLOCATOR.with_mut(MemoryAllocator::finish_exit_boot_services);
+    disable_pool_allocator();
+}
+
+pub(crate) fn exit_in_progress() -> bool {
+    ALLOCATOR.borrow().boot_services_exiting()
+}
+
+/// Drop a firmware-owned BootServicesData allocation. During handoff its
+/// pages stay typed until commit, which reclaims them without editing the
+/// loader's accepted map while DMA is still active.
+pub(crate) fn release_boot_services_pages(address: u64, pages: u64) -> efi::Status {
+    ALLOCATOR.with_mut(|alloc| {
+        if alloc.boot_services_exiting() {
+            efi::Status::SUCCESS
+        } else {
+            alloc.free_pages(address, pages)
+        }
+    })
 }
 
 /// Allocate one contiguous runtime image and privately split its leading code
@@ -536,6 +566,29 @@ pub fn reserve_boot_image_region() {
             }
         }
     }
+}
+
+/// Test the real commit without closing the global allocator for other host tests.
+#[cfg(test)]
+pub(crate) fn with_exit_test_allocator<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(MemoryAllocator, PoolState, bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ALLOCATOR.with_mut(|alloc| core::mem::swap(alloc, &mut self.0));
+            *POOL_STATE.lock() = core::mem::replace(&mut self.1, PoolState::new());
+            POOL_DISABLED.store(self.2, Ordering::Release);
+        }
+    }
+
+    let _state = crate::efi::boot_services::IMAGE_EXECUTION_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _restore = Restore(
+        ALLOCATOR.with_mut(core::mem::take),
+        core::mem::replace(&mut *POOL_STATE.lock(), PoolState::new()),
+        POOL_DISABLED.swap(false, Ordering::AcqRel),
+    );
+    f()
 }
 
 #[cfg(test)]
