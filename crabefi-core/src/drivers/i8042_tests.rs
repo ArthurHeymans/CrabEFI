@@ -17,6 +17,7 @@ struct FakeController {
     output: RefCell<VecDeque<(u64, bool, u8)>>,
     commands: RefCell<Vec<u8>>,
     data: RefCell<Vec<u8>>,
+    aux_bytes: RefCell<Vec<u8>>,
 }
 
 impl FakeController {
@@ -33,6 +34,7 @@ impl FakeController {
             output: RefCell::new(VecDeque::new()),
             commands: RefCell::new(Vec::new()),
             data: RefCell::new(Vec::new()),
+            aux_bytes: RefCell::new(Vec::new()),
         }
     }
 
@@ -97,6 +99,10 @@ impl Controller for FakeController {
     fn delay(&self) {
         self.now.set(self.now.get() + POLL_US);
     }
+
+    fn on_aux_byte(&self, byte: u8) {
+        self.aux_bytes.borrow_mut().push(byte);
+    }
 }
 
 #[test]
@@ -104,7 +110,7 @@ fn stale_keyboard_ack_and_bat_cannot_be_written_as_controller_config() {
     let mut io = FakeController::new();
     io.reply(0, false, 0xFA);
     io.reply(0, false, 0xAA);
-    assert!(init_aux(&mut io, |io| {
+    assert!(init_aux(&mut io, false, |io| {
         assert_eq!(io.config.get(), 0x54); // translated, keyboard off, AUX on, no IRQs
         true
     }));
@@ -120,7 +126,7 @@ fn stale_keyboard_ack_and_bat_cannot_be_written_as_controller_config() {
 #[test]
 fn failed_aux_probe_still_restores_keyboard_clock() {
     let mut io = FakeController::new();
-    assert!(!init_aux(&mut io, |io| {
+    assert!(!init_aux(&mut io, false, |io| {
         assert_ne!(io.config.get() & KB_DISABLE, 0);
         false
     }));
@@ -132,7 +138,9 @@ fn failed_aux_probe_still_restores_keyboard_clock() {
 fn config_timeout_restores_keyboard_without_running_aux_probe() {
     let mut io = FakeController::new();
     io.reply_to_config = false;
-    assert!(!init_aux(&mut io, |_| panic!("configuration read failed")));
+    assert!(!init_aux(&mut io, false, |_| panic!(
+        "configuration read failed"
+    )));
     assert_eq!(io.config.get() & KB_DISABLE, 0);
     assert!(io.data.borrow().is_empty());
     assert!(io.now.get() >= CONTROLLER_TIMEOUT_US);
@@ -144,7 +152,7 @@ fn aux_port_test_runs_with_both_clocks_inhibited() {
     // Stale AUX bytes must be drained before the untagged port-test reply.
     io.reply(0, true, 0x08);
     io.reply(0, true, 0x00);
-    assert!(init_aux(&mut io, |io| {
+    assert!(init_aux(&mut io, false, |io| {
         let tested_config = io.port_test_config.get().unwrap();
         assert_eq!(
             tested_config & (KB_DISABLE | AUX_DISABLE),
@@ -161,7 +169,9 @@ fn aux_port_test_failure_restores_keyboard_without_enabling_aux() {
     for reply in [None, Some(1)] {
         let mut io = FakeController::new();
         io.port_test_reply = reply;
-        assert!(!init_aux(&mut io, |_| panic!("AUX port test failed")));
+        assert!(!init_aux(&mut io, false, |_| panic!(
+            "AUX port test failed"
+        )));
         assert_eq!(io.config.get() & KB_DISABLE, 0);
         assert_ne!(io.config.get() & AUX_DISABLE, 0);
         assert!(io.data.borrow().is_empty());
@@ -173,7 +183,7 @@ fn aux_port_test_failure_restores_keyboard_without_enabling_aux() {
 fn timeout_after_disabling_keyboard_still_restores_its_clock() {
     let mut io = FakeController::new();
     io.busy_after_command = Some(0xAD);
-    assert!(!init_aux(&mut io, |_| panic!(
+    assert!(!init_aux(&mut io, false, |_| panic!(
         "keyboard-disable wait failed"
     )));
     assert_eq!(io.config.get() & KB_DISABLE, 0);
@@ -235,4 +245,40 @@ fn repeated_resend_is_bounded() {
     }
     assert!(!io.send_device_byte(false, 0xF4));
     assert_eq!(*io.data.borrow(), vec![0xF4; 3]);
+}
+
+#[test]
+fn init_aux_reenables_keyboard_scanning_and_inhibits_aux_on_failure() {
+    let mut io = FakeController::new();
+    assert!(!init_aux(&mut io, true, |io| {
+        io.reply(io.now.get(), false, 0xFA); // ACK for keyboard 0xF4 ENABLE
+        false
+    }));
+    assert_eq!(
+        *io.commands.borrow(),
+        vec![0xAD, 0xA7, 0xA9, 0x20, 0x60, 0xA7, 0xAE]
+    );
+    assert_eq!(*io.data.borrow(), vec![0x54, 0xF4]);
+    assert_eq!(io.config.get() & (KB_DISABLE | AUX_DISABLE), AUX_DISABLE);
+    assert!(io.now.get() < ACK_TIMEOUT_US);
+}
+
+#[test]
+fn init_aux_preserves_aux_bytes_while_reenabling_keyboard_scanning() {
+    let mut io = FakeController::new();
+    assert!(init_aux(&mut io, true, |io| {
+        io.reply(io.now.get(), true, 0x08); // AUX packet byte 0
+        io.reply(io.now.get(), true, 0x01); // AUX packet byte 1
+        io.reply(io.now.get(), true, 0xFF); // AUX packet byte 2
+        io.reply(io.now.get(), false, 0xFA); // ACK for keyboard 0xF4 ENABLE
+        true
+    }));
+    assert_eq!(
+        *io.commands.borrow(),
+        vec![0xAD, 0xA7, 0xA9, 0x20, 0x60, 0xAE]
+    );
+    assert_eq!(*io.data.borrow(), vec![0x54, 0xF4]);
+    assert_eq!(*io.aux_bytes.borrow(), vec![0x08, 0x01, 0xFF]);
+    assert_eq!(io.config.get() & (KB_DISABLE | AUX_DISABLE), 0);
+    assert!(io.now.get() < ACK_TIMEOUT_US);
 }
