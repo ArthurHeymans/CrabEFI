@@ -331,6 +331,9 @@ impl ScreenInfo {
     /// VIDEO_TYPE_EFI - EFI/UEFI framebuffer
     pub const VIDEO_TYPE_EFI: u8 = 0x70;
 
+    /// VIDEO_CAPABILITY_64BIT_BASE - `ext_lfb_base` holds upper 32 bits of framebuffer base
+    pub const VIDEO_CAPABILITY_64BIT_BASE: u32 = 1 << 1;
+
     /// Create a zeroed ScreenInfo
     pub const fn new() -> Self {
         // Safety: ScreenInfo is all integer types, zero is valid
@@ -539,11 +542,18 @@ impl BootParams {
 
         // Set framebuffer address (split into lower and upper 32 bits)
         self.screen_info.lfb_base = fb.physical_address as u32;
-        self.screen_info.ext_lfb_base = (fb.physical_address >> 32) as u32;
+        let ext_lfb_base = (fb.physical_address >> 32) as u32;
+        self.screen_info.ext_lfb_base = ext_lfb_base;
+        if ext_lfb_base != 0 {
+            self.screen_info.capabilities |= ScreenInfo::VIDEO_CAPABILITY_64BIT_BASE;
+        } else {
+            self.screen_info.capabilities &= !ScreenInfo::VIDEO_CAPABILITY_64BIT_BASE;
+        }
 
-        // Calculate framebuffer size in 64KB units
-        let fb_size = fb.bytes_per_line() as u64 * fb.height as u64;
-        self.screen_info.lfb_size = fb_size.div_ceil(0x10000) as u32;
+        // For VIDEO_TYPE_EFI, Linux interprets lfb_size in bytes (unlike legacy
+        // VESA VIDEO_TYPE_VLFB, which uses 64 KiB units).
+        let fb_size = (fb.bytes_per_line() as u64).saturating_mul(fb.height as u64);
+        self.screen_info.lfb_size = u32::try_from(fb_size).unwrap_or(u32::MAX);
 
         // Set color mask information
         self.screen_info.red_size = fb.red_mask_size;
@@ -589,9 +599,26 @@ const _: () = assert!(mem::size_of::<BootParams>() == 4096);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::FramebufferConfig;
 
     fn descriptor(memory_type: EfiMemoryType, addr: u64) -> MemoryDescriptor {
         MemoryDescriptor::new(memory_type as u32, addr, 1, 0)
+    }
+
+    fn framebuffer(physical_address: u64) -> FramebufferConfig {
+        FramebufferConfig {
+            physical_address,
+            width: 1280,
+            height: 768,
+            stride: 1280,
+            bits_per_pixel: 32,
+            red_mask_pos: 16,
+            red_mask_size: 8,
+            green_mask_pos: 8,
+            green_mask_size: 8,
+            blue_mask_pos: 0,
+            blue_mask_size: 8,
+        }
     }
 
     #[test]
@@ -642,6 +669,43 @@ mod tests {
         assert_eq!(
             params.set_efi_memory_map(&descriptors),
             Err(E820MapError::TooManyEntries)
+        );
+    }
+
+    #[test]
+    fn set_framebuffer_encodes_efi_size_in_bytes_and_32bit_base() {
+        let fb = framebuffer(0xe000_0000);
+        let mut params = BootParams::new();
+        params.set_framebuffer(&fb);
+
+        let video_type = params.screen_info.orig_video_isVGA;
+        let lfb_size = params.screen_info.lfb_size;
+        let lfb_base = params.screen_info.lfb_base;
+        let ext_lfb_base = params.screen_info.ext_lfb_base;
+        let capabilities = params.screen_info.capabilities;
+
+        assert_eq!(video_type, ScreenInfo::VIDEO_TYPE_EFI);
+        assert_eq!(lfb_size, 1280 * 4 * 768);
+        assert_eq!(lfb_base, 0xe000_0000);
+        assert_eq!(ext_lfb_base, 0);
+        assert_eq!(capabilities & ScreenInfo::VIDEO_CAPABILITY_64BIT_BASE, 0);
+    }
+
+    #[test]
+    fn set_framebuffer_sets_64bit_base_capability_above_4gib() {
+        let fb = framebuffer(0x1_8000_0000);
+        let mut params = BootParams::new();
+        params.set_framebuffer(&fb);
+
+        let lfb_base = params.screen_info.lfb_base;
+        let ext_lfb_base = params.screen_info.ext_lfb_base;
+        let capabilities = params.screen_info.capabilities;
+
+        assert_eq!(lfb_base, 0x8000_0000);
+        assert_eq!(ext_lfb_base, 1);
+        assert_eq!(
+            capabilities & ScreenInfo::VIDEO_CAPABILITY_64BIT_BASE,
+            ScreenInfo::VIDEO_CAPABILITY_64BIT_BASE
         );
     }
 }

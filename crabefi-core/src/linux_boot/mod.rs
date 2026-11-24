@@ -255,22 +255,20 @@ impl LoadedLinux {
         // SAFETY: Disabling interrupts and jumping to kernel entry point.
         // The caller guarantees the kernel is properly loaded and boot params are valid.
         unsafe {
-            // Disable interrupts
-            core::arch::asm!("cli");
-
-            // Jump to kernel entry point
-            // The x86-64 calling convention puts first argument in RDI, second in RSI
-            // Linux expects boot_params in RSI and a dummy value in RDI
+            // Linux 64-bit boot protocol expects interrupts disabled and
+            // boot_params in RSI (with RDI = 0). Bind inputs to fixed
+            // registers so none can be allocated into a register cleared
+            // before the jump.
             core::arch::asm!(
-                "xor rdi, rdi",           // Clear RDI (dummy value)
-                "mov rsi, {boot_params}", // boot_params pointer in RSI
-                "xor rdx, rdx",           // Clear other registers
+                "cli",
+                "xor rdi, rdi",
+                "xor rdx, rdx",
                 "xor rcx, rcx",
                 "xor r8, r8",
                 "xor r9, r9",
-                "jmp {entry}",
-                boot_params = in(reg) BOOT_PARAMS_ADDR,
-                entry = in(reg) self.entry_point,
+                "jmp rax",
+                in("rsi") BOOT_PARAMS_ADDR,
+                in("rax") self.entry_point,
                 options(noreturn)
             );
         }
@@ -308,20 +306,18 @@ impl LoadedLinux {
             // - RDI: EFI image handle
             // - RSI: EFI system table
             // - RDX: boot_params pointer
-            core::arch::asm!("cli");
-
+            // Bind inputs to their ABI registers (and entry to RAX) so none
+            // can alias a register cleared or overwritten before the jump.
             core::arch::asm!(
-                "mov rdi, {handle}",
-                "mov rsi, {systab}",
-                "mov rdx, {boot_params}",
+                "cli",
                 "xor rcx, rcx",
                 "xor r8, r8",
                 "xor r9, r9",
-                "jmp {entry}",
-                handle = in(reg) image_handle as u64,
-                systab = in(reg) system_table as u64,
-                boot_params = in(reg) boot_params_ptr as u64,
-                entry = in(reg) entry,
+                "jmp rax",
+                in("rdi") image_handle as u64,
+                in("rsi") system_table as u64,
+                in("rdx") boot_params_ptr as u64,
+                in("rax") entry,
                 options(noreturn)
             );
         }
