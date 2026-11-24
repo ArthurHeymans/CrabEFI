@@ -22,6 +22,11 @@ pub(super) trait Controller {
     fn write_data(&self, byte: u8);
     fn write_command(&self, byte: u8);
 
+    /// Retain an AUX byte read while waiting for a keyboard command reply
+    /// after AUX reporting has already been enabled.
+    #[cfg(any(feature = "ui", test))]
+    fn on_aux_byte(&self, _byte: u8) {}
+
     fn now_us(&self) -> u64 {
         ((crate::time::read_counter() as u128 * 1_000_000)
             / crate::time::counter_frequency().max(1) as u128) as u64
@@ -80,6 +85,17 @@ pub(super) trait Controller {
     /// Ignore unrelated bytes rather than mistaking the first byte for an ACK.
     /// The caller must inhibit the other interface for the whole transaction.
     fn send_device_byte(&self, aux: bool, byte: u8) -> bool {
+        self.send_device_byte_with(aux, byte, |_| {})
+    }
+
+    /// Variant of [`Self::send_device_byte`] that forwards any unrelated AUX
+    /// bytes read while waiting for a keyboard command ACK.
+    fn send_device_byte_with(
+        &self,
+        aux: bool,
+        byte: u8,
+        mut on_unrelated_aux: impl FnMut(u8),
+    ) -> bool {
         for _ in 0..3 {
             if aux && !self.send_controller_cmd(0xD4) {
                 return false;
@@ -99,6 +115,8 @@ pub(super) trait Controller {
                             0xFE => break,
                             _ => {}
                         }
+                    } else if !aux && status & AUX_DATA != 0 {
+                        on_unrelated_aux(response);
                     }
                 }
                 if self.now_us().wrapping_sub(start) >= ACK_TIMEOUT_US {
@@ -114,8 +132,19 @@ pub(super) trait Controller {
 /// Run AUX discovery without letting keyboard replies or scancodes masquerade
 /// as controller configuration/test replies. The keyboard reset must already
 /// have completed (or timed out) before calling this.
+///
+/// When `restore_keyboard_scanning` is true, re-sends `ENABLE` (`0xF4`) after
+/// re-enabling the keyboard clock (`0xAE`). Older ChromeEC firmware (such as
+/// Peppy `firmware-falco_peppy-4389.B`) clears its internal `keystroke_enabled`
+/// flag when the keyboard interface is inhibited (`0xAD` / `KB_DISABLE`), and
+/// `0xAE` alone does not re-enable keystroke reporting.
 #[cfg(any(feature = "ui", test))]
-pub(super) fn init_aux<C: Controller>(io: &mut C, init: impl FnOnce(&mut C) -> bool) -> bool {
+pub(super) fn init_aux<C: Controller>(
+    io: &mut C,
+    restore_keyboard_scanning: bool,
+    init: impl FnOnce(&mut C) -> bool,
+) -> bool {
+    let mut aux_enabled = false;
     let result = (|| {
         // Even a failed wait after writing DISABLE_KB can leave the keyboard
         // inhibited. Keep this command inside the keyboard-restoration path.
@@ -136,14 +165,26 @@ pub(super) fn init_aux<C: Controller>(io: &mut C, init: impl FnOnce(&mut C) -> b
         if !io.send_controller_cmd(0x60) || !io.wait_input_ready() {
             return false;
         }
+        aux_enabled = true;
         io.write_data(config);
         if !io.wait_input_ready() {
             return false;
         }
         init(io)
     })();
+    if !result && aux_enabled {
+        // Re-inhibit AUX on failed discovery before restoring the keyboard.
+        let _ = io.send_controller_cmd(0xA7);
+    }
     // Restore the keyboard on every exit, including failed AUX discovery.
     let restored = io.send_controller_cmd(0xAE);
+    if restored && restore_keyboard_scanning {
+        let _ = io.send_device_byte_with(false, 0xF4, |byte| {
+            if result {
+                io.on_aux_byte(byte);
+            }
+        });
+    }
     result && restored
 }
 

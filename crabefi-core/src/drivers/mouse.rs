@@ -165,6 +165,10 @@ impl Controller for MouseState {
     fn write_command(&self, byte: u8) {
         self.status_port.set(byte);
     }
+
+    fn on_aux_byte(&self, byte: u8) {
+        push_aux_byte(byte);
+    }
 }
 
 static AUX_FIFO: Mutex<heapless::Deque<u8, 128>> = Mutex::new(heapless::Deque::new());
@@ -556,9 +560,12 @@ pub fn push_aux_byte(byte: u8) {
 /// X280 and similar models.
 pub fn init() {
     let mut mouse = MOUSE.lock();
-    if mouse.init_attempted || !super::keyboard::ready_for_aux_init() {
+    if mouse.init_attempted {
         return;
     }
+    let Some(keyboard_ready) = super::keyboard::ready_for_aux_init() else {
+        return;
+    };
     mouse.init_attempted = true;
 
     if mouse.status_port.get() == 0xFF {
@@ -567,7 +574,7 @@ pub fn init() {
     }
 
     log::debug!("Initializing PS/2 mouse");
-    mouse.initialized = i8042::init_aux(&mut *mouse, init_device);
+    mouse.initialized = i8042::init_aux(&mut *mouse, keyboard_ready, init_device);
     if mouse.initialized {
         log::info!("PS/2 mouse initialized (protocol: {:?})", mouse.protocol);
     }

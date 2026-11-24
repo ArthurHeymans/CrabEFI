@@ -424,11 +424,15 @@ pub fn init() {
 
 /// AUX discovery shares the controller's untagged command replies. Do not
 /// start it while the keyboard RESET transaction still owns the data port.
+///
+/// Returns `Some(keyboard_ready)` when AUX discovery may run: `Some(true)`
+/// means the keyboard is active and `init_aux` should re-enable scanning
+/// (`0xF4`) after restoring the keyboard clock.
 #[cfg(feature = "ui")]
-pub(super) fn ready_for_aux_init() -> bool {
+pub(super) fn ready_for_aux_init() -> Option<bool> {
     let mut kb = KEYBOARD.lock();
     poll_bat_completion(&mut kb);
-    aux_init_allowed(kb.init_state)
+    aux_init_allowed(kb.init_state).then_some(kb.is_ready())
 }
 
 #[cfg(any(feature = "ui", test))]
