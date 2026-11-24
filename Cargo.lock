@@ -136,7 +136,7 @@ dependencies = [
  "mem-barrier",
  "object",
  "pci_types",
- "r-efi 7.1.0",
+ "r-efi 7.2.0",
  "rflasher-core",
  "rflasher-internal",
  "sha1",
@@ -162,7 +162,7 @@ dependencies = [
  "heapless 0.9.3",
  "linked_list_allocator",
  "log",
- "r-efi 7.1.0",
+ "r-efi 7.2.0",
  "sha2",
  "x86_64",
  "zerocopy",
@@ -191,7 +191,7 @@ dependencies = [
  "heapless 0.9.3",
  "log",
  "proptest",
- "r-efi 7.1.0",
+ "r-efi 7.2.0",
 ]
 
 [[package]]
@@ -515,9 +515,9 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "r-efi"
-version = "7.1.0"
+version = "7.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b0ff379dd174eec5b2cab797063a2e7592dfcf0bf0323a50eeee724ee3537f13"
+checksum = "985ede7b27e96936c369ba18787c9178af0ef38d130792fc88e936242a7071c4"
 
 [[package]]
 name = "rand"
