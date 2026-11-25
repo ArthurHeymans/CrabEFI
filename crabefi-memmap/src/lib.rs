@@ -1381,14 +1381,58 @@ impl<const ENTRIES: usize, const OWNERS: usize, const ADDRESS_LIMIT: u64>
         image_pages: u64,
         code_pages: u64,
     ) -> Result<u64, efi::Status> {
+        self.allocate_runtime_image_layout_preferring_below(image_pages, code_pages, u64::MAX)
+    }
+
+    /// Like [`Self::allocate_runtime_image_layout`], but place the image in
+    /// the highest free range below `preferred_max` (inclusive) when one
+    /// exists and its split fits the descriptor table. Otherwise fall back
+    /// to the highest free range anywhere.
+    pub fn allocate_runtime_image_layout_preferring_below(
+        &mut self,
+        image_pages: u64,
+        code_pages: u64,
+        preferred_max: u64,
+    ) -> Result<u64, efi::Status> {
         if image_pages == 0 || code_pages == 0 || code_pages > image_pages {
             return Err(efi::Status::INVALID_PARAMETER);
         }
         self.require_active()?;
-        let placement = self
+        if preferred_max != u64::MAX {
+            // A failed attempt leaves the map unchanged, so if the preferred
+            // placement does not fit the descriptor table, retry without it.
+            let preferred = self
+                .find_free_pages(
+                    image_pages,
+                    0..=preferred_max,
+                    PAGE_SIZE,
+                    Placement::Highest,
+                )
+                .and_then(|address| {
+                    self.place_runtime_image(address, image_pages, code_pages)
+                        .ok()
+                });
+            if let Some(base) = preferred {
+                return Ok(base);
+            }
+        }
+        let address = self
             .find_free_pages(image_pages, 0..=u64::MAX, PAGE_SIZE, Placement::Highest)
-            .and_then(|address| PageRange::from_bytes(address, image_pages))
             .ok_or(efi::Status::OUT_OF_RESOURCES)?;
+        self.place_runtime_image(address, image_pages, code_pages)
+    }
+
+    /// Split the runtime image at `address` out of conventional memory.
+    /// Returns an error without changing the map when the split does not fit
+    /// the descriptor table.
+    fn place_runtime_image(
+        &mut self,
+        address: u64,
+        image_pages: u64,
+        code_pages: u64,
+    ) -> Result<u64, efi::Status> {
+        let placement =
+            PageRange::from_bytes(address, image_pages).ok_or(efi::Status::OUT_OF_RESOURCES)?;
         let source = self
             .find_descriptor(placement, &[MemoryType::ConventionalMemory])
             .ok_or(efi::Status::OUT_OF_RESOURCES)?;

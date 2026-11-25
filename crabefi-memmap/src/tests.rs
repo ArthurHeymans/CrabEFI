@@ -197,6 +197,79 @@ fn runtime_image_layout_counts_the_merge_before_charging_capacity() {
 }
 
 #[test]
+fn runtime_image_layout_without_preference_takes_the_highest_range() {
+    const LOW: u64 = 0x10_0000;
+    const HIGH: u64 = 0x1_0000_0000;
+    let mut map = MemoryMap::<8, 4>::new();
+    map.force_add_region(LOW, 8, MemoryType::ConventionalMemory)
+        .unwrap();
+    map.force_add_region(HIGH, 8, MemoryType::ConventionalMemory)
+        .unwrap();
+    assert_eq!(
+        map.allocate_runtime_image_layout(2, 1),
+        Ok(HIGH + 6 * PAGE_SIZE)
+    );
+    map.check_well_formed().unwrap();
+}
+
+#[test]
+fn runtime_image_layout_prefers_memory_below_the_limit() {
+    const LOW: u64 = 0x10_0000;
+    const HIGH: u64 = 0x1_0000_0000;
+    let mut map = MemoryMap::<8, 4>::new();
+    map.force_add_region(LOW, 8, MemoryType::ConventionalMemory)
+        .unwrap();
+    map.force_add_region(HIGH, 8, MemoryType::ConventionalMemory)
+        .unwrap();
+    assert_eq!(
+        map.allocate_runtime_image_layout_preferring_below(2, 1, HIGH - 1),
+        Ok(LOW + 6 * PAGE_SIZE)
+    );
+    map.check_well_formed().unwrap();
+}
+
+#[test]
+fn runtime_image_layout_falls_back_above_the_limit() {
+    const LOW: u64 = 0x10_0000;
+    const HIGH: u64 = 0x1_0000_0000;
+    let mut map = MemoryMap::<8, 4>::new();
+    map.force_add_region(LOW, 1, MemoryType::ConventionalMemory)
+        .unwrap();
+    map.force_add_region(HIGH, 8, MemoryType::ConventionalMemory)
+        .unwrap();
+    assert_eq!(
+        map.allocate_runtime_image_layout_preferring_below(2, 1, HIGH - 1),
+        Ok(HIGH + 6 * PAGE_SIZE)
+    );
+    map.check_well_formed().unwrap();
+}
+
+#[test]
+fn runtime_image_layout_falls_back_when_the_preferred_split_does_not_fit() {
+    const FOUR_GIB: u64 = 0x1_0000_0000;
+    const HIGH: u64 = 0x2_0000_0000;
+    let mut map = MemoryMap::<4, 4>::new();
+    map.force_add_region(FOUR_GIB - 3 * PAGE_SIZE, 6, MemoryType::ConventionalMemory)
+        .unwrap();
+    map.force_add_region(HIGH, 8, MemoryType::ConventionalMemory)
+        .unwrap();
+    let key = map.map_key();
+    // Below 4 GiB the split needs five descriptors: head, code, data, tail
+    // and the high region. Above 4 GiB it needs four.
+    assert_eq!(
+        map.allocate_runtime_image_layout_preferring_below(2, 1, FOUR_GIB - 1),
+        Ok(HIGH + 6 * PAGE_SIZE)
+    );
+    assert_eq!(map.map_key(), key + 1);
+    assert_eq!(
+        map.memory_type_at(FOUR_GIB - 3 * PAGE_SIZE),
+        Some(MemoryType::ConventionalMemory)
+    );
+    assert_eq!(map.descriptors()[0].number_of_pages, 6);
+    map.check_well_formed().unwrap();
+}
+
+#[test]
 fn adjacent_ram_is_allocatable_without_a_prior_edit() {
     const RAM: u64 = 0x10_0000;
     for (kind, mut address) in [
