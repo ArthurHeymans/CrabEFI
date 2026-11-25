@@ -23,6 +23,9 @@ use crabefi_runtime_abi::format::{
 
 use crate::{Arch, project_root};
 
+mod stack;
+
+const STACK_BUDGET: u64 = 16 * 1024;
 const PAGE_SIZE: u64 = EFI_PAGE_SIZE as u64;
 
 #[derive(Clone)]
@@ -161,7 +164,7 @@ pub fn build(arch: Arch) -> Result<RuntimeArtifact> {
     build_with_capabilities(arch, true)
 }
 
-fn build_with_capabilities(arch: Arch, secure_boot: bool) -> Result<RuntimeArtifact> {
+pub fn build_with_capabilities(arch: Arch, secure_boot: bool) -> Result<RuntimeArtifact> {
     let root = project_root();
     let runtime = root.join("target/runtime");
     let output = if secure_boot {
@@ -262,6 +265,10 @@ fn runtime_rustflags(arch: Arch, map_path: &Path) -> OsString {
         arguments.extend([OsString::from("-Z"), OsString::from("fixed-x18=yes")]);
     }
     arguments.extend([
+        // A jump table is an indirect branch the stack audit cannot follow.
+        // Without them, every indirect transfer is a genuine call.
+        OsString::from("-C"),
+        OsString::from("jump-tables=no"),
         OsString::from("-C"),
         OsString::from("linker=rust-lld"),
         OsString::from("-C"),
@@ -524,6 +531,7 @@ fn normalize(
         anyhow::anyhow!("normalized runtime image failed ABI self-validation: {error}")
     })?;
     run_audit_tools(elf_path, output, arch, relocations.len())?;
+    stack::audit(&file, arch, &relocations, output)?;
     println!(
         "Runtime size ({}, {}): {} bytes normalized, {} bytes executable sections",
         arch.dir_name(),
@@ -969,7 +977,6 @@ fn run_audit_tools(elf: &Path, output: &Path, arch: Arch, relocation_slots: usiz
         .filter_map(|value| u64::from_str_radix(value, 16).ok())
         .max()
         .context("LLVM stack-size report contained no function sizes")?;
-    const STACK_BUDGET: u64 = 16 * 1024;
     if maximum > STACK_BUDGET {
         bail!("runtime function stack size {maximum} exceeds {STACK_BUDGET}-byte budget");
     }
@@ -1336,6 +1343,7 @@ mod tests {
         let expected = format!("link-arg=-Map={}", map_path.display());
         assert!(arguments.contains(&expected.as_str()));
         assert!(arguments.contains(&"link-arg=--no-relax"));
+        assert!(arguments.contains(&"jump-tables=no"));
         assert!(!arguments.iter().any(|argument| argument == &"runtime"));
 
         fs::remove_dir_all(directory).unwrap();
