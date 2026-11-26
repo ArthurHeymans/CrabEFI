@@ -612,6 +612,18 @@ extern "efiapi" fn file_flush_ex(
 }
 
 fn with_fat<R>(f: impl FnOnce(&mut FatFilesystem) -> Result<R, Status>) -> Result<R, Status> {
+    let mut f = Some(f);
+    let mut result = Err(Status::DEVICE_ERROR);
+    with_fat_dyn(&mut |fat| {
+        if let Some(f) = f.take() {
+            result = f(fat);
+        }
+    })?;
+    result
+}
+
+#[inline(never)]
+fn with_fat_dyn(f: &mut dyn FnMut(&mut FatFilesystem)) -> Result<(), Status> {
     let mut state = FILESYSTEM.get().ok_or(Status::NOT_READY)?;
     storage::with_disk(state.storage, |device| {
         let info = device.info();
@@ -634,11 +646,11 @@ fn with_fat<R>(f: impl FnOnce(&mut FatFilesystem) -> Result<R, Status>) -> Resul
             state.volume,
         )
         .map_err(fat_status)?;
-        let result = f(&mut fat);
+        f(&mut fat);
         state.volume = fat.volume_state();
         state.read_only = fat.is_read_only();
         FILESYSTEM.set(Some(state));
-        result
+        Ok(())
     })
     .map_err(|error| match error {
         crate::drivers::block::BlockError::MediaChanged => Status::MEDIA_CHANGED,

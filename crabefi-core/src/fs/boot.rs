@@ -128,18 +128,44 @@ pub(crate) fn with_filesystem<R>(
     kind: Kind,
     f: impl FnOnce(&mut dyn BootFilesystem) -> R,
 ) -> Option<R> {
+    let mut f = Some(f);
+    let mut result = None;
+    with_filesystem_dyn(storage, partition, kind, &mut |fs| {
+        if let Some(f) = f.take() {
+            result = Some(f(fs));
+        }
+    });
+    result
+}
+
+#[inline(never)]
+fn with_filesystem_dyn(
+    storage: StorageId,
+    partition: &Partition,
+    kind: Kind,
+    f: &mut dyn FnMut(&mut dyn BootFilesystem),
+) {
     match kind {
-        Kind::Fat => storage::with_disk(storage, |disk| {
-            let mut fs =
-                FatFilesystem::new_partition(disk, partition.first_lba, partition.size_sectors())
-                    .ok()?;
-            Some(f(&mut fs))
-        })
-        .ok()?,
+        Kind::Fat => {
+            let _ = storage::with_disk(storage, |disk| {
+                let Ok(mut fs) = FatFilesystem::new_partition(
+                    disk,
+                    partition.first_lba,
+                    partition.size_sectors(),
+                ) else {
+                    return;
+                };
+                f(&mut fs);
+            });
+        }
         #[cfg(all(feature = "ext4", target_arch = "x86_64"))]
         Kind::Ext { media, discovery } => {
-            let mut fs = super::ext::ExtFilesystem::mount(storage, partition, media, discovery)?;
-            Some(f(&mut fs))
+            let Some(mut fs) =
+                super::ext::ExtFilesystem::mount(storage, partition, media, discovery)
+            else {
+                return;
+            };
+            f(&mut fs);
         }
     }
 }
