@@ -62,9 +62,14 @@ impl PageBuffer {
             pages,
             &mut address,
         );
-        // Lazily: a buffer built for a failed allocation would free pages
-        // it never owned when dropped.
-        (status == r_efi::efi::Status::SUCCESS).then(|| Self {
+        if status != r_efi::efi::Status::SUCCESS {
+            return None;
+        }
+        // SAFETY: `allocate_pages` returned `pages` exclusive, identity-mapped
+        // pages covering at least `len` bytes. Zeroing before exposing slices
+        // ensures `Deref`/`DerefMut` never observe uninitialized memory.
+        unsafe { core::ptr::write_bytes(address as *mut u8, 0, len) };
+        Some(Self {
             address,
             pages,
             len,
@@ -375,5 +380,17 @@ mod tests {
             | EFI_OS_INDICATIONS_FILE_CAPSULE_DELIVERY_SUPPORTED;
         assert_eq!(supported, 0x0c);
         assert_eq!(clear_capsule_bits(0x01 | supported), 0x01);
+    }
+
+    #[test]
+    fn page_buffer_zeroes_reused_pages() {
+        crate::efi::allocator::with_host_pages(|| {
+            let mut first = PageBuffer::new(64).unwrap();
+            first.fill(0xA5);
+            drop(first);
+
+            let second = PageBuffer::new(64).unwrap();
+            assert!(second.iter().all(|&byte| byte == 0));
+        });
     }
 }

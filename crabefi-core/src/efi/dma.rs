@@ -145,21 +145,21 @@ impl DmaBuffer {
         if status != Status::SUCCESS {
             return Err(DmaError::OutOfResources);
         }
-        if !allocation_fits_mask(address, pages, PAGE_SIZE, mask.max_address()) {
-            let _ = allocator::free_pages(address, pages);
-            return Err(DmaError::OutOfResources);
-        }
-
-        // SAFETY: the page allocator returned exclusive identity-mapped memory
-        // covering `allocation_len` bytes, retained by this object until Drop.
-        unsafe { core::slice::from_raw_parts_mut(address as *mut u8, allocation_len) }.fill(0);
-        Ok(Self {
+        let buffer = Self {
             address,
             device_address: address,
             byte_len,
             pages,
             coherency,
-        })
+        };
+        if !allocation_fits_mask(address, pages, PAGE_SIZE, mask.max_address()) {
+            return Err(DmaError::OutOfResources);
+        }
+
+        // SAFETY: the page allocator returned exclusive identity-mapped memory
+        // covering `allocation_len` bytes, retained by `buffer` until Drop.
+        unsafe { core::ptr::write_bytes(address as *mut u8, 0, allocation_len) };
+        Ok(buffer)
     }
 
     /// Allocate inside an explicitly described DMA translation window.
@@ -190,25 +190,24 @@ impl DmaBuffer {
         if status != Status::SUCCESS {
             return Err(DmaError::OutOfResources);
         }
-        let Some(device_address) = domain.device_address(address, allocation_len) else {
-            let _ = allocator::free_pages(address, pages);
-            return Err(DmaError::OutOfResources);
-        };
-        if !allocation_fits_mask(device_address, pages, PAGE_SIZE, mask.max_address()) {
-            let _ = allocator::free_pages(address, pages);
-            return Err(DmaError::OutOfResources);
-        }
-        // SAFETY: the allocator returned an exclusive CPU mapping covering the
-        // complete page-rounded allocation retained by this owner.
-        unsafe { core::slice::from_raw_parts_mut(address as *mut u8, allocation_len_usize) }
-            .fill(0);
-        Ok(Self {
+        let mut buffer = Self {
             address,
-            device_address,
+            device_address: 0,
             byte_len,
             pages,
             coherency: domain.coherency,
-        })
+        };
+        let device_address = domain
+            .device_address(address, allocation_len)
+            .ok_or(DmaError::OutOfResources)?;
+        if !allocation_fits_mask(device_address, pages, PAGE_SIZE, mask.max_address()) {
+            return Err(DmaError::OutOfResources);
+        }
+        buffer.device_address = device_address;
+        // SAFETY: the allocator returned an exclusive CPU mapping covering the
+        // complete page-rounded allocation retained by `buffer` until Drop.
+        unsafe { core::ptr::write_bytes(address as *mut u8, 0, allocation_len_usize) };
+        Ok(buffer)
     }
 
     /// Return the CPU physical address of the owned allocation.
