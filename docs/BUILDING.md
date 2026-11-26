@@ -55,7 +55,7 @@ rustup on first use.
 **Rust Toolchain:**
 
 The workspace builds on nightly Rust, pinned by date in `rust-toolchain.toml`
-(currently nightly-2026-10-08). A nightly is required because the runtime
+(currently nightly-2026-11-26). A nightly is required because the runtime
 image builds `core`/`alloc` from source (`-Z build-std`) with a small PIC code
 model, while the prebuilt `x86_64-unknown-none` std uses the kernel code model.
 Everything else also builds on stable. From the repository root:

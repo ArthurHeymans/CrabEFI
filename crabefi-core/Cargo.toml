@@ -2,6 +2,7 @@
 name = "crabefi-core"
 version = "0.1.0"
 edition.workspace = true
+rust-version.workspace = true
 authors = ["CrabEFI Contributors"]
 description = "A platform-agnostic UEFI implementation library"
 license.workspace = true
