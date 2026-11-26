@@ -287,6 +287,34 @@ fn resolve_deferred_buffer(
     .map(Some)
 }
 
+/// The virtual address of a mechanism's MMIO window `[base, base + width)`
+/// through the retained external range that holds it.
+fn virtual_mmio_base(
+    runtime: &state::RuntimeState,
+    base: u64,
+    width: u64,
+    range_virtual_bases: &[u64],
+) -> Result<u64, efi::Status> {
+    let physical_end = base
+        .checked_add(width)
+        .ok_or(efi::Status::INVALID_PARAMETER)?;
+    let (range, virtual_base) = runtime
+        .ranges
+        .iter()
+        .zip(range_virtual_bases)
+        .find(|(range, _)| {
+            range.physical_base <= base
+                && range
+                    .physical_base
+                    .checked_add(range.byte_len)
+                    .is_some_and(|end| physical_end <= end)
+        })
+        .ok_or(efi::Status::NOT_FOUND)?;
+    base.checked_sub(range.physical_base)
+        .and_then(|offset| virtual_base.checked_add(offset))
+        .ok_or(efi::Status::INVALID_PARAMETER)
+}
+
 fn virtual_time_config(
     runtime: &state::RuntimeState,
     range_virtual_bases: &[u64],
@@ -295,28 +323,23 @@ fn virtual_time_config(
     let Some(width) = time.mechanism.mmio_width() else {
         return Ok(time);
     };
-    let physical_end = time
-        .base
-        .checked_add(width)
-        .ok_or(efi::Status::INVALID_PARAMETER)?;
-    let (range, virtual_base) = runtime
-        .ranges
-        .iter()
-        .zip(range_virtual_bases)
-        .find(|(range, _)| {
-            range.physical_base <= time.base
-                && range
-                    .physical_base
-                    .checked_add(range.byte_len)
-                    .is_some_and(|end| physical_end <= end)
-        })
-        .ok_or(efi::Status::NOT_FOUND)?;
-    let base = time
-        .base
-        .checked_sub(range.physical_base)
-        .and_then(|offset| virtual_base.checked_add(offset))
-        .ok_or(efi::Status::INVALID_PARAMETER)?;
+    let base = virtual_mmio_base(runtime, time.base, width, range_virtual_bases)?;
     Ok(TimeConfig { base, ..time })
+}
+
+/// The reset configuration's MMIO base after the map, if it has one.
+fn virtual_reset_base(
+    runtime: &state::RuntimeState,
+    reset: Option<state::ResetConfig>,
+    range_virtual_bases: &[u64],
+) -> Result<Option<u64>, efi::Status> {
+    let Some(reset) = reset else {
+        return Ok(None);
+    };
+    let Some(width) = reset.mechanism.mmio_width() else {
+        return Ok(None);
+    };
+    virtual_mmio_base(runtime, reset.base, width, range_virtual_bases).map(Some)
 }
 
 /// Virtual address of `physical` inside the descriptor `mapping` it.
@@ -357,6 +380,7 @@ fn validate_and_commit(
     )?;
 
     let virtual_time = virtual_time_config(runtime, &range_virtual_bases)?;
+    let virtual_reset = virtual_reset_base(runtime, state::reset_config(), &range_virtual_bases)?;
 
     let retained_virtual_base = runtime
         .retained
@@ -378,6 +402,9 @@ fn validate_and_commit(
         range.virtual_base = *virtual_base;
     }
     runtime.time = virtual_time;
+    if let Some(base) = virtual_reset {
+        state::RUNTIME_RESET_CONFIG.relocate(base);
+    }
     #[cfg(all(target_arch = "x86_64", not(feature = "mm")))]
     if let Some(base) = proxy_virtual {
         crate::proxy::set_virtual(base);

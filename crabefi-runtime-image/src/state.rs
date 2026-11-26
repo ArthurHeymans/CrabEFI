@@ -324,7 +324,10 @@ fn range_from_handoff(range: &RuntimeExternalRange) -> RangeRecord {
 /// mechanism load in `read` makes the prior base store visible without taking
 /// the operation lease, so a re-entrant reset never reads a torn
 /// configuration. Every ABI reset mechanism value is nonzero, so a zero
-/// mechanism word means the snapshot is unpublished.
+/// mechanism word means the snapshot is unpublished. A mechanism with an
+/// MMIO window has its base moved once more, to the window's virtual
+/// address, while SetVirtualAddressMap commits ([`Self::relocate`]); the
+/// base is one word, so a reset reads the old or the new one whole.
 #[repr(C)]
 pub struct ResetConfigCell {
     mechanism: AtomicU64,
@@ -349,8 +352,14 @@ impl ResetConfigCell {
         let mechanism = u32::try_from(self.mechanism.load(Ordering::Acquire)).ok()?;
         Some(ResetConfig {
             mechanism: ResetMechanism::try_from(mechanism).ok()?,
-            base: self.base.load(Ordering::Relaxed),
+            base: self.base.load(Ordering::Acquire),
         })
+    }
+
+    /// The MMIO window's virtual base, once SetVirtualAddressMap resolved
+    /// it.
+    pub fn relocate(&self, base: u64) {
+        self.base.store(base, Ordering::Release);
     }
 
     fn address(&self) -> u64 {
@@ -545,6 +554,23 @@ mod tests {
         };
         snapshot.publish(expected);
         assert_eq!(snapshot.read(), Some(expected));
+    }
+
+    #[test]
+    fn relocated_reset_snapshot_keeps_its_mechanism() {
+        let snapshot = ResetConfigCell::new();
+        snapshot.publish(ResetConfig {
+            mechanism: ResetMechanism::X86AmdFch,
+            base: 0xfed8_0000,
+        });
+        snapshot.relocate(0xffff_8000_0001_0000);
+        assert_eq!(
+            snapshot.read(),
+            Some(ResetConfig {
+                mechanism: ResetMechanism::X86AmdFch,
+                base: 0xffff_8000_0001_0000,
+            })
+        );
     }
 
     #[test]

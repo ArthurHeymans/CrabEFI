@@ -340,6 +340,28 @@ fn handoff_validates_architecture_mechanism_pairs() {
 }
 
 #[test]
+fn amd_fch_reset_needs_its_acpi_mmio_page_retained() {
+    let mut handoff = valid_handoff(architecture::X86_64);
+    handoff.reset.mechanism = reset_mechanism::X86_AMD_FCH;
+    handoff.reset.io_or_mmio_base = 0xfed8_0000;
+    assert_eq!(handoff.validate(), Err(HandoffError::Range));
+    handoff.range_count = 1;
+    handoff.ranges[0] = RuntimeExternalRange {
+        physical_base: 0xfed8_0000,
+        byte_len: 0x1000,
+        attributes: 1 << 63,
+    };
+    assert_eq!(handoff.validate(), Ok(()));
+    // The page, not a part of it.
+    handoff.reset.io_or_mmio_base = 0xfed8_0300;
+    assert_eq!(handoff.validate(), Err(HandoffError::Range));
+    // x86 only.
+    let mut arm = valid_handoff(architecture::AARCH64);
+    arm.reset.mechanism = reset_mechanism::X86_AMD_FCH;
+    assert_eq!(arm.validate(), Err(HandoffError::Mechanism));
+}
+
+#[test]
 fn handoff_requires_complete_pl031_range_containment() {
     let mut handoff = valid_handoff(architecture::AARCH64);
     handoff.time.mechanism = time_mechanism::PL031;

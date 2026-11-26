@@ -758,6 +758,45 @@ impl MemoryAllocator {
         )
     }
 
+    /// Describe `[addr, addr + num_pages)` as runtime MMIO
+    /// (`EfiMemoryMappedIO` with `attribute`, which must hold
+    /// `EFI_MEMORY_RUNTIME`): a retained external range the runtime image
+    /// reaches after ExitBootServices, which the OS then maps. A reserved
+    /// or MMIO descriptor holding it is split; a range of nothing is
+    /// added; one that overlaps other memory is refused.
+    pub fn add_runtime_mmio(
+        &mut self,
+        addr: u64,
+        num_pages: u64,
+        attribute: u64,
+    ) -> Result<(), efi::Status> {
+        let range = PageRange::from_bytes(addr, num_pages).ok_or(efi::Status::INVALID_PARAMETER)?;
+        if attribute & attributes::EFI_MEMORY_RUNTIME == 0 {
+            return Err(efi::Status::INVALID_PARAMETER);
+        }
+        let holders = [MemoryType::ReservedMemoryType, MemoryType::MemoryMappedIo];
+        if let Some(index) = self.find_descriptor(range, &holders) {
+            self.retype_range(index, range, MemoryType::MemoryMappedIo, attribute)?;
+        } else if self.entries.iter().any(|entry| {
+            entry
+                .page_range()
+                .is_some_and(|entry| entry.overlaps(range))
+        }) {
+            return Err(efi::Status::INVALID_PARAMETER);
+        } else {
+            self.entries
+                .push(descriptor_for_range(
+                    MemoryType::MemoryMappedIo,
+                    range,
+                    attribute,
+                ))
+                .map_err(|_| efi::Status::OUT_OF_RESOURCES)?;
+            self.sort_entries();
+        }
+        self.map_key += 1;
+        Ok(())
+    }
+
     fn allocation_attribute(memory_type: MemoryType, source_attribute: u64) -> u64 {
         match memory_type {
             MemoryType::RuntimeServicesCode => {
@@ -1504,6 +1543,11 @@ pub fn mark_as_reserved(addr: u64, num_pages: u64) -> Result<(), efi::Status> {
     ALLOCATOR.with_mut(|alloc| alloc.mark_as_reserved(addr, num_pages))
 }
 
+/// Describe a retained runtime MMIO range ([`MemoryAllocator::add_runtime_mmio`]).
+pub fn add_runtime_mmio(addr: u64, num_pages: u64, attribute: u64) -> Result<(), efi::Status> {
+    ALLOCATOR.with_mut(|alloc| alloc.add_runtime_mmio(addr, num_pages, attribute))
+}
+
 /// Allocate pages of memory
 pub fn allocate_pages(
     alloc_type: AllocateType,
@@ -2068,6 +2112,41 @@ mod tests {
             ))
             .unwrap();
         allocator
+    }
+
+    #[test]
+    fn runtime_mmio_is_described_once() {
+        let mut allocator = allocator_with_ram();
+        allocator
+            .entries
+            .push(memory_descriptor(
+                MemoryType::ReservedMemoryType,
+                0xfed0_0000,
+                0x100,
+                attributes::EFI_MEMORY_UC,
+            ))
+            .unwrap();
+        let runtime = attributes::EFI_MEMORY_UC | attributes::EFI_MEMORY_RUNTIME;
+        // Inside a reserved range: split out of it.
+        allocator.add_runtime_mmio(0xfed8_0000, 1, runtime).unwrap();
+        let mmio = allocator
+            .entries
+            .iter()
+            .find(|e| e.physical_start == 0xfed8_0000)
+            .unwrap();
+        assert_eq!(mmio.get_memory_type(), Some(MemoryType::MemoryMappedIo));
+        assert_eq!((mmio.number_of_pages, mmio.attribute), (1, runtime));
+        assert_eq!(allocator.entries.len(), 4);
+        // Outside the map: added.
+        allocator.add_runtime_mmio(0xfee0_0000, 1, runtime).unwrap();
+        assert_eq!(allocator.entries.len(), 5);
+        // In RAM, or without the runtime attribute: refused.
+        assert!(allocator.add_runtime_mmio(0x10_0000, 1, runtime).is_err());
+        assert!(
+            allocator
+                .add_runtime_mmio(0xfef0_0000, 1, attributes::EFI_MEMORY_UC)
+                .is_err()
+        );
     }
 
     #[test]

@@ -24,6 +24,11 @@ pub mod reset_mechanism {
     pub const PSCI_SMC: u32 = 2;
     pub const PSCI_HVC: u32 = 3;
     pub const SBI_SRST: u32 = 4;
+    /// An AMD FCH: CF9h after its power-management registers say which
+    /// reset (cold: PMx10 ToggleAllPwrGood set; warm: clear, PMxC2 bit 4
+    /// written to clear the full-reset status). `io_or_mmio_base` is the
+    /// FCH's ACPI-MMIO block, which a retained external range covers.
+    pub const X86_AMD_FCH: u32 = 5;
 }
 
 /// Parsed [`RuntimeTimeConfig::mechanism`].
@@ -67,6 +72,18 @@ pub enum ResetMechanism {
     PsciSmc,
     PsciHvc,
     SbiSrst,
+    X86AmdFch,
+}
+
+impl ResetMechanism {
+    /// Width of the MMIO register window the mechanism writes, if any.
+    pub const fn mmio_width(self) -> Option<u64> {
+        match self {
+            // PM (+0x300) through ACPI (+0x800) of the ACPI-MMIO block.
+            Self::X86AmdFch => Some(EFI_PAGE_SIZE as u64),
+            Self::X86Legacy | Self::PsciSmc | Self::PsciHvc | Self::SbiSrst => None,
+        }
+    }
 }
 
 impl TryFrom<u32> for ResetMechanism {
@@ -78,6 +95,7 @@ impl TryFrom<u32> for ResetMechanism {
             reset_mechanism::PSCI_SMC => Ok(Self::PsciSmc),
             reset_mechanism::PSCI_HVC => Ok(Self::PsciHvc),
             reset_mechanism::SBI_SRST => Ok(Self::SbiSrst),
+            reset_mechanism::X86_AMD_FCH => Ok(Self::X86AmdFch),
             _ => Err(HandoffError::Mechanism),
         }
     }
@@ -90,6 +108,7 @@ impl From<ResetMechanism> for u32 {
             ResetMechanism::PsciSmc => reset_mechanism::PSCI_SMC,
             ResetMechanism::PsciHvc => reset_mechanism::PSCI_HVC,
             ResetMechanism::SbiSrst => reset_mechanism::SBI_SRST,
+            ResetMechanism::X86AmdFch => reset_mechanism::X86_AMD_FCH,
         }
     }
 }
@@ -390,36 +409,42 @@ impl RuntimeHandoff {
             | (architecture::RISCV64, TimeMechanism::GoldfishRtc) => {}
             _ => return Err(HandoffError::Mechanism),
         }
-        match (
-            self.architecture,
-            ResetMechanism::try_from(self.reset.mechanism)?,
-        ) {
-            (architecture::X86_64, ResetMechanism::X86Legacy)
+        let reset = ResetMechanism::try_from(self.reset.mechanism)?;
+        match (self.architecture, reset) {
+            (architecture::X86_64, ResetMechanism::X86Legacy | ResetMechanism::X86AmdFch)
             | (architecture::AARCH64, ResetMechanism::PsciSmc | ResetMechanism::PsciHvc)
             | (architecture::RISCV64, ResetMechanism::SbiSrst) => {}
             _ => return Err(HandoffError::Mechanism),
         }
-        if let Some(width) = time.mmio_width() {
-            let end = self
-                .time
-                .io_or_mmio_base
-                .checked_add(width)
-                .ok_or(HandoffError::Overflow)?;
-            if self.time.io_or_mmio_base == 0
-                || !self.time.io_or_mmio_base.is_multiple_of(4)
-                || !ranges.iter().any(|range| {
-                    range.physical_base <= self.time.io_or_mmio_base
-                        && range
-                            .physical_base
-                            .checked_add(range.byte_len)
-                            .is_some_and(|range_end| end <= range_end)
-                })
-            {
-                return Err(HandoffError::Range);
+        for (width, base) in [
+            (time.mmio_width(), self.time.io_or_mmio_base),
+            (reset.mmio_width(), self.reset.io_or_mmio_base),
+        ] {
+            if let Some(width) = width {
+                check_mmio(ranges, base, width)?;
             }
         }
         Ok(())
     }
+}
+
+/// A mechanism's MMIO window `[base, base + width)` lies in one retained
+/// external range.
+fn check_mmio(ranges: &[RuntimeExternalRange], base: u64, width: u64) -> Result<(), HandoffError> {
+    let end = base.checked_add(width).ok_or(HandoffError::Overflow)?;
+    if base == 0
+        || !base.is_multiple_of(4)
+        || !ranges.iter().any(|range| {
+            range.physical_base <= base
+                && range
+                    .physical_base
+                    .checked_add(range.byte_len)
+                    .is_some_and(|range_end| end <= range_end)
+        })
+    {
+        return Err(HandoffError::Range);
+    }
+    Ok(())
 }
 
 fn ranges_overlap(a_base: u64, a_len: u64, b_base: u64, b_len: u64) -> bool {

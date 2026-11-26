@@ -49,6 +49,7 @@ pub fn load(
     validate_capabilities(image.header().feature_bits)?;
     validate_layout(&image, platform.external_ranges.len())?;
     reserve_deferred_buffer(platform)?;
+    describe_external_ranges(platform)?;
     let header = image.header();
     let image_pages = u64::from(header.image_size).div_ceil(PAGE_SIZE);
     let code = image.section(0).map_err(LoadError::InvalidFormat)?;
@@ -184,6 +185,24 @@ fn validate_deferred_buffer(
         return Err(LoadError::InvalidLayout);
     }
     Ok((base, size))
+}
+
+/// The retained external ranges in the memory map as runtime MMIO, so the
+/// OS maps them and SetVirtualAddressMap gives them their virtual bases.
+fn describe_external_ranges(platform: RuntimePlatformConfig<'_>) -> Result<(), LoadError> {
+    for range in platform.external_ranges {
+        if !range.physical_base.is_multiple_of(PAGE_SIZE)
+            || !range.byte_len.is_multiple_of(PAGE_SIZE)
+        {
+            return Err(LoadError::InvalidLayout);
+        }
+        let attribute = range.attributes
+            | allocator::attributes::EFI_MEMORY_UC
+            | allocator::attributes::EFI_MEMORY_RUNTIME;
+        allocator::add_runtime_mmio(range.physical_base, range.byte_len / PAGE_SIZE, attribute)
+            .map_err(LoadError::Allocation)?;
+    }
+    Ok(())
 }
 
 fn reserve_deferred_buffer(platform: RuntimePlatformConfig<'_>) -> Result<(), LoadError> {

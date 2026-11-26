@@ -121,32 +121,78 @@ fn reset_port(configured: u64) -> u16 {
     }
 }
 
-pub fn reset(config: Option<ResetConfig>, reset_type: efi::ResetType) -> ! {
-    if let Some(ResetConfig {
-        mechanism: ResetMechanism::X86Legacy,
-        base,
-    }) = config
-    {
-        let port = reset_port(base);
-        // QEMU and most modern chipsets implement reset control at the
-        // platform-provided CF9-compatible reset port.
-        // SAFETY: initialization supplies the selected x86 reset mechanism.
-        unsafe {
-            outb(
-                port,
-                if reset_type == efi::RESET_SHUTDOWN {
-                    0x04
-                } else {
-                    0x06
-                },
-            )
-        };
-        for _ in 0..100_000 {
-            core::hint::spin_loop();
+/// The AMD FCH's power-management registers, from its ACPI-MMIO block.
+mod amd_fch {
+    /// PMx10 ResetControl0: bit 1 ToggleAllPwrGood (the next CF9h reset
+    /// is a cold one).
+    pub const PM_RESET_CONTROL0: usize = 0x310;
+    pub const TOGGLE_ALL_PWR_GOOD: u8 = 1 << 1;
+    /// PMxC2, byte 2 of the reset status PMxC0 (write 1 to clear): bit 4
+    /// is the last full reset.
+    pub const PM_RESET_STATUS2: usize = 0x3c2;
+    pub const FULL_RESET_STATUS: u8 = 1 << 4;
+    /// PMxD2: bit 6 Cf9RstDisable.
+    pub const PM_D2: usize = 0x3d2;
+    pub const CF9_RESET_DISABLE: u8 = 1 << 6;
+    /// CF9h FullRst | RstCpu | SysRst.
+    pub const FULL_RESET: u8 = 0x0e;
+
+    /// The byte writes ahead of CF9h for `cold` (AMD's DXE ResetSystem:
+    /// cold sets ToggleAllPwrGood; warm clears it and the full-reset
+    /// status), as `(offset, and, or)`. The CF9h value follows: a cold
+    /// reset is the full one, 0Eh, as both of AMD's Venice ResetSystem
+    /// builds write it; a warm one 06h.
+    pub const fn writes(cold: bool) -> [(usize, u8, u8); 3] {
+        if cold {
+            [
+                (PM_D2, !CF9_RESET_DISABLE, 0),
+                (PM_RESET_CONTROL0, 0xff, TOGGLE_ALL_PWR_GOOD),
+                (PM_RESET_STATUS2, 0xff, 0),
+            ]
+        } else {
+            [
+                (PM_D2, !CF9_RESET_DISABLE, 0),
+                (PM_RESET_CONTROL0, !TOGGLE_ALL_PWR_GOOD, 0),
+                (PM_RESET_STATUS2, 0xff, FULL_RESET_STATUS),
+            ]
         }
-        // Fall back to the keyboard-controller pulse.
-        // SAFETY: 0x64 is the architectural i8042 command port.
-        unsafe { outb(0x64, 0xfe) };
+    }
+}
+
+pub fn reset(config: Option<ResetConfig>, reset_type: efi::ResetType) -> ! {
+    match config {
+        Some(ResetConfig {
+            mechanism: ResetMechanism::X86Legacy,
+            base,
+        }) => cf9(reset_port(base), reset_type),
+        Some(ResetConfig {
+            mechanism: ResetMechanism::X86AmdFch,
+            base,
+        }) => {
+            if reset_type != efi::RESET_SHUTDOWN {
+                let block = base as usize as *mut u8;
+                for (offset, and, or) in amd_fch::writes(reset_type != efi::RESET_WARM) {
+                    // SAFETY: initialization validated that a retained
+                    // external range covers the ACPI-MMIO page at `base`
+                    // (virtual after SetVirtualAddressMap); the registers
+                    // are bytes of its PM block.
+                    unsafe {
+                        let register = block.add(offset);
+                        let value = core::ptr::read_volatile(register);
+                        core::ptr::write_volatile(register, (value & and) | or);
+                    }
+                }
+            }
+            if reset_type == efi::RESET_SHUTDOWN || reset_type == efi::RESET_WARM {
+                cf9(0xcf9, reset_type)
+            } else {
+                // SAFETY: the FCH's CF9h reset port; FullRst with the power
+                // goods toggled (PMx10[1], set above).
+                unsafe { outb(0xcf9, amd_fch::FULL_RESET) };
+                kbc_fallback();
+            }
+        }
+        _ => {}
     }
     loop {
         // SAFETY: halting is the terminal fallback after ResetSystem.
@@ -154,9 +200,47 @@ pub fn reset(config: Option<ResetConfig>, reset_type: efi::ResetType) -> ! {
     }
 }
 
+/// The CF9h-compatible reset at `port`, then the keyboard controller's.
+fn cf9(port: u16, reset_type: efi::ResetType) {
+    // QEMU and most modern chipsets implement reset control at the
+    // platform-provided CF9-compatible reset port.
+    // SAFETY: initialization supplies the selected x86 reset mechanism.
+    unsafe {
+        outb(
+            port,
+            if reset_type == efi::RESET_SHUTDOWN {
+                0x04
+            } else {
+                0x06
+            },
+        )
+    };
+    kbc_fallback();
+}
+
+/// A while for the reset to land, then the keyboard controller's pulse.
+fn kbc_fallback() {
+    for _ in 0..100_000 {
+        core::hint::spin_loop();
+    }
+    // Fall back to the keyboard-controller pulse.
+    // SAFETY: 0x64 is the architectural i8042 command port.
+    unsafe { outb(0x64, 0xfe) };
+}
+
 #[cfg(test)]
 mod tests {
-    use super::reset_port;
+    use super::{amd_fch, reset_port};
+
+    #[test]
+    fn amd_fch_cold_sets_and_warm_clears_toggle_all_power_good() {
+        let cold = amd_fch::writes(true);
+        assert!(cold.contains(&(0x310, 0xff, 0x02)));
+        let warm = amd_fch::writes(false);
+        assert!(warm.contains(&(0x310, !0x02, 0)));
+        assert!(warm.contains(&(0x3c2, 0xff, 0x10)));
+        assert!(cold.iter().chain(&warm).any(|&w| w == (0x3d2, !0x40, 0)));
+    }
 
     #[test]
     fn reset_port_uses_cf9_for_missing_or_invalid_configuration() {
