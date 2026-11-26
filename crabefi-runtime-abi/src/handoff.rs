@@ -25,9 +25,11 @@ pub mod reset_mechanism {
     pub const PSCI_HVC: u32 = 3;
     pub const SBI_SRST: u32 = 4;
     /// An AMD FCH: CF9h after its power-management registers say which
-    /// reset (cold: PMx10 ToggleAllPwrGood set; warm: clear, PMxC2 bit 4
-    /// written to clear the full-reset status). `io_or_mmio_base` is the
-    /// FCH's ACPI-MMIO block, which a retained external range covers.
+    /// reset (cold: PMx10 ToggleAllPwrGood set, CF9h 0Eh; warm: clear,
+    /// PMxC2 written back with bit 4 to clear the reset status, CF9h 06h);
+    /// shutdown is S5 through PM1_CNT (SLP_TYP 5, then SLP_EN, at the port
+    /// PMx62 decodes). `io_or_mmio_base` is the FCH's ACPI-MMIO block,
+    /// which a retained external range covers.
     pub const X86_AMD_FCH: u32 = 5;
 }
 
