@@ -22,6 +22,12 @@ pub use crate::fs::gpt::PartitionSignature;
 /// # Returns
 /// A pointer to the device path protocol, or null on allocation failure.
 fn allocate_device_path<T: Copy>(value: T) -> *mut Protocol {
+    const {
+        assert!(
+            core::mem::align_of::<T>() <= crate::efi::allocator::POOL_ALIGNMENT,
+            "device path alignment exceeds EFI pool alignment"
+        );
+    }
     let size = core::mem::size_of::<T>();
     let dest = match allocate_pool(MemoryType::BootServicesData, size) {
         Ok(p) => p as *mut T,

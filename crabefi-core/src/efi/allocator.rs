@@ -50,6 +50,7 @@ static ALLOCATOR: Local<MemoryAllocator> = Local::new(MemoryAllocator::with_addr
 // can compile and execute it directly with `rustc --test`.
 #[path = "pool_free_list.rs"]
 mod pool_free_list;
+pub use pool_free_list::POOL_ALIGNMENT;
 use pool_free_list::{
     POOL_ALLOCATED_MAGIC, POOL_FREE_MAGIC, PoolHeader, PoolListError, PoolState, align_pool_size,
 };

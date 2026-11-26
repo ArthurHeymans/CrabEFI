@@ -400,6 +400,8 @@ pub struct RuntimeStoreCell(UnsafeCell<RuntimeStore>);
 unsafe impl Sync for RuntimeStoreCell {}
 
 impl RuntimeStoreCell {
+    // Const-evaluated for static initialization; never called on a runtime stack.
+    #[allow(clippy::large_unopt_stack_frames)]
     const fn new() -> Self {
         Self(UnsafeCell::new(RuntimeStore::new()))
     }

@@ -95,6 +95,34 @@ fn own_image_path(
     result
 }
 
+/// Resources acquired during `LoadImage` before the image is committed to the
+/// loaded-image table. Rolled back via `DropGuard` on any intermediate failure.
+struct PendingImage {
+    loaded_image: pe::LoadedImage,
+    #[cfg(feature = "tpm")]
+    deferred_measurement: Option<DeferredImageMeasurement>,
+    handle: Option<Handle>,
+    protocol: *mut r_efi::protocols::loaded_image::Protocol,
+}
+
+impl PendingImage {
+    fn rollback(self) {
+        // Reclaim the handle before freeing the protocol allocation so the
+        // handle table never retains a dangling interface pointer.
+        if let Some(handle) = self.handle {
+            reclaim_image_handle(handle);
+        }
+        if !self.protocol.is_null() {
+            let _ = allocator::free_pool(self.protocol.cast());
+        }
+        pe::unload_image(&self.loaded_image);
+        #[cfg(feature = "tpm")]
+        if let Some(measurement) = self.deferred_measurement {
+            let _ = allocator::free_pool(measurement.event_data);
+        }
+    }
+}
+
 // ============================================================================
 // Image Functions
 // ============================================================================
@@ -251,19 +279,25 @@ pub(super) extern "efiapi" fn load_image(
     // Free the buffer now that PE is loaded and measured (PE loading makes its own copy).
     free_if_owned(&source);
 
-    // Create a new handle for this image
-    let new_handle = match super::create_handle() {
-        Some(h) => h,
-        None => {
-            log::error!("BS.LoadImage: Failed to create handle");
+    // Roll back every acquired image resource on any error before the image is
+    // committed to the loaded images table.
+    let mut pending = core::mem::DropGuard::new(
+        PendingImage {
+            loaded_image,
             #[cfg(feature = "tpm")]
-            if let Some(measurement) = deferred_measurement {
-                let _ = allocator::free_pool(measurement.event_data);
-            }
-            pe::unload_image(&loaded_image);
-            return Status::OUT_OF_RESOURCES;
-        }
+            deferred_measurement,
+            handle: None,
+            protocol: core::ptr::null_mut(),
+        },
+        PendingImage::rollback,
+    );
+
+    // Create a new handle for this image
+    let Some(new_handle) = super::create_handle() else {
+        log::error!("BS.LoadImage: Failed to create handle");
+        return Status::OUT_OF_RESOURCES;
     };
+    pending.handle = Some(new_handle);
 
     // Create LoadedImageProtocol for this image
     // Use the device handle from loading if we loaded from device path,
@@ -278,21 +312,16 @@ pub(super) extern "efiapi" fn load_image(
         parent_image_handle,
         system_table,
         device_handle,
-        loaded_image.image_base,
-        loaded_image.image_size,
+        pending.loaded_image.image_base,
+        pending.loaded_image.image_size,
     );
 
     let (loaded_image_protocol, owned_path) = own_image_path(loaded_image_protocol, device_path);
     if loaded_image_protocol.is_null() {
         log::error!("BS.LoadImage: Failed to create LoadedImageProtocol");
-        #[cfg(feature = "tpm")]
-        if let Some(measurement) = deferred_measurement {
-            let _ = allocator::free_pool(measurement.event_data);
-        }
-        pe::unload_image(&loaded_image);
-        reclaim_image_handle(new_handle);
         return Status::OUT_OF_RESOURCES;
     }
+    pending.protocol = loaded_image_protocol;
 
     // SAFETY: the protocol was just allocated by us and is not yet published.
     unsafe {
@@ -345,13 +374,6 @@ pub(super) extern "efiapi" fn load_image(
             "BS.LoadImage: Failed to install LoadedImageProtocol: {:?}",
             status
         );
-        #[cfg(feature = "tpm")]
-        if let Some(measurement) = deferred_measurement {
-            let _ = allocator::free_pool(measurement.event_data);
-        }
-        pe::unload_image(&loaded_image);
-        let _ = allocator::free_pool(loaded_image_protocol.cast());
-        reclaim_image_handle(new_handle);
         return status;
     }
 
@@ -371,16 +393,16 @@ pub(super) extern "efiapi" fn load_image(
         match slot.map(|index| &mut images[index]) {
             Some(entry) => {
                 entry.handle = new_handle;
-                entry.image_base = loaded_image.image_base;
-                entry.image_size = loaded_image.image_size;
-                entry.entry_point = loaded_image.entry_point;
-                entry.alloc_base = loaded_image.alloc_base;
-                entry.num_pages = loaded_image.num_pages;
+                entry.image_base = pending.loaded_image.image_base;
+                entry.image_size = pending.loaded_image.image_size;
+                entry.entry_point = pending.loaded_image.entry_point;
+                entry.alloc_base = pending.loaded_image.alloc_base;
+                entry.num_pages = pending.loaded_image.num_pages;
                 entry.parent_handle = parent_image_handle;
                 entry.subsystem = image_subsystem;
                 entry.security_violation = security_violation;
                 #[cfg(feature = "tpm")]
-                if let Some(measurement) = deferred_measurement {
+                if let Some(measurement) = pending.deferred_measurement {
                     entry.measurement_pcr = measurement.pcr_index;
                     entry.measurement_event_type = measurement.event_type;
                     entry.measurement_digest_count = measurement.digest_count;
@@ -396,15 +418,10 @@ pub(super) extern "efiapi" fn load_image(
 
     if !store_result {
         log::error!("BS.LoadImage: out of heap for the loaded images table");
-        #[cfg(feature = "tpm")]
-        if let Some(measurement) = deferred_measurement {
-            let _ = allocator::free_pool(measurement.event_data);
-        }
-        pe::unload_image(&loaded_image);
-        reclaim_image_handle(new_handle);
-        let _ = allocator::free_pool(loaded_image_protocol.cast());
         return Status::OUT_OF_RESOURCES;
     }
+
+    let loaded_image = core::mem::DropGuard::dismiss(pending).loaded_image;
 
     for guid in [LOADED_IMAGE_PROTOCOL_GUID, LOADED_IMAGE_DEVICE_PATH_GUID] {
         if guid == LOADED_IMAGE_DEVICE_PATH_GUID && owned_path.is_null() {
@@ -833,6 +850,140 @@ mod tests {
         assert_eq!(state.open_protocols.len(), 1);
         assert_eq!(state.open_protocols[0].agent_handle, other);
     }
+
+    #[test]
+    fn pending_image_rollback_reclaims_handle_protocol_pages_and_measurement() {
+        allocator::with_host_pages(|| {
+            let mut alloc_base = 0u64;
+            assert_eq!(
+                allocator::allocate_pages(
+                    allocator::AllocateType::AllocateAnyPages,
+                    MemoryType::LoaderCode,
+                    1,
+                    &mut alloc_base,
+                ),
+                Status::SUCCESS
+            );
+            let handle = super::super::create_handle().unwrap();
+            let protocol = create_loaded_image_protocol(
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                alloc_base,
+                4096,
+            );
+            assert!(!protocol.is_null());
+            assert_eq!(
+                super::super::install_protocol_internal(
+                    handle,
+                    &LOADED_IMAGE_PROTOCOL_GUID,
+                    protocol.cast(),
+                    false,
+                ),
+                Status::SUCCESS
+            );
+            #[cfg(feature = "tpm")]
+            let event_data = allocator::allocate_pool(MemoryType::BootServicesData, 32).unwrap();
+
+            {
+                let mut pending = core::mem::DropGuard::new(
+                    PendingImage {
+                        loaded_image: pe::LoadedImage {
+                            image_base: alloc_base,
+                            image_size: 4096,
+                            entry_point: alloc_base,
+                            alloc_base,
+                            num_pages: 1,
+                        },
+                        #[cfg(feature = "tpm")]
+                        deferred_measurement: Some(DeferredImageMeasurement {
+                            pcr_index: 4,
+                            event_type: 0,
+                            digest_count: 0,
+                            digests: [super::super::super::tcg::types::TaggedDigest::zeroed(0); 5],
+                            event_data,
+                            event_data_size: 32,
+                        }),
+                        handle: None,
+                        protocol: core::ptr::null_mut(),
+                    },
+                    PendingImage::rollback,
+                );
+                pending.handle = Some(handle);
+                pending.protocol = protocol;
+                // Drop `pending` without dismissing to simulate an error path.
+            }
+
+            assert!(tables().handles.iter().all(|entry| entry.handle != handle));
+            assert_eq!(
+                allocator::get_memory_type_at(alloc_base),
+                Some(MemoryType::ConventionalMemory)
+            );
+            assert_eq!(
+                allocator::free_pool(protocol.cast()),
+                Status::INVALID_PARAMETER
+            );
+            #[cfg(feature = "tpm")]
+            assert_eq!(allocator::free_pool(event_data), Status::INVALID_PARAMETER);
+        });
+    }
+
+    #[test]
+    fn pending_image_dismiss_keeps_resources_live() {
+        allocator::with_host_pages(|| {
+            let mut alloc_base = 0u64;
+            assert_eq!(
+                allocator::allocate_pages(
+                    allocator::AllocateType::AllocateAnyPages,
+                    MemoryType::LoaderCode,
+                    1,
+                    &mut alloc_base,
+                ),
+                Status::SUCCESS
+            );
+            let handle = super::super::create_handle().unwrap();
+            let protocol = create_loaded_image_protocol(
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                alloc_base,
+                4096,
+            );
+            assert!(!protocol.is_null());
+
+            let pending = core::mem::DropGuard::new(
+                PendingImage {
+                    loaded_image: pe::LoadedImage {
+                        image_base: alloc_base,
+                        image_size: 4096,
+                        entry_point: alloc_base,
+                        alloc_base,
+                        num_pages: 1,
+                    },
+                    #[cfg(feature = "tpm")]
+                    deferred_measurement: None,
+                    handle: Some(handle),
+                    protocol,
+                },
+                PendingImage::rollback,
+            );
+            let committed = core::mem::DropGuard::dismiss(pending);
+
+            assert!(tables().handles.iter().any(|entry| entry.handle == handle));
+            assert_eq!(
+                allocator::get_memory_type_at(alloc_base),
+                Some(MemoryType::LoaderCode)
+            );
+
+            // Clean up host test resources.
+            committed.rollback();
+            assert!(tables().handles.iter().all(|entry| entry.handle != handle));
+            assert_eq!(
+                allocator::get_memory_type_at(alloc_base),
+                Some(MemoryType::ConventionalMemory)
+            );
+        });
+    }
 }
 
 pub(super) extern "efiapi" fn unload_image(image_handle: Handle) -> Status {
@@ -933,14 +1084,7 @@ fn attempt_exit_boot_services<T>(
     if EXIT_ATTEMPT_ACTIVE.get() {
         return Err(Status::INVALID_PARAMETER);
     }
-    struct ExitAttempt;
-    impl Drop for ExitAttempt {
-        fn drop(&mut self) {
-            EXIT_ATTEMPT_ACTIVE.set(false);
-        }
-    }
-    EXIT_ATTEMPT_ACTIVE.set(true);
-    let _attempt = ExitAttempt;
+    let _attempt = EXIT_ATTEMPT_ACTIVE.scoped_set(true);
 
     #[cfg(feature = "tpm")]
     super::super::tcg::measured_boot::measure_action_all(5, "Exit Boot Services Invocation");

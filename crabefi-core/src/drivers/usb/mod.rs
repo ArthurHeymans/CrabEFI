@@ -165,7 +165,8 @@ fn store_controller<T>(
         discard(controller);
         return Err(());
     }
-    let pages = mem::size_of::<T>().div_ceil(4096);
+    const { assert!(mem::align_of::<T>() <= 4096) };
+    let pages = mem::size_of::<T>().div_ceil(4096).max(1);
     let Some(alloc) = efi::allocate_pages(pages as u64) else {
         drop(controllers);
         log::error!(

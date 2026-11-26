@@ -210,6 +210,16 @@ impl<T: Copy> LocalCell<T> {
         self.set(value);
     }
 
+    /// Replace the value and return a guard that restores the previous value
+    /// when dropped.
+    #[inline]
+    #[must_use = "the previous value is restored immediately if the guard is dropped"]
+    pub fn scoped_set(&self, value: T) -> core::mem::DropGuard<T, impl FnOnce(T) + '_> {
+        let previous = self.get();
+        self.set(value);
+        core::mem::DropGuard::new(previous, |previous| self.set(previous))
+    }
+
     /// Raw pointer to the value, for protocol structures that expose a
     /// firmware-owned mode block to EFI applications.
     #[inline]
@@ -247,5 +257,37 @@ impl<T> StaticMut<T> {
     #[inline]
     pub const fn get(&self) -> *mut T {
         self.0.get()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LocalCell;
+
+    #[test]
+    fn scoped_set_restores_previous_value_on_drop_and_nesting() {
+        let cell = LocalCell::new(1u32);
+        {
+            let _outer = cell.scoped_set(2);
+            assert_eq!(cell.get(), 2);
+            {
+                let _inner = cell.scoped_set(3);
+                assert_eq!(cell.get(), 3);
+            }
+            assert_eq!(cell.get(), 2);
+        }
+        assert_eq!(cell.get(), 1);
+    }
+
+    #[test]
+    fn scoped_set_restores_previous_value_on_unwind() {
+        let cell = LocalCell::new(false);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = cell.scoped_set(true);
+            assert!(cell.get());
+            panic!("simulated failure");
+        }));
+        assert!(result.is_err());
+        assert!(!cell.get());
     }
 }

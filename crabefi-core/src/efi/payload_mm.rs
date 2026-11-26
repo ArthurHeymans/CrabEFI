@@ -294,7 +294,8 @@ pub fn with_setup_authorization<R>(operation: u32, action: impl FnOnce() -> R) -
             opened
         );
     }
-    let result = action();
-    let _ = setup_authorize(operation, false);
-    result
+    let _close = core::mem::DropGuard::new(operation, |operation| {
+        let _ = setup_authorize(operation, false);
+    });
+    action()
 }

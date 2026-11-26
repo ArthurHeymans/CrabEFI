@@ -36,7 +36,7 @@ fn project_root() -> &'static Path {
 }
 
 /// The Rust toolchain pinned by the workspace `rust-toolchain.toml`
-/// (e.g. `"nightly-2026-10-08"`). Subprocesses that run outside the project tree —
+/// (e.g. `"nightly-2026-11-26"`). Subprocesses that run outside the project tree —
 /// where rustup cannot discover the file — pass it explicitly as
 /// `+<channel>` so every firmware build uses the same compiler.
 fn pinned_toolchain() -> Result<String> {

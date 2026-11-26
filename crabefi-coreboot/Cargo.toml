@@ -2,6 +2,7 @@
 name = "crabefi-coreboot"
 version = "0.1.0"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "CrabEFI as a coreboot payload binary"

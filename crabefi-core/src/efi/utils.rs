@@ -42,9 +42,16 @@ pub fn ucs2_eq(a: &[u16], b: &[u16]) -> bool {
 
 /// Move a fully initialized protocol value into the EFI pool.
 ///
-/// The caller owns the allocation. Returns null on allocation failure or if
-/// the pool cannot provide the alignment required by `T`.
+/// The caller owns the allocation. Fails to compile if `T` requires stricter
+/// alignment than [`crate::efi::allocator::POOL_ALIGNMENT`], and returns null
+/// on allocation failure.
 pub fn allocate_protocol_value<T>(value: T) -> *mut T {
+    const {
+        assert!(
+            core::mem::align_of::<T>() <= crate::efi::allocator::POOL_ALIGNMENT,
+            "protocol alignment exceeds EFI pool alignment"
+        );
+    }
     let Ok(raw) = allocate_pool(MemoryType::BootServicesData, core::mem::size_of::<T>()) else {
         return core::ptr::null_mut();
     };
