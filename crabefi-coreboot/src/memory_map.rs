@@ -118,7 +118,15 @@ pub fn overlay_framebuffer_region<R: Region, const N: usize>(
             kind: source.kind(),
         };
     }
-    existing[..count].sort_unstable_by_key(|region| region.base);
+    // Inline insertion sort keeps this module standalone for `rustc --test`
+    // while avoiding core::slice::sort's monomorphization footprint.
+    for i in 1..count {
+        let mut j = i;
+        while j > 0 && existing[j - 1].base > existing[j].base {
+            existing.swap(j - 1, j);
+            j -= 1;
+        }
+    }
 
     // Normalize the input map before overlaying: coalesce same-kind overlaps
     // (identical memory described twice) and reject different-kind overlaps,

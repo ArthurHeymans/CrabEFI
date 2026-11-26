@@ -492,7 +492,7 @@ fn write_order(
         running.is_some_and(|at| at >= region.offset && at - region.offset < region.size)
     };
     let mut order: alloc::vec::Vec<_> = image_offsets(regions).enumerate().collect();
-    order.sort_by_key(|&(index, _)| holds_running(&regions[index]));
+    crate::sort::sort_by_key(&mut order, |&(index, _)| holds_running(&regions[index]));
     order
 }
 

@@ -86,6 +86,7 @@ pub mod peripheral;
 pub mod platform;
 #[cfg(feature = "secure-boot")]
 pub(crate) mod secure_boot_menu;
+pub mod sort;
 #[cfg(test)]
 mod test_allocator;
 pub mod time;

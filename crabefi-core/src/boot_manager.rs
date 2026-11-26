@@ -591,7 +591,7 @@ fn try_boot_file_from_esps(
     // that starts must not depend on whether USB came up early.
     let mut devices = crate::drivers::storage::devices();
     devices.retain(|device| scope.includes(device));
-    devices.sort_by_key(|device| {
+    crate::sort::sort_by_key(&mut devices, |device| {
         (
             device.external,
             matches!(device.id, crate::drivers::storage::StorageId::Usb { .. }),
