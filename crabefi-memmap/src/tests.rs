@@ -629,3 +629,27 @@ fn pe_retype_accepts_only_matching_code_and_data_types() {
     assert_eq!(allocator.map_key(), key);
     allocator.check_well_formed().unwrap();
 }
+
+#[test]
+fn fresh_map_starts_at_key_one_and_enforces_const_address_limit() {
+    const LIMIT: u64 = 0x10_ffff;
+    let mut map = MemoryMap::<4, 4, LIMIT>::new();
+    assert_eq!(map.map_key(), 1);
+    map.init_from_platform(&[MemoryRegion {
+        base: 0x10_0000,
+        size: 0x20_0000,
+        region_type: RegionType::Ram,
+    }]);
+    assert_eq!(map.map_key(), 1);
+    let mut addr = 0;
+    assert_eq!(
+        map.allocate_pages(
+            AllocateType::AllocateAnyPages,
+            MemoryType::LoaderData,
+            1,
+            &mut addr,
+        ),
+        efi::Status::SUCCESS
+    );
+    assert!(addr + PAGE_SIZE - 1 <= LIMIT);
+}

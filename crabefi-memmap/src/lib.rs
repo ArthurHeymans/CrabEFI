@@ -250,50 +250,56 @@ fn can_merge(left: &MemoryDescriptor, right: &MemoryDescriptor) -> bool {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 enum BootServicesState {
-    Active,
-    Exiting,
-    Exited,
+    Active = 0,
+    Exiting = 1,
+    Exited = 2,
 }
 
 /// EFI memory map with exact page ownership.
-pub struct MemoryMap<const ENTRIES: usize, const OWNERS: usize> {
+///
+/// `ADDRESS_LIMIT` is the highest byte address (inclusive) that searching
+/// allocations (`AllocateAnyPages` / `AllocateMaxAddress`) may return, for
+/// example the last identity-mapped byte. `AllocateAddress` is not limited.
+/// Keeping the limit as a const generic and storing the map key zero-based
+/// leaves a fresh `MemoryMap` all-zero so production statics live in `.bss`.
+pub struct MemoryMap<
+    const ENTRIES: usize,
+    const OWNERS: usize,
+    const ADDRESS_LIMIT: u64 = { u64::MAX },
+> {
     /// Memory map entries, sorted by physical address (ascending)
     entries: Vec<MemoryDescriptor, ENTRIES>,
     /// Exact page allocations, retained even when adjacent map descriptors merge.
     allocations: Vec<PageAllocation, OWNERS>,
-    /// Memory map key (incremented on every change)
-    map_key: usize,
+    /// Offset from the initial key (`1`), incremented on every change.
+    map_key_offset: usize,
     boot_services: BootServicesState,
-    /// Highest byte address that searching allocations may return.
-    address_limit: u64,
 }
 
-impl<const ENTRIES: usize, const OWNERS: usize> Default for MemoryMap<ENTRIES, OWNERS> {
+impl<const ENTRIES: usize, const OWNERS: usize, const ADDRESS_LIMIT: u64> Default
+    for MemoryMap<ENTRIES, OWNERS, ADDRESS_LIMIT>
+{
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<const ENTRIES: usize, const OWNERS: usize> MemoryMap<ENTRIES, OWNERS> {
-    /// Create an empty map whose searching allocations may use any address.
+impl<const ENTRIES: usize, const OWNERS: usize, const ADDRESS_LIMIT: u64>
+    MemoryMap<ENTRIES, OWNERS, ADDRESS_LIMIT>
+{
+    /// Create an empty map whose searching allocations end at or below
+    /// `ADDRESS_LIMIT` (inclusive).
     pub const fn new() -> Self {
-        Self::with_address_limit(u64::MAX)
-    }
-
-    /// Create an empty map whose AllocateAnyPages and AllocateMaxAddress
-    /// results end at or below `address_limit` (inclusive), for example the
-    /// last identity-mapped byte. AllocateAddress is not limited.
-    pub const fn with_address_limit(address_limit: u64) -> Self {
         const {
             assert!(ENTRIES >= 1 && OWNERS >= 1);
         }
         Self {
             entries: Vec::new(),
             allocations: Vec::new(),
-            map_key: 1,
+            map_key_offset: 0,
             boot_services: BootServicesState::Active,
-            address_limit,
         }
     }
 
@@ -577,7 +583,7 @@ impl<const ENTRIES: usize, const OWNERS: usize> MemoryMap<ENTRIES, OWNERS> {
 
         self.entries.clear();
         self.allocations.clear();
-        self.map_key = 1;
+        self.map_key_offset = 0;
 
         info!("Importing platform memory map ({} regions):", regions.len());
         for region in regions {
@@ -694,7 +700,7 @@ impl<const ENTRIES: usize, const OWNERS: usize> MemoryMap<ENTRIES, OWNERS> {
             .ok_or(efi::Status::INVALID_PARAMETER)?;
         let attribute = Self::allocation_attribute(memory_type, memory_type.default_attributes());
         self.insert_descriptor(descriptor_for_range(memory_type, range, attribute))?;
-        self.map_key += 1;
+        self.map_key_offset += 1;
 
         Ok(())
     }
@@ -749,7 +755,7 @@ impl<const ENTRIES: usize, const OWNERS: usize> MemoryMap<ENTRIES, OWNERS> {
                 range,
                 attributes::EFI_MEMORY_RAM_CAPS,
             ))?;
-            self.map_key += 1;
+            self.map_key_offset += 1;
             return Ok(());
         };
 
@@ -765,7 +771,7 @@ impl<const ENTRIES: usize, const OWNERS: usize> MemoryMap<ENTRIES, OWNERS> {
 
         self.retype_range(descriptor_index, range, target_type, descriptor.attribute)?;
 
-        self.map_key += 1;
+        self.map_key_offset += 1;
         Ok(())
     }
 
@@ -825,7 +831,7 @@ impl<const ENTRIES: usize, const OWNERS: usize> MemoryMap<ENTRIES, OWNERS> {
             memory_type,
             restore_attribute,
         })?;
-        self.map_key += 1;
+        self.map_key_offset += 1;
         Ok(())
     }
 
@@ -906,7 +912,7 @@ impl<const ENTRIES: usize, const OWNERS: usize> MemoryMap<ENTRIES, OWNERS> {
                 }),
             )?;
         }
-        self.map_key += 1;
+        self.map_key_offset += 1;
         Ok(())
     }
 
@@ -1041,7 +1047,7 @@ impl<const ENTRIES: usize, const OWNERS: usize> MemoryMap<ENTRIES, OWNERS> {
                         self.record_allocation(replacement)
                     }
                 })
-                .map(|()| self.map_key += 1)
+                .map(|()| self.map_key_offset += 1)
         } else {
             Err(efi::Status::NOT_FOUND)
         };
@@ -1109,7 +1115,7 @@ impl<const ENTRIES: usize, const OWNERS: usize> MemoryMap<ENTRIES, OWNERS> {
                 }
             }
         }
-        self.map_key += 1;
+        self.map_key_offset += 1;
         efi::Status::SUCCESS
     }
 
@@ -1129,7 +1135,7 @@ impl<const ENTRIES: usize, const OWNERS: usize> MemoryMap<ENTRIES, OWNERS> {
 
         *descriptor_size = entry_size;
         *descriptor_version = 1;
-        *map_key = self.map_key;
+        *map_key = self.map_key();
 
         let required_size = self.entries.len() * entry_size;
 
@@ -1171,7 +1177,7 @@ impl<const ENTRIES: usize, const OWNERS: usize> MemoryMap<ENTRIES, OWNERS> {
 
     /// Get the current map key
     pub fn map_key(&self) -> usize {
-        self.map_key
+        self.map_key_offset.wrapping_add(1)
     }
 
     /// Get the number of entries
@@ -1220,12 +1226,13 @@ impl<const ENTRIES: usize, const OWNERS: usize> MemoryMap<ENTRIES, OWNERS> {
     }
 
     pub fn validate_map_key(&self, provided_map_key: usize) -> efi::Status {
-        if provided_map_key == self.map_key && self.boot_services == BootServicesState::Active {
+        let expected = self.map_key();
+        if provided_map_key == expected && self.boot_services == BootServicesState::Active {
             efi::Status::SUCCESS
         } else {
             warn!(
                 "exit_boot_services: map_key mismatch or inactive allocator; expected {:#x}, got {:#x}",
-                self.map_key, provided_map_key
+                expected, provided_map_key
             );
             efi::Status::INVALID_PARAMETER
         }
@@ -1299,10 +1306,13 @@ impl<const ENTRIES: usize, const OWNERS: usize> MemoryMap<ENTRIES, OWNERS> {
         // Ownership records are a Boot Services implementation detail. They
         // must not retain stale claims on memory handed to the OS.
         self.allocations.clear();
-        self.map_key += 1;
+        self.map_key_offset += 1;
         self.merge_entries();
 
-        info!("ExitBootServices complete, new map_key={:#x}", self.map_key);
+        info!(
+            "ExitBootServices complete, new map_key={:#x}",
+            self.map_key()
+        );
     }
 
     /// Exit directly when there are no callbacks or hardware to quiesce.
@@ -1388,7 +1398,7 @@ impl<const ENTRIES: usize, const OWNERS: usize> MemoryMap<ENTRIES, OWNERS> {
             );
             self.replace_descriptor_middle(source, placement, &[code_desc, data_desc])?;
         }
-        self.map_key += 1;
+        self.map_key_offset += 1;
         Ok(base)
     }
 
@@ -1453,7 +1463,7 @@ impl<const ENTRIES: usize, const OWNERS: usize> MemoryMap<ENTRIES, OWNERS> {
 
         // EFI AllocateMaxAddress is inclusive: the final byte of the entire
         // allocation must be no greater than the caller's maximum address.
-        let max_addr = max_addr.min(self.address_limit);
+        let max_addr = max_addr.min(ADDRESS_LIMIT);
         let max_end = max_addr.checked_add(1);
 
         // Search from high to low addresses (prefer high memory within the limit).
@@ -1519,7 +1529,7 @@ impl<const ENTRIES: usize, const OWNERS: usize> MemoryMap<ENTRIES, OWNERS> {
         let attribute =
             Self::allocation_attribute(memory_type, self.entries[descriptor_index].attribute);
         self.retype_range(descriptor_index, range, memory_type, attribute)?;
-        self.map_key += 1;
+        self.map_key_offset += 1;
         Ok(())
     }
 
