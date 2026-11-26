@@ -40,6 +40,8 @@ impl E820Entry {
     pub const VENDOR_RESERVED_TYPE: u32 = 6;
     /// Coreboot table (coreboot specific)
     pub const COREBOOT_TABLE_TYPE: u32 = 16;
+    /// Soft-reserved (specific-purpose) memory (Linux `E820_TYPE_SOFT_RESERVED`).
+    pub const SOFT_RESERVED_TYPE: u32 = 0xefff_ffff;
 
     /// Create a new E820 entry
     pub const fn new(addr: u64, size: u64, entry_type: u32) -> Self {
@@ -60,6 +62,7 @@ impl From<&MemoryRegion> for E820Entry {
             }
             MemoryType::AcpiReclaimable => E820Entry::ACPI_RECLAIMABLE_TYPE,
             MemoryType::AcpiNvs => E820Entry::ACPI_NVS_TYPE,
+            MemoryType::SpecificPurpose => E820Entry::SOFT_RESERVED_TYPE,
         };
 
         Self {
@@ -73,6 +76,12 @@ impl From<&MemoryRegion> for E820Entry {
 impl From<&MemoryDescriptor> for E820Entry {
     fn from(descriptor: &MemoryDescriptor) -> Self {
         let entry_type = match EfiMemoryType::try_from(descriptor.memory_type) {
+            // Linux's EFI stub does the same with `EFI_MEMORY_SP`.
+            Ok(EfiMemoryType::ConventionalMemory)
+                if descriptor.attribute & crate::efi::allocator::attributes::EFI_MEMORY_SP != 0 =>
+            {
+                E820Entry::SOFT_RESERVED_TYPE
+            }
             Ok(EfiMemoryType::ConventionalMemory) => E820Entry::RAM_TYPE,
             Ok(EfiMemoryType::AcpiReclaimMemory) => E820Entry::ACPI_RECLAIMABLE_TYPE,
             Ok(EfiMemoryType::AcpiMemoryNvs) => E820Entry::ACPI_NVS_TYPE,
@@ -605,6 +614,22 @@ mod tests {
         let entry_type =
             E820Entry::from(&descriptor(EfiMemoryType::ConventionalMemory, 0)).entry_type;
         assert_eq!(entry_type, E820Entry::RAM_TYPE);
+    }
+
+    #[test]
+    fn specific_purpose_memory_is_soft_reserved_for_linux() {
+        use crate::efi::allocator::attributes::EFI_MEMORY_SP;
+        let mut sp = descriptor(EfiMemoryType::ConventionalMemory, 0);
+        sp.attribute = EFI_MEMORY_SP;
+        let entry_type = E820Entry::from(&sp).entry_type;
+        assert_eq!(entry_type, E820Entry::SOFT_RESERVED_TYPE);
+        let region = MemoryRegion {
+            base: 0x40_0000_0000,
+            size: 0x1000,
+            region_type: MemoryType::SpecificPurpose,
+        };
+        let entry_type = E820Entry::from(&region).entry_type;
+        assert_eq!(entry_type, 0xefff_ffff);
     }
 
     #[test]

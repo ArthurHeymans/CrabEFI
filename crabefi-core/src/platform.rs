@@ -88,6 +88,13 @@ pub enum MemoryType {
     /// firmware regions that are not needed at runtime (e.g., firmware
     /// BSS/stack when CrabEFI is called as a library).
     BootServicesData,
+    /// Specific-purpose ("soft-reserved") memory, such as CXL or HBM
+    /// windows the OS hands to dedicated drivers (becomes
+    /// `EfiConventionalMemory` with the `EFI_MEMORY_SP` attribute, and an
+    /// E820 soft-reserved range for Linux boot). Boot services never
+    /// allocate from it (UEFI 2.10 §7.2: "not intended for general-purpose
+    /// allocation").
+    SpecificPurpose,
 }
 
 // ============================================================================

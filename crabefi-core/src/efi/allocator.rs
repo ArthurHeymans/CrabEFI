@@ -226,6 +226,8 @@ pub mod attributes {
 trait MemoryDescriptorExt {
     fn page_range(&self) -> Option<PageRange>;
     fn get_memory_type(&self) -> Option<MemoryType>;
+    /// Specific-purpose memory (`EFI_MEMORY_SP`): never allocated.
+    fn is_specific_purpose(&self) -> bool;
 }
 
 impl MemoryDescriptorExt for MemoryDescriptor {
@@ -235,6 +237,10 @@ impl MemoryDescriptorExt for MemoryDescriptor {
 
     fn get_memory_type(&self) -> Option<MemoryType> {
         MemoryType::try_from(self.memory_type).ok()
+    }
+
+    fn is_specific_purpose(&self) -> bool {
+        self.attribute & attributes::EFI_MEMORY_SP != 0
     }
 }
 
@@ -311,11 +317,14 @@ impl MemoryAllocator {
             .find(|(_, allocation)| allocation.contains(range))
     }
 
+    /// The descriptor of one of `types` containing `range`. Specific-purpose
+    /// memory is never one: nothing allocates, carves or reserves from it.
     fn find_descriptor(&self, range: PageRange, types: &[MemoryType]) -> Option<usize> {
         self.entries.iter().position(|entry| {
-            entry
-                .get_memory_type()
-                .is_some_and(|memory_type| types.contains(&memory_type))
+            !entry.is_specific_purpose()
+                && entry
+                    .get_memory_type()
+                    .is_some_and(|memory_type| types.contains(&memory_type))
                 && entry
                     .page_range()
                     .is_some_and(|entry| entry.contains(range))
@@ -504,7 +513,7 @@ impl MemoryAllocator {
         log::info!("Importing platform memory map ({} regions):", regions.len());
         for region in regions {
             let memory_type = match region.region_type {
-                PlatMemType::Ram => MemoryType::ConventionalMemory,
+                PlatMemType::Ram | PlatMemType::SpecificPurpose => MemoryType::ConventionalMemory,
                 PlatMemType::Reserved => MemoryType::ReservedMemoryType,
                 PlatMemType::AcpiReclaimable => MemoryType::AcpiReclaimMemory,
                 PlatMemType::AcpiNvs => MemoryType::AcpiMemoryNvs,
@@ -522,7 +531,12 @@ impl MemoryAllocator {
                 memory_type
             );
 
-            let attribute = memory_type.default_attributes();
+            let attribute = match region.region_type {
+                PlatMemType::SpecificPurpose => {
+                    memory_type.default_attributes() | attributes::EFI_MEMORY_SP
+                }
+                _ => memory_type.default_attributes(),
+            };
 
             let Some(range) = PageRange::from_bytes(region.base, num_pages.get()) else {
                 log::warn!(
@@ -579,7 +593,9 @@ impl MemoryAllocator {
 
         let mut fragments: heapless::Vec<PageRange, MAX_MEMORY_ENTRIES> = heapless::Vec::new();
         for entry in &self.entries {
-            if entry.get_memory_type() != Some(MemoryType::ConventionalMemory) {
+            if entry.get_memory_type() != Some(MemoryType::ConventionalMemory)
+                || entry.is_specific_purpose()
+            {
                 continue;
             }
             let Some(fragment) = entry
@@ -1305,6 +1321,7 @@ impl MemoryAllocator {
         // Search from high to low addresses (prefer high memory within the limit).
         for entry in self.entries.iter().rev() {
             if entry.get_memory_type() != Some(MemoryType::ConventionalMemory)
+                || entry.is_specific_purpose()
                 || entry.physical_start > max_addr
                 || entry.end() <= min_addr
             {
@@ -2051,6 +2068,97 @@ mod tests {
             ))
             .unwrap();
         allocator
+    }
+
+    #[test]
+    fn specific_purpose_memory_is_reported_never_allocated() {
+        use crate::platform::{MemoryRegion, MemoryType as PlatformMemoryType};
+        let mut allocator = MemoryAllocator::new();
+        // Soft-reserved memory right above the RAM, the highest free pages.
+        allocator.init_from_platform(&[
+            MemoryRegion {
+                base: 0x10_0000,
+                size: 4 * PAGE_SIZE,
+                region_type: PlatformMemoryType::Ram,
+            },
+            MemoryRegion {
+                base: 0x10_4000,
+                size: 16 * PAGE_SIZE,
+                region_type: PlatformMemoryType::SpecificPurpose,
+            },
+        ]);
+        let mut map = [MemoryDescriptor::default(); 4];
+        let mut size = core::mem::size_of_val(&map);
+        assert_eq!(
+            allocator.get_memory_map(&mut size, Some(&mut map), &mut 0, &mut 0, &mut 0),
+            efi::Status::SUCCESS
+        );
+        // Not merged with the RAM: conventional memory with EFI_MEMORY_SP.
+        assert_eq!(size, 2 * core::mem::size_of::<MemoryDescriptor>());
+        assert_eq!(map[1].physical_start, 0x10_4000);
+        assert_eq!(map[1].memory_type, MemoryType::ConventionalMemory as u32);
+        assert_eq!(
+            map[1].attribute,
+            attributes::EFI_MEMORY_RAM_CAPS | attributes::EFI_MEMORY_SP
+        );
+        assert_eq!(map[0].attribute & attributes::EFI_MEMORY_SP, 0);
+
+        // Any pages and max-address come from the RAM, never from it.
+        let mut address = 0;
+        assert_eq!(
+            allocator.allocate_pages(
+                AllocateType::AllocateAnyPages,
+                MemoryType::BootServicesData,
+                1,
+                &mut address
+            ),
+            efi::Status::SUCCESS
+        );
+        assert!(address < 0x10_4000);
+        // An allocation only it could hold fails.
+        assert_eq!(
+            allocator.allocate_pages(
+                AllocateType::AllocateAnyPages,
+                MemoryType::LoaderData,
+                8,
+                &mut address
+            ),
+            efi::Status::OUT_OF_RESOURCES
+        );
+        // So does one at an address inside it, and a firmware carve.
+        let mut inside = 0x10_8000;
+        assert_eq!(
+            allocator.allocate_pages(
+                AllocateType::AllocateAddress,
+                MemoryType::LoaderData,
+                1,
+                &mut inside
+            ),
+            efi::Status::NOT_FOUND
+        );
+        assert!(
+            allocator
+                .reserve_region(0x10_8000, 1, MemoryType::ReservedMemoryType)
+                .is_err()
+        );
+        assert!(
+            allocator
+                .reserve_region_fragments(0x10_0000, 20, MemoryType::ReservedMemoryType)
+                .is_ok()
+        );
+        // ExitBootServices leaves it as it was.
+        assert_eq!(
+            allocator.exit_boot_services(allocator.map_key()),
+            efi::Status::SUCCESS
+        );
+        let sp = allocator
+            .entries
+            .iter()
+            .find(|e| e.physical_start == 0x10_4000)
+            .unwrap();
+        assert_eq!(sp.get_memory_type(), Some(MemoryType::ConventionalMemory));
+        assert_eq!(sp.number_of_pages, 16);
+        assert!(sp.is_specific_purpose());
     }
 
     #[test]
