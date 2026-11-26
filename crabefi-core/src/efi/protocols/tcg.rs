@@ -19,6 +19,7 @@
 //! - TCG EFI Protocol Specification, for TPM Family 1.1 or 1.2
 //! - EDK2 `SecurityPkg/Tcg/TcgDxe/TcgDxe.c`
 
+use alloc::boxed::Box;
 use core::ffi::c_void;
 
 use r_efi::efi::Status;
@@ -38,7 +39,10 @@ use crate::efi::utils::allocate_protocol_value_with_log;
 // ============================================================================
 
 /// Global TCG (TPM 1.2) state.
-static TCG_STATE: Mutex<Option<TcgState>> = Mutex::new(None);
+///
+/// Boxed so the uninitialized `None` state is a zero-initialized pointer in
+/// `.bss` rather than a non-zero niche in `.data`.
+static TCG_STATE: Mutex<Option<Box<TcgState>>> = Mutex::new(None);
 
 struct TcgState {
     /// SHA-1 PCR bank.
@@ -61,11 +65,11 @@ pub fn init_state(buffer: &'static mut [u8], existing_log: Option<&[u8]>) -> Res
         Sha1EventLog::new(buffer)
     };
 
-    *TCG_STATE.lock() = Some(TcgState {
+    *TCG_STATE.lock() = Some(Box::new(TcgState {
         pcr_bank: Sha1PcrBank::new(),
         event_log,
         hardware_tpm: None,
-    });
+    }));
 
     Ok(())
 }
@@ -86,11 +90,11 @@ pub unsafe fn init_state_with_hardware(
     };
     let tpm = unsafe { Tpm12Tis::probe(tpm_base)? };
 
-    *TCG_STATE.lock() = Some(TcgState {
+    *TCG_STATE.lock() = Some(Box::new(TcgState {
         pcr_bank: Sha1PcrBank::new(),
         event_log,
         hardware_tpm: Some(tpm),
-    });
+    }));
 
     Ok(())
 }

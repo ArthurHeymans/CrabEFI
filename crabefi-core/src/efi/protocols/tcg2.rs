@@ -26,6 +26,7 @@
 #[path = "tcg2_tests.rs"]
 mod tests;
 
+use alloc::boxed::Box;
 use core::ffi::c_void;
 
 use r_efi::efi::Status;
@@ -45,9 +46,9 @@ use crate::platform::{Tpm2Device, TpmDigest, TpmError};
 
 /// Global TCG2 state shared between all protocol function calls.
 ///
-/// Protected by a spin mutex since UEFI boot services are single-threaded
-/// but we still want to be safe with the global.
-static TCG2_STATE: Mutex<Option<Tcg2State>> = Mutex::new(None);
+/// Boxed so the uninitialized `None` state is a zero-initialized pointer in
+/// `.bss` rather than a multi-kilobyte non-zero niche in `.data`.
+static TCG2_STATE: Mutex<Option<Box<Tcg2State>>> = Mutex::new(None);
 
 enum Tpm2Backend {
     Tis(TpmTis),
@@ -185,7 +186,7 @@ pub fn init_state(
         get_event_log_called: false,
     };
 
-    *TCG2_STATE.lock() = Some(state);
+    *TCG2_STATE.lock() = Some(Box::new(state));
     Ok(())
 }
 
@@ -241,7 +242,7 @@ pub unsafe fn init_state_with_hardware(
         get_event_log_called: false,
     };
 
-    *TCG2_STATE.lock() = Some(state);
+    *TCG2_STATE.lock() = Some(Box::new(state));
     log::info!("TCG2 state initialized with TIS hardware TPM");
     Ok(())
 }
@@ -293,7 +294,7 @@ pub fn init_state_with_platform_tpm(
         get_event_log_called: false,
     };
 
-    *TCG2_STATE.lock() = Some(state);
+    *TCG2_STATE.lock() = Some(Box::new(state));
     log::info!("TCG2 state initialized with platform TPM");
     Ok(())
 }
