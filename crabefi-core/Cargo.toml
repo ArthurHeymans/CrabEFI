@@ -96,8 +96,8 @@ atomic_refcell = "0.1"
 spin = "0.12"
 tock-registers = "0.10"
 zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
-rflasher-core = { optional = true, git = "https://github.com/ArthurHeymans/rflasher.git", rev = "4fb9d6270972d5ba04b5e22671b3416aaaaf6328", default-features = false }
-rflasher-internal = { optional = true, git = "https://github.com/ArthurHeymans/rflasher.git", rev = "4fb9d6270972d5ba04b5e22671b3416aaaaf6328", default-features = false }
+rflasher-core = { optional = true, git = "https://github.com/ArthurHeymans/rflasher.git", rev = "a37c758fd373b4c23d631c20b78a64c1210205c3", default-features = false }
+rflasher-internal = { optional = true, git = "https://github.com/ArthurHeymans/rflasher.git", rev = "a37c758fd373b4c23d631c20b78a64c1210205c3", default-features = false }
 
 # RustCrypto hashes for Authenticode, measured boot and variable digests
 sha1 = { optional = true, version = "0.11", default-features = false }

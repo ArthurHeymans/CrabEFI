@@ -211,6 +211,18 @@ pub fn with_disk<R>(
     id: StorageId,
     f: impl FnOnce(&mut dyn BlockDevice) -> R,
 ) -> Result<R, BlockError> {
+    let mut f = Some(f);
+    let mut result = None;
+    with_disk_dyn(id, &mut |disk| {
+        if let Some(f) = f.take() {
+            result = Some(f(disk));
+        }
+    })?;
+    result.ok_or(BlockError::NoMedia)
+}
+
+#[inline(never)]
+fn with_disk_dyn(id: StorageId, f: &mut dyn FnMut(&mut dyn BlockDevice)) -> Result<(), BlockError> {
     match id {
         StorageId::Nvme {
             controller_id,
@@ -218,14 +230,15 @@ pub fn with_disk<R>(
         } => nvme::with_controller(controller_id, |controller| {
             let namespace = controller.get_namespace(nsid)?;
             let info = fixed_disk_info(namespace.num_blocks, namespace.block_size);
-            Some(f(&mut Disk::new(
+            f(&mut Disk::new(
                 info,
                 ReadOnly(|lba, count, buffer: &mut [u8]| {
                     controller
                         .read_sectors(nsid, lba, count, buffer)
                         .map_err(io_failed(id, "read", lba))
                 }),
-            )))
+            ));
+            Some(())
         }),
         StorageId::Ahci {
             controller_id,
@@ -233,48 +246,52 @@ pub fn with_disk<R>(
         } => ahci::with_controller(controller_id, |controller| {
             let port_info = controller.get_port(port)?;
             let info = ahci_disk_info(port_info);
-            Some(f(&mut Disk::new(
+            f(&mut Disk::new(
                 info,
                 ReadOnly(|lba, count, buffer: &mut [u8]| {
                     controller
                         .read_sectors_into(port, lba, count, buffer)
                         .map_err(io_failed(id, "read", lba))
                 }),
-            )))
+            ));
+            Some(())
         }),
         StorageId::Usb {
             controller_id,
             device_addr,
         } => usb::mass_storage::with_device(controller_id, device_addr, |device, controller| {
             let info = usb_disk_info(device);
-            Some(f(&mut Disk::new(
+            f(&mut Disk::new(
                 info,
                 UsbDisk {
                     id,
                     device,
                     controller,
                 },
-            )))
+            ));
+            Some(())
         }),
         StorageId::Sdhci { controller_id } => sdhci::with_controller(controller_id, |controller| {
             if !controller.is_ready() {
                 return None;
             }
             let info = sdhci_disk_info(controller);
-            Some(f(&mut Disk::new(
+            f(&mut Disk::new(
                 info,
                 ReadOnly(|lba, count, buffer: &mut [u8]| {
                     controller
                         .read_sectors(lba, count, buffer)
                         .map_err(io_failed(id, "read", lba))
                 }),
-            )))
+            ));
+            Some(())
         }),
         StorageId::Platform { index } => Some(PLATFORM_BLOCK_DEVICES.with_mut(|devices| {
             let &device = devices.get(index)?;
             // SAFETY: registered devices outlive the firmware and the mutable
             // borrow of the registry excludes any other access to them.
-            Some(f(unsafe { &mut *device }))
+            f(unsafe { &mut *device });
+            Some(())
         })),
     }
     .flatten()

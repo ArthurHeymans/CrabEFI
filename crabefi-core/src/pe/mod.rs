@@ -249,7 +249,7 @@ fn image_code_pages(
                 .map_err(|_| Status::OUT_OF_RESOURCES)?;
         }
     }
-    code.sort_unstable_by_key(|range| range.start);
+    crate::sort::sort_by_key(&mut code, |range| range.start);
     let mut merged = CodePages::new();
     for range in code {
         if let Some(previous) = merged.last_mut()
@@ -391,12 +391,17 @@ where
         .checked_add(opt_header_size)
         .ok_or(Status::INVALID_PARAMETER)?;
 
+    let num_sections = file_header.number_of_sections.get(LittleEndian);
+    if num_sections > MAX_SECTIONS {
+        return Err(Status::INVALID_PARAMETER);
+    }
+
     Ok(PeHeaders {
         data,
         opt_header_offset,
         opt_header_size,
         is_pe32_plus: nt_headers.is_type_64(),
-        num_sections: file_header.number_of_sections.get(LittleEndian),
+        num_sections,
         num_data_dirs: optional_header.number_of_rva_and_sizes(),
         size_of_headers: optional_header.size_of_headers(),
         data_dirs_offset,
@@ -1204,13 +1209,23 @@ mod tests {
                 }
             );
 
-            let truncated_len = headers.sections_offset + core::mem::size_of::<SectionHeader>() - 1;
+            let sections_offset = headers.sections_offset;
+            let truncated_len = sections_offset + core::mem::size_of::<SectionHeader>() - 1;
             assert!(parse_headers(&data[..truncated_len]).is_err());
 
             let num_data_dirs_offset =
                 headers.opt_header_offset + if is_pe32_plus { 108 } else { 92 };
             put_u32(&mut data, num_data_dirs_offset, 6);
             assert!(parse_headers(&data).is_err());
+
+            let mut too_many = minimal_pe(is_pe32_plus).to_vec();
+            let too_many_count = MAX_SECTIONS + 1;
+            put_u16(&mut too_many, 0x80 + 4 + 2, too_many_count);
+            too_many.resize(
+                sections_offset + (too_many_count as usize) * core::mem::size_of::<SectionHeader>(),
+                0,
+            );
+            assert!(parse_headers(&too_many).is_err());
         }
     }
 

@@ -39,12 +39,14 @@ const MAX_MEMORY_ENTRIES: usize = 2048;
 const MAX_PAGE_ALLOCATIONS: usize = 2048;
 
 /// The firmware's memory map at production capacity.
-pub type MemoryAllocator = crabefi_memmap::MemoryMap<MAX_MEMORY_ENTRIES, MAX_PAGE_ALLOCATIONS>;
+pub type MemoryAllocator = crabefi_memmap::MemoryMap<
+    MAX_MEMORY_ENTRIES,
+    MAX_PAGE_ALLOCATIONS,
+    MAX_IDENTITY_MAPPED_ADDRESS,
+>;
 
 /// Page allocator and memory map.
-static ALLOCATOR: Local<MemoryAllocator> = Local::new(MemoryAllocator::with_address_limit(
-    MAX_IDENTITY_MAPPED_ADDRESS,
-));
+static ALLOCATOR: Local<MemoryAllocator> = Local::new(MemoryAllocator::new());
 
 // Keep this dependency-free helper in a flat file so the CI regression job
 // can compile and execute it directly with `rustc --test`.

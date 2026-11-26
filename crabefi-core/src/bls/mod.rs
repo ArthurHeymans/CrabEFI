@@ -168,8 +168,7 @@ pub(crate) fn discover_entries_at(
         }
     }
 
-    // Preserve the directory order of ties without stable sort's heap scratch.
-    discovery.entries.sort_unstable_by(|a, b| {
+    crate::sort::sort_by(&mut discovery.entries, |a, b| {
         let order = if !a.sort_key.is_empty() || !b.sort_key.is_empty() {
             a.sort_key.cmp(&b.sort_key)
         } else {

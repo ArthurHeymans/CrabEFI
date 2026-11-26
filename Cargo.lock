@@ -129,7 +129,7 @@ dependencies = [
  "embedded-hal",
  "ext4-view",
  "fdt",
- "heapless 0.9.3",
+ "heapless",
  "hidreport",
  "linked_list_allocator",
  "log",
@@ -159,7 +159,7 @@ dependencies = [
  "crabefi-runtime-abi",
  "embedded-hal-bus",
  "fdt",
- "heapless 0.9.3",
+ "heapless",
  "linked_list_allocator",
  "log",
  "r-efi 7.2.0",
@@ -188,7 +188,7 @@ name = "crabefi-memmap"
 version = "0.1.0"
 dependencies = [
  "crabefi-runtime-abi",
- "heapless 0.9.3",
+ "heapless",
  "log",
  "proptest",
  "r-efi 7.2.0",
@@ -218,7 +218,7 @@ dependencies = [
 name = "crabefi-ui"
 version = "0.1.0"
 dependencies = [
- "heapless 0.9.3",
+ "heapless",
  "log",
  "noto-sans-mono-bitmap",
 ]
@@ -341,16 +341,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47d60b12902ba28e2730cd37e95b8c9223af2808df9e902d4df49588d1470606"
 dependencies = [
  "byteorder",
-]
-
-[[package]]
-name = "heapless"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0bfb9eb618601c89945a70e254898da93b13be0388091d42117462b265bb3fad"
-dependencies = [
- "hash32",
- "stable_deref_trait",
 ]
 
 [[package]]
@@ -553,16 +543,15 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "rflasher-chip-types"
 version = "0.1.0"
-source = "git+https://github.com/ArthurHeymans/rflasher.git?rev=4fb9d6270972d5ba04b5e22671b3416aaaaf6328#4fb9d6270972d5ba04b5e22671b3416aaaaf6328"
+source = "git+https://github.com/ArthurHeymans/rflasher.git?rev=a37c758fd373b4c23d631c20b78a64c1210205c3#a37c758fd373b4c23d631c20b78a64c1210205c3"
 dependencies = [
  "bitflags",
- "heapless 0.8.0",
 ]
 
 [[package]]
 name = "rflasher-core"
 version = "0.1.0"
-source = "git+https://github.com/ArthurHeymans/rflasher.git?rev=4fb9d6270972d5ba04b5e22671b3416aaaaf6328#4fb9d6270972d5ba04b5e22671b3416aaaaf6328"
+source = "git+https://github.com/ArthurHeymans/rflasher.git?rev=a37c758fd373b4c23d631c20b78a64c1210205c3#a37c758fd373b4c23d631c20b78a64c1210205c3"
 dependencies = [
  "bitflags",
  "embedded-io",
@@ -575,7 +564,7 @@ dependencies = [
 [[package]]
 name = "rflasher-internal"
 version = "0.1.0"
-source = "git+https://github.com/ArthurHeymans/rflasher.git?rev=4fb9d6270972d5ba04b5e22671b3416aaaaf6328#4fb9d6270972d5ba04b5e22671b3416aaaaf6328"
+source = "git+https://github.com/ArthurHeymans/rflasher.git?rev=a37c758fd373b4c23d631c20b78a64c1210205c3#a37c758fd373b4c23d631c20b78a64c1210205c3"
 dependencies = [
  "log",
  "rflasher-core",
@@ -585,7 +574,7 @@ dependencies = [
 [[package]]
 name = "rflasher-pci"
 version = "0.1.0"
-source = "git+https://github.com/ArthurHeymans/rflasher.git?rev=4fb9d6270972d5ba04b5e22671b3416aaaaf6328#4fb9d6270972d5ba04b5e22671b3416aaaaf6328"
+source = "git+https://github.com/ArthurHeymans/rflasher.git?rev=a37c758fd373b4c23d631c20b78a64c1210205c3#a37c758fd373b4c23d631c20b78a64c1210205c3"
 dependencies = [
  "pci_types",
 ]

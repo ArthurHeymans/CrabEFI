@@ -495,7 +495,7 @@ fn mark_acpi_tables_memory(rsdp_addr: u64) {
         let _ = regions.push(region);
     });
     let region_count = regions.len();
-    regions.sort_unstable_by_key(|r| r.start);
+    crate::sort::sort_by_key(&mut regions, |r| r.start);
 
     // Merge overlapping/adjacent regions
     let mut merged: [AcpiRegion; MAX_ACPI_REGIONS] =

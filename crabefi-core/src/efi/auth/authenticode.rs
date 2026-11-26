@@ -299,7 +299,7 @@ fn parse_pe_for_hash(pe_data: &[u8]) -> Result<PeInfo, AuthError> {
         .collect();
 
     // Sort sections by file offset
-    sections.sort_by_key(|s| s.file_offset);
+    crate::sort::sort_by_key(&mut sections, |s| s.file_offset);
 
     Ok(PeInfo {
         checksum_offset,
