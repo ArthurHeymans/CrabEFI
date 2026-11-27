@@ -509,6 +509,7 @@ impl Playground {
             countdown: sim.state.countdown,
             outcome: self.outcome.map(|o| match o {
                 Outcome::Boot(index) => format!("boot:{index}"),
+                Outcome::Refresh => "refresh".into(),
                 Outcome::Reset => "reset".into(),
                 Outcome::Exit => "exit".into(),
             }),
