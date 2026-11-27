@@ -270,6 +270,28 @@ jobs:
       - name: Test USB filesystem mutations and on-disk consistency
         run: >-
           ./crabefi test --app directory-test --disable-kvm --timeout 180
+  test-usb-hotplug:
+    name: Test x86_64 (USB Hotplug)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: build
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchains
+        uses: ./.github/actions/setup-rust
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 mtools dosfstools zstd coreboot-utils
+      - name: Download CrabEFI ELF
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: crabefi-elf
+          path: target/x86_64-unknown-none/release/
+      - name: Test QMP USB hotplug and input in an EFI app
+        run: ./crabefi test --app usb-hotplug-test --disable-kvm --timeout 120
   test-debug-assertions:
     name: Test x86_64 (payload debug assertions)
     runs-on: ubuntu-latest

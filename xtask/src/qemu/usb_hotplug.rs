@@ -144,9 +144,13 @@ impl<'a> Scenario<'a> {
         self.marker("Found 1 boot entries")?;
         self.qmp.delete("disk")?;
         self.marker("Found 0 boot entries")?;
-        if model == "qemu-xhci" {
+        // QEMU's usb-hub is full-speed; standalone usb-ehci cannot
+        // attach it without a companion. Exercise this topology elsewhere.
+        if model != "usb-ehci" {
             self.add("usb-hub", "hub", "2", None)?;
             self.marker("USB hub ")?;
+            self.add("usb-kbd", "hub-keyboard", "2.2", None)?;
+            self.marker("USB: attached keyboard")?;
             self.add("usb-storage", "hub-disk", "2.1", Some("hotdisk"))?;
             self.marker("Found 1 boot entries")?;
             // QEMU recursively removes the child qdev with the hub. Leave
@@ -156,8 +160,8 @@ impl<'a> Scenario<'a> {
         }
         self.add("usb-storage", "boot-disk", "2", Some("hotdisk"))?;
         self.marker("Found 1 boot entries")?;
+        // Storage-induced refreshes must still allow unattended autoboot.
         self.marker("Showing boot menu")?;
-        self.qmp.key("ret")?;
         self.marker("USB HOTPLUG: waiting for keyboard")?;
         self.qmp.delete("keyboard")?;
         self.add("usb-kbd", "app-keyboard", "1", None)?;
