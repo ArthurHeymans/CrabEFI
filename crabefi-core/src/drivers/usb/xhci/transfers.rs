@@ -4,7 +4,7 @@ use super::{TrbRing, XhciError};
 use crate::barrier;
 use crate::drivers::pci;
 use crate::efi::dma::{DmaBuffer, DmaDirection, DmaMask};
-use xhci::ring::trb::{command, transfer};
+use xhci::ring::trb::{command, event, transfer};
 
 const TRB_BOUNDARY: usize = 0x10000;
 
@@ -184,7 +184,11 @@ impl super::XhciController {
             Err(error) => {
                 let recovered = match error {
                     XhciError::Timeout => self.stop_endpoint(slot_id, DCI_EP0),
-                    XhciError::StallError => self.reset_endpoint(slot_id, DCI_EP0),
+                    XhciError::StallError
+                    | XhciError::TransferFailed(Ok(
+                        event::CompletionCode::BabbleDetectedError
+                        | event::CompletionCode::UsbTransactionError,
+                    )) => self.reset_endpoint(slot_id, DCI_EP0),
                     _ => Err(XhciError::NotReady),
                 };
                 if recovered.is_ok() {
