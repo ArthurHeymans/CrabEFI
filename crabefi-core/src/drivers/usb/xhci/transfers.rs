@@ -129,13 +129,7 @@ impl super::XhciController {
 
         let first_trb_addr = ring.enqueue(setup, true); // defer_cycle = true
 
-        // Data Stage TRB (if needed)
-        // Note: We intentionally do NOT set ISP (Interrupt on Short Packet) on the
-        // Data Stage TRB. With ISP, a short packet would generate an extra event
-        // before the Status Stage's IOC event, but wait_transfer_completion only
-        // expects 1 event. The orphaned Status event would corrupt later transfers.
-        // EDK2 also relies solely on IOC on the Status Stage TRB.
-        if let Some(buffer) = &bounce {
+        let data_trb_addr = bounce.as_ref().map(|buffer| {
             let mut data_trb = transfer::DataStage::new();
             data_trb
                 .set_data_buffer_pointer(buffer.dma_address() + offset as u64)
@@ -145,9 +139,11 @@ impl super::XhciController {
                 } else {
                     transfer::Direction::Out
                 });
-
-            ring.enqueue(data_trb, false);
-        }
+            if is_in {
+                data_trb.set_interrupt_on_short_packet();
+            }
+            ring.enqueue(data_trb, false)
+        });
 
         // Status Stage TRB
         let mut status = transfer::StatusStage::new();
@@ -156,7 +152,7 @@ impl super::XhciController {
         }
         status.set_interrupt_on_completion();
 
-        ring.enqueue(status, false);
+        let status_trb_addr = ring.enqueue(status, false);
 
         // Commit the deferred first TRB — atomically makes the entire TD live
         TrbRing::commit_deferred_trb(first_trb_addr, first_trb_cycle);
@@ -166,9 +162,12 @@ impl super::XhciController {
         self.ring_doorbell(slot_id, DCI_EP0);
 
         // Wait for completion
-        match self.wait_transfer_completion(slot_id, 0, 1) {
+        match self.wait_control_transfer(slot_id, first_trb_addr, data_trb_addr, status_trb_addr) {
             Ok(total_residual) => {
                 let transferred = data_len.saturating_sub(total_residual as usize);
+                if is_in && transferred < data_len {
+                    log::debug!("xHCI: EP0 short IN: {transferred}/{data_len} bytes");
+                }
                 if let Some(buffer) = &bounce {
                     buffer
                         .sync_for_cpu(0..buffer.len(), direction)

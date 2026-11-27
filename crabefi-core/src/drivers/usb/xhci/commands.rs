@@ -83,103 +83,68 @@ impl super::XhciController {
         Err(XhciError::Timeout)
     }
 
-    /// Wait for transfer completion events
-    ///
-    /// Each TRB is its own independent TD with IOC=1. CrabEFI keeps its
-    /// polling, timeout, and ERDP policy while decoding events upstream.
-    pub(super) fn wait_transfer_completion(
+    pub(super) fn wait_control_transfer(
         &mut self,
         slot: u8,
-        ep: u8,
-        expected_trbs: usize,
+        setup: u64,
+        data: Option<u64>,
+        status: u64,
     ) -> Result<u32, XhciError> {
-        self.wait_transfer_events(slot, ep, expected_trbs, None)
+        self.wait_transfer_events(
+            slot,
+            1,
+            TransferCompletion::Control {
+                setup,
+                data,
+                status,
+                residual: 0,
+            },
+        )
     }
 
     /// Wait for one particular TD, rejecting stale completions after cancellation.
     pub(super) fn wait_transfer_td(
         &mut self,
         slot: u8,
-        ep: u8,
+        dci: u8,
         trb: u64,
     ) -> Result<u32, XhciError> {
-        self.wait_transfer_events(slot, ep, 1, Some(trb))
+        self.wait_transfer_events(slot, dci, TransferCompletion::Bulk(trb))
     }
 
     fn wait_transfer_events(
         &mut self,
         slot: u8,
-        ep: u8,
-        expected_trbs: usize,
-        expected_td: Option<u64>,
+        endpoint: u8,
+        mut completion: TransferCompletion,
     ) -> Result<u32, XhciError> {
         let timeout = Timeout::from_ms(5000);
-        let mut completed = 0usize;
-        let mut total_residual = 0u32;
-
         while !timeout.is_expired() {
             let erdp = self.event_ring.base + (self.event_ring.dequeue_idx * trb::BYTES) as u64;
-            let raw = read_event_trb(erdp, self.event_ring.cycle);
-
-            if let Some(raw) = raw {
+            if let Some(raw) = read_event_trb(erdp, self.event_ring.cycle) {
                 self.event_ring.dequeue_idx += 1;
                 if self.event_ring.dequeue_idx >= self.event_ring.size {
                     self.event_ring.dequeue_idx = 0;
                     self.event_ring.cycle = !self.event_ring.cycle;
                 }
                 self.update_erdp();
-
                 if self.capture_interrupt_event(raw) {
                     continue;
                 }
                 match event::Allowed::try_from(raw) {
                     Ok(event::Allowed::PortStatusChange(_)) => continue,
-                    Ok(event::Allowed::TransferEvent(transfer_event)) => {
+                    Ok(event::Allowed::TransferEvent(event)) => {
                         let event_slot = (raw[3] >> 24) as u8;
                         let event_dci = ((raw[3] >> 16) & 0x1f) as u8;
-                        let pointer = u64::from(raw[0]) | (u64::from(raw[1]) << 32);
-                        if event_slot != slot
-                            || event_dci / 2 != ep
-                            || expected_td.is_some_and(|expected| expected != pointer)
+                        if event_slot == slot
+                            && endpoint == event_dci
+                            && let Some(result) = completion.observe(
+                                event.trb_pointer(),
+                                event.completion_code(),
+                                event.trb_transfer_length(),
+                            )
                         {
-                            continue;
-                        }
-                        let residual = transfer_event.trb_transfer_length();
-                        let completion_code = transfer_event.completion_code();
-                        log::trace!(
-                            "xHCI: Transfer event cc={:?} residue={} [{}/{}]",
-                            completion_code,
-                            residual,
-                            completed + 1,
-                            expected_trbs
-                        );
-
-                        if matches!(
-                            completion_code,
-                            Ok(event::CompletionCode::Success | event::CompletionCode::ShortPacket)
-                        ) {
-                            completed += 1;
-                            total_residual += residual;
-                            if completed >= expected_trbs {
-                                return Ok(total_residual);
-                            }
-                        } else if completion_code == Ok(event::CompletionCode::StallError) {
-                            log::debug!(
-                                "xHCI: Transfer stalled [{}/{}]",
-                                completed + 1,
-                                expected_trbs
-                            );
-                            self.drain_remaining_transfer_events(expected_trbs - completed - 1);
-                            return Err(XhciError::StallError);
-                        } else {
-                            log::debug!(
-                                "xHCI: Transfer failed with cc={:?} [{}/{}]",
-                                completion_code,
-                                completed + 1,
-                                expected_trbs
-                            );
-                            self.drain_remaining_transfer_events(expected_trbs - completed - 1);
-                            return Err(XhciError::TransferFailed(completion_code));
+                            return result;
                         }
                     }
                     Ok(event::Allowed::HostController(host)) => {
@@ -189,67 +154,18 @@ impl super::XhciController {
                         );
                         return Err(XhciError::TransferFailed(host.completion_code()));
                     }
-                    _ => log::trace!(
-                        "xHCI: Got event type {} while waiting for transfer",
-                        raw_trb_type(&raw)
-                    ),
+                    _ => {}
                 }
             }
             core::hint::spin_loop();
         }
-
         log::warn!(
-            "xHCI: Transfer timeout, completed={}/{}, event ring dequeue_idx={}, cycle={}",
-            completed,
-            expected_trbs,
+            "xHCI: Transfer timeout, event ring dequeue_idx={}, cycle={}",
             self.event_ring.dequeue_idx,
             self.event_ring.cycle
         );
         Err(XhciError::Timeout)
     }
-
-    /// Drain remaining transfer events after an error
-    ///
-    /// When a multi-TRB transfer fails on one TRB, the controller may have
-    /// already queued completion events for subsequent TRBs. These must be
-    /// consumed to prevent them from confusing later transfers.
-    pub(super) fn drain_remaining_transfer_events(&mut self, max_events: usize) {
-        let timeout = Timeout::from_ms(100); // Short timeout — events should already be there
-        let mut drained = 0usize;
-        let mut consumed = 0usize;
-
-        while drained < max_events && !timeout.is_expired() {
-            let erdp = self.event_ring.base + (self.event_ring.dequeue_idx * trb::BYTES) as u64;
-            let raw = read_event_trb(erdp, self.event_ring.cycle);
-
-            if let Some(raw) = raw {
-                self.event_ring.dequeue_idx += 1;
-                if self.event_ring.dequeue_idx >= self.event_ring.size {
-                    self.event_ring.dequeue_idx = 0;
-                    self.event_ring.cycle = !self.event_ring.cycle;
-                }
-                consumed += 1;
-
-                if !self.capture_interrupt_event(raw) && event::TransferEvent::try_from(raw).is_ok()
-                {
-                    drained += 1;
-                }
-            } else {
-                break; // No more events ready
-            }
-            core::hint::spin_loop();
-        }
-
-        if consumed > 0 {
-            self.update_erdp();
-            log::trace!(
-                "xHCI: drained {} orphaned transfer events ({} total consumed)",
-                drained,
-                consumed
-            );
-        }
-    }
-
     /// Update the Event Ring Dequeue Pointer (ERDP) in hardware
     ///
     /// This writes the current software dequeue pointer to the interrupter's
@@ -268,4 +184,72 @@ impl super::XhciController {
                 erdp.clear_event_handler_busy();
             });
     }
+}
+
+// A short Data Stage can generate a Transfer Event before Status completes.
+// Its residual is the only actual length information for a short control IN.
+enum TransferCompletion {
+    Bulk(u64),
+    Control {
+        setup: u64,
+        data: Option<u64>,
+        status: u64,
+        residual: u32,
+    },
+}
+
+impl TransferCompletion {
+    fn observe(
+        &mut self,
+        pointer: u64,
+        code: Result<event::CompletionCode, u8>,
+        length: u32,
+    ) -> Option<Result<u32, XhciError>> {
+        use event::CompletionCode::{ShortPacket, StallError, Success};
+        let result = match *self {
+            Self::Bulk(trb) if trb == pointer => length,
+            Self::Control {
+                setup,
+                data,
+                status,
+                residual,
+            } if pointer == setup || Some(pointer) == data || pointer == status => {
+                if code == Ok(ShortPacket) && Some(pointer) == data {
+                    if let Self::Control { residual, .. } = self {
+                        *residual = length;
+                    }
+                    return None;
+                }
+                if code == Ok(Success) && pointer != status {
+                    return None;
+                }
+                residual
+            }
+            _ => return None, // Not part of the current transfer.
+        };
+        Some(match code {
+            Ok(Success | ShortPacket) => Ok(result),
+            Ok(StallError) => Err(XhciError::StallError),
+            _ => Err(XhciError::TransferFailed(code)),
+        })
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn control_short_data_records_residual_but_waits_for_its_status() {
+    use event::CompletionCode::{ShortPacket, StallError, Success};
+    let mut td = TransferCompletion::Control {
+        setup: 0x1000,
+        data: Some(0x1010),
+        status: 0x1020,
+        residual: 0,
+    };
+    assert!(td.observe(0x1010, Ok(ShortPacket), 27).is_none());
+    assert!(td.observe(0x1030, Ok(Success), 0).is_none());
+    assert!(matches!(td.observe(0x1020, Ok(Success), 0), Some(Ok(27))));
+    assert!(matches!(
+        td.observe(0x1000, Ok(StallError), 0),
+        Some(Err(XhciError::StallError))
+    ));
 }

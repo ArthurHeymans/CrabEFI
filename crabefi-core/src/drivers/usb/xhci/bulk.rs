@@ -373,7 +373,7 @@ impl super::XhciController {
             // Error completions halt the endpoint, but recovery must also skip
             // the old TD before a later doorbell can resume it. Release the
             // buffer only after recovery confirms that it is no longer reachable.
-            match self.wait_transfer_td(slot_id, ep, td) {
+            match self.wait_transfer_td(slot_id, dci as u8, td) {
                 Ok(residual) => {
                     bounce
                         .sync_for_cpu(0..bounce.len(), direction)
