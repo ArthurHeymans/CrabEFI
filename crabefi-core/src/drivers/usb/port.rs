@@ -346,26 +346,31 @@ pub(super) async fn transfer() {
 // Only one device may use address zero on a shared USB2/USB1 bus. This
 // reservation serializes port resets, not controller access: foreground I/O
 // to addressed devices and hub status reads remain possible while it is held.
-static DEFAULT_ADDRESSES: crate::cell::Local<Vec<bool>> = crate::cell::Local::new(Vec::new());
+static DEFAULT_ADDRESSES: Local<Vec<Rc<LocalCell<bool>>>> = Local::new(Vec::new());
 
-struct DefaultAddress(usize);
+struct DefaultAddress(Rc<LocalCell<bool>>);
 impl DefaultAddress {
     async fn reserve(controller: usize) -> Self {
+        let owner = DEFAULT_ADDRESSES.borrow()[controller].clone();
+        Self::reserve_on(owner).await
+    }
+
+    async fn reserve_on(owner: Rc<LocalCell<bool>>) -> Self {
         poll_fn(|_| {
-            let mut reserved = DEFAULT_ADDRESSES.borrow_mut();
-            if reserved[controller] {
+            if owner.get() {
                 Poll::Pending
             } else {
-                reserved[controller] = true;
-                Poll::Ready(Self(controller))
+                owner.set(true);
+                Poll::Ready(())
             }
         })
-        .await
+        .await;
+        Self(owner)
     }
 }
 impl Drop for DefaultAddress {
     fn drop(&mut self) {
-        DEFAULT_ADDRESSES.borrow_mut()[self.0] = false;
+        self.0.set(false);
     }
 }
 
@@ -450,7 +455,9 @@ pub(super) async fn buses() {
         for controller in initialized..count {
             if let Some((kind, count)) = with_port_controller(controller, |host| host.root_ports())
             {
-                DEFAULT_ADDRESSES.borrow_mut().push(false);
+                DEFAULT_ADDRESSES
+                    .borrow_mut()
+                    .push(Rc::new(LocalCell::new(false)));
                 for number in 0..count {
                     ports.add(Port {
                         controller,
@@ -509,6 +516,7 @@ struct Hub {
     superspeed: bool,
     upstream: Option<Rc<Hub>>,
     status_failures: LocalCell<u8>,
+    quarantine: Local<Option<DefaultAddress>>,
 }
 
 const HUB_STATUS_FAILURE_LIMIT: u8 = 2;
@@ -516,7 +524,26 @@ const HUB_STATUS_FAILURE_LIMIT: u8 = 2;
 impl Hub {
     fn parked(&self) -> bool {
         self.status_failures.get() >= HUB_STATUS_FAILURE_LIMIT
+            || self.quarantine.borrow().is_some()
             || self.upstream.as_ref().is_some_and(|hub| hub.parked())
+    }
+
+    fn isolate_or_quarantine(
+        &self,
+        reservation: DefaultAddress,
+        disabled: bool,
+        upstream: RootStatus,
+    ) {
+        if !disabled && upstream.connected && !upstream.changed {
+            // Address zero might still respond. Keep the reservation for
+            // this hub attachment, but leave addressed transfers available.
+            assert!(self.quarantine.borrow().is_none());
+            *self.quarantine.borrow_mut() = Some(reservation);
+            log::warn!(
+                "USB hub {} port disable unconfirmed; quarantining address zero until disconnect",
+                self.address
+            );
+        }
     }
 
     fn observe_status(&self, ok: bool) {
@@ -948,7 +975,7 @@ impl PortOps for Port {
 
     async fn bring_up(&self) -> Result<Option<u8>, UsbError> {
         let shares_default_address = self.shares_default_address();
-        let _default = if shares_default_address {
+        let reservation = if shares_default_address {
             Some(DefaultAddress::reserve(self.controller).await)
         } else {
             None
@@ -979,13 +1006,21 @@ impl PortOps for Port {
             }
         }
         .await;
-        if result.is_err() && shares_default_address {
-            // No other port may use address zero until this port cannot
-            // answer it (SET_ADDRESS may not have succeeded).
-            if self.hub.is_some() {
-                let _ = self
+        if result.is_err()
+            && let Some(reservation) = reservation
+        {
+            // Never release address zero on a failed reset or SET_ADDRESS
+            // while this device can still answer it.
+            if let Some(hub) = &self.hub {
+                let disabled = self
                     .hub_feature(request::CLEAR_FEATURE, hub_feature::PORT_ENABLE)
-                    .await;
+                    .await
+                    .is_ok()
+                    && self
+                        .hub_status()
+                        .await
+                        .is_ok_and(|(status, _)| status & hub_port_status::ENABLE == 0);
+                hub.isolate_or_quarantine(reservation, disabled, self.root_status());
             } else {
                 self.root_command(RootCommand::Disable);
             }
@@ -1110,6 +1145,7 @@ async fn configure_hub(parent: &Port, pipe: Pipe) -> Result<(Rc<Hub>, u8, u64), 
         address: pipe.address,
         upstream: parent.hub.clone(),
         status_failures: LocalCell::new(0),
+        quarantine: Local::new(None),
         #[cfg(feature = "xhci")]
         superspeed,
     });
@@ -1457,6 +1493,7 @@ mod tests {
             address: 1,
             upstream: None,
             status_failures: LocalCell::new(0),
+            quarantine: Local::new(None),
             #[cfg(feature = "xhci")]
             superspeed: false,
         });
@@ -1468,6 +1505,38 @@ mod tests {
         assert!(!sibling.parked());
         sibling.observe_status(false);
         assert!(hub.parked());
+    }
+
+    #[test]
+    fn failed_isolation_keeps_address_zero_reserved_until_hub_detaches() {
+        let owner = Rc::new(LocalCell::new(false));
+        let cx = &mut Context::from_waker(Waker::noop());
+        let mut next = core::pin::pin!(DefaultAddress::reserve_on(owner.clone()));
+        {
+            let hub = Hub {
+                address: 1,
+                upstream: None,
+                status_failures: LocalCell::new(0),
+                quarantine: Local::new(None),
+                #[cfg(feature = "xhci")]
+                superspeed: false,
+            };
+            let reservation = exec::block_on(DefaultAddress::reserve_on(owner.clone()));
+            let connected = RootStatus {
+                connected: true,
+                ..RootStatus::default()
+            };
+            hub.isolate_or_quarantine(reservation, true, connected);
+            assert!(!owner.get());
+            let reservation = exec::block_on(DefaultAddress::reserve_on(owner.clone()));
+            hub.isolate_or_quarantine(reservation, false, RootStatus::default());
+            assert!(!owner.get());
+            let reservation = exec::block_on(DefaultAddress::reserve_on(owner.clone()));
+            hub.isolate_or_quarantine(reservation, false, connected);
+            assert!(hub.parked());
+            assert!(next.as_mut().poll(cx).is_pending());
+        }
+        assert!(next.as_mut().poll(cx).is_ready());
     }
 
     #[test]
