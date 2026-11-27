@@ -481,6 +481,7 @@ pub fn init_mice() {
 /// USB drivers can properly initialize the controllers. Following
 /// libpayload's shutdown patterns for each controller type.
 pub fn cleanup() {
+    crate::exec::stop_background();
     log::info!("USB cleanup: stopping all controllers for OS handoff");
 
     let mut controllers = ALL_CONTROLLERS.lock();
