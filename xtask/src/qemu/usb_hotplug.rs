@@ -55,6 +55,116 @@ impl Topology {
     }
 }
 
+fn test_qemu(config: &QemuConfig) -> Command {
+    let mut qemu = Command::new("qemu-system-x86_64");
+    // No PS/2 input: the app can receive keys only from USB.
+    qemu.args(["-machine", "q35,usb=off,i8042=off", "-m", "2G"]);
+    if !config.disable_kvm && super::is_kvm_available() {
+        qemu.args(["-enable-kvm", "-cpu", "host"]);
+    } else {
+        qemu.args(["-cpu", "max"]);
+    }
+    qemu.args(["-display", "none", "-monitor", "none"]);
+    qemu.stdin(Stdio::null()).stdout(Stdio::null());
+    qemu
+}
+
+fn boot_order(
+    config: &QemuConfig,
+    disk: &Path,
+    topology: &Topology,
+    timeout: Duration,
+) -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let flash = super::prepare_runtime_test_flash(Path::new(&config.coreboot_rom))?;
+    let build = |serial: &Path| -> Command {
+        let mut qemu = test_qemu(config);
+        qemu.args([
+            "-no-reboot",
+            "-drive",
+            &format!("if=pflash,format=raw,file={}", flash.path().display()),
+        ]);
+        qemu.args(["-serial", &format!("file:{}", serial.display())]);
+        qemu.args([
+            "-drive",
+            &format!(
+                "if=none,format=raw,file={},snapshot=on,id=internal",
+                disk.display()
+            ),
+        ]);
+        qemu.args(["-device", "nvme,serial=cold-order,drive=internal"]);
+        qemu
+    };
+    let seed_log = temp.path().join("seed.log");
+    let mut seed = build(&seed_log).spawn()?;
+    let deadline = Instant::now() + timeout;
+    while seed.try_wait()?.is_none() {
+        if Instant::now() >= deadline {
+            cleanup_child(&mut seed);
+            bail!(
+                "cold BootOrder seed did not reset: {}",
+                fs::read_to_string(&seed_log).unwrap_or_default()
+            );
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let seed = fs::read_to_string(seed_log)?;
+    if !seed.contains("USB BOOT ORDER: seed installed") {
+        bail!("failed to seed BootOrder: {seed}");
+    }
+
+    let serial = temp.path().join("cold.log");
+    let usb = super::boot_policy::usb_disk_path(disk);
+    let mut qemu = build(&serial);
+    qemu.args([
+        "-drive",
+        &format!(
+            "if=none,format=raw,file={},snapshot=on,id=hotdisk",
+            usb.display()
+        ),
+    ]);
+    topology.add_args(&mut qemu);
+    let port = match topology {
+        Topology::Standalone(_) => "1",
+        Topology::Companions { .. } => {
+            // QEMU mass storage supports high and full speed. Put it behind
+            // a full-speed hub so EHCI hands that root port to UHCI.
+            qemu.args(["-device", "usb-hub,bus=hotusb.0,port=2"]);
+            "2.1"
+        }
+    };
+    qemu.args([
+        "-device",
+        &format!("usb-storage,bus=hotusb.0,port={port},drive=hotdisk"),
+    ]);
+    let mut cold = qemu.spawn()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        let log = fs::read_to_string(&serial).unwrap_or_default();
+        if log.contains("USB BOOT ORDER: NVMe fallback reached")
+            || log.contains("BootOrder: trying Boot0001")
+        {
+            cleanup_child(&mut cold);
+            bail!("cold USB lost BootOrder priority: {log}");
+        }
+        let companion = matches!(topology, Topology::Companions { .. });
+        if log.contains("BootOrder: trying Boot0000")
+            && log.contains("USB HOTPLUG: waiting for keyboard")
+            && (!companion
+                || (log.contains("releasing to companion")
+                    && log.contains("USB: attached storage on controller 0")))
+        {
+            cleanup_child(&mut cold);
+            return Ok(());
+        }
+        if let Err(error) = check_alive(&mut cold, deadline, "USB Boot0000 before NVMe fallback") {
+            cleanup_child(&mut cold);
+            bail!("{error:#}: {log}");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 pub(crate) fn run(config: &QemuConfig, disk: &Path) -> Result<()> {
     let timeout = Duration::from_secs(config.timeout_secs.unwrap_or(60));
     let mut failed = Vec::new();
@@ -68,17 +178,8 @@ pub(crate) fn run(config: &QemuConfig, disk: &Path) -> Result<()> {
         let serial = temp.path().join("serial.log");
         let stderr = temp.path().join("qemu.log");
         let socket = temp.path().join("qmp.sock");
-        let mut qemu = Command::new("qemu-system-x86_64");
-        // Ensure that the app can only get keyboard input from the hotplugged
-        // USB device rather than the usual QEMU PS/2 keyboard.
-        qemu.args(["-machine", "q35,usb=off,i8042=off", "-m", "2G"]);
-        if !config.disable_kvm && super::is_kvm_available() {
-            qemu.args(["-enable-kvm", "-cpu", "host"]);
-        } else {
-            qemu.args(["-cpu", "max"]);
-        }
+        let mut qemu = test_qemu(config);
         add_x86_boot_args(&mut qemu, &config.coreboot_rom, CaptureScenario::BootSmoke);
-        qemu.args(["-display", "none", "-monitor", "none"]);
         qemu.args(["-serial", &format!("file:{}", serial.display())]);
         qemu.args([
             "-qmp",
@@ -115,6 +216,23 @@ pub(crate) fn run(config: &QemuConfig, disk: &Path) -> Result<()> {
                     eprintln!("{line}");
                 }
                 eprintln!("{}", fs::read_to_string(&stderr).unwrap_or_default());
+            }
+        }
+    }
+    for topology in [
+        Topology::Standalone("qemu-xhci"),
+        Topology::Standalone("usb-ehci"),
+        Topology::Companions { cold: false },
+    ] {
+        let label = match &topology {
+            Topology::Companions { .. } => "ich9-uhci-full-speed",
+            _ => topology.name(),
+        };
+        match boot_order(config, disk, &topology, timeout) {
+            Ok(()) => println!("[PASS] USB cold BootOrder {label}"),
+            Err(error) => {
+                eprintln!("[FAIL] USB cold BootOrder {label}: {error:#}");
+                failed.push(label);
             }
         }
     }

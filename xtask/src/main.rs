@@ -1085,7 +1085,7 @@ fn cmd_test(
                 &efi_path,
                 arch,
             )?;
-        } else if app == "boot-policy-test" {
+        } else if matches!(app, "boot-policy-test" | "usb-hotplug-test") {
             disk::create_boot_policy_disks(
                 &disk_path,
                 &qemu::boot_policy::usb_disk_path(&disk_path),
