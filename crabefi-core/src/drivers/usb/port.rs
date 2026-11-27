@@ -397,20 +397,12 @@ struct StartupActivity<'a>(&'a LocalCell<usize>);
 impl<'a> StartupActivity<'a> {
     fn new(active: &'a LocalCell<usize>) -> Self {
         active.update(|n| *n += 1);
-        // Fake ports have their own activity counter and never touch the
-        // firmware's single-hart state from test threads.
-        if core::ptr::eq(active, &STARTUP_ACTIVE) {
-            note_startup_progress();
-        }
         Self(active)
     }
 }
 impl Drop for StartupActivity<'_> {
     fn drop(&mut self) {
         self.0.update(|n| *n -= 1);
-        if core::ptr::eq(self.0, &STARTUP_ACTIVE) {
-            note_startup_progress();
-        }
     }
 }
 
@@ -685,7 +677,9 @@ async fn port_task(port: impl PortOps, mut initial_scan: Option<StartupActivity<
                 if connection.connected {
                     break;
                 }
-                drop(initial_scan.take());
+                if initial_scan.take().is_some() {
+                    note_startup_progress();
+                }
             } else if port.upstream_parked() {
                 drop(initial_scan.take());
             }
@@ -1090,6 +1084,9 @@ impl PortOps for Port {
         if !connection.connected || connection.changed {
             return Err(UsbError::Disconnected);
         }
+        // Only a stable connection reaching reset is progress. A stuck
+        // change latch or a bouncing connection must not renew boot forever.
+        note_startup_progress();
         let result = async {
             let Some(speed) = self.reset().await? else {
                 return Ok(None);
@@ -1286,6 +1283,9 @@ async fn configure_hub(parent: &Port, pipe: Pipe) -> Result<(Rc<Hub>, u8, u64), 
         }
         .hub_feature(request::SET_FEATURE, hub_feature::PORT_POWER)
         .await;
+        if power.is_ok() {
+            note_startup_progress();
+        }
         if matches!(power, Err(UsbError::Timeout | UsbError::Disconnected)) {
             power?;
         }
