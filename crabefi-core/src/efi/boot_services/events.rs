@@ -360,8 +360,9 @@ pub(super) extern "efiapi" fn check_event(event: efi::Event) -> Status {
     log::trace!("BS.CheckEvent(event={:?}, slot={})", event, event_id);
 
     // Poll hardware without holding a table borrow: platform input can reenter.
-    // Advance USB hotplug so keyboards, mice and storage added after boot appear.
-    crate::drivers::usb::poll();
+    // Background discovery can register new input devices. It does not
+    // publish Block I/O handles for storage added while this app runs.
+    crate::exec::poll_background();
     let ready = match event_id {
         KEYBOARD_EVENT_ID => crate::efi::protocols::console::keyboard_check_ready(),
         #[cfg(feature = "ui")]

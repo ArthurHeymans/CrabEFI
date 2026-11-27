@@ -105,9 +105,10 @@ pub(crate) fn show_menu_for_mode<const NATIVE: bool>(menu: &mut BootMenu) -> Men
     #[cfg(feature = "ui")]
     let mut cursor_renderer = crate::cursor::CursorRenderer::new();
 
+    let storage_revision = crate::drivers::usb::storage_revision();
     loop {
-        // Poll for hotplugged/removed USB keyboards, mice, and storage.
-        if crate::drivers::usb::poll() {
+        crate::exec::poll_background();
+        if storage_revision != crate::drivers::usb::storage_revision() {
             return MenuAction::Refresh;
         }
         // Update mouse cursor on framebuffer

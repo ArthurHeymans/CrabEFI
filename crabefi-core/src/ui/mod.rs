@@ -35,12 +35,12 @@ pub mod secure_boot {
 static TEXT_SIZE: AtomicU8 = AtomicU8::new(0);
 
 struct FirmwareBackend {
-    last_storage_gen: u32,
+    entries_revision: u32,
 }
 impl FirmwareBackend {
     fn new() -> Self {
         Self {
-            last_storage_gen: crate::drivers::usb::storage_generation(),
+            entries_revision: crate::drivers::usb::storage_revision(),
         }
     }
 }
@@ -57,19 +57,14 @@ impl Backend for FirmwareBackend {
             / crate::time::counter_frequency().max(1) as u128) as u64
     }
     fn poll_frame(&mut self, _: &mut Context<'_>) -> Poll<()> {
-        crate::drivers::usb::poll();
+        crate::exec::poll_background();
         crate::time::delay_ms(8);
         Poll::Ready(())
     }
-    fn storage_changed(&mut self) -> bool {
-        let current = crate::drivers::usb::storage_generation();
-        if current != self.last_storage_gen {
-            self.last_storage_gen = current;
-            true
-        } else {
-            false
-        }
+    fn boot_entries_stale(&self) -> bool {
+        self.entries_revision != crate::drivers::usb::storage_revision()
     }
+
     fn text_size(&self) -> TextSize {
         match TEXT_SIZE.load(Ordering::Relaxed) {
             1 => TextSize::Large,
@@ -214,8 +209,10 @@ fn no_media_text(fb: &FramebufferConfig) -> bool {
     use crate::menu_common::{self, KeyPress};
     let mut console = Some(crate::framebuffer_console::FramebufferConsole::new(fb));
     let mut redraw = true;
+    let storage_revision = crate::drivers::usb::storage_revision();
     loop {
-        if crate::drivers::usb::poll() {
+        crate::exec::poll_background();
+        if storage_revision != crate::drivers::usb::storage_revision() {
             return true;
         }
         if redraw {

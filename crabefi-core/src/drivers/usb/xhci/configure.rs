@@ -1,6 +1,6 @@
 //! xHCI endpoint configuration by device class.
 
-use super::super::controller::{ConfigurationInfo, UsbController};
+use super::super::controller::ConfigurationInfo;
 use super::{TrbRing, XhciError};
 use crate::barrier;
 use crate::efi;
@@ -33,27 +33,14 @@ mod tests {
 }
 
 impl super::XhciController {
-    /// Fetch and parse the full configuration descriptor for a device
-    pub(super) fn get_config_descriptor(
-        &mut self,
-        slot_id: u8,
-    ) -> Result<ConfigurationInfo, XhciError> {
-        self.read_configuration(slot_id).map_err(|error| {
-            log::warn!(
-                "xHCI: configuration descriptor for slot {}: {:?}",
-                slot_id,
-                error
-            );
-            XhciError::UsbError
-        })
-    }
-
     /// Configure a mass storage device
     ///
     /// Uses the shared parse_configuration() infrastructure from controller.rs
-    pub(super) fn configure_mass_storage(&mut self, slot_id: u8) -> Result<(), XhciError> {
-        let config_info = self.get_config_descriptor(slot_id)?;
-
+    pub(super) fn configure_mass_storage(
+        &mut self,
+        slot_id: u8,
+        config_info: &ConfigurationInfo,
+    ) -> Result<(), XhciError> {
         // Find mass storage interface
         let mut bulk_in = 0u8;
         let mut bulk_out = 0u8;
@@ -97,9 +84,6 @@ impl super::XhciController {
             return Err(XhciError::DeviceNotFound);
         }
 
-        // Set configuration
-        self.set_configuration(slot_id, config_info.configuration_value)?;
-
         // Configure endpoints
         self.configure_bulk_endpoints(
             slot_id,
@@ -130,9 +114,11 @@ impl super::XhciController {
     /// Configure a HID keyboard device
     ///
     /// Uses the shared parse_configuration() infrastructure from controller.rs
-    pub(super) fn configure_hid_keyboard(&mut self, slot_id: u8) -> Result<(), XhciError> {
-        let config_info = self.get_config_descriptor(slot_id)?;
-
+    pub(super) fn configure_hid_keyboard(
+        &mut self,
+        slot_id: u8,
+        config_info: &ConfigurationInfo,
+    ) -> Result<(), XhciError> {
         // Find HID keyboard interface
         let mut interrupt_in = 0u8;
         let mut interrupt_max_packet = 0u16;
@@ -166,16 +152,6 @@ impl super::XhciController {
             return Err(XhciError::DeviceNotFound);
         }
 
-        // Do not reset another function's already-configured endpoints.
-        let already_configured = self
-            .slots
-            .get(slot_id as usize)
-            .and_then(Option::as_ref)
-            .is_some_and(|slot| slot.is_mass_storage || slot.is_hid_mouse);
-        if !already_configured {
-            self.set_configuration(slot_id, config_info.configuration_value)?;
-        }
-
         self.configure_hid_interrupt_endpoint(
             slot_id,
             interrupt_in,
@@ -202,9 +178,11 @@ impl super::XhciController {
     /// Configure a HID mouse device.
     ///
     /// Configure the interrupt pipe, shared with HID keyboards.
-    pub(super) fn configure_hid_mouse(&mut self, slot_id: u8) -> Result<(), XhciError> {
-        let config_info = self.get_config_descriptor(slot_id)?;
-
+    pub(super) fn configure_hid_mouse(
+        &mut self,
+        slot_id: u8,
+        config_info: &ConfigurationInfo,
+    ) -> Result<(), XhciError> {
         let mut interrupt_in = 0u8;
         let mut interrupt_max_packet = 0u16;
         let mut interrupt_interval = 0u8;
@@ -226,18 +204,6 @@ impl super::XhciController {
 
         if !found || interrupt_in == 0 {
             return Err(XhciError::DeviceNotFound);
-        }
-
-        // Set configuration (only if not already set by keyboard config)
-        let already_configured = self
-            .slots
-            .get(slot_id as usize)
-            .and_then(|s| s.as_deref())
-            .map(|s| s.is_hid_keyboard || s.is_mass_storage)
-            .unwrap_or(false);
-
-        if !already_configured {
-            self.set_configuration(slot_id, config_info.configuration_value)?;
         }
 
         self.configure_hid_interrupt_endpoint(

@@ -10,8 +10,8 @@
 //! - Device Class Drivers (MSC, HID) use the trait to communicate with devices
 //! - The core layer handles enumeration and device management
 
+use super::port::{self, Control};
 use crate::efi;
-use crate::time::Timeout;
 use core::ptr;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
@@ -605,121 +605,6 @@ pub struct UsbDeviceHandle {
     pub address: u8,
 }
 
-/// Hotplug event produced by a USB host controller.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum UsbHotplugEvent {
-    /// A newly enumerated device is ready at `address` (slot ID for xHCI).
-    Attached(u8),
-    /// The device previously at `address` has been disconnected and torn down.
-    Detached(u8),
-}
-
-/// Non-blocking per-root-port hotplug state for legacy controllers (EHCI/OHCI/UHCI).
-#[derive(Clone, Copy)]
-pub enum LegacyPortState {
-    /// No device attached.
-    Empty,
-    /// Connection seen; waiting for a stable 100 ms USB debounce window.
-    Debouncing {
-        stable_since: Timeout,
-        deadline: Timeout,
-    },
-    /// Device attached and active.
-    Attached,
-    /// Enumeration failed while connected; wait for disconnect before retrying.
-    Failed,
-}
-
-/// Action returned by [`LegacyPortState::step`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LegacyPortAction {
-    /// Keep waiting.
-    None,
-    /// Clear the port's connect-status-change bit.
-    ClearCsc,
-    /// Port disconnected (or bounced while attached); detach its device tree.
-    Detach,
-    /// Debounce finished; reset and attach the newly connected device.
-    Attach,
-}
-
-/// USB 2.0 debounce window for legacy root ports (ms).
-const LEGACY_DEBOUNCE_MS: u64 = 100;
-/// Maximum time a bouncing port stays in `Debouncing` before giving up (ms).
-const LEGACY_DEBOUNCE_TIMEOUT_MS: u64 = 1000;
-/// Hub hotplug poll interval for legacy controllers (ms).
-pub const LEGACY_HUB_POLL_INTERVAL_MS: u64 = 200;
-
-impl LegacyPortState {
-    /// Advance one legacy root port's state machine given its current `CCS` and `CSC` bits.
-    pub fn step(&mut self, connected: bool, csc: bool) -> LegacyPortAction {
-        match *self {
-            Self::Attached => {
-                if !connected || csc {
-                    *self = if connected {
-                        Self::Debouncing {
-                            stable_since: Timeout::from_ms(LEGACY_DEBOUNCE_MS),
-                            deadline: Timeout::from_ms(LEGACY_DEBOUNCE_TIMEOUT_MS),
-                        }
-                    } else {
-                        Self::Empty
-                    };
-                    LegacyPortAction::Detach
-                } else {
-                    LegacyPortAction::None
-                }
-            }
-            Self::Empty => {
-                if connected {
-                    *self = Self::Debouncing {
-                        stable_since: Timeout::from_ms(LEGACY_DEBOUNCE_MS),
-                        deadline: Timeout::from_ms(LEGACY_DEBOUNCE_TIMEOUT_MS),
-                    };
-                    if csc {
-                        LegacyPortAction::ClearCsc
-                    } else {
-                        LegacyPortAction::None
-                    }
-                } else if csc {
-                    LegacyPortAction::ClearCsc
-                } else {
-                    LegacyPortAction::None
-                }
-            }
-            Self::Debouncing {
-                stable_since,
-                deadline,
-            } => {
-                if !connected {
-                    *self = Self::Empty;
-                    LegacyPortAction::ClearCsc
-                } else if csc {
-                    *self = Self::Debouncing {
-                        stable_since: Timeout::from_ms(LEGACY_DEBOUNCE_MS),
-                        deadline,
-                    };
-                    LegacyPortAction::ClearCsc
-                } else if stable_since.is_expired() {
-                    LegacyPortAction::Attach
-                } else if deadline.is_expired() {
-                    *self = Self::Failed;
-                    LegacyPortAction::None
-                } else {
-                    LegacyPortAction::None
-                }
-            }
-            Self::Failed => {
-                if !connected {
-                    *self = Self::Empty;
-                    LegacyPortAction::ClearCsc
-                } else {
-                    LegacyPortAction::None
-                }
-            }
-        }
-    }
-}
-
 /// Allocate an unused USB address in `1..=127` for a legacy controller.
 pub fn allocate_legacy_address(devices: &[Option<UsbDevice>], next_address: &mut u8) -> Option<u8> {
     let mut candidate = if (1..=127).contains(next_address) {
@@ -739,29 +624,11 @@ pub fn allocate_legacy_address(devices: &[Option<UsbDevice>], next_address: &mut
     None
 }
 
-/// Snapshot all currently assigned addresses in a legacy device table.
-pub fn snapshot_legacy_addresses(devices: &[Option<UsbDevice>]) -> alloc::vec::Vec<u8> {
-    devices.iter().flatten().map(|dev| dev.address).collect()
-}
-
-/// Emit `Attached` events for every device in `devices` whose address was not in `before`.
-pub fn emit_new_legacy_devices(
-    devices: &[Option<UsbDevice>],
-    before: &[u8],
-    events: &mut alloc::vec::Vec<UsbHotplugEvent>,
-) {
-    for dev in devices.iter().flatten() {
-        if !before.contains(&dev.address) {
-            events.push(UsbHotplugEvent::Attached(dev.address));
-        }
-    }
-}
-
 /// Recursively detach a legacy USB device and any downstream hub children.
 pub fn detach_legacy_device(
     devices: &mut [Option<UsbDevice>],
     addr: u8,
-    events: &mut alloc::vec::Vec<UsbHotplugEvent>,
+    removed_devices: &mut alloc::vec::Vec<u8>,
 ) {
     let children: alloc::vec::Vec<u8> = devices
         .iter()
@@ -770,7 +637,7 @@ pub fn detach_legacy_device(
         .map(|dev| dev.address)
         .collect();
     for child in children {
-        detach_legacy_device(devices, child, events);
+        detach_legacy_device(devices, child, removed_devices);
     }
 
     let mut removed = false;
@@ -781,46 +648,7 @@ pub fn detach_legacy_device(
         }
     }
     if removed {
-        events.push(UsbHotplugEvent::Detached(addr));
-    }
-}
-
-/// Detach any root-port device (and its downstream hub tree) attached to `port`.
-pub fn detach_legacy_root_port(
-    devices: &mut [Option<UsbDevice>],
-    port: u8,
-    events: &mut alloc::vec::Vec<UsbHotplugEvent>,
-) {
-    let root_addrs: alloc::vec::Vec<u8> = devices
-        .iter()
-        .flatten()
-        .filter(|dev| dev.hub_addr == 0 && dev.port == port)
-        .map(|dev| dev.address)
-        .collect();
-    for addr in root_addrs {
-        detach_legacy_device(devices, addr, events);
-    }
-}
-
-/// Sync legacy root-port states from the initial device table.
-pub fn sync_legacy_port_states(
-    devices: &[Option<UsbDevice>],
-    states: &mut [LegacyPortState],
-    mut is_connected: impl FnMut(u8) -> bool,
-) {
-    for (port, state) in states.iter_mut().enumerate() {
-        let port_u8 = port as u8;
-        let has_device = devices
-            .iter()
-            .flatten()
-            .any(|dev| dev.hub_addr == 0 && dev.port == port_u8);
-        *state = if has_device {
-            LegacyPortState::Attached
-        } else if is_connected(port_u8) {
-            LegacyPortState::Failed
-        } else {
-            LegacyPortState::Empty
-        };
+        removed_devices.push(addr);
     }
 }
 
@@ -1086,10 +914,6 @@ pub trait UsbController {
     fn get_interrupt_endpoint(&self, device: u8) -> Option<EndpointInfo> {
         self.get_device(device).and_then(|h| h.interrupt_in)
     }
-
-    /// Advance non-blocking hotplug state (port debounce, resets, disconnects)
-    /// and append any newly attached or detached device addresses to `events`.
-    fn poll_hotplug(&mut self, _events: &mut alloc::vec::Vec<UsbHotplugEvent>) {}
 }
 
 /// Device information
@@ -1166,39 +990,12 @@ fn legacy_detach_removes_hub_children_recursively() {
     let mut devices = [Some(hub), Some(child), Some(unrelated)];
     let mut events = alloc::vec::Vec::new();
 
-    detach_legacy_root_port(&mut devices, 0, &mut events);
+    detach_legacy_device(&mut devices, 1, &mut events);
 
-    assert_eq!(
-        events,
-        [UsbHotplugEvent::Detached(2), UsbHotplugEvent::Detached(1)]
-    );
+    assert_eq!(events, [2, 1]);
     assert!(devices[0].is_none());
     assert!(devices[1].is_none());
     assert_eq!(devices[2].as_ref().map(|d| d.address), Some(3));
-}
-
-#[cfg(test)]
-#[test]
-fn legacy_port_state_handles_connect_detach_and_failed_recovery() {
-    let mut state = LegacyPortState::Empty;
-    assert_eq!(state.step(false, false), LegacyPortAction::None);
-    assert_eq!(state.step(true, true), LegacyPortAction::ClearCsc);
-    assert!(matches!(state, LegacyPortState::Debouncing { .. }));
-
-    // Disconnecting during debounce returns to Empty.
-    assert_eq!(state.step(false, false), LegacyPortAction::ClearCsc);
-    assert!(matches!(state, LegacyPortState::Empty));
-
-    // Disconnecting while attached emits Detach and resets to Empty.
-    state = LegacyPortState::Attached;
-    assert_eq!(state.step(false, true), LegacyPortAction::Detach);
-    assert!(matches!(state, LegacyPortState::Empty));
-
-    // A Failed port recovers once disconnected.
-    state = LegacyPortState::Failed;
-    assert_eq!(state.step(true, false), LegacyPortAction::None);
-    assert_eq!(state.step(false, false), LegacyPortAction::ClearCsc);
-    assert!(matches!(state, LegacyPortState::Empty));
 }
 
 /// Common USB device state shared across EHCI/OHCI/UHCI controllers
@@ -1228,8 +1025,6 @@ pub struct UsbDevice {
     pub is_hid_mouse: bool,
     /// Is USB hub
     pub is_hub: bool,
-    /// Number of hub ports (if is_hub)
-    pub num_hub_ports: u8,
     /// Bulk IN endpoint
     pub bulk_in: Option<EndpointInfo>,
     /// Bulk OUT endpoint
@@ -1264,7 +1059,6 @@ impl UsbDevice {
             is_hid_keyboard: false,
             is_hid_mouse: false,
             is_hub: false,
-            num_hub_ports: 0,
             bulk_in: None,
             bulk_out: None,
             interrupt_in: None,
@@ -1472,8 +1266,17 @@ fn read_configuration_with(
     mut read: impl FnMut(&mut [u8]) -> Result<usize, UsbError>,
 ) -> Result<ConfigurationInfo, UsbError> {
     let mut header = [0u8; 9];
-    if read(&mut header)? != header.len() || header[0] != 9 || header[1] != desc_type::CONFIGURATION
-    {
+    let actual = read(&mut header)?;
+    let length = configuration_length(&header, actual)?;
+    let mut buffer = alloc::vec![0; length];
+    if read(&mut buffer)? != length {
+        return Err(UsbError::InvalidParameter);
+    }
+    parse_configuration_checked(&buffer)
+}
+
+pub(super) fn configuration_length(header: &[u8; 9], actual: usize) -> Result<usize, UsbError> {
+    if actual != header.len() || header[0] != 9 || header[1] != desc_type::CONFIGURATION {
         return Err(UsbError::InvalidParameter);
     }
     let length = u16::from_le_bytes([header[2], header[3]]) as usize;
@@ -1483,11 +1286,7 @@ fn read_configuration_with(
     if length > MAX_CONFIGURATION_DESCRIPTOR_SIZE {
         return Err(UsbError::NotSupported);
     }
-    let mut buffer = alloc::vec![0; length];
-    if read(&mut buffer)? != length {
-        return Err(UsbError::InvalidParameter);
-    }
-    parse_configuration_checked(&buffer)
+    Ok(length)
 }
 
 pub fn parse_configuration_checked(config_data: &[u8]) -> Result<ConfigurationInfo, UsbError> {
@@ -1781,75 +1580,45 @@ impl InterfaceInfo {
 ///
 /// # Returns
 /// The fully enumerated UsbDevice on success, or an error
-pub fn enumerate_device<F>(
+pub(super) async fn enumerate_device(
     mut device: UsbDevice,
     address: u8,
-    mut do_control: F,
-) -> Result<UsbDevice, UsbError>
-where
-    F: FnMut(&UsbDevice, u8, u8, u16, u16, Option<&mut [u8]>) -> Result<usize, UsbError>,
-{
-    if address >= 128 {
-        return Err(UsbError::NoFreeSlots);
+    mut control: impl AsyncFnMut(&UsbDevice, Control, Option<&mut [u8]>) -> Result<usize, UsbError>,
+) -> Result<UsbDevice, UsbError> {
+    let get_device = Control::descriptor(req_type::RCPT_DEVICE, desc_type::DEVICE, 0);
+    let mut short = [0; 8];
+    if control(&device, get_device, Some(&mut short)).await? != short.len() {
+        return Err(UsbError::InvalidParameter);
     }
-
-    // Step 1: Get initial device descriptor (first 8 bytes) to learn EP0 max packet size
-    let mut desc_buf = [0u8; 8];
-    do_control(
+    device.ep0_max_packet = u16::from(short[7].max(8));
+    control(
         &device,
-        req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
-        request::GET_DESCRIPTOR,
-        (desc_type::DEVICE as u16) << 8,
-        0,
-        Some(&mut desc_buf),
-    )?;
-
-    device.ep0_max_packet = desc_buf[7].max(8) as u16;
-
-    // Step 2: Set address
-    do_control(
-        &device,
-        req_type::DIR_OUT | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
-        request::SET_ADDRESS,
-        address as u16,
-        0,
+        Control::new(
+            req_type::RCPT_DEVICE,
+            request::SET_ADDRESS,
+            u16::from(address),
+            0,
+        ),
         None,
-    )?;
-
-    crate::time::delay_ms(2);
+    )
+    .await?;
+    crate::exec::sleep_ms(2).await;
     device.address = address;
 
-    // Step 3: Get full device descriptor (18 bytes)
-    let mut desc_buf = [0u8; 18];
-    do_control(
-        &device,
-        req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
-        request::GET_DESCRIPTOR,
-        (desc_type::DEVICE as u16) << 8,
-        0,
-        Some(&mut desc_buf),
-    )?;
-
-    device.device_desc = match DeviceDescriptor::read_from_prefix(&desc_buf) {
-        Ok((d, _)) => d,
-        Err(_) => return Err(UsbError::TransferFailed(0)),
-    };
-
+    let mut descriptor = [0; 18];
+    if control(&device, get_device, Some(&mut descriptor)).await? != descriptor.len() {
+        return Err(UsbError::InvalidParameter);
+    }
+    device.device_desc =
+        DeviceDescriptor::read_from_bytes(&descriptor).map_err(|_| UsbError::InvalidParameter)?;
     let vid = device.device_desc.vendor_id;
     let pid = device.device_desc.product_id;
     log::info!("  Device {}: VID={:04x} PID={:04x}", address, vid, pid);
 
-    // Step 4: Get configuration descriptor
-    device.config_info = read_configuration_with(|buffer| {
-        do_control(
-            &device,
-            req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
-            request::GET_DESCRIPTOR,
-            (desc_type::CONFIGURATION as u16) << 8,
-            0,
-            Some(buffer),
-        )
-    })?;
+    let get_config = Control::descriptor(req_type::RCPT_DEVICE, desc_type::CONFIGURATION, 0);
+    device.config_info =
+        port::read_configuration(async |buffer| control(&device, get_config, Some(buffer)).await)
+            .await?;
 
     // Check if this is a hub (device class)
     if device.device_desc.device_class == class::HUB {
@@ -1881,219 +1650,18 @@ where
 
     // Step 6: Set configuration
     if device.config_info.configuration_value > 0 {
-        do_control(
+        control(
             &device,
-            req_type::DIR_OUT | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
-            request::SET_CONFIGURATION,
-            device.config_info.configuration_value as u16,
-            0,
+            Control::new(
+                req_type::RCPT_DEVICE,
+                request::SET_CONFIGURATION,
+                u16::from(device.config_info.configuration_value),
+                0,
+            ),
             None,
-        )?;
+        )
+        .await?;
     }
 
     Ok(device)
-}
-
-// ============================================================================
-// Hub Enumeration Helper
-// ============================================================================
-
-/// Maximum number of downstream hub ports tracked per hub.
-///
-/// USB 2.0 compound devices may have up to 7 ports; USB 3.x hubs up to 15.
-/// 16 covers all realistic cases without heap allocation.
-const MAX_HUB_PORTS: usize = 16;
-
-/// Enumerate devices connected to an external USB hub.
-///
-/// Encapsulates the protocol sequence shared by EHCI and UHCI: fetch the hub
-/// descriptor, power all downstream ports, wait for power stabilisation, then
-/// for each port that has a device connected — clear the connection-change bit,
-/// issue a port reset, and record the result.
-///
-/// The second closure problem (two `&mut self` borrows at once) is avoided by
-/// returning the list of ready ports rather than calling a second closure
-/// inline. The caller iterates the returned list and enumerates each device
-/// separately, after `enumerate_hub_ports` has returned and released the
-/// `do_control` borrow.
-///
-/// # Arguments
-/// * `hub_device` - The hub's [`UsbDevice`] (used as the transfer target)
-/// * `do_control` - Performs a control transfer on behalf of the caller
-/// * `supports_high_speed` - `true` for EHCI; `false` for UHCI (USB 1.1 only)
-///
-/// # Returns
-/// `Ok((num_ports, ready_ports))` where `ready_ports` is the list of
-/// `(port, speed)` pairs for ports whose reset completed successfully.
-pub fn enumerate_hub_ports<C>(
-    hub_device: &UsbDevice,
-    mut do_control: C,
-    supports_high_speed: bool,
-) -> Result<(u8, heapless::Vec<(u8, UsbSpeed), MAX_HUB_PORTS>), UsbError>
-where
-    C: FnMut(&UsbDevice, u8, u8, u16, u16, Option<&mut [u8]>) -> Result<usize, UsbError>,
-{
-    // Fetch hub class descriptor (bmRequestType = 0xA0: D→H, Class, Device).
-    let mut hub_desc_buf = [0u8; 9];
-    do_control(
-        hub_device,
-        req_type::DIR_IN | req_type::TYPE_CLASS | req_type::RCPT_DEVICE,
-        request::GET_DESCRIPTOR,
-        (HUB_DESCRIPTOR_TYPE as u16) << 8,
-        0,
-        Some(&mut hub_desc_buf),
-    )?;
-
-    let (hub_desc, _) =
-        HubDescriptor::read_from_prefix(&hub_desc_buf).map_err(|_| UsbError::TransferFailed(0))?;
-    let num_ports = hub_desc.num_ports;
-    let power_on_delay = (hub_desc.power_on_to_power_good as u64) * 2; // 2 ms units
-
-    log::info!(
-        "  Hub has {} ports, power-on delay: {}ms",
-        num_ports,
-        power_on_delay
-    );
-
-    let mut ready_ports: heapless::Vec<(u8, UsbSpeed), MAX_HUB_PORTS> = heapless::Vec::new();
-
-    // Power on all downstream ports (SET_FEATURE PORT_POWER).
-    for port in 1..=num_ports {
-        let _ = do_control(
-            hub_device,
-            req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
-            request::SET_FEATURE,
-            hub_feature::PORT_POWER,
-            port as u16,
-            None,
-        );
-    }
-
-    // Wait for power to stabilise (spec minimum 100 ms).
-    crate::time::delay_ms(power_on_delay.max(100));
-
-    // Check each port for a connected device and enumerate it.
-    for port in 1..=num_ports {
-        let mut status_buf = [0u8; 4];
-        if do_control(
-            hub_device,
-            req_type::DIR_IN | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
-            request::GET_STATUS,
-            0,
-            port as u16,
-            Some(&mut status_buf),
-        )
-        .is_err()
-        {
-            continue;
-        }
-
-        let port_status = u16::from_le_bytes([status_buf[0], status_buf[1]]);
-        let port_change = u16::from_le_bytes([status_buf[2], status_buf[3]]);
-
-        log::debug!(
-            "  Hub port {} status: {:#06x}, change: {:#06x}",
-            port,
-            port_status,
-            port_change
-        );
-
-        if (port_status & hub_port_status::CONNECTION) == 0 {
-            continue;
-        }
-
-        log::info!("  Device detected on hub port {}", port);
-
-        // Clear the connection-change bit if set.
-        if port_change & hub_port_change::C_CONNECTION != 0 {
-            let _ = do_control(
-                hub_device,
-                req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
-                request::CLEAR_FEATURE,
-                hub_feature::C_PORT_CONNECTION,
-                port as u16,
-                None,
-            );
-        }
-
-        // Issue a port reset (SET_FEATURE PORT_RESET).
-        if do_control(
-            hub_device,
-            req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
-            request::SET_FEATURE,
-            hub_feature::PORT_RESET,
-            port as u16,
-            None,
-        )
-        .is_err()
-        {
-            continue;
-        }
-
-        // Wait at least 50 ms then poll for C_PORT_RESET.
-        crate::time::delay_ms(50);
-
-        let mut reset_complete = false;
-        let timeout = Timeout::from_ms(500);
-        while !timeout.is_expired() {
-            let mut status_buf = [0u8; 4];
-            if do_control(
-                hub_device,
-                req_type::DIR_IN | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
-                request::GET_STATUS,
-                0,
-                port as u16,
-                Some(&mut status_buf),
-            )
-            .is_err()
-            {
-                break;
-            }
-
-            let port_status = u16::from_le_bytes([status_buf[0], status_buf[1]]);
-            let port_change = u16::from_le_bytes([status_buf[2], status_buf[3]]);
-
-            if port_change & hub_port_change::C_RESET != 0 {
-                // Acknowledge the reset-complete change bit.
-                let _ = do_control(
-                    hub_device,
-                    req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
-                    request::CLEAR_FEATURE,
-                    hub_feature::C_PORT_RESET,
-                    port as u16,
-                    None,
-                );
-
-                if (port_status & hub_port_status::ENABLE) != 0 {
-                    // Determine device speed from port status bits.
-                    let speed = if supports_high_speed
-                        && (port_status & hub_port_status::HIGH_SPEED) != 0
-                    {
-                        UsbSpeed::High
-                    } else if (port_status & hub_port_status::LOW_SPEED) != 0 {
-                        UsbSpeed::Low
-                    } else {
-                        UsbSpeed::Full
-                    };
-
-                    log::info!("  Hub port {} reset complete, speed: {:?}", port, speed);
-
-                    crate::time::delay_ms(10); // USB spec reset-recovery time
-                    // Overflow is silently ignored: more than MAX_HUB_PORTS
-                    // ready devices on a single hub is not realistic.
-                    let _ = ready_ports.push((port, speed));
-                    reset_complete = true;
-                }
-                break;
-            }
-
-            crate::time::delay_ms(10);
-        }
-
-        if !reset_complete {
-            log::warn!("  Hub port {} reset timed out", port);
-        }
-    }
-
-    Ok((num_ports, ready_ports))
 }

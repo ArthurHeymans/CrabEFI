@@ -1,12 +1,10 @@
 //! xHCI control transfers and descriptors.
 
-use super::super::controller::{DeviceDescriptor, desc_type, req_type, request};
 use super::{TrbRing, XhciError};
 use crate::barrier;
 use crate::drivers::pci;
 use crate::efi::dma::{DmaBuffer, DmaDirection, DmaMask};
 use xhci::ring::trb::{command, transfer};
-use zerocopy::FromBytes;
 
 const TRB_BOUNDARY: usize = 0x10000;
 
@@ -248,62 +246,6 @@ impl super::XhciController {
         barrier::mmio_write();
         self.ring_doorbell(0, 0);
         self.wait_command_completion()?;
-        Ok(())
-    }
-
-    /// Get the device descriptor.
-    pub(super) fn get_device_descriptor(
-        &mut self,
-        slot_id: u8,
-    ) -> Result<DeviceDescriptor, XhciError> {
-        let mut desc = [0u8; 18];
-
-        // First, get just 8 bytes to determine max packet size.
-        let mut short_desc = [0u8; 8];
-        self.control_transfer(
-            slot_id,
-            req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
-            request::GET_DESCRIPTOR,
-            (desc_type::DEVICE as u16) << 8,
-            0,
-            Some(&mut short_desc),
-        )?;
-
-        let full_speed = self
-            .slots
-            .get(slot_id as usize)
-            .and_then(|slot| slot.as_deref())
-            .is_some_and(|slot| !slot.is_superspeed && slot.speed == 1);
-        if full_speed {
-            self.update_full_speed_ep0_max_packet(slot_id, short_desc[7] as u16)?;
-        }
-
-        // Now get full descriptor
-        self.control_transfer(
-            slot_id,
-            req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
-            request::GET_DESCRIPTOR,
-            (desc_type::DEVICE as u16) << 8,
-            0,
-            Some(&mut desc),
-        )?;
-
-        // Parse device descriptor using zerocopy
-        DeviceDescriptor::read_from_prefix(&desc)
-            .map(|(d, _)| d)
-            .map_err(|_| XhciError::InvalidParameter)
-    }
-
-    /// Set configuration
-    pub(super) fn set_configuration(&mut self, slot_id: u8, config: u8) -> Result<(), XhciError> {
-        self.control_transfer(
-            slot_id,
-            req_type::DIR_OUT | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
-            request::SET_CONFIGURATION,
-            config as u16,
-            0,
-            None,
-        )?;
         Ok(())
     }
 }

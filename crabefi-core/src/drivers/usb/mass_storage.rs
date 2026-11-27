@@ -7,8 +7,10 @@
 //! `UsbController` trait (xHCI, EHCI, OHCI, UHCI).
 
 use super::controller::{UsbController, UsbError};
+use super::port::{self, Pipe};
 use crate::cell::Local;
 use crate::time;
+use core::num::NonZeroU64;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 #[cfg(test)]
@@ -198,6 +200,49 @@ fn rw_16_cdb(opcode: u8, lba: u64, count: u32) -> [u8; 16] {
     ]
 }
 
+const SYNCHRONIZE_CACHE: [u8; 10] = [scsi_cmd::SYNCHRONIZE_CACHE_10, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+/// Both callers use the same BOT sequence. A published disk has a synchronous
+/// EFI interface; discovery instead takes a fresh controller borrow for each
+/// transfer, and consumes at most one USB transfer budget per idle poll.
+enum Transport<'a> {
+    Foreground(&'a mut dyn UsbController),
+    Discovery(usize),
+}
+
+impl Transport<'_> {
+    async fn operation<T>(
+        &mut self,
+        f: impl FnOnce(&mut dyn UsbController) -> Result<T, UsbError>,
+    ) -> Result<T, UsbError> {
+        match self {
+            Self::Foreground(controller) => f(*controller),
+            Self::Discovery(index) => {
+                port::transfer().await;
+                super::with_controller(*index, f).ok_or(UsbError::Disconnected)?
+            }
+        }
+    }
+
+    async fn pause(&self, ms: u64) {
+        match self {
+            Self::Foreground(_) => time::delay_ms(ms),
+            Self::Discovery(_) => crate::exec::sleep_ms(ms).await,
+        }
+    }
+}
+
+// Foreground transports never return Pending, including during BOT recovery.
+// Do not start a nested busy-poll executor from a protocol callback.
+fn synchronous<T>(future: impl core::future::Future<Output = T>) -> T {
+    let mut future = core::pin::pin!(future);
+    let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+    match future.as_mut().poll(&mut cx) {
+        core::task::Poll::Ready(value) => value,
+        core::task::Poll::Pending => unreachable!("foreground BOT operations are synchronous"),
+    }
+}
+
 impl UsbMassStorage {
     /// Create a new USB mass storage device from any USB controller
     ///
@@ -205,6 +250,15 @@ impl UsbMassStorage {
     /// * `controller` - Any USB controller implementing the UsbController trait
     /// * `device_addr` - Device address (slot ID for xHCI, device address for others)
     pub fn new(
+        controller: &mut dyn UsbController,
+        device_addr: u8,
+    ) -> Result<Self, MassStorageError> {
+        let mut device = Self::from_controller(controller, device_addr)?;
+        synchronous(device.init(&mut Transport::Foreground(controller)))?;
+        Ok(device)
+    }
+
+    fn from_controller(
         controller: &mut dyn UsbController,
         device_addr: u8,
     ) -> Result<Self, MassStorageError> {
@@ -222,7 +276,7 @@ impl UsbMassStorage {
             .get_bulk_endpoints(device_addr)
             .ok_or(MassStorageError::NotReady)?;
 
-        let mut device = Self {
+        Ok(Self {
             device_addr,
             bulk_in: bulk_in_ep.number,
             bulk_out: bulk_out_ep.number,
@@ -237,16 +291,10 @@ impl UsbMassStorage {
             write_buffer: alloc::vec::Vec::new(),
             vendor: [0; 8],
             product: [0; 16],
-        };
-
-        // Initialize the device
-        device.init(controller)?;
-
-        Ok(device)
+        })
     }
 
-    /// Initialize the device
-    fn init(&mut self, controller: &mut dyn UsbController) -> Result<(), MassStorageError> {
+    async fn init(&mut self, transport: &mut Transport<'_>) -> Result<(), MassStorageError> {
         log::debug!(
             "USB Mass Storage: init device={} bulk_in={} bulk_out={}",
             self.device_addr,
@@ -258,7 +306,7 @@ impl UsbMassStorage {
         let mut ready = false;
         let mut readiness_error = MassStorageError::NotReady;
         for attempt in 0..5 {
-            match self.test_unit_ready(controller) {
+            match self.test_unit_ready(transport).await {
                 Ok(()) => {
                     log::debug!(
                         "USB Mass Storage: TEST_UNIT_READY succeeded on attempt {}",
@@ -275,7 +323,7 @@ impl UsbMassStorage {
                     );
                     readiness_error = error;
                     // Delay 100ms between retries
-                    time::delay_ms(100);
+                    transport.pause(100).await;
                 }
             }
         }
@@ -287,24 +335,29 @@ impl UsbMassStorage {
 
         // Inquiry
         log::debug!("USB Mass Storage: sending INQUIRY");
-        self.inquiry(controller)?;
+        self.inquiry(transport).await?;
         log::debug!(
             "USB Mass Storage: INQUIRY succeeded, vendor={:?}",
             core::str::from_utf8(&self.vendor).unwrap_or("?").trim()
         );
 
         log::debug!("USB Mass Storage: sending READ_CAPACITY");
-        self.read_capacity(controller)?;
+        self.read_capacity(transport).await?;
         log::debug!(
             "USB Mass Storage: READ_CAPACITY succeeded, blocks={} size={}",
             self.num_blocks,
             self.block_size
         );
 
-        self.read_only = self.query_write_protection(controller).unwrap_or(true);
+        self.read_only = self.query_write_protection(transport).await.unwrap_or(true);
         // If cache durability cannot be established, keep this device read-only.
-        if !self.read_only && self.synchronize_cache(controller).is_err() {
-            self.request_sense(controller);
+        if !self.read_only
+            && self
+                .scsi_command_with(transport, &SYNCHRONIZE_CACHE, None, false)
+                .await
+                .is_err()
+        {
+            self.request_sense_with(transport).await;
             self.read_only = true;
         }
 
@@ -336,46 +389,55 @@ impl UsbMassStorage {
     ///
     /// This is the same sequence used by EDK2 (UsbBotResetDevice) and
     /// Linux (usb_stor_Bulk_reset + usb_stor_reset_common).
-    fn bot_reset_recovery(
+    async fn bot_reset_recovery_with(
         &mut self,
-        controller: &mut dyn UsbController,
+        transport: &mut Transport<'_>,
     ) -> Result<(), MassStorageError> {
         log::debug!("USB BOT: Performing reset recovery");
 
         // Step 1: Send class-specific Bulk-Only Mass Storage Reset
         // bmRequestType=0x21 (class, interface), bRequest=0xFF, wValue=0, wIndex=interface
-        controller.control_transfer(
-            self.device_addr,
-            0x21,                         // Class request, Host-to-Device, Interface
-            0xFF,                         // Bulk-Only Mass Storage Reset
-            0,                            // wValue
-            self.interface_number as u16, // wIndex = interface number
-            None,                         // No data
-        )?;
+        transport
+            .operation(|controller| {
+                controller.control_transfer(
+                    self.device_addr,
+                    0x21,                         // Class request, Host-to-Device, Interface
+                    0xFF,                         // Bulk-Only Mass Storage Reset
+                    0,                            // wValue
+                    self.interface_number as u16, // wIndex = interface number
+                    None,                         // No data
+                )
+            })
+            .await?;
 
         // Step 2: Wait for device recovery (EDK2 uses 100ms, Linux uses 6 seconds)
-        time::delay_ms(100);
+        transport.pause(100).await;
 
         // Steps 3-4: clear both bulk endpoint halts. The host-controller
         // implementation also restores any software/HCD endpoint state.
-        controller.clear_endpoint_halt(self.device_addr, self.bulk_in, true)?;
-        controller.clear_endpoint_halt(self.device_addr, self.bulk_out, false)?;
+        self.clear_endpoint_halt(transport, self.bulk_in, true)
+            .await?;
+        self.clear_endpoint_halt(transport, self.bulk_out, false)
+            .await?;
 
         log::debug!("USB BOT: Reset recovery complete");
         Ok(())
     }
 
     /// Clear a stalled endpoint before continuing BOT recovery.
-    fn clear_endpoint_halt(
+    async fn clear_endpoint_halt(
         &self,
-        controller: &mut dyn UsbController,
+        transport: &mut Transport<'_>,
         endpoint: u8,
         is_in: bool,
     ) -> Result<(), MassStorageError> {
         let endpoint_address = endpoint | if is_in { 0x80 } else { 0 };
         log::debug!("USB BOT: Clearing halt on endpoint {:#x}", endpoint_address);
-        controller
-            .clear_endpoint_halt(self.device_addr, endpoint, is_in)
+        transport
+            .operation(|controller| {
+                controller.clear_endpoint_halt(self.device_addr, endpoint, is_in)
+            })
+            .await
             .map_err(MassStorageError::from)
     }
 
@@ -389,9 +451,9 @@ impl UsbMassStorage {
     /// - Phase errors and invalid CSW trigger BOT Reset Recovery
     // Sequential CBW field setup reads clearer than one large struct literal.
     #[allow(clippy::field_reassign_with_default)]
-    fn scsi_command(
+    async fn scsi_command_with(
         &mut self,
-        controller: &mut dyn UsbController,
+        transport: &mut Transport<'_>,
         cdb: &[u8],
         data: Option<&mut [u8]>,
         is_read: bool,
@@ -423,17 +485,22 @@ impl UsbMassStorage {
         let mut cbw_buf = [0u8; 31];
         cbw_buf.copy_from_slice(IntoBytes::as_bytes(&cbw));
 
-        match controller.bulk_transfer(self.device_addr, self.bulk_out, false, &mut cbw_buf) {
+        match transport
+            .operation(|controller| {
+                controller.bulk_transfer(self.device_addr, self.bulk_out, false, &mut cbw_buf)
+            })
+            .await
+        {
             Ok(n) if n == cbw_buf.len() => {}
             Ok(_) => {
-                self.bot_reset_recovery(controller)?;
+                self.bot_reset_recovery_with(transport).await?;
                 return Err(MassStorageError::ShortTransfer);
             }
             Err(e) => {
                 log::debug!("USB SCSI: CBW transfer failed: {:?}", e);
                 if matches!(e, UsbError::Stall) {
                     // Per BOT spec 5.3.1: Bulk-Out stall requires Reset Recovery.
-                    self.bot_reset_recovery(controller)?;
+                    self.bot_reset_recovery_with(transport).await?;
                 }
                 return Err(MassStorageError::Usb(e));
             }
@@ -444,22 +511,27 @@ impl UsbMassStorage {
         // attempt to read the CSW. The device may have a CSW ready regardless.
         let mut data_phase_error: Option<UsbError> = None;
         let transferred = if let Some(buf) = data {
-            match controller.bulk_transfer(
-                self.device_addr,
-                if is_read { self.bulk_in } else { self.bulk_out },
-                is_read,
-                buf,
-            ) {
+            match transport
+                .operation(|controller| {
+                    controller.bulk_transfer(
+                        self.device_addr,
+                        if is_read { self.bulk_in } else { self.bulk_out },
+                        is_read,
+                        buf,
+                    )
+                })
+                .await
+            {
                 Ok(n) => n,
                 Err(e) => {
                     log::debug!("USB SCSI: Data phase failed: {:?}", e);
                     if matches!(e, UsbError::Stall) {
                         // Per EDK2's UsbBotDataTransfer: clear the stalled endpoint
                         let ep = if is_read { self.bulk_in } else { self.bulk_out };
-                        self.clear_endpoint_halt(controller, ep, is_read)?;
+                        self.clear_endpoint_halt(transport, ep, is_read).await?;
                     } else if matches!(e, UsbError::Timeout) {
                         // Per EDK2: timeout during data phase triggers full reset
-                        self.bot_reset_recovery(controller)?;
+                        self.bot_reset_recovery_with(transport).await?;
                         return Err(MassStorageError::Usb(e));
                     }
                     // For babble and transaction errors: continue to CSW phase
@@ -474,16 +546,24 @@ impl UsbMassStorage {
 
         // Phase 3: Receive CSW (IN) — always attempted per BOT spec
         let mut csw_buf = [0u8; 13];
-        let csw_result =
-            controller.bulk_transfer(self.device_addr, self.bulk_in, true, &mut csw_buf);
+        let csw_result = transport
+            .operation(|controller| {
+                controller.bulk_transfer(self.device_addr, self.bulk_in, true, &mut csw_buf)
+            })
+            .await;
 
         // Handle CSW transfer errors with retry (like EDK2's 3-retry loop)
         let csw_result = match csw_result {
             Ok(n) => Ok(n),
             Err(UsbError::Stall) => {
                 // Per EDK2: clear the stall and retry CSW once
-                self.clear_endpoint_halt(controller, self.bulk_in, true)?;
-                controller.bulk_transfer(self.device_addr, self.bulk_in, true, &mut csw_buf)
+                self.clear_endpoint_halt(transport, self.bulk_in, true)
+                    .await?;
+                transport
+                    .operation(|controller| {
+                        controller.bulk_transfer(self.device_addr, self.bulk_in, true, &mut csw_buf)
+                    })
+                    .await
             }
             Err(e) => Err(e),
         };
@@ -493,7 +573,7 @@ impl UsbMassStorage {
             Err(e) => {
                 log::debug!("USB SCSI: CSW transfer failed: {:?}", e);
                 // CSW transfer failed even after retry — perform full reset recovery
-                self.bot_reset_recovery(controller)?;
+                self.bot_reset_recovery_with(transport).await?;
                 // Return the original data phase error if there was one
                 return Err(MassStorageError::Usb(data_phase_error.unwrap_or(e)));
             }
@@ -504,7 +584,7 @@ impl UsbMassStorage {
                 csw_len,
                 csw_buf.len()
             );
-            self.bot_reset_recovery(controller)?;
+            self.bot_reset_recovery_with(transport).await?;
             return Err(MassStorageError::InvalidCsw);
         }
 
@@ -535,7 +615,7 @@ impl UsbMassStorage {
                 CSW_SIGNATURE
             );
             // Invalid CSW requires Reset Recovery per BOT spec
-            self.bot_reset_recovery(controller)?;
+            self.bot_reset_recovery_with(transport).await?;
             return Err(MassStorageError::InvalidCsw);
         }
 
@@ -545,7 +625,7 @@ impl UsbMassStorage {
                 csw_tag,
                 cbw_tag
             );
-            self.bot_reset_recovery(controller)?;
+            self.bot_reset_recovery_with(transport).await?;
             return Err(MassStorageError::InvalidCsw);
         }
 
@@ -568,7 +648,7 @@ impl UsbMassStorage {
                 csw_residue,
                 data_len
             );
-            self.bot_reset_recovery(controller)?;
+            self.bot_reset_recovery_with(transport).await?;
             return Err(MassStorageError::InvalidCsw);
         }
 
@@ -584,33 +664,34 @@ impl UsbMassStorage {
             csw_status::PHASE_ERROR => {
                 log::debug!("USB SCSI: Phase error for command {:#04x}", cdb[0]);
                 // Phase error requires Reset Recovery per BOT spec
-                self.bot_reset_recovery(controller)?;
+                self.bot_reset_recovery_with(transport).await?;
                 Err(MassStorageError::PhaseError)
             }
             _ => {
                 log::debug!("USB SCSI: Unknown CSW status {}", csw_stat);
-                self.bot_reset_recovery(controller)?;
+                self.bot_reset_recovery_with(transport).await?;
                 Err(MassStorageError::InvalidCsw)
             }
         }
     }
 
     /// Test Unit Ready command
-    fn test_unit_ready(
+    async fn test_unit_ready(
         &mut self,
-        controller: &mut dyn UsbController,
+        transport: &mut Transport<'_>,
     ) -> Result<(), MassStorageError> {
         let cdb = [scsi_cmd::TEST_UNIT_READY, 0, 0, 0, 0, 0];
-        self.scsi_command(controller, &cdb, None, false)?;
+        self.scsi_command_with(transport, &cdb, None, false).await?;
         Ok(())
     }
 
     /// Inquiry command
-    fn inquiry(&mut self, controller: &mut dyn UsbController) -> Result<(), MassStorageError> {
+    async fn inquiry(&mut self, transport: &mut Transport<'_>) -> Result<(), MassStorageError> {
         let cdb = [scsi_cmd::INQUIRY, 0, 0, 0, 36, 0]; // Request 36 bytes
         let mut response = [0u8; 36];
 
-        self.scsi_command(controller, &cdb, Some(&mut response), true)?;
+        self.scsi_command_with(transport, &cdb, Some(&mut response), true)
+            .await?;
 
         // Parse inquiry response using zerocopy
         if let Ok((inquiry, _)) = InquiryResponse::read_from_prefix(&response) {
@@ -621,15 +702,16 @@ impl UsbMassStorage {
         Ok(())
     }
 
-    fn request_sense(&mut self, controller: &mut dyn UsbController) -> Option<u8> {
+    async fn request_sense_with(&mut self, transport: &mut Transport<'_>) -> Option<u8> {
         let mut response = [0u8; 18];
         let result = self
-            .scsi_command(
-                controller,
+            .scsi_command_with(
+                transport,
                 &[scsi_cmd::REQUEST_SENSE, 0, 0, 0, 18, 0],
                 Some(&mut response),
                 true,
             )
+            .await
             .ok()?;
         if result.transferred < 3 {
             return None;
@@ -641,29 +723,33 @@ impl UsbMassStorage {
         }
     }
 
-    fn query_write_protection(&mut self, controller: &mut dyn UsbController) -> Option<bool> {
+    async fn query_write_protection(&mut self, transport: &mut Transport<'_>) -> Option<bool> {
         let mut header6 = [0u8; 4];
-        if let Ok(result) = self.scsi_command(
-            controller,
-            &[scsi_cmd::MODE_SENSE_6, 8, 0x3f, 0, 4, 0],
-            Some(&mut header6),
-            true,
-        ) && result.transferred == header6.len()
+        if let Ok(result) = self
+            .scsi_command_with(
+                transport,
+                &[scsi_cmd::MODE_SENSE_6, 8, 0x3f, 0, 4, 0],
+                Some(&mut header6),
+                true,
+            )
+            .await
+            && result.transferred == header6.len()
             && result.residue == 0
             && header6[0] >= 3
         {
             return Some(header6[2] & 0x80 != 0);
         }
         // Clear CHECK CONDITION before trying the alternative command.
-        self.request_sense(controller);
+        self.request_sense_with(transport).await;
         let mut header10 = [0u8; 8];
         let result = self
-            .scsi_command(
-                controller,
+            .scsi_command_with(
+                transport,
                 &[scsi_cmd::MODE_SENSE_10, 8, 0x3f, 0, 0, 0, 0, 0, 8, 0],
                 Some(&mut header10),
                 true,
             )
+            .await
             .ok()?;
         (result.transferred == header10.len()
             && result.residue == 0
@@ -672,14 +758,15 @@ impl UsbMassStorage {
     }
 
     /// Read Capacity command
-    fn read_capacity(
+    async fn read_capacity(
         &mut self,
-        controller: &mut dyn UsbController,
+        transport: &mut Transport<'_>,
     ) -> Result<(), MassStorageError> {
         let cdb = [scsi_cmd::READ_CAPACITY_10, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let mut response = [0u8; 8];
 
-        self.scsi_command(controller, &cdb, Some(&mut response), true)?;
+        self.scsi_command_with(transport, &cdb, Some(&mut response), true)
+            .await?;
 
         // Parse capacity response using zerocopy
         let cap = ReadCapacity10Response::read_from_prefix(&response)
@@ -695,16 +782,16 @@ impl UsbMassStorage {
 
         // If last_lba is 0xFFFFFFFF, we need READ CAPACITY 16
         if last_lba == 0xFFFFFFFF {
-            self.read_capacity_16(controller)?;
+            self.read_capacity_16(transport).await?;
         }
 
         Ok(())
     }
 
     /// Read Capacity 16 command (for large drives)
-    fn read_capacity_16(
+    async fn read_capacity_16(
         &mut self,
-        controller: &mut dyn UsbController,
+        transport: &mut Transport<'_>,
     ) -> Result<(), MassStorageError> {
         let mut cdb = [0u8; 16];
         cdb[0] = scsi_cmd::READ_CAPACITY_16;
@@ -712,7 +799,8 @@ impl UsbMassStorage {
         cdb[13] = 32; // Allocation length
 
         let mut response = [0u8; 32];
-        self.scsi_command(controller, &cdb, Some(&mut response), true)?;
+        self.scsi_command_with(transport, &cdb, Some(&mut response), true)
+            .await?;
 
         // Response: bytes 0-7 = last LBA (big-endian), bytes 8-11 = block length (big-endian)
         let last_lba = u64::from_be_bytes([
@@ -731,6 +819,32 @@ impl UsbMassStorage {
         self.block_size = block_len;
 
         Ok(())
+    }
+
+    fn scsi_command(
+        &mut self,
+        controller: &mut dyn UsbController,
+        cdb: &[u8],
+        data: Option<&mut [u8]>,
+        is_read: bool,
+    ) -> Result<ScsiTransfer, MassStorageError> {
+        synchronous(self.scsi_command_with(
+            &mut Transport::Foreground(controller),
+            cdb,
+            data,
+            is_read,
+        ))
+    }
+
+    fn bot_reset_recovery(
+        &mut self,
+        controller: &mut dyn UsbController,
+    ) -> Result<(), MassStorageError> {
+        synchronous(self.bot_reset_recovery_with(&mut Transport::Foreground(controller)))
+    }
+
+    fn request_sense(&mut self, controller: &mut dyn UsbController) -> Option<u8> {
+        synchronous(self.request_sense_with(&mut Transport::Foreground(controller)))
     }
 
     /// Maximum number of retries for failed SCSI read commands.
@@ -1032,12 +1146,11 @@ impl UsbMassStorage {
             return Ok(());
         }
         // LBA 0 with a zero block count covers the whole medium.
-        let cdb = [scsi_cmd::SYNCHRONIZE_CACHE_10, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         // Cache synchronization is idempotent. A transient timeout can occur
         // while the medium drains earlier writes; retry only after BOT reset
         // recovery succeeds, without treating an exhausted retry as durable.
         for attempt in 0..=Self::MAX_READ_RETRIES {
-            match self.scsi_command(controller, &cdb, None, false) {
+            match self.scsi_command(controller, &SYNCHRONIZE_CACHE, None, false) {
                 Ok(_) => {
                     self.writes_pending = false;
                     return Ok(());
@@ -1211,21 +1324,21 @@ impl UsbMassStorage {
 /// An initialized mass storage device and the controller it is attached to.
 struct RegisteredDevice {
     controller_id: usize,
-    generation: u32,
+    attachment_id: NonZeroU64,
     device: UsbMassStorage,
 }
 
 /// Initialized mass storage devices.
 static DEVICES: Local<alloc::vec::Vec<RegisteredDevice>> = Local::new(alloc::vec::Vec::new());
 
-/// Monotonic generation counter so reused USB slot IDs / addresses cannot alias
-/// previously removed disks.
-static NEXT_GENERATION: crate::cell::LocalCell<u32> = crate::cell::LocalCell::new(1);
+/// A fresh ID for every published disk, even if a controller reuses an address.
+static NEXT_ATTACHMENT_ID: crate::cell::LocalCell<NonZeroU64> =
+    crate::cell::LocalCell::new(NonZeroU64::MIN);
 
-fn alloc_generation() -> u32 {
-    let generation = NEXT_GENERATION.get();
-    NEXT_GENERATION.set(generation.wrapping_add(1).max(1));
-    generation
+fn allocate_attachment_id() -> NonZeroU64 {
+    let id = NEXT_ATTACHMENT_ID.get();
+    NEXT_ATTACHMENT_ID.set(id.checked_add(1).expect("USB attachment ID exhausted"));
+    id
 }
 
 fn is_registered(controller_id: usize, device_addr: u8) -> bool {
@@ -1234,24 +1347,31 @@ fn is_registered(controller_id: usize, device_addr: u8) -> bool {
     })
 }
 
-/// Return the generation tag of a registered USB mass storage device.
-pub fn generation(controller_id: usize, device_addr: u8) -> Option<u32> {
-    DEVICES.borrow().iter().find_map(|registered| {
-        (registered.controller_id == controller_id && registered.device.device_addr == device_addr)
-            .then_some(registered.generation)
-    })
+/// Snapshot the identities of available USB disks, without probing the bus.
+pub(crate) fn attachments() -> alloc::vec::Vec<(usize, u8, NonZeroU64)> {
+    if super::STOPPED.get() {
+        return alloc::vec::Vec::new();
+    }
+    DEVICES
+        .borrow()
+        .iter()
+        .map(|entry| {
+            (
+                entry.controller_id,
+                entry.device.device_addr,
+                entry.attachment_id,
+            )
+        })
+        .collect()
 }
 
-/// Remove a disconnected mass storage device from the registry.
-///
-/// Returns `true` if a registered device was removed.
-pub fn remove(controller_id: usize, device_addr: u8) -> bool {
+/// Remove a disconnected disk and return its attachment ID.
+pub(super) fn remove(controller_id: usize, device_addr: u8) -> Option<NonZeroU64> {
     let mut devices = DEVICES.borrow_mut();
-    let before = devices.len();
-    devices.retain(|registered| {
-        !(registered.controller_id == controller_id && registered.device.device_addr == device_addr)
-    });
-    devices.len() != before
+    let index = devices.iter().position(|entry| {
+        entry.controller_id == controller_id && entry.device.device_addr == device_addr
+    })?;
+    Some(devices.remove(index).attachment_id)
 }
 
 /// Initialize and register the mass storage device at `device_addr` on
@@ -1259,75 +1379,54 @@ pub fn remove(controller_id: usize, device_addr: u8) -> bool {
 ///
 /// # Returns
 /// `true` if the device is registered with media present.
-pub fn probe(controller_id: usize, device_addr: u8) -> bool {
+pub(super) async fn probe(pipe: Pipe) -> bool {
+    let Pipe {
+        controller: controller_id,
+        address: device_addr,
+    } = pipe;
     if is_registered(controller_id, device_addr) {
-        return true;
+        return false;
     }
-
-    log::info!(
-        "Found USB mass storage on controller {}, device {}",
-        controller_id,
-        device_addr
-    );
-    let device = match super::with_controller(controller_id, |controller| {
-        UsbMassStorage::new(controller, device_addr)
-    }) {
-        Some(Ok(device)) if device.num_blocks != 0 => device,
-        Some(Ok(_)) => {
-            log::info!("USB Mass Storage: no media present, skipping");
-            return false;
-        }
-        Some(Err(error)) => {
-            log::debug!("Failed to create USB mass storage: {:?}", error);
-            return false;
-        }
-        None => return false,
+    log::info!("Found USB mass storage on controller {controller_id}, device {device_addr}");
+    let Some(Ok(mut device)) = super::with_controller(controller_id, |controller| {
+        UsbMassStorage::from_controller(controller, device_addr)
+    }) else {
+        return false;
     };
+    if let Err(error) = device.init(&mut Transport::Discovery(controller_id)).await {
+        log::debug!("Failed to initialize USB mass storage: {error:?}");
+        return false;
+    }
+    if device.num_blocks == 0 {
+        log::info!("USB Mass Storage: no media present, skipping");
+        return false;
+    }
 
     DEVICES.borrow_mut().push(RegisteredDevice {
         controller_id,
-        generation: alloc_generation(),
+        attachment_id: allocate_attachment_id(),
         device,
     });
     true
 }
 
-/// Access a registered mass storage device together with its controller.
-///
-/// # Returns
-/// `None` if the controller or device is not registered.
+/// Access a registered disk only when its full identity still matches.
+/// Reusing a USB address cannot grant access through a stale EFI handle.
 pub fn with_device<R>(
     controller_id: usize,
     device_addr: u8,
+    attachment_id: NonZeroU64,
     f: impl FnOnce(&mut UsbMassStorage, &mut dyn UsbController) -> R,
 ) -> Option<R> {
+    if super::STOPPED.get() {
+        return None;
+    }
     super::with_controller(controller_id, |controller| {
         let mut devices = DEVICES.borrow_mut();
         let registered = devices.iter_mut().find(|registered| {
             registered.controller_id == controller_id
                 && registered.device.device_addr == device_addr
-        })?;
-        Some(f(&mut registered.device, controller))
-    })
-    .flatten()
-}
-
-/// Access a registered mass storage device only if its generation matches.
-///
-/// Prevents a stale `StorageId::Usb` from accessing a newly plugged device
-/// that reused the same slot ID or USB address.
-pub fn with_device_generation<R>(
-    controller_id: usize,
-    device_addr: u8,
-    expected_generation: u32,
-    f: impl FnOnce(&mut UsbMassStorage, &mut dyn UsbController) -> R,
-) -> Option<R> {
-    super::with_controller(controller_id, |controller| {
-        let mut devices = DEVICES.borrow_mut();
-        let registered = devices.iter_mut().find(|registered| {
-            registered.controller_id == controller_id
-                && registered.device.device_addr == device_addr
-                && (expected_generation == 0 || registered.generation == expected_generation)
+                && registered.attachment_id == attachment_id
         })?;
         Some(f(&mut registered.device, controller))
     })

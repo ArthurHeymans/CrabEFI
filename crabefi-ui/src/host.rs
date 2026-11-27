@@ -116,8 +116,8 @@ pub trait Backend {
     fn set_text_size(&mut self, _size: TextSize) {}
     fn observe(&mut self, _state: UiState) {}
     fn observe_dialog(&mut self, _title: Option<&str>) {}
-    /// Returns `true` when hotplug storage changes require rebuilding the boot menu.
-    fn storage_changed(&mut self) -> bool {
+    /// Whether the boot entries supplied to this surface need to be rebuilt.
+    fn boot_entries_stale(&self) -> bool {
         false
     }
 }
@@ -256,8 +256,8 @@ impl Surface {
     pub fn observe_dialog(&self, title: Option<&str>) {
         self.backend.borrow_mut().observe_dialog(title);
     }
-    pub fn storage_changed(&self) -> bool {
-        self.backend.borrow_mut().storage_changed()
+    pub fn boot_entries_stale(&self) -> bool {
+        self.backend.borrow().boot_entries_stale()
     }
 }
 

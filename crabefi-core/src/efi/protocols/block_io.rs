@@ -283,15 +283,16 @@ fn create_block_io_internal(
 /// Mark all BlockIO protocol instances backed by a disconnected USB device as
 /// having no media and advance their `media_id` so subsequent reads return
 /// `EFI_MEDIA_CHANGED` / `EFI_NO_MEDIA`.
-pub fn mark_usb_removed(controller_id: usize, device_addr: u8) {
+pub fn mark_usb_removed(controller_id: usize, device_addr: u8, removed: core::num::NonZeroU64) {
     INSTANCES.for_each(|protocol, ctx| {
         if let StorageId::Usb {
             controller_id: cid,
             device_addr: addr,
-            ..
+            attachment_id,
         } = ctx.storage
             && cid == controller_id
             && addr == device_addr
+            && attachment_id == removed
         {
             ctx.media_id = ctx.media_id.wrapping_add(1);
             if !protocol.media.is_null() {

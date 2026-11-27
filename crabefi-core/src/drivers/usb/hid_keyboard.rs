@@ -8,6 +8,7 @@
 //! - libpayload usbhid.c
 
 use super::controller::{UsbController, UsbError, hid_request, req_type};
+use super::port::{Control, Pipe};
 use crate::drivers::hid_descriptor::{input_capacity, input_size, parse};
 use crate::time::Timeout;
 use alloc::vec::Vec;
@@ -175,19 +176,7 @@ impl UsbHidKeyboard {
         if let Ok(bytes) =
             controller.hid_report_descriptor(self.device_address, self.interface_number)
         {
-            log::debug!(
-                "USB keyboard {} report descriptor: {} bytes",
-                self.device_address,
-                bytes.len()
-            );
-            if let Some(descriptor) = parse(&bytes)
-                && let Some(capacity) = input_capacity(self.max_packet, input_size(&descriptor))
-            {
-                self.report = crate::drivers::hid_report::Keyboard::find(&descriptor);
-                if self.report.is_some() {
-                    self.report_buffer.resize(capacity, 0);
-                }
-            }
+            self.load_report(&bytes);
         }
         // SET_PROTOCOL with protocol = 0 (boot protocol)
         controller.control_transfer(
@@ -198,7 +187,21 @@ impl UsbHidKeyboard {
             self.interface_number as u16,
             None,
         )?;
-        // A successful switch means reports now have the fixed boot layout.
+        self.use_boot_report()
+    }
+
+    fn load_report(&mut self, bytes: &[u8]) {
+        if let Some(descriptor) = parse(bytes)
+            && let Some(capacity) = input_capacity(self.max_packet, input_size(&descriptor))
+        {
+            self.report = crate::drivers::hid_report::Keyboard::find(&descriptor);
+            if self.report.is_some() {
+                self.report_buffer.resize(capacity, 0);
+            }
+        }
+    }
+
+    fn use_boot_report(&mut self) -> Result<(), UsbError> {
         let capacity = input_capacity(self.max_packet, 8).ok_or(UsbError::NotSupported)?;
         self.report_buffer.resize(capacity, 0);
         self.report = None;
@@ -723,6 +726,60 @@ pub fn init_keyboard<C: UsbController + ?Sized>(
     // Set idle rate (30ms)
     if let Err(e) = keyboard.set_idle(controller, 30) {
         log::warn!("Failed to set idle rate: {:?}", e);
+    }
+    Ok(keyboard)
+}
+
+pub(super) async fn bind(pipe: Pipe) -> Result<UsbHidKeyboard, UsbError> {
+    let ep = super::with_controller(pipe.controller, |host| {
+        host.get_interrupt_endpoint(pipe.address)
+    })
+    .flatten()
+    .ok_or(UsbError::DeviceNotFound)?;
+    let mut keyboard = UsbHidKeyboard::new(
+        pipe.controller,
+        pipe.address,
+        ep.number,
+        ep.max_packet_size,
+        ep.interval,
+    );
+    let (interface, descriptor) = pipe.hid_report(ep.number).await?;
+    keyboard.interface_number = interface;
+    if let Some(descriptor) = descriptor {
+        keyboard.load_report(&descriptor);
+    }
+    let request_type = req_type::TYPE_CLASS | req_type::RCPT_INTERFACE;
+    match pipe
+        .control(
+            Control::new(
+                request_type,
+                hid_request::SET_PROTOCOL,
+                0,
+                u16::from(interface),
+            ),
+            None,
+        )
+        .await
+    {
+        Ok(_) => keyboard.use_boot_report()?,
+        Err(error) if matches!(error, UsbError::Timeout) || keyboard.report.is_none() => {
+            return Err(error);
+        }
+        Err(error) => log::debug!("Boot protocol rejected: {error:?}; using report descriptor"),
+    }
+    if let Err(error) = pipe
+        .control(
+            Control::new(
+                request_type,
+                hid_request::SET_IDLE,
+                (30 / 4) << 8,
+                u16::from(interface),
+            ),
+            None,
+        )
+        .await
+    {
+        log::warn!("Failed to set idle rate: {error:?}");
     }
     Ok(keyboard)
 }

@@ -197,17 +197,12 @@ impl super::XhciController {
             control_buffer: None,
             slots,
             interrupt_polls: alloc::vec::Vec::new(),
-            root_ports: alloc::vec![super::enumerate::RootPortState::Empty; usize::from(num_ports)],
-            port_change_pending: false,
-            next_hub_poll: None,
         };
 
         controller.init().await?;
 
         // Give USB devices time to connect and be detected
         exec::sleep_ms(50).await;
-
-        controller.enumerate_ports().await?;
 
         Ok(controller)
     }

@@ -7,13 +7,8 @@
 //! - UHCI Design Guide Revision 1.1
 //! - libpayload uhci.c
 
-use super::controller::{
-    LEGACY_HUB_POLL_INTERVAL_MS, LegacyPortAction, LegacyPortState, SetupPacket, UsbController,
-    UsbDevice, UsbError, UsbHotplugEvent, UsbSpeed, allocate_legacy_address, detach_legacy_device,
-    detach_legacy_root_port, emit_new_legacy_devices, enumerate_device, enumerate_hub_ports,
-    hub_feature, hub_port_change, hub_port_status, req_type, request, snapshot_legacy_addresses,
-    sync_legacy_port_states,
-};
+use super::controller::{SetupPacket, UsbController, UsbDevice, UsbError, UsbSpeed};
+use super::port::{Control, PortController, RootCommand, RootKind, RootStatus};
 use super::uhci_regs::{PORTSC, USBCMD, USBSTS, UhciRegs};
 use crate::arch::{flush_cache_range, invalidate_cache_range};
 use crate::barrier;
@@ -286,10 +281,6 @@ pub struct UhciController {
     qh: u64,
     /// DMA buffer
     dma_buffer: u64,
-    /// Per-root-port hotplug state machine (UHCI has 2 root ports).
-    port_states: [LegacyPortState; 2],
-    /// Next time to poll downstream ports of attached hubs.
-    next_hub_poll: Option<Timeout>,
 }
 
 impl UhciController {
@@ -333,8 +324,6 @@ impl UhciController {
             frame_list,
             qh,
             dma_buffer,
-            port_states: [LegacyPortState::Empty; 2],
-            next_hub_poll: None,
         };
 
         controller.init().await?;
@@ -465,181 +454,6 @@ impl UhciController {
         exec::sleep_ms(100).await;
 
         log::info!("UHCI controller initialized");
-        Ok(())
-    }
-
-    /// Enumerate ports
-    fn enumerate_ports(&mut self) -> Result<(), UsbError> {
-        let regs = self.regs();
-
-        for port in 0..self.num_ports {
-            let portsc = regs.portsc(port);
-
-            // Clear status change bits (write-1-to-clear CSC and PEC)
-            portsc.modify(PORTSC::CSC::SET + PORTSC::PEC::SET);
-
-            if !portsc.is_set(PORTSC::CCS) {
-                continue;
-            }
-
-            let is_low_speed = portsc.is_set(PORTSC::LSDA);
-            log::info!(
-                "UHCI: Device on port {} ({})",
-                port,
-                if is_low_speed {
-                    "low-speed"
-                } else {
-                    "full-speed"
-                }
-            );
-
-            // Reset port
-            portsc.write(PORTSC::PR::SET);
-            crate::time::delay_ms(50);
-            portsc.set(0);
-            crate::time::delay_ms(10);
-
-            // Enable port
-            for _ in 0..10 {
-                if !portsc.is_set(PORTSC::CCS) {
-                    break;
-                }
-                if portsc.is_set(PORTSC::PE) {
-                    break;
-                }
-                portsc.modify(PORTSC::PE::SET);
-                crate::time::delay_ms(10);
-            }
-
-            if !portsc.is_set(PORTSC::PE) {
-                log::warn!("UHCI: Port {} not enabled", port);
-                continue;
-            }
-
-            // Clear status changes again
-            portsc.modify(PORTSC::CSC::SET + PORTSC::PEC::SET);
-
-            let speed = if is_low_speed {
-                UsbSpeed::Low
-            } else {
-                UsbSpeed::Full
-            };
-
-            if let Err(e) = self.attach_device(port, speed) {
-                log::error!("Failed to attach device on port {}: {:?}", port, e);
-            }
-        }
-
-        let io_base = self.io_base;
-        let num_ports = usize::from(self.num_ports).min(2);
-        sync_legacy_port_states(&self.devices, &mut self.port_states[..num_ports], |port| {
-            UhciRegs::new(io_base).portsc(port).is_set(PORTSC::CCS)
-        });
-        Ok(())
-    }
-
-    /// Attach a device on a root hub port
-    fn attach_device(&mut self, port: u8, speed: UsbSpeed) -> Result<(), UsbError> {
-        let address = allocate_legacy_address(&self.devices, &mut self.next_address)
-            .ok_or(UsbError::NoFreeSlots)?;
-
-        let slot = self
-            .devices
-            .iter()
-            .position(|h| h.is_none())
-            .ok_or(UsbError::NoFreeSlots)?;
-
-        let initial_device = UsbDevice::new(0, port, speed);
-
-        // Use the common enumeration helper with a closure for control transfers
-        let device = enumerate_device(initial_device, address, |dev, rt, req, val, idx, data| {
-            self.control_transfer_internal(dev, rt, req, val, idx, data)
-        })?;
-
-        // Store the device and check if it's a hub
-        let is_hub = device.is_hub;
-        let hub_address = device.address;
-        self.devices[slot] = Some(device);
-
-        // If this is a hub, enumerate its downstream ports
-        if is_hub && let Err(e) = self.enumerate_hub(slot, hub_address) {
-            log::warn!("Failed to enumerate hub ports: {:?}", e);
-            // Don't fail the device attachment, hub is still registered
-        }
-
-        Ok(())
-    }
-
-    /// Attach a device connected through an external hub
-    ///
-    /// # Arguments
-    /// * `hub_port` - Hub port number (1-based)
-    /// * `speed` - Detected device speed
-    /// * `hub_addr` - USB address of the parent hub
-    /// * `hub_port_num` - Hub port number for tracking
-    fn attach_device_on_hub(
-        &mut self,
-        hub_port: u8,
-        speed: UsbSpeed,
-        hub_addr: u8,
-        hub_port_num: u8,
-    ) -> Result<(), UsbError> {
-        let address = allocate_legacy_address(&self.devices, &mut self.next_address)
-            .ok_or(UsbError::NoFreeSlots)?;
-
-        let slot = self
-            .devices
-            .iter()
-            .position(|h| h.is_none())
-            .ok_or(UsbError::NoFreeSlots)?;
-
-        let initial_device = UsbDevice::new_on_hub(0, hub_port, speed, hub_addr, hub_port_num);
-        let device = enumerate_device(initial_device, address, |dev, rt, req, val, idx, data| {
-            self.control_transfer_internal(dev, rt, req, val, idx, data)
-        })?;
-
-        // Store the device and check for nested hubs
-        let is_hub = device.is_hub;
-        let new_hub_address = device.address;
-        self.devices[slot] = Some(device);
-
-        if is_hub && let Err(e) = self.enumerate_hub(slot, new_hub_address) {
-            log::warn!("Failed to enumerate nested hub ports: {:?}", e);
-        }
-
-        Ok(())
-    }
-
-    /// Enumerate devices connected to an external USB hub.
-    ///
-    /// UHCI is USB 1.1 only so devices behind hubs are low-speed or
-    /// full-speed. Delegates to the shared [`enumerate_hub_ports`] helper.
-    fn enumerate_hub(&mut self, hub_slot: usize, hub_addr: u8) -> Result<(), UsbError> {
-        log::info!("UHCI: Enumerating hub at address {}", hub_addr);
-
-        let hub_device = self.devices[hub_slot]
-            .as_ref()
-            .ok_or(UsbError::DeviceNotFound)?
-            .clone();
-
-        let (num_ports, ready_ports) = enumerate_hub_ports(
-            &hub_device,
-            |dev, rt, req, val, idx, data| {
-                self.control_transfer_internal(dev, rt, req, val, idx, data)
-            },
-            false, // UHCI is USB 1.1: low-speed or full-speed only
-        )?;
-
-        if let Some(ref mut dev) = self.devices[hub_slot] {
-            dev.num_hub_ports = num_ports;
-        }
-
-        for (port, speed) in ready_ports {
-            if let Err(e) = self.attach_device_on_hub(port, speed, hub_addr, port) {
-                log::warn!("  Failed to attach device on hub port {}: {:?}", port, e);
-            }
-        }
-
         Ok(())
     }
 
@@ -1141,220 +955,9 @@ impl UsbController for UhciController {
     fn devices(&self) -> &[Option<UsbDevice>] {
         &self.devices
     }
-
-    fn poll_hotplug(&mut self, events: &mut alloc::vec::Vec<UsbHotplugEvent>) {
-        self.poll_hotplug_impl(events);
-    }
 }
 
 impl UhciController {
-    fn poll_hotplug_impl(&mut self, events: &mut alloc::vec::Vec<UsbHotplugEvent>) {
-        let num_ports = self.num_ports.min(2);
-        for port in 0..num_ports {
-            let portsc = self.regs().portsc(port);
-            let connected = portsc.is_set(PORTSC::CCS);
-            let csc = portsc.is_set(PORTSC::CSC);
-            match self.port_states[usize::from(port)].step(connected, csc) {
-                LegacyPortAction::None => {}
-                LegacyPortAction::ClearCsc => {
-                    portsc.modify(PORTSC::CSC::SET + PORTSC::PEC::SET);
-                }
-                LegacyPortAction::Detach => {
-                    log::info!("UHCI: Port {} disconnected", port);
-                    portsc.modify(PORTSC::CSC::SET + PORTSC::PEC::SET);
-                    detach_legacy_root_port(&mut self.devices, port, events);
-                }
-                LegacyPortAction::Attach => {
-                    portsc.modify(PORTSC::CSC::SET + PORTSC::PEC::SET);
-                    let is_low_speed = portsc.is_set(PORTSC::LSDA);
-                    log::info!("UHCI: Hotplugging device on port {}", port);
-
-                    portsc.write(PORTSC::PR::SET);
-                    crate::time::delay_ms(50);
-                    portsc.set(0);
-                    crate::time::delay_ms(10);
-
-                    for _ in 0..10 {
-                        if !portsc.is_set(PORTSC::CCS) || portsc.is_set(PORTSC::PE) {
-                            break;
-                        }
-                        portsc.modify(PORTSC::PE::SET);
-                        crate::time::delay_ms(10);
-                    }
-
-                    if !portsc.is_set(PORTSC::PE) {
-                        self.port_states[usize::from(port)] = if portsc.is_set(PORTSC::CCS) {
-                            LegacyPortState::Failed
-                        } else {
-                            LegacyPortState::Empty
-                        };
-                        continue;
-                    }
-                    portsc.modify(PORTSC::CSC::SET + PORTSC::PEC::SET);
-
-                    let speed = if is_low_speed {
-                        UsbSpeed::Low
-                    } else {
-                        UsbSpeed::Full
-                    };
-                    let before = snapshot_legacy_addresses(&self.devices);
-                    match self.attach_device(port, speed) {
-                        Ok(()) => {
-                            self.port_states[usize::from(port)] = LegacyPortState::Attached;
-                            emit_new_legacy_devices(&self.devices, &before, events);
-                        }
-                        Err(e) => {
-                            log::warn!("UHCI: Hotplug attach failed on port {}: {:?}", port, e);
-                            self.port_states[usize::from(port)] = if portsc.is_set(PORTSC::CCS) {
-                                LegacyPortState::Failed
-                            } else {
-                                LegacyPortState::Empty
-                            };
-                        }
-                    }
-                }
-            }
-        }
-
-        let poll_hubs = self.next_hub_poll.as_ref().is_none_or(Timeout::is_expired);
-        if poll_hubs {
-            self.next_hub_poll = Some(Timeout::from_ms(LEGACY_HUB_POLL_INTERVAL_MS));
-            self.poll_hubs(events);
-        }
-    }
-
-    fn poll_hubs(&mut self, events: &mut alloc::vec::Vec<UsbHotplugEvent>) {
-        let hubs: alloc::vec::Vec<UsbDevice> = self
-            .devices
-            .iter()
-            .flatten()
-            .filter(|dev| dev.is_hub && dev.num_hub_ports > 0)
-            .cloned()
-            .collect();
-
-        for hub in hubs {
-            if self.get_device(hub.address).is_none() {
-                continue;
-            }
-            for p in 1..=hub.num_hub_ports.min(15) {
-                let mut status_buf = [0u8; 4];
-                if self
-                    .control_transfer_internal(
-                        &hub,
-                        req_type::DIR_IN | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
-                        request::GET_STATUS,
-                        0,
-                        u16::from(p),
-                        Some(&mut status_buf),
-                    )
-                    .is_err()
-                {
-                    break;
-                }
-                let ps = u16::from_le_bytes([status_buf[0], status_buf[1]]);
-                let pc = u16::from_le_bytes([status_buf[2], status_buf[3]]);
-                let connected = ps & hub_port_status::CONNECTION != 0;
-                let changed = pc & hub_port_change::C_CONNECTION != 0;
-                if changed {
-                    let _ = self.control_transfer_internal(
-                        &hub,
-                        req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
-                        request::CLEAR_FEATURE,
-                        hub_feature::C_PORT_CONNECTION,
-                        u16::from(p),
-                        None,
-                    );
-                }
-
-                let existing_child = self
-                    .devices
-                    .iter()
-                    .flatten()
-                    .find(|d| d.hub_addr == hub.address && d.hub_port == p)
-                    .map(|d| d.address);
-
-                if let Some(child_addr) = existing_child
-                    && (!connected || changed)
-                {
-                    log::info!(
-                        "UHCI: Hub {} port {} disconnected (addr {})",
-                        hub.address,
-                        p,
-                        child_addr
-                    );
-                    detach_legacy_device(&mut self.devices, child_addr, events);
-                }
-
-                let still_empty = !self
-                    .devices
-                    .iter()
-                    .flatten()
-                    .any(|d| d.hub_addr == hub.address && d.hub_port == p);
-                if connected && still_empty {
-                    let _ = self.control_transfer_internal(
-                        &hub,
-                        req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
-                        request::SET_FEATURE,
-                        hub_feature::PORT_RESET,
-                        u16::from(p),
-                        None,
-                    );
-                    crate::time::delay_ms(60);
-                    let mut sb = [0u8; 4];
-                    if self
-                        .control_transfer_internal(
-                            &hub,
-                            req_type::DIR_IN | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
-                            request::GET_STATUS,
-                            0,
-                            u16::from(p),
-                            Some(&mut sb),
-                        )
-                        .is_ok()
-                    {
-                        let ps = u16::from_le_bytes([sb[0], sb[1]]);
-                        let _ = self.control_transfer_internal(
-                            &hub,
-                            req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
-                            request::CLEAR_FEATURE,
-                            hub_feature::C_PORT_RESET,
-                            u16::from(p),
-                            None,
-                        );
-                        if ps & hub_port_status::ENABLE != 0 {
-                            let speed = if ps & hub_port_status::LOW_SPEED != 0 {
-                                UsbSpeed::Low
-                            } else {
-                                UsbSpeed::Full
-                            };
-                            let before = snapshot_legacy_addresses(&self.devices);
-                            if self.attach_device_on_hub(p, speed, hub.address, p).is_ok() {
-                                emit_new_legacy_devices(&self.devices, &before, events);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-impl UhciController {
-    /// Enumerate ports (deferred initialization)
-    ///
-    /// On ICH8/9/10 chipsets, UHCI companion controllers are initialized before
-    /// their EHCI companion due to PCI BDF ordering (UHCI at functions 0-2,
-    /// EHCI at function 7). EHCI must set CONFIGFLAG and release companion ports
-    /// before UHCI can see correct devices and speeds on its ports.
-    ///
-    /// This is called from `rescan_companion_ports()` after all USB controllers
-    /// have been initialized, ensuring EHCI has already released its companions.
-    pub fn rescan_ports(&mut self) {
-        if let Err(e) = self.enumerate_ports() {
-            log::error!("UHCI: Port enumeration failed: {:?}", e);
-        }
-    }
-
     /// Clean up the controller before handing off to the OS
     ///
     /// This must be called before ExitBootServices to ensure Linux's UHCI
@@ -1384,5 +987,56 @@ impl UhciController {
         regs.usbsts().set(0x3F);
 
         log::debug!("UHCI cleanup complete");
+    }
+}
+
+impl PortController for UhciController {
+    fn root_ports(&self) -> (RootKind, u8) {
+        (RootKind::Uhci, self.num_ports)
+    }
+
+    fn legacy_devices(&mut self) -> Option<(&mut [Option<UsbDevice>], &mut u8)> {
+        Some((&mut self.devices, &mut self.next_address))
+    }
+
+    fn legacy_control(
+        &mut self,
+        device: &UsbDevice,
+        request: Control,
+        data: Option<&mut [u8]>,
+    ) -> Result<usize, UsbError> {
+        self.control_transfer_internal(
+            device,
+            request.ty,
+            request.request,
+            request.value,
+            request.index,
+            data,
+        )
+    }
+
+    fn root_status(&self, port: u8) -> RootStatus {
+        let status = self.regs().portsc(port).extract();
+        RootStatus {
+            connected: status.is_set(PORTSC::CCS),
+            changed: status.is_set(PORTSC::CSC),
+            enabled: status.is_set(PORTSC::PE),
+            low_speed: status.is_set(PORTSC::LSDA),
+            ..RootStatus::default()
+        }
+    }
+
+    fn root_command(&mut self, port: u8, command: RootCommand) {
+        let reg = self.regs().portsc(port);
+        let w1c = PORTSC::CSC::SET + PORTSC::PEC::SET;
+        let command = match command {
+            RootCommand::ClearChanges => w1c,
+            RootCommand::Reset => PORTSC::PR::SET + PORTSC::PE::CLEAR,
+            RootCommand::EndReset => PORTSC::PR::CLEAR,
+            RootCommand::Enable => PORTSC::PE::SET,
+            RootCommand::Disable => PORTSC::PR::CLEAR + PORTSC::PE::CLEAR,
+            _ => unreachable!(),
+        };
+        reg.set(command.modify(reg.get() & !w1c.value));
     }
 }

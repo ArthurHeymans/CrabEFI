@@ -242,7 +242,7 @@ mod disk_detail_tests {
             storage_identity(StorageId::Usb {
                 controller_id: 4,
                 device_addr: 5,
-                generation: 1,
+                attachment_id: core::num::NonZeroU64::MIN,
             })
             .contains("controller 4")
         );

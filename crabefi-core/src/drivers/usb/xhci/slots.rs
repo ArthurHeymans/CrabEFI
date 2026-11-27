@@ -134,16 +134,13 @@ pub struct UsbSlot {
     pub interrupt_interval: u8,
     /// Is this a hub?
     pub is_hub: bool,
-    /// Number of downstream ports (if hub)
-    pub hub_ports: u8,
+    pub(super) sublinks: Option<super::speed::SublinkSpeeds>,
     /// Route string for this device (xHCI hub topology)
     pub route_string: u32,
     /// Root hub port this device chain starts from
     pub root_port: u8,
     /// Parent hub `(hub_slot_id, hub_port)` if attached behind a hub.
     pub parent_hub: Option<(u8, u8)>,
-    /// Downstream child slot IDs indexed by 1-based hub port (0 = empty).
-    pub hub_port_slots: [u8; 16],
 }
 
 /// Reset is valid only for a halted endpoint. A timed-out transfer can still
@@ -274,62 +271,7 @@ impl super::XhciController {
     }
 
     /// Address a device
-    pub(super) fn address_device(
-        &mut self,
-        slot_id: u8,
-        port: u8,
-        speed: u8,
-    ) -> Result<(), XhciError> {
-        self.address_slot(
-            slot_id,
-            speed,
-            SlotRoute {
-                port,
-                root_port: port,
-                route_string: 0,
-                parent_hub: None,
-            },
-        )
-    }
-
-    /// Address either a root or hub device, rolling back an enabled slot on error.
     pub(super) fn address_slot(
-        &mut self,
-        slot_id: u8,
-        speed: u8,
-        route: SlotRoute,
-    ) -> Result<(), XhciError> {
-        let result = self.prepare_address_slot(slot_id, speed, route);
-        if result.is_err() && slot_id != 0 {
-            let mut command = command::DisableSlot::new();
-            command.set_slot_id(slot_id);
-            self.cmd_ring.enqueue(command, false);
-            barrier::mmio_write();
-            self.ring_doorbell(0, 0);
-            if self.wait_command_completion().is_ok() {
-                // Only Disable Slot completion proves that a timed-out Address
-                // Device can no longer access its input/device context or ring.
-                if let Some(entry) = self.slots.get_mut(slot_id as usize)
-                    && let Some(slot) = entry.take()
-                {
-                    // SAFETY: the slot index was checked before publication.
-                    unsafe {
-                        core::ptr::write_volatile((self.dcbaa as *mut u64).add(slot_id as usize), 0)
-                    };
-                    let _pages = SlotPages([
-                        slot.device_context as u64,
-                        slot.input_context as u64,
-                        slot.transfer_rings[0].as_ref().map_or(0, |ring| ring.base),
-                    ]);
-                }
-            } else {
-                log::warn!("xHCI: retaining slot {} DMA after failed rollback", slot_id);
-            }
-        }
-        result
-    }
-
-    fn prepare_address_slot(
         &mut self,
         slot_id: u8,
         speed: u8,
@@ -398,7 +340,7 @@ impl super::XhciController {
         let ring = TrbRing::new(transfer_ring, 256);
 
         // Track ownership before exposing any pages to the controller.
-        // Failed Address Device commands are rolled back by address_slot.
+        // Failed Address Device commands are rolled back by the port task.
         // Store slot info
         let mut transfer_rings: [Option<TrbRing>; 31] = core::array::from_fn(|_| None);
         transfer_rings[0] = Some(ring);
@@ -432,11 +374,10 @@ impl super::XhciController {
             interrupt_max_packet: 0,
             interrupt_interval: 0,
             is_hub: false,
-            hub_ports: 0,
+            sublinks: None,
             route_string: route.route_string,
             root_port: route.root_port,
             parent_hub: route.parent_hub,
-            hub_port_slots: [0; 16],
         })?);
         core::mem::forget(pages);
 
@@ -455,46 +396,14 @@ impl super::XhciController {
         barrier::mmio_write();
         self.ring_doorbell(0, 0);
         self.wait_command_completion()?;
-        // SET_ADDRESS recovery interval (xHCI issues the USB request).
-        crate::time::delay_ms(2);
         Ok(())
     }
 
-    /// Tear down a disconnected device slot (and any downstream hub children),
-    /// releasing its xHCI slot, interrupt DMA buffers, and context/ring pages.
-    pub(super) fn detach_slot(
-        &mut self,
-        slot_id: u8,
-        events: &mut alloc::vec::Vec<super::super::controller::UsbHotplugEvent>,
-    ) {
-        if slot_id == 0 || self.get_slot(slot_id).is_none() {
+    /// Disable a slot before releasing DMA memory. The port task removes
+    /// downstream children first, yielding between Disable Slot commands.
+    pub(super) fn detach_slot(&mut self, slot_id: u8) {
+        if slot_id == 0 || usize::from(slot_id) >= self.slots.len() {
             return;
-        }
-
-        // Recursively detach downstream hub children first.
-        let children: alloc::vec::Vec<u8> = self
-            .slots
-            .iter()
-            .enumerate()
-            .skip(1)
-            .filter_map(|(id, slot)| {
-                let slot = slot.as_deref()?;
-                (slot.parent_hub.is_some_and(|(hub, _)| hub == slot_id))
-                    .then(|| u8::try_from(id).ok())
-                    .flatten()
-            })
-            .collect();
-        for child_id in children {
-            self.detach_slot(child_id, events);
-        }
-
-        // Clear parent hub's port mapping if this slot was behind a hub.
-        if let Some((hub_slot, hub_port)) = self.get_slot(slot_id).and_then(|s| s.parent_hub)
-            && let Some(hub) = self.get_slot_mut(hub_slot)
-            && usize::from(hub_port) < hub.hub_port_slots.len()
-            && hub.hub_port_slots[usize::from(hub_port)] == slot_id
-        {
-            hub.hub_port_slots[usize::from(hub_port)] = 0;
         }
 
         log::info!("xHCI: Detaching slot {}", slot_id);
@@ -530,8 +439,6 @@ impl super::XhciController {
                 );
             }
         }
-
-        events.push(super::super::controller::UsbHotplugEvent::Detached(slot_id));
     }
 }
 

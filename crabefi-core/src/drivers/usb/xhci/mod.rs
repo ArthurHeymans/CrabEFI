@@ -128,12 +128,6 @@ pub struct XhciController {
     slots: alloc::vec::Vec<Option<Box<UsbSlot>>>,
     /// Persistent interrupt TDs; their DMA buffers remain alive between polls.
     interrupt_polls: alloc::vec::Vec<bulk::InterruptPoll>,
-    /// Per-root-port hotplug state machine (0-based port index).
-    root_ports: alloc::vec::Vec<enumerate::RootPortState>,
-    /// Set when the event ring observes a Port Status Change event.
-    port_change_pending: bool,
-    /// Next time to poll downstream ports of attached hubs.
-    next_hub_poll: Option<crate::time::Timeout>,
 }
 
 /// xHCI error type

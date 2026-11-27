@@ -189,7 +189,7 @@ fn protection_discovery_and_cache_support_gate_writes() {
             ..Default::default()
         };
         let mut disk = device();
-        disk.init(&mut peer).unwrap();
+        synchronous(disk.init(&mut Transport::Foreground(&mut peer))).unwrap();
         assert_eq!(disk.read_only, read_only);
         if read_only {
             assert!(matches!(
@@ -208,7 +208,7 @@ fn clean_read_only_devices_do_not_require_cache_commands() {
         ..Default::default()
     };
     let mut disk = device();
-    disk.init(&mut peer).unwrap();
+    synchronous(disk.init(&mut Transport::Foreground(&mut peer))).unwrap();
     assert!(disk.read_only);
     let commands = peer.commands.len();
     disk.synchronize_cache(&mut peer).unwrap();
@@ -219,7 +219,7 @@ fn clean_read_only_devices_do_not_require_cache_commands() {
 fn writes_obey_controller_limits_and_reuse_the_bounce_buffer() {
     let mut peer = BotPeer::default();
     let mut disk = device();
-    disk.init(&mut peer).unwrap();
+    synchronous(disk.init(&mut Transport::Foreground(&mut peer))).unwrap();
     let data: Vec<u8> = (0..8192).map(|i| (i % 251) as u8).collect();
     disk.write_sectors_generic(&mut peer, 20, 16, &data)
         .unwrap();
@@ -258,7 +258,7 @@ fn writes_obey_controller_limits_and_reuse_the_bounce_buffer() {
 fn data_protect_stops_retries_and_updates_media_protection() {
     let mut peer = BotPeer::default();
     let mut disk = device();
-    disk.init(&mut peer).unwrap();
+    synchronous(disk.init(&mut Transport::Foreground(&mut peer))).unwrap();
     peer.protect_write = true;
     assert!(matches!(
         disk.write_sectors_generic(&mut peer, 0, 1, &[0; 512]),
@@ -335,7 +335,7 @@ fn cache_flush_retries_timeouts_only_after_reset_and_remains_bounded() {
 fn short_payload_is_not_a_successful_write() {
     let mut peer = BotPeer::default();
     let mut disk = device();
-    disk.init(&mut peer).unwrap();
+    synchronous(disk.init(&mut Transport::Foreground(&mut peer))).unwrap();
     peer.short_write = true;
     let cdb = rw_10_cdb(scsi_cmd::WRITE_10, 0, 1);
     assert!(matches!(

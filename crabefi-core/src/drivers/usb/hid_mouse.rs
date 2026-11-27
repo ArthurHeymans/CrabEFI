@@ -4,7 +4,8 @@
 //! bytes from a six-byte endpoint waits for the next report after a full first
 //! packet, then babbles because that next packet cannot fit the remaining TD.
 
-use super::controller::{UsbController, UsbError, hid_request, req_type};
+use super::controller::{EndpointInfo, UsbController, UsbError, hid_request, req_type};
+use super::port::{Control, Pipe};
 use crate::drivers::hid_descriptor::{input_capacity, input_size, parse};
 use crate::drivers::hid_report::Mouse;
 use crate::drivers::pointer::{PointerDevice, PointerReport};
@@ -142,16 +143,17 @@ pub fn init_mouse<C: UsbController + ?Sized>(
     let interface = controller.hid_interface_number(device_addr, ep.number)?;
     let descriptor = controller
         .hid_report_descriptor(device_addr, interface)
-        .ok()
-        .and_then(|bytes| parse(&bytes));
-    let report = descriptor.as_ref().and_then(Mouse::find);
-    let size = if report.is_some() {
-        input_size(descriptor.as_ref().unwrap())
-    } else {
-        3
-    };
-    let capacity = input_capacity(ep.max_packet_size, size).ok_or(UsbError::NotSupported)?;
-    let protocol = u16::from(report.is_some()); // 1 = descriptor-defined report protocol
+        .ok();
+    let mouse = mouse_for_interface(
+        Pipe {
+            controller: controller_idx,
+            address: device_addr,
+        },
+        ep,
+        interface,
+        descriptor.as_deref(),
+    )?;
+    let protocol = u16::from(mouse.report.is_some());
     if let Err(error) = controller.control_transfer(
         device_addr,
         req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_INTERFACE,
@@ -160,7 +162,7 @@ pub fn init_mouse<C: UsbController + ?Sized>(
         u16::from(interface),
         None,
     ) {
-        if report.is_none() {
+        if mouse.report.is_none() {
             return Err(error);
         }
         // Some BMC gadgets reject this optional request but remain in their
@@ -179,18 +181,60 @@ pub fn init_mouse<C: UsbController + ?Sized>(
         u16::from(interface),
         None,
     );
-    log::info!(
-        "USB HID mouse: device {}, interface {}, EP {}, packet {}, input {}, report protocol {}",
-        device_addr,
-        interface,
-        ep.number,
-        ep.max_packet_size,
-        capacity,
-        report.is_some()
-    );
+    Ok(mouse)
+}
+
+pub(super) async fn bind(pipe: Pipe) -> Result<UsbHidMouse, UsbError> {
+    let ep = super::with_controller(pipe.controller, |host| {
+        host.get_mouse_interrupt_endpoint(pipe.address)
+    })
+    .flatten()
+    .ok_or(UsbError::DeviceNotFound)?;
+    let (interface, descriptor) = pipe.hid_report(ep.number).await?;
+    let mouse = mouse_for_interface(pipe, ep, interface, descriptor.as_deref())?;
+    let protocol = u16::from(mouse.report.is_some());
+    let ty = req_type::TYPE_CLASS | req_type::RCPT_INTERFACE;
+    if let Err(error) = pipe
+        .control(
+            Control::new(
+                ty,
+                hid_request::SET_PROTOCOL,
+                protocol,
+                u16::from(interface),
+            ),
+            None,
+        )
+        .await
+        && (matches!(error, UsbError::Timeout) || mouse.report.is_none())
+    {
+        return Err(error);
+    }
+    let _ = pipe
+        .control(
+            Control::new(ty, hid_request::SET_IDLE, 0, u16::from(interface)),
+            None,
+        )
+        .await;
+    Ok(mouse)
+}
+
+fn mouse_for_interface(
+    pipe: Pipe,
+    ep: EndpointInfo,
+    interface: u8,
+    descriptor: Option<&[u8]>,
+) -> Result<UsbHidMouse, UsbError> {
+    let descriptor = descriptor.and_then(parse);
+    let report = descriptor.as_ref().and_then(Mouse::find);
+    let size = if report.is_some() {
+        input_size(descriptor.as_ref().unwrap())
+    } else {
+        3
+    };
+    let capacity = input_capacity(ep.max_packet_size, size).ok_or(UsbError::NotSupported)?;
     Ok(UsbHidMouse {
-        controller_idx,
-        device_address: device_addr,
+        controller_idx: pipe.controller,
+        device_address: pipe.address,
         interface_number: interface,
         endpoint: ep.number,
         report,

@@ -7,6 +7,7 @@
 
 use alloc::vec::Vec;
 use core::fmt::Write;
+use core::num::NonZeroU64;
 
 use heapless::String;
 
@@ -60,7 +61,7 @@ pub enum StorageId {
     Usb {
         controller_id: usize,
         device_addr: u8,
-        generation: u32,
+        attachment_id: NonZeroU64,
     },
     /// SDHCI (SD card / eMMC)
     Sdhci { controller_id: usize },
@@ -145,21 +146,17 @@ pub fn devices() -> Vec<StorageDevice> {
         });
     }
 
-    for (controller_id, device_addr) in usb::find_mass_storage_devices() {
-        if !usb::mass_storage::probe(controller_id, device_addr) {
-            continue;
-        }
-        let generation = usb::mass_storage::generation(controller_id, device_addr).unwrap_or(0);
-        usb::mass_storage::with_device_generation(
+    for (controller_id, device_addr, attachment_id) in usb::mass_storage::attachments() {
+        usb::mass_storage::with_device(
             controller_id,
             device_addr,
-            generation,
+            attachment_id,
             |device, controller| {
                 push(StorageDevice {
                     id: StorageId::Usb {
                         controller_id,
                         device_addr,
-                        generation,
+                        attachment_id,
                     },
                     pci: None,
                     info: usb_disk_info(device),
@@ -267,11 +264,11 @@ fn with_disk_dyn(id: StorageId, f: &mut dyn FnMut(&mut dyn BlockDevice)) -> Resu
         StorageId::Usb {
             controller_id,
             device_addr,
-            generation,
-        } => usb::mass_storage::with_device_generation(
+            attachment_id,
+        } => usb::mass_storage::with_device(
             controller_id,
             device_addr,
-            generation,
+            attachment_id,
             |device, controller| {
                 let info = usb_disk_info(device);
                 f(&mut Disk::new(

@@ -26,6 +26,7 @@ pub mod hid_mouse;
 pub mod mass_storage;
 pub mod ohci;
 pub mod ohci_regs;
+mod port;
 #[cfg(target_arch = "x86_64")]
 pub mod uhci;
 #[cfg(target_arch = "x86_64")]
@@ -131,15 +132,8 @@ static ALL_CONTROLLERS: Mutex<alloc::vec::Vec<UsbControllerHandle>> =
 /// Set once [`cleanup()`] has stopped every controller for OS handoff.
 static STOPPED: crate::cell::LocalCell<bool> = crate::cell::LocalCell::new(false);
 
-/// Incremented whenever a USB mass storage device is hotplugged or removed.
-static STORAGE_GENERATION: crate::cell::LocalCell<u32> = crate::cell::LocalCell::new(0);
-
-/// Rate-limit timer for [`poll()`] so tight idle/EFI loops stay fast.
-static NEXT_HOTPLUG_POLL: crate::cell::LocalCell<Option<crate::time::Timeout>> =
-    crate::cell::LocalCell::new(None);
-
-/// Minimum interval between USB hotplug polls (ms).
-const HOTPLUG_POLL_INTERVAL_MS: u64 = 25;
+/// Changes when the set of available USB disks changes.
+static STORAGE_REVISION: crate::cell::LocalCell<u32> = crate::cell::LocalCell::new(0);
 
 // ============================================================================
 // Initialization
@@ -189,6 +183,9 @@ fn store_controller<T>(
     };
     let controller_ptr = alloc.as_mut_ptr() as *mut T;
     unsafe { ptr::write(controller_ptr, controller) };
+    if controllers.is_empty() {
+        crate::exec::spawn(port::buses());
+    }
     controllers.push(wrap(controller_ptr));
     log::info!("  {} controller initialized", name);
     Ok(())
@@ -231,8 +228,7 @@ fn companion_slot(address: pci::PciAddress) -> (u16, u8, u8) {
     (address.segment(), address.bus(), address.device())
 }
 
-/// Bring up a USB host controller and enumerate its devices without
-/// registering it.
+/// Bring up a USB host controller without registering it.
 // Failures are logged at the error site; callers only branch on success.
 #[allow(clippy::result_unit_err)]
 pub async fn init_controller(dev: &pci::PciDevice) -> Result<InitializedController, ()> {
@@ -385,94 +381,13 @@ pub fn init_all() {
     // Initialize all controllers
     init();
 
-    // Initialize USB keyboards
-    init_keyboards();
+    rescan_companion_ports();
 }
 
-/// Enumerate UHCI companion controller ports (deferred phase)
-///
-/// On ICH8/9/10 chipsets, UHCI companion controllers appear at lower PCI BDFs
-/// than their EHCI companion (UHCI at functions 0-2, EHCI at function 7).
-/// Since PCI drivers bind in ascending BDF order, UHCI hardware is initialized
-/// before EHCI. EHCI must set CONFIGFLAG and release companion ports before
-/// UHCI can see the correct devices and speeds.
-///
-/// UHCI port enumeration is therefore deferred to this function, which must be
-/// called after all USB controllers are initialized (i.e., after
-/// `bind_drivers()`) but before keyboard/device discovery.
+/// Run the normal bus tasks after all companion controllers have been bound.
+/// In particular, UHCI must not touch its ports before EHCI sets CONFIGFLAG.
 pub fn rescan_companion_ports() {
-    let controllers = ALL_CONTROLLERS.lock();
-
-    for handle in controllers.iter() {
-        match handle {
-            #[cfg(target_arch = "x86_64")]
-            UsbControllerHandle::Uhci(ptr) => {
-                // SAFETY: pointer is valid for the firmware's lifetime and we hold
-                // the ALL_CONTROLLERS lock, serializing access.
-                let controller = unsafe { &mut **ptr };
-                controller.rescan_ports();
-            }
-            _ => {}
-        }
-    }
-}
-
-/// Initialize USB keyboards from all controllers
-///
-/// Can be called separately after controller initialization via the PCI
-/// driver model, or as part of `init_all()` for the legacy path.
-pub fn init_keyboards_public() {
-    init_keyboards();
-}
-
-/// Register every USB boot keyboard on every controller (internal)
-fn init_keyboards() {
-    let keyboards = {
-        let controllers = ALL_CONTROLLERS.lock();
-        let mut keyboards = alloc::vec::Vec::new();
-        for (idx, handle) in controllers.iter().enumerate() {
-            with_usb_controller!(handle, mut |controller| {
-                let mut addresses = alloc::vec::Vec::new();
-                controller.for_each_hid_keyboard(&mut |address| addresses.push(address));
-                for address in addresses {
-                    match hid_keyboard::init_keyboard(controller, idx, address) {
-                        Ok(keyboard) => keyboards.push(keyboard),
-                        Err(e) => log::warn!("USB keyboard {} unusable: {:?}", address, e),
-                    }
-                }
-            });
-        }
-        keyboards
-    };
-    // Registered devices poll through the controller list themselves.
-    for keyboard in keyboards {
-        crate::drivers::keyboard_common::register(Box::new(keyboard));
-    }
-}
-
-/// Register every USB boot mouse on every controller
-#[cfg(feature = "ui")]
-pub fn init_mice() {
-    let mice = {
-        let controllers = ALL_CONTROLLERS.lock();
-        let mut mice = alloc::vec::Vec::new();
-        for (idx, handle) in controllers.iter().enumerate() {
-            with_usb_controller!(handle, mut |controller| {
-                let mut addresses = alloc::vec::Vec::new();
-                controller.for_each_hid_mouse(&mut |address| addresses.push(address));
-                for address in addresses {
-                    match hid_mouse::init_mouse(controller, idx, address) {
-                        Ok(mouse) => mice.push(mouse),
-                        Err(e) => log::warn!("USB mouse {} unusable: {:?}", address, e),
-                    }
-                }
-            });
-        }
-        mice
-    };
-    for mouse in mice {
-        crate::drivers::pointer::register(Box::new(mouse));
-    }
+    crate::exec::block_on(port::settle());
 }
 
 /// Clean up all USB controllers before ExitBootServices
@@ -501,133 +416,66 @@ pub fn controller_count() -> usize {
     ALL_CONTROLLERS.lock().len()
 }
 
-/// Current generation counter for USB mass storage topology changes.
-pub fn storage_generation() -> u32 {
-    STORAGE_GENERATION.get()
+/// Revision of the set of USB disks, for consumers with cached entries.
+pub fn storage_revision() -> u32 {
+    STORAGE_REVISION.get()
 }
 
-/// Poll all USB controllers for hotplugged or removed devices.
-///
-/// Rate-limited to [`HOTPLUG_POLL_INTERVAL_MS`] so callers in tight UI or
-/// `WaitForEvent` loops can invoke it freely. Newly attached keyboards and
-/// mice are registered automatically; removed devices are unregistered and
-/// torn down.
-///
-/// Returns `true` if any USB mass storage device was attached or removed.
-pub fn poll() -> bool {
-    if STOPPED.get() {
-        return false;
-    }
-    if let Some(next) = NEXT_HOTPLUG_POLL.get()
-        && !next.is_expired()
-    {
-        return false;
-    }
-    NEXT_HOTPLUG_POLL.set(Some(crate::time::Timeout::from_ms(
-        HOTPLUG_POLL_INTERVAL_MS,
-    )));
-
-    let count = ALL_CONTROLLERS.lock().len();
-    if count == 0 {
-        return false;
-    }
-
-    let mut storage_changed = false;
-    let mut events = alloc::vec::Vec::new();
-
-    for idx in 0..count {
-        events.clear();
-        {
-            let controllers = ALL_CONTROLLERS.lock();
-            if let Some(handle) = controllers.get(idx) {
-                with_usb_controller!(handle, mut |controller| {
-                    controller.poll_hotplug(&mut events);
-                });
-            }
-        }
-
-        for event in events.iter().copied() {
-            match event {
-                controller::UsbHotplugEvent::Detached(addr) => {
-                    crate::drivers::keyboard_common::unregister_usb(idx, addr);
-                    #[cfg(feature = "ui")]
-                    crate::drivers::pointer::unregister_usb(idx, addr);
-                    if mass_storage::remove(idx, addr) {
-                        storage_changed = true;
-                    }
-                    crate::efi::protocols::block_io::mark_usb_removed(idx, addr);
-                }
-                controller::UsbHotplugEvent::Attached(addr) => {
-                    if attach_hotplug_device(idx, addr) {
-                        storage_changed = true;
-                    }
-                }
-            }
-        }
-    }
-
-    if storage_changed {
-        STORAGE_GENERATION.set(STORAGE_GENERATION.get().wrapping_add(1));
-    }
-    storage_changed
-}
-
-/// Bind class drivers to a newly hotplugged USB device.
-/// Returns `true` if a mass storage device with media became available.
-fn attach_hotplug_device(controller_idx: usize, device_addr: u8) -> bool {
-    let Some(info) = with_controller(controller_idx, |c| c.get_device_info(device_addr)).flatten()
-    else {
-        return false;
-    };
-
-    if info.is_keyboard
-        && !crate::drivers::keyboard_common::is_usb_registered(controller_idx, device_addr)
-    {
-        let keyboard = with_controller(controller_idx, |controller| {
-            hid_keyboard::init_keyboard(controller, controller_idx, device_addr)
-        });
-        match keyboard {
-            Some(Ok(kbd)) => {
-                crate::drivers::keyboard_common::register(Box::new(kbd));
+async fn bind_input(pipe: port::Pipe) -> Option<DeviceInfo> {
+    let info = with_controller(pipe.controller, |c| c.get_device_info(pipe.address)).flatten()?;
+    if info.is_keyboard {
+        match hid_keyboard::bind(pipe).await {
+            Ok(keyboard) => {
+                crate::drivers::keyboard_common::register(Box::new(keyboard));
                 log::info!(
-                    "USB: Hotplugged keyboard on controller {} device {}",
-                    controller_idx,
-                    device_addr
+                    "USB: attached keyboard on controller {} device {}",
+                    pipe.controller,
+                    pipe.address
                 );
             }
-            Some(Err(e)) => {
-                log::warn!("USB hotplugged keyboard {} unusable: {:?}", device_addr, e);
-            }
-            None => {}
+            Err(error) => log::warn!("USB keyboard {} unusable: {:?}", pipe.address, error),
         }
     }
-
     #[cfg(feature = "ui")]
-    if info.is_mouse && !crate::drivers::pointer::is_usb_registered(controller_idx, device_addr) {
-        let mouse = with_controller(controller_idx, |controller| {
-            hid_mouse::init_mouse(controller, controller_idx, device_addr)
-        });
-        match mouse {
-            Some(Ok(mouse)) => {
+    if info.is_mouse {
+        match hid_mouse::bind(pipe).await {
+            Ok(mouse) => {
                 crate::drivers::pointer::register(Box::new(mouse));
                 log::info!(
-                    "USB: Hotplugged mouse on controller {} device {}",
-                    controller_idx,
-                    device_addr
+                    "USB: attached mouse on controller {} device {}",
+                    pipe.controller,
+                    pipe.address
                 );
             }
-            Some(Err(e)) => {
-                log::warn!("USB hotplugged mouse {} unusable: {:?}", device_addr, e);
-            }
-            None => {}
+            Err(error) => log::warn!("USB mouse {} unusable: {:?}", pipe.address, error),
         }
     }
+    Some(info)
+}
 
-    if info.is_mass_storage {
-        return mass_storage::probe(controller_idx, device_addr);
+async fn publish_storage(pipe: port::Pipe) -> bool {
+    if mass_storage::probe(pipe).await {
+        STORAGE_REVISION.update(|revision| *revision = revision.wrapping_add(1));
+        log::info!(
+            "USB: attached storage on controller {} device {}",
+            pipe.controller,
+            pipe.address
+        );
+        true
+    } else {
+        false
     }
+}
 
-    false
+fn unbind_device(controller: usize, address: u8) {
+    crate::drivers::keyboard_common::unregister_usb(controller, address);
+    #[cfg(feature = "ui")]
+    crate::drivers::pointer::unregister_usb(controller, address);
+    if let Some(attachment_id) = mass_storage::remove(controller, address) {
+        crate::efi::protocols::block_io::mark_usb_removed(controller, address, attachment_id);
+        STORAGE_REVISION.update(|revision| *revision = revision.wrapping_add(1));
+        log::info!("USB: detached storage on controller {controller} device {address}");
+    }
 }
 
 /// Find every mass storage device on every controller.
@@ -664,6 +512,25 @@ where
     let result = with_usb_controller!(handle, mut |controller| f(controller));
 
     Some(result)
+}
+
+fn with_port_controller<R>(
+    index: usize,
+    f: impl FnOnce(&mut dyn port::PortController) -> R,
+) -> Option<R> {
+    let controllers = ALL_CONTROLLERS.lock();
+    let handle = controllers.get(index)?;
+    Some(with_usb_controller!(handle, mut |controller| f(controller)))
+}
+
+#[cfg(feature = "xhci")]
+fn with_xhci<R>(index: usize, f: impl FnOnce(&mut XhciController) -> R) -> Option<R> {
+    let controllers = ALL_CONTROLLERS.lock();
+    let UsbControllerHandle::Xhci(ptr) = controllers.get(index)? else {
+        return None;
+    };
+    // SAFETY: the controller list owns the pointer and serializes access.
+    Some(f(unsafe { &mut **ptr }))
 }
 
 // ============================================================================
@@ -855,9 +722,5 @@ impl UsbController for XhciController {
             interval: slot.interrupt_interval,
             toggle: false,
         })
-    }
-
-    fn poll_hotplug(&mut self, events: &mut alloc::vec::Vec<self::controller::UsbHotplugEvent>) {
-        xhci::XhciController::poll_hotplug(self, events);
     }
 }

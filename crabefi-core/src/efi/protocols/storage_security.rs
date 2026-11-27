@@ -155,10 +155,11 @@ extern "efiapi" fn storage_security_receive_data(
         StorageId::Usb {
             controller_id,
             device_addr,
-            ..
+            attachment_id,
         } => usb_security_receive(
             controller_id,
             device_addr,
+            attachment_id,
             security_protocol_id,
             security_protocol_specific,
             buffer,
@@ -266,10 +267,11 @@ extern "efiapi" fn storage_security_send_data(
         StorageId::Usb {
             controller_id,
             device_addr,
-            ..
+            attachment_id,
         } => usb_security_send(
             controller_id,
             device_addr,
+            attachment_id,
             security_protocol_id,
             security_protocol_specific,
             buffer,
@@ -376,15 +378,21 @@ fn ahci_security_send(
 fn usb_security_receive(
     controller_index: usize,
     device_addr: u8,
+    attachment_id: core::num::NonZeroU64,
     protocol_id: u8,
     sp_specific: u16,
     buffer: &mut [u8],
 ) -> Result<usize, &'static str> {
-    usb::mass_storage::with_device(controller_index, device_addr, |device, controller| {
-        device
-            .security_protocol_in(controller, protocol_id, sp_specific, buffer)
-            .map_err(|_| "USB security protocol in failed")
-    })
+    usb::mass_storage::with_device(
+        controller_index,
+        device_addr,
+        attachment_id,
+        |device, controller| {
+            device
+                .security_protocol_in(controller, protocol_id, sp_specific, buffer)
+                .map_err(|_| "USB security protocol in failed")
+        },
+    )
     .ok_or("USB controller or mass storage device not available")?
 }
 
@@ -392,15 +400,21 @@ fn usb_security_receive(
 fn usb_security_send(
     controller_index: usize,
     device_addr: u8,
+    attachment_id: core::num::NonZeroU64,
     protocol_id: u8,
     sp_specific: u16,
     buffer: &[u8],
 ) -> Result<(), &'static str> {
-    usb::mass_storage::with_device(controller_index, device_addr, |device, controller| {
-        device
-            .security_protocol_out(controller, protocol_id, sp_specific, buffer)
-            .map_err(|_| "USB security protocol out failed")
-    })
+    usb::mass_storage::with_device(
+        controller_index,
+        device_addr,
+        attachment_id,
+        |device, controller| {
+            device
+                .security_protocol_out(controller, protocol_id, sp_specific, buffer)
+                .map_err(|_| "USB security protocol out failed")
+        },
+    )
     .ok_or("USB controller or mass storage device not available")?
 }
 

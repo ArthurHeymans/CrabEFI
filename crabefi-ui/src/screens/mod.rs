@@ -40,12 +40,7 @@ pub enum ScreenNav {
     Reset,
     Nav(NavItem),
 }
-enum BootResult {
-    Selected(usize),
-    Refresh,
-    Reset,
-    Nav(NavItem),
-}
+type BootResult = core::ops::ControlFlow<Outcome, NavItem>;
 const NAV_ITEMS: &[(NavItem, &str)] = &[
     (NavItem::Boot, "Boot"),
     #[cfg(feature = "secure-boot")]
@@ -323,10 +318,8 @@ pub async fn show_graphical_menu<E: MenuEntry>(
     loop {
         let next = match screen {
             NavItem::Boot => match run_boot(fb, menu, default).await {
-                BootResult::Selected(i) => return Outcome::Boot(i),
-                BootResult::Refresh => return Outcome::Refresh,
-                BootResult::Reset => return Outcome::Reset,
-                BootResult::Nav(nav) => ScreenNav::Nav(nav),
+                BootResult::Break(outcome) => return outcome,
+                BootResult::Continue(nav) => ScreenNav::Nav(nav),
             },
             #[cfg(feature = "secure-boot")]
             NavItem::Security => secure_boot::show(fb).await,
@@ -491,7 +484,7 @@ pub async fn empty_screen(
             if fb.reset_requested() {
                 return ScreenNav::Reset;
             }
-            if nav == NavItem::Boot && fb.storage_changed() {
+            if nav == NavItem::Boot && fb.boot_entries_stale() {
                 cursor.hide(fb);
                 return ScreenNav::Refresh;
             }
@@ -1158,7 +1151,7 @@ async fn run_boot<E: MenuEntry>(
             match chrome_key(fb, key, &mut state.focus, NavItem::Boot, actions) {
                 Some(FocusEvent::Navigate(i)) => {
                     cursor.hide(fb);
-                    return BootResult::Nav(nav_at(i));
+                    return BootResult::Continue(nav_at(i));
                 }
                 // Space activates buttons, but never the one that boots.
                 Some(FocusEvent::Action(i)) if !(i == 0 && key == KeyPress::Char(' ')) => {
@@ -1226,7 +1219,7 @@ async fn run_boot<E: MenuEntry>(
             match activate {
                 Some(0) => {
                     cursor.hide(fb);
-                    return BootResult::Selected(state.sel);
+                    return BootResult::Break(Outcome::Boot(state.sel));
                 }
                 Some(_) => {
                     if let Some(entry) = menu.entries.get(state.sel)
@@ -1279,17 +1272,17 @@ async fn run_boot<E: MenuEntry>(
             if state.countdown == 0 {
                 cursor.hide(fb);
                 observe_boot(fb, &state);
-                return BootResult::Selected(state.sel);
+                return BootResult::Break(Outcome::Boot(state.sel));
             }
             cursor.while_hidden(fb, || paint_boot_strip(fb, menu, &state));
         }
         observe_boot(fb, &state);
         if fb.reset_requested() {
-            return BootResult::Reset;
+            return BootResult::Break(Outcome::Reset);
         }
-        if state.edit.is_none() && fb.storage_changed() {
+        if state.edit.is_none() && fb.boot_entries_stale() {
             cursor.hide(fb);
-            return BootResult::Refresh;
+            return BootResult::Break(Outcome::Refresh);
         }
         fb.wait_for_frame().await;
     }
@@ -1311,7 +1304,7 @@ fn apply_cmdline_and_boot<E: MenuEntry>(
         }
         menu.set_edited_cmdline(index, edited);
     }
-    BootResult::Selected(index)
+    BootResult::Break(Outcome::Boot(index))
 }
 
 /// Keys while the details pane owns the one-shot command-line editor.

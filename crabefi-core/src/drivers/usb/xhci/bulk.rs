@@ -186,9 +186,7 @@ impl super::XhciController {
             };
             if !self.capture_interrupt_event(raw) {
                 match event::Allowed::try_from(raw) {
-                    Ok(event::Allowed::PortStatusChange(_)) => {
-                        self.port_change_pending = true;
-                    }
+                    Ok(event::Allowed::PortStatusChange(_)) => {}
                     Ok(event::Allowed::HostController(host)) => {
                         return Err(XhciError::TransferFailed(host.completion_code()));
                     }

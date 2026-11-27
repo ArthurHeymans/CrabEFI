@@ -59,17 +59,8 @@ pub(crate) fn init_storage_subsystem<const NATIVE: bool>(with_usb: bool) {
 
 /// Enumerate input devices behind freshly bound USB controllers.
 fn init_usb_devices() {
-    // Rescan UHCI/OHCI companion controller ports for devices that EHCI
-    // released after the initial scan (ICH8/9/10 chipsets initialize UHCI
-    // before EHCI due to PCI BDF ordering)
+    // Start polling only after EHCI has configured companion routing.
     drivers::usb::rescan_companion_ports();
-
-    // Initialize USB keyboards (needs to happen after USB controllers are bound)
-    drivers::usb::init_keyboards_public();
-
-    // Initialize USB mice (needs to happen after USB controllers are bound)
-    #[cfg(feature = "ui")]
-    drivers::usb::init_mice();
 }
 
 /// Whether USB controllers have been bound.
@@ -365,7 +356,9 @@ fn show_boot_menu_once<const NATIVE: bool>(
     let mut boot_menu = menu::discover_entries::<NATIVE>();
     // After a refused choice the user is in the menu on purpose, like an
     // explicit setup request: keep the menu even without media.
-    let keep_menu = firmware_ui_requested || countdown.is_none();
+    let keep_menu = firmware_ui_requested
+        || countdown.is_none()
+        || (usb_ready() && drivers::usb::controller_count() != 0);
 
     if boot_menu.entry_count() == 0 && !keep_menu {
         log::warn!("No bootable media found!");

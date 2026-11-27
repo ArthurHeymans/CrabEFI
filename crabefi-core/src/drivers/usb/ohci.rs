@@ -16,14 +16,11 @@ use crate::time::{Timeout, wait_for};
 use core::ptr;
 use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
 
-use super::controller::{
-    Direction, LegacyPortAction, LegacyPortState, SetupPacket, UsbController, UsbDevice, UsbError,
-    UsbHotplugEvent, UsbSpeed, allocate_legacy_address, detach_legacy_root_port,
-    emit_new_legacy_devices, enumerate_device, snapshot_legacy_addresses, sync_legacy_port_states,
-};
+use super::controller::{Direction, SetupPacket, UsbController, UsbDevice, UsbError, UsbSpeed};
 use super::ohci_regs::{
     self, HCCOMMANDSTATUS, HCCONTROL, HCREVISION, HCRHDESCRIPTORA, HCRHPORTSTATUS, HCRHSTATUS,
 };
+use super::port::{Control, PortController, RootCommand, RootKind, RootStatus};
 
 // ============================================================================
 // OHCI Data Structures
@@ -285,8 +282,6 @@ pub struct OhciController {
     bulk_ed: u64,
     /// DMA buffer
     dma_buffer: u64,
-    /// Per-root-port hotplug state machine.
-    port_states: [LegacyPortState; MAX_PORTS],
 }
 
 impl OhciController {
@@ -345,11 +340,9 @@ impl OhciController {
             control_ed,
             bulk_ed,
             dma_buffer,
-            port_states: [LegacyPortState::Empty; MAX_PORTS],
         };
 
         controller.init().await?;
-        controller.enumerate_ports().await?;
 
         Ok(controller)
     }
@@ -474,106 +467,6 @@ impl OhciController {
         exec::sleep_ms(100).await; // Wait for power to stabilize
 
         log::info!("OHCI controller initialized");
-        Ok(())
-    }
-
-    /// Enumerate ports and attach devices
-    async fn enumerate_ports(&mut self) -> Result<(), UsbError> {
-        for port_num in 0..self.num_ports {
-            let port = self.port(port_num);
-            let connected = port.portsc.is_set(HCRHPORTSTATUS::CCS);
-            let is_low_speed = port.portsc.is_set(HCRHPORTSTATUS::LSDA);
-
-            // Clear status change bits (W1C)
-            port.portsc.write(
-                HCRHPORTSTATUS::CSC::SET
-                    + HCRHPORTSTATUS::PESC::SET
-                    + HCRHPORTSTATUS::PSSC::SET
-                    + HCRHPORTSTATUS::OCIC::SET
-                    + HCRHPORTSTATUS::PRSC::SET,
-            );
-
-            // Check if device connected
-            if !connected {
-                continue;
-            }
-
-            log::info!(
-                "OHCI: Device on port {} ({})",
-                port_num,
-                if is_low_speed {
-                    "low-speed"
-                } else {
-                    "full-speed"
-                }
-            );
-
-            // Reset the port
-            self.port(port_num).portsc.write(HCRHPORTSTATUS::PRS::SET);
-
-            // Wait for reset complete
-            exec::wait_for(100, || {
-                !self.port(port_num).portsc.is_set(HCRHPORTSTATUS::PRS)
-            })
-            .await;
-
-            exec::sleep_ms(10).await; // Recovery time
-
-            // Clear status change
-            self.port(port_num).portsc.write(HCRHPORTSTATUS::PRSC::SET);
-
-            // Check if enabled
-            if !self.port(port_num).portsc.is_set(HCRHPORTSTATUS::PES) {
-                log::warn!("OHCI: Port {} not enabled after reset", port_num);
-                continue;
-            }
-
-            // Enumerate the device
-            let speed = if is_low_speed {
-                UsbSpeed::Low
-            } else {
-                UsbSpeed::Full
-            };
-
-            if let Err(e) = self.attach_device(port_num, speed) {
-                log::error!("Failed to attach device on port {}: {:?}", port_num, e);
-            }
-        }
-
-        let port_regs_base = self.port_regs_base;
-        let num_ports = usize::from(self.num_ports).min(MAX_PORTS);
-        sync_legacy_port_states(&self.devices, &mut self.port_states[..num_ports], |port| {
-            let reg = unsafe {
-                &*((port_regs_base + u64::from(port) * 4) as *const ohci_regs::OhciPortRegs)
-            };
-            reg.portsc.is_set(HCRHPORTSTATUS::CCS)
-        });
-        Ok(())
-    }
-
-    /// Attach a device on a port
-    fn attach_device(&mut self, port: u8, speed: UsbSpeed) -> Result<(), UsbError> {
-        let address = allocate_legacy_address(&self.devices, &mut self.next_address)
-            .ok_or(UsbError::NoFreeSlots)?;
-
-        let slot = self
-            .devices
-            .iter()
-            .position(|h| h.is_none())
-            .ok_or(UsbError::NoFreeSlots)?;
-
-        let initial_device = UsbDevice::new(0, port, speed);
-
-        // Use the common enumeration helper with a closure for control transfers
-        let device = enumerate_device(
-            initial_device,
-            address,
-            |dev, req_type, req, value, index, data| {
-                self.control_transfer_internal(dev, req_type, req, value, index, data)
-            },
-        )?;
-
-        self.devices[slot] = Some(device);
         Ok(())
     }
 
@@ -1003,87 +896,6 @@ impl UsbController for OhciController {
     fn devices(&self) -> &[Option<UsbDevice>] {
         &self.devices
     }
-
-    fn poll_hotplug(&mut self, events: &mut alloc::vec::Vec<UsbHotplugEvent>) {
-        let num_ports = self.num_ports.min(MAX_PORTS as u8);
-        for port_num in 0..num_ports {
-            let connected = self.port(port_num).portsc.is_set(HCRHPORTSTATUS::CCS);
-            let csc = self.port(port_num).portsc.is_set(HCRHPORTSTATUS::CSC);
-            match self.port_states[usize::from(port_num)].step(connected, csc) {
-                LegacyPortAction::None => {}
-                LegacyPortAction::ClearCsc => {
-                    self.port(port_num).portsc.write(
-                        HCRHPORTSTATUS::CSC::SET
-                            + HCRHPORTSTATUS::PESC::SET
-                            + HCRHPORTSTATUS::PSSC::SET
-                            + HCRHPORTSTATUS::OCIC::SET
-                            + HCRHPORTSTATUS::PRSC::SET,
-                    );
-                }
-                LegacyPortAction::Detach => {
-                    log::info!("OHCI: Port {} disconnected", port_num);
-                    self.port(port_num).portsc.write(
-                        HCRHPORTSTATUS::CSC::SET
-                            + HCRHPORTSTATUS::PESC::SET
-                            + HCRHPORTSTATUS::PSSC::SET
-                            + HCRHPORTSTATUS::OCIC::SET
-                            + HCRHPORTSTATUS::PRSC::SET,
-                    );
-                    detach_legacy_root_port(&mut self.devices, port_num, events);
-                }
-                LegacyPortAction::Attach => {
-                    self.port(port_num).portsc.write(
-                        HCRHPORTSTATUS::CSC::SET
-                            + HCRHPORTSTATUS::PESC::SET
-                            + HCRHPORTSTATUS::PSSC::SET
-                            + HCRHPORTSTATUS::OCIC::SET
-                            + HCRHPORTSTATUS::PRSC::SET,
-                    );
-                    let is_low_speed = self.port(port_num).portsc.is_set(HCRHPORTSTATUS::LSDA);
-                    log::info!("OHCI: Hotplugging device on port {}", port_num);
-                    self.port(port_num).portsc.write(HCRHPORTSTATUS::PRS::SET);
-                    wait_for(100, || {
-                        !self.port(port_num).portsc.is_set(HCRHPORTSTATUS::PRS)
-                    });
-                    crate::time::delay_ms(10);
-                    self.port(port_num).portsc.write(HCRHPORTSTATUS::PRSC::SET);
-
-                    if !self.port(port_num).portsc.is_set(HCRHPORTSTATUS::PES) {
-                        let still_connected =
-                            self.port(port_num).portsc.is_set(HCRHPORTSTATUS::CCS);
-                        self.port_states[usize::from(port_num)] = if still_connected {
-                            LegacyPortState::Failed
-                        } else {
-                            LegacyPortState::Empty
-                        };
-                        continue;
-                    }
-                    let speed = if is_low_speed {
-                        UsbSpeed::Low
-                    } else {
-                        UsbSpeed::Full
-                    };
-                    let before = snapshot_legacy_addresses(&self.devices);
-                    match self.attach_device(port_num, speed) {
-                        Ok(()) => {
-                            self.port_states[usize::from(port_num)] = LegacyPortState::Attached;
-                            emit_new_legacy_devices(&self.devices, &before, events);
-                        }
-                        Err(e) => {
-                            log::warn!("OHCI: Hotplug attach failed on port {}: {:?}", port_num, e);
-                            let still_connected =
-                                self.port(port_num).portsc.is_set(HCRHPORTSTATUS::CCS);
-                            self.port_states[usize::from(port_num)] = if still_connected {
-                                LegacyPortState::Failed
-                            } else {
-                                LegacyPortState::Empty
-                            };
-                        }
-                    }
-                }
-            }
-        }
-    }
 }
 
 impl OhciController {
@@ -1116,5 +928,59 @@ impl OhciController {
         crate::time::delay_ms(10);
 
         log::debug!("OHCI cleanup complete");
+    }
+}
+
+impl PortController for OhciController {
+    fn root_ports(&self) -> (RootKind, u8) {
+        (RootKind::Ohci, self.num_ports)
+    }
+
+    fn legacy_devices(&mut self) -> Option<(&mut [Option<UsbDevice>], &mut u8)> {
+        Some((&mut self.devices, &mut self.next_address))
+    }
+
+    fn legacy_control(
+        &mut self,
+        device: &UsbDevice,
+        request: Control,
+        data: Option<&mut [u8]>,
+    ) -> Result<usize, UsbError> {
+        self.control_transfer_internal(
+            device,
+            request.ty,
+            request.request,
+            request.value,
+            request.index,
+            data,
+        )
+    }
+
+    fn root_status(&self, port: u8) -> RootStatus {
+        let status = self.port(port).portsc.extract();
+        RootStatus {
+            connected: status.is_set(HCRHPORTSTATUS::CCS),
+            changed: status.is_set(HCRHPORTSTATUS::CSC),
+            enabled: status.is_set(HCRHPORTSTATUS::PES),
+            resetting: status.is_set(HCRHPORTSTATUS::PRS),
+            low_speed: status.is_set(HCRHPORTSTATUS::LSDA),
+            ..RootStatus::default()
+        }
+    }
+
+    fn root_command(&mut self, port: u8, command: RootCommand) {
+        self.port(port).portsc.write(match command {
+            RootCommand::ClearChanges => {
+                HCRHPORTSTATUS::CSC::SET
+                    + HCRHPORTSTATUS::PESC::SET
+                    + HCRHPORTSTATUS::PSSC::SET
+                    + HCRHPORTSTATUS::OCIC::SET
+                    + HCRHPORTSTATUS::PRSC::SET
+            }
+            RootCommand::Reset => HCRHPORTSTATUS::PRS::SET,
+            // Writing bit 0 clears Port Enable (reading it reports CCS).
+            RootCommand::Disable => HCRHPORTSTATUS::CCS::SET,
+            _ => unreachable!(),
+        });
     }
 }
