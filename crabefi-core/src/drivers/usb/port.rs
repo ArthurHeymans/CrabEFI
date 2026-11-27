@@ -624,6 +624,14 @@ struct Hub {
 const HUB_TRANSPORT_FAILURE_LIMIT: u8 = 3;
 
 impl Hub {
+    fn root_hub(&self) -> &Hub {
+        let mut hub = self;
+        while let Some(upstream) = &hub.upstream {
+            hub = upstream;
+        }
+        hub
+    }
+
     fn parked(&self) -> bool {
         self.transport_failures.get() >= HUB_TRANSPORT_FAILURE_LIMIT
             || self.quarantine.borrow().is_some()
@@ -729,7 +737,7 @@ async fn port_task(
                                 initial_scans = 0;
                                 drop(initial_scan.take());
                                 port.report_parked(&error);
-                                wait_for_replug(&port, false).await;
+                                wait_for_replug(&port, connection.connected, false).await;
                                 continue 'connect;
                             }
                             port.sleep(port.interval()).await;
@@ -785,8 +793,15 @@ async fn port_task(
                             // reset the port forever.
                             Ok(link) if !link.connected => continue 'connect,
                             Ok(link) if link.changed => {
-                                let _ = port.clear_change().await;
-                                change_cleared = false;
+                                if port.clear_change().await.is_ok() {
+                                    match port.connection().await {
+                                        Ok(after) if !after.connected => continue 'connect,
+                                        Ok(after) => change_cleared = !after.changed,
+                                        Err(_) => change_cleared = false,
+                                    }
+                                } else {
+                                    change_cleared = false;
+                                }
                             }
                             Ok(_) => {
                                 change_cleared = true;
@@ -815,7 +830,7 @@ async fn port_task(
             drop(startup);
             // A parked port wakes on disconnect, or on a fresh change once the
             // change latch has been observed clear.
-            wait_for_replug(&port, change_cleared).await;
+            wait_for_replug(&port, true, change_cleared).await;
             continue 'connect;
         };
 
@@ -845,14 +860,14 @@ async fn wait_for_port_change(port: &impl PortOps) {
     }
 }
 
-async fn wait_for_replug(port: &impl PortOps, mut change_cleared: bool) {
+async fn wait_for_replug(port: &impl PortOps, parked_connected: bool, mut change_cleared: bool) {
     loop {
         port.sleep(port.interval()).await;
         if port.upstream_parked() {
             return;
         }
         if let Ok(connection) = port.connection().await {
-            if !connection.connected {
+            if connection.connected != parked_connected {
                 return;
             }
             if connection.changed {
@@ -1018,6 +1033,7 @@ impl Port {
                 Some(reset_submitted),
             )
             .await?;
+            note_startup_progress();
             exec::sleep_ms(60).await;
             let deadline = Timeout::from_ms(500);
             loop {
@@ -1028,6 +1044,7 @@ impl Port {
                 if change & hub_port_change::C_RESET != 0 {
                     self.hub_feature(request::CLEAR_FEATURE, hub_feature::C_PORT_RESET)
                         .await?;
+                    note_startup_progress();
                     if status & hub_port_status::ENABLE == 0 {
                         return Err(UsbError::NotReady);
                     }
@@ -1269,9 +1286,40 @@ impl PortOps for Port {
         if real_port {
             note_startup_progress();
         }
-        let mut reset_submitted = false;
+        struct ResetGuard<'a> {
+            port: &'a Port,
+            reservation: Option<DefaultAddress>,
+            submitted: bool,
+        }
+        impl Drop for ResetGuard<'_> {
+            fn drop(&mut self) {
+                if self.submitted
+                    && let Some(reservation) = self.reservation.take()
+                {
+                    if let Some(hub) = &self.port.hub {
+                        // Cancellation during a parked-ancestor teardown cannot
+                        // issue disable requests; quarantine on the root-attached
+                        // hub until physical disconnect.
+                        if hub.parked() {
+                            hub.root_hub().isolate_or_quarantine(
+                                reservation,
+                                false,
+                                self.port.root_status(),
+                            );
+                        }
+                    } else {
+                        self.port.root_command(RootCommand::Disable);
+                    }
+                }
+            }
+        }
+        let mut guard = ResetGuard {
+            port: self,
+            reservation,
+            submitted: false,
+        };
         let result = async {
-            let Some(speed) = self.reset(retry, &mut reset_submitted).await? else {
+            let Some(speed) = self.reset(retry, &mut guard.submitted).await? else {
                 // If EHCI still owns the port, PO did not take effect.
                 // Treat it as a failed attempt, not a new connection.
                 return if self.root_status().connected {
@@ -1298,8 +1346,9 @@ impl PortOps for Port {
             }
         }
         .await;
+        let reservation = guard.reservation.take();
         if result.is_err()
-            && reset_submitted
+            && guard.submitted
             && let Some(reservation) = reservation
         {
             // Never release address zero on a failed reset or SET_ADDRESS
@@ -1312,7 +1361,8 @@ impl PortOps for Port {
                     status & hub_port_status::CONNECTION == 0
                         || status & hub_port_status::ENABLE == 0
                 });
-                hub.isolate_or_quarantine(reservation, isolated, self.root_status());
+                hub.root_hub()
+                    .isolate_or_quarantine(reservation, isolated, self.root_status());
             } else {
                 self.root_command(RootCommand::Disable);
             }
@@ -1596,6 +1646,7 @@ mod tests {
         reset_latches_change: bool,
         relatches_on_clear: bool,
         clear_change_fails: Cell<bool>,
+        clear_change_calls: Cell<usize>,
         upstream_parked: Cell<bool>,
         failed_observations: Cell<usize>,
         reset_for: Cell<u64>,
@@ -1616,6 +1667,7 @@ mod tests {
                 reset_latches_change: false,
                 relatches_on_clear: false,
                 clear_change_fails: Cell::default(),
+                clear_change_calls: Cell::default(),
                 upstream_parked: Cell::default(),
                 failed_observations: Cell::default(),
                 reset_for: Cell::default(),
@@ -1636,6 +1688,7 @@ mod tests {
             Ok(self.connection.get())
         }
         async fn clear_change(&self) -> Result<(), UsbError> {
+            self.clear_change_calls.update(|n| n + 1);
             if self.clear_change_fails.get() {
                 return Err(UsbError::Stall);
             }
@@ -2375,5 +2428,83 @@ mod tests {
         port.set(false, true);
         port.advance(DEBOUNCE_MS, task.as_mut());
         assert_eq!(port.failed_observations.get(), 1);
+    }
+
+    #[test]
+    fn disconnected_stuck_change_latch_stays_parked_after_clear_failures() {
+        let port = FakePort::default();
+        port.clear_change_fails.set(true);
+        port.set(false, true);
+        let mut task = core::pin::pin!(port_task(&port, 0, None));
+        for _ in 0..MAX_PORT_ATTEMPTS {
+            port.advance(ROOT_POLL_MS, task.as_mut());
+        }
+        assert_eq!(port.clear_change_calls.get(), MAX_PORT_ATTEMPTS);
+        // Subsequent polls with the same disconnected+changed state must not retry clear_change.
+        for _ in 0..10 {
+            port.advance(ROOT_POLL_MS, task.as_mut());
+        }
+        assert_eq!(port.clear_change_calls.get(), MAX_PORT_ATTEMPTS);
+    }
+
+    #[test]
+    fn fast_replug_after_verified_clear_wakes_exhausted_port() {
+        let port = FakePort {
+            reset_latches_change: true,
+            ..FakePort::default()
+        };
+        let mut task = core::pin::pin!(port_task(&port, 0, None));
+        port.set(true, true);
+        port.advance(0, task.as_mut());
+        for attempt in 1..=MAX_PORT_ATTEMPTS {
+            port.advance(DEBOUNCE_MS, task.as_mut());
+            assert_eq!(port.attempted.get(), attempt);
+            if attempt != MAX_PORT_ATTEMPTS {
+                port.advance(PORT_RETRY_MS, task.as_mut());
+            }
+        }
+        // Final attempt saw changed=true and verified clear_change cleared it.
+        // A fast replug arriving BEFORE the first parked poll must wake immediately.
+        port.set(true, true);
+        port.advance(ROOT_POLL_MS, task.as_mut());
+        assert_eq!(port.startup_active.get(), 1);
+    }
+
+    #[test]
+    fn nested_hub_root_quarantine_survives_child_hub_drop() {
+        let owner = Rc::new(LocalCell::new(false));
+        let cx = &mut Context::from_waker(Waker::noop());
+        let mut next = core::pin::pin!(DefaultAddress::reserve_on(owner.clone()));
+        let root_hub = Rc::new(Hub {
+            address: 1,
+            upstream: None,
+            transport_failures: LocalCell::new(0),
+            quarantine: Local::new(None),
+            #[cfg(feature = "xhci")]
+            superspeed: false,
+        });
+        {
+            let nested_hub = Rc::new(Hub {
+                address: 2,
+                upstream: Some(root_hub.clone()),
+                transport_failures: LocalCell::new(0),
+                quarantine: Local::new(None),
+                #[cfg(feature = "xhci")]
+                superspeed: false,
+            });
+            let reservation = exec::block_on(DefaultAddress::reserve_on(owner.clone()));
+            let connected = RootStatus {
+                connected: true,
+                ..RootStatus::default()
+            };
+            // Quarantining on root_hub() survives nested_hub being dropped.
+            nested_hub
+                .root_hub()
+                .isolate_or_quarantine(reservation, false, connected);
+        }
+        assert!(root_hub.parked());
+        assert!(next.as_mut().poll(cx).is_pending());
+        drop(root_hub);
+        assert!(next.as_mut().poll(cx).is_ready());
     }
 }

@@ -754,13 +754,25 @@ impl EhciController {
         if unlinked {
             self.op().usbsts.modify(USBSTS::IAA::SET);
             self.op().usbcmd.modify(USBCMD::IAAD::SET);
+            let mut retired = false;
             let timeout = Timeout::from_ms(100);
             while !timeout.is_expired() {
                 if self.op().usbsts.is_set(USBSTS::IAA) {
                     self.op().usbsts.modify(USBSTS::IAA::SET);
+                    retired = true;
                     break;
                 }
                 crate::time::delay_us(10);
+            }
+            if !retired {
+                // Fallback: stop the async schedule so hardware cannot retain a
+                // cached pointer to the unlinked QH. If ASS stays set, ASE is
+                // left clear and the next transfer refuses to reuse descriptors
+                // until hardware confirms !ASS.
+                self.op().usbcmd.modify(USBCMD::ASE::CLEAR);
+                if !wait_for(100, || !self.op().usbsts.is_set(USBSTS::ASS)) {
+                    log::warn!("EHCI: bulk QH unlink neither acknowledged IAA nor stopped ASS");
+                }
             }
         } else {
             log::debug!("EHCI: persistent bulk QH was not found in async schedule");
@@ -785,6 +797,17 @@ impl EhciController {
             || data_len > Qtd::max_transfer_len(self.dma_buffer + 64)
         {
             return Err(UsbError::InvalidParameter);
+        }
+
+        // Run one-shot control transfers on a quiet async schedule, matching
+        // libpayload/U-Boot. Confirm !ASS before touching any shared DMA buffer
+        // or descriptor pool so a previous stop timeout cannot race with CPU writes.
+        if self.op().usbcmd.is_set(USBCMD::ASE) || self.op().usbsts.is_set(USBSTS::ASS) {
+            self.op().usbcmd.modify(USBCMD::ASE::CLEAR);
+            if !self.wait_async_schedule(false, &timeout) {
+                log::warn!("EHCI: Async schedule failed to stop before control transfer");
+                return Err(UsbError::Timeout);
+            }
         }
 
         log::trace!(
@@ -948,17 +971,6 @@ impl EhciController {
 
         // Flush QH to main memory
         flush_cache_range(qh_addr, 96);
-
-        // Run one-shot control transfers on a quiet async schedule, matching
-        // libpayload/U-Boot. ICH7-era EHCI can otherwise keep stale async-list
-        // state around transient QHs.
-        if self.op().usbcmd.is_set(USBCMD::ASE) || self.op().usbsts.is_set(USBSTS::ASS) {
-            self.op().usbcmd.modify(USBCMD::ASE::CLEAR);
-            if !self.wait_async_schedule(false, &timeout) {
-                log::warn!("EHCI: Async schedule failed to stop before control transfer");
-                return Err(UsbError::Timeout);
-            }
-        }
 
         // Link QH into async schedule (insert after async head)
         let async_qh = unsafe { &mut *(self.async_qh as *mut Qh) };
@@ -1191,6 +1203,16 @@ impl EhciController {
         let data_addr = self.dma_buffer;
         if data.len() > Self::DMA_BUFFER_SIZE || data.len() > Qtd::max_transfer_len(data_addr) {
             return Err(UsbError::InvalidParameter);
+        }
+        // If a previous control transfer or bulk unlink commanded the async
+        // schedule to stop (ASE=0) and hardware has not yet confirmed !ASS,
+        // wait for !ASS before reusing the shared bounce buffer or bulk QH/qTD.
+        if !self.op().usbcmd.is_set(USBCMD::ASE)
+            && self.op().usbsts.is_set(USBSTS::ASS)
+            && !self.wait_async_schedule(false, &timeout)
+        {
+            log::warn!("EHCI: Async schedule still stopping before bulk transfer");
+            return Err(UsbError::Timeout);
         }
         let qh_addr = self.bulk_qh;
         let qtd_addr = self.bulk_qtd;
