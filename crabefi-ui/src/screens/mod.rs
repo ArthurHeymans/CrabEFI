@@ -1110,6 +1110,12 @@ async fn run_boot<E: MenuEntry>(
     let mut hover = Hover::default();
     let origin = fb.position();
     loop {
+        // A background poll during the previous frame may have removed the
+        // selected disk. Refresh before accepting input or expiring the timer.
+        if fb.boot_entries_stale() {
+            cursor.hide(fb);
+            return BootResult::Break(Outcome::Refresh);
+        }
         poll_and_render_cursor(fb, &mut cursor);
         // Tabs are not live while the command-line editor owns the keys.
         let tabs = state
@@ -1285,10 +1291,6 @@ async fn run_boot<E: MenuEntry>(
         if fb.reset_requested() {
             return BootResult::Break(Outcome::Reset);
         }
-        if state.edit.is_none() && fb.boot_entries_stale() {
-            cursor.hide(fb);
-            return BootResult::Break(Outcome::Refresh);
-        }
         fb.wait_for_frame().await;
     }
 }
@@ -1411,6 +1413,46 @@ mod tests {
         }
         menu
     }
+    #[test]
+    fn stale_entries_win_on_the_countdown_expiry_frame() {
+        use alloc::rc::Rc;
+        use core::cell::Cell;
+        use core::future::Future;
+        use core::task::{Context, Poll, Waker};
+
+        struct Backend(Rc<Cell<u64>>);
+        impl crate::Backend for Backend {
+            fn poll_pointer(&mut self) -> (i32, i32) {
+                (0, 0)
+            }
+            fn read_key(&mut self) -> Option<KeyPress> {
+                None
+            }
+            fn now_ms(&self) -> u64 {
+                self.0.get()
+            }
+            fn poll_frame(&mut self, _: &mut Context<'_>) -> Poll<()> {
+                self.0.set(1000);
+                Poll::Ready(())
+            }
+            fn boot_entries_stale(&self) -> bool {
+                self.0.get() == 1000
+            }
+        }
+
+        let mut mem = std::vec![0u32; 800 * 600];
+        let fb = framebuffer(&mut mem, 800, 600);
+        let surface = crate::Surface::new(*fb, Backend(Rc::new(Cell::new(0))));
+        surface.set_pointer((0, 0));
+        let mut menu = boot_menu(1);
+        menu.set_timeout(1);
+        let mut task = core::pin::pin!(run_boot(&surface, &mut menu, 0));
+        assert!(matches!(
+            task.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(BootResult::Break(Outcome::Refresh))
+        ));
+    }
+
     #[test]
     fn page_navigation_is_bounded_and_handles_empty_lists() {
         assert_eq!(page_selection(KeyPress::End, 0, 40, 6), Some(39));

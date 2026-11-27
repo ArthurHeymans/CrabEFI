@@ -27,6 +27,7 @@ struct Controller {
     class_indices: alloc::vec::Vec<u16>,
     descriptor: Option<alloc::vec::Vec<u8>>,
     boot_protocol_stalls: bool,
+    descriptor_stalls: bool,
 }
 
 impl Controller {
@@ -39,6 +40,7 @@ impl Controller {
             class_indices: alloc::vec::Vec::new(),
             descriptor: None,
             boot_protocol_stalls: false,
+            descriptor_stalls: false,
         }
     }
 }
@@ -58,6 +60,11 @@ impl UsbController for Controller {
     ) -> Result<usize, UsbError> {
         if request_type & req_type::TYPE_CLASS == 0 {
             assert_eq!(req, request::GET_DESCRIPTOR);
+            if value >> 8 == u16::from(super::super::controller::desc_type::HID_REPORT)
+                && self.descriptor_stalls
+            {
+                return Err(UsbError::Stall);
+            }
             return super::super::port::fake_hid_descriptor(
                 value,
                 index,
@@ -130,6 +137,17 @@ fn bind_test_keyboard(controller: &mut Controller) -> UsbHidKeyboard {
         async |r, data| controller.control_transfer(1, r.ty, r.request, r.value, r.index, data),
     ))
     .unwrap()
+}
+
+#[test]
+fn stalled_report_descriptor_can_still_use_boot_protocol() {
+    let mut controller = Controller::new();
+    controller.descriptor = Some(alloc::vec![0; 40]);
+    controller.descriptor_stalls = true;
+    let mut keyboard = bind_test_keyboard(&mut controller);
+    assert!(keyboard.report.is_none());
+    keyboard.poll_report(&mut controller);
+    assert_eq!(keyboard.keys.get_key(), Some(u16::from(b'a')));
 }
 
 #[test]

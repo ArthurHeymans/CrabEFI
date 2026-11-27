@@ -201,7 +201,11 @@ pub(super) async fn hid_report(
     .await;
     match result {
         Ok(actual) if actual == length => Ok((number, Some(data))),
-        Err(UsbError::Timeout) => Err(UsbError::Timeout),
+        Err(error @ (UsbError::Timeout | UsbError::Disconnected | UsbError::DeviceNotFound)) => {
+            Err(error)
+        }
+        // EP0 STALL and an absent/unsupported descriptor do not preclude
+        // HID boot protocol, which does not require a report descriptor.
         _ => Ok((number, None)),
     }
 }
@@ -1209,6 +1213,16 @@ impl PortOps for Port {
     }
 }
 
+fn addressable_hub_ports(kind: RootKind, advertised: u8) -> u8 {
+    match kind {
+        // EHCI's transaction-translator port field is seven bits wide.
+        RootKind::Ehci => advertised.min(127),
+        #[cfg(feature = "xhci")]
+        RootKind::Xhci => advertised.min(15),
+        _ => advertised,
+    }
+}
+
 async fn configure_hub(parent: &Port, pipe: Pipe) -> Result<(Rc<Hub>, u8, u64), UsbError> {
     #[cfg(feature = "xhci")]
     let geometry = if parent.kind == RootKind::Xhci {
@@ -1235,8 +1249,11 @@ async fn configure_hub(parent: &Port, pipe: Pipe) -> Result<(Rc<Hub>, u8, u64), 
             Some(&mut descriptor),
         )
         .await?;
-    let (ports, delay) = (descriptor[2], u64::from(descriptor[5]) * 2);
-    if len < 7 || !(1..=15).contains(&ports) {
+    let (ports, delay) = (
+        addressable_hub_ports(parent.kind, descriptor[2]),
+        u64::from(descriptor[5]) * 2,
+    );
+    if len < 7 || ports == 0 {
         return Err(UsbError::InvalidParameter);
     }
     #[cfg(feature = "xhci")]
@@ -1536,6 +1553,17 @@ mod tests {
         port.advance(DEBOUNCE_MS, task.as_mut());
         assert_eq!(port.attempted.get(), 2);
         assert_eq!(*port.events.borrow(), [("attached", 1)]);
+    }
+
+    #[test]
+    fn hub_port_limit_depends_on_the_controller_route_format() {
+        assert_eq!(addressable_hub_ports(RootKind::Ohci, 32), 32);
+        assert_eq!(addressable_hub_ports(RootKind::Ehci, 32), 32);
+        assert_eq!(addressable_hub_ports(RootKind::Ehci, 255), 127);
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(addressable_hub_ports(RootKind::Uhci, 32), 32);
+        #[cfg(feature = "xhci")]
+        assert_eq!(addressable_hub_ports(RootKind::Xhci, 32), 15);
     }
 
     #[test]
