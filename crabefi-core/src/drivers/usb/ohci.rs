@@ -231,20 +231,20 @@ impl TransferDescriptor {
         }
     }
 
-    /// Get condition code
+    /// Get the DMA-updated condition code.
     pub fn condition_code(&self) -> u32 {
-        (self.control >> Self::CTRL_CC_SHIFT) & 0xF
+        (unsafe { ptr::read_volatile(&raw const self.control) } >> Self::CTRL_CC_SHIFT) & 0xF
     }
 
-    /// Check if TD is complete
+    /// OHCI reserves both 0xe and 0xf for unprocessed TDs.
     pub fn is_complete(&self) -> bool {
-        self.condition_code() != Self::CC_NOT_ACCESSED
+        self.condition_code() < Self::CC_NOT_ACCESSED
     }
 
-    /// Check if TD has error
+    /// Check if TD completed with a transfer error.
     pub fn has_error(&self) -> bool {
         let cc = self.condition_code();
-        cc != Self::CC_NO_ERROR && cc != Self::CC_NOT_ACCESSED && cc != Self::CC_DATA_UNDERRUN
+        cc < Self::CC_NOT_ACCESSED && cc != Self::CC_NO_ERROR && cc != Self::CC_DATA_UNDERRUN
     }
 }
 
@@ -533,20 +533,18 @@ impl OhciController {
                 true,
                 (td_base + 32) as u32,
             );
-            *status_td = TransferDescriptor::status(!is_in, 0);
             status_td_addr = td_base + 32;
-
             ed.head_td = td_base as u32;
             ed.tail_td = (td_base + 48) as u32;
+            *status_td = TransferDescriptor::status(!is_in, ed.tail_td);
         } else {
             let status_td = unsafe { &mut *((td_base + 16) as *mut TransferDescriptor) };
 
             *setup_td = TransferDescriptor::setup(setup_addr as u32, (td_base + 16) as u32);
-            *status_td = TransferDescriptor::status(true, 0);
             status_td_addr = td_base + 16;
-
             ed.head_td = td_base as u32;
             ed.tail_td = (td_base + 32) as u32;
+            *status_td = TransferDescriptor::status(true, ed.tail_td);
         }
 
         flush_cache_range(setup_addr, 8);
@@ -576,16 +574,22 @@ impl OhciController {
         let status_td = unsafe { &*(status_td_addr as *const TransferDescriptor) };
         let timeout = Timeout::from_ms(5000);
 
-        while !timeout.is_expired() {
+        let completed = loop {
             invalidate_cache_range(status_td_addr, 16);
+            invalidate_cache_range(ed_addr, 16);
             barrier::dma_read();
-            if status_td.is_complete() {
-                break;
+            // A failed SETUP/DATA TD halts the ED before STATUS runs.
+            let halted = unsafe { ptr::read_volatile(&raw const ed.head_td) }
+                & EndpointDescriptor::HEAD_HALTED
+                != 0;
+            if status_td.is_complete() || halted {
+                break true;
+            }
+            if timeout.is_expired() {
+                break false;
             }
             core::hint::spin_loop();
-        }
-
-        let completed = status_td.is_complete();
+        };
         let resume_list = !completed && self.quiesce_list(true);
 
         // Remove ED from the list only after a timed-out controller has stopped
@@ -605,12 +609,14 @@ impl OhciController {
             return Err(UsbError::Timeout);
         }
 
-        if setup_td.has_error() || status_td.has_error() {
-            let cc = if setup_td.has_error() {
-                setup_td.condition_code()
-            } else {
-                status_td.condition_code()
-            };
+        let data_td =
+            (data_len > 0).then(|| unsafe { &*((td_base + 16) as *const TransferDescriptor) });
+        let failed = [Some(&*setup_td), data_td, Some(status_td)]
+            .into_iter()
+            .flatten()
+            .find(|td| td.has_error());
+        if let Some(failed) = failed {
+            let cc = failed.condition_code();
             if cc == TransferDescriptor::CC_STALL {
                 return Err(UsbError::Stall);
             }
@@ -766,7 +772,13 @@ impl UsbController for OhciController {
 
             // Create TD for this chunk
             let td = unsafe { &mut *(td_addr as *mut TransferDescriptor) };
-            *td = TransferDescriptor::data(data_buffer as u32, chunk, is_in, toggle, 0);
+            *td = TransferDescriptor::data(
+                data_buffer as u32,
+                chunk,
+                is_in,
+                toggle,
+                (td_addr + 16) as u32,
+            );
             td.control &= !TransferDescriptor::CTRL_DI_NONE;
             td.control |= 0 << TransferDescriptor::CTRL_DI_SHIFT;
 
@@ -982,5 +994,23 @@ impl PortController for OhciController {
             RootCommand::Disable => HCRHPORTSTATUS::CCS::SET,
             _ => unreachable!(),
         });
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn ohci_transfer_descriptor_distinguishes_pending_and_completed_conditions() {
+    let mut td = TransferDescriptor::setup(0x1000, 0x1100);
+    assert_eq!(td.condition_code(), 0xf);
+    assert!(!td.is_complete());
+    assert!(!td.has_error());
+    for (cc, complete, error) in [
+        (0xe, false, false),
+        (TransferDescriptor::CC_NO_ERROR, true, false),
+        (TransferDescriptor::CC_STALL, true, true),
+    ] {
+        td.control = cc << TransferDescriptor::CTRL_CC_SHIFT;
+        assert_eq!(td.is_complete(), complete);
+        assert_eq!(td.has_error(), error);
     }
 }
