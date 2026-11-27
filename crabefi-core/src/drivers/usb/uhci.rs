@@ -328,12 +328,7 @@ impl UhciController {
 
         controller.init().await?;
 
-        // Port enumeration is deferred to rescan_ports(), called after all
-        // USB controllers are initialized. On ICH8/9/10 chipsets, UHCI
-        // companion controllers appear at lower PCI BDFs than their EHCI
-        // companion, so they are initialized first.  EHCI must set
-        // CONFIGFLAG and release companion ports before UHCI can see
-        // the correct devices and speeds on its ports.
+        // Boot enumerates the bus after EHCI routes any companion ports.
 
         Ok(controller)
     }

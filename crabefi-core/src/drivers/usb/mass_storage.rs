@@ -265,16 +265,16 @@ impl UsbMassStorage {
         // Get device info to verify it's a mass storage device
         let device_info = controller
             .get_device_info(device_addr)
-            .ok_or(MassStorageError::NotReady)?;
+            .ok_or(UsbError::DeviceNotFound)?;
 
         if !device_info.is_mass_storage {
-            return Err(MassStorageError::NotReady);
+            return Err(MassStorageError::InvalidParameter);
         }
 
         // Get bulk endpoint info
         let (bulk_in_ep, bulk_out_ep) = controller
             .get_bulk_endpoints(device_addr)
-            .ok_or(MassStorageError::NotReady)?;
+            .ok_or(UsbError::InvalidParameter)?;
 
         Ok(Self {
             device_addr,
@@ -302,35 +302,23 @@ impl UsbMassStorage {
             self.bulk_out
         );
 
-        // Test Unit Ready (may need multiple attempts as device spins up)
-        let mut ready = false;
-        let mut readiness_error = MassStorageError::NotReady;
+        // A drive without media answers TUR with CHECK CONDITION. Only retry
+        // after it positively reports readiness/attention in REQUEST SENSE.
         for attempt in 0..5 {
             match self.test_unit_ready(transport).await {
-                Ok(()) => {
-                    log::debug!(
-                        "USB Mass Storage: TEST_UNIT_READY succeeded on attempt {}",
-                        attempt
-                    );
-                    ready = true;
-                    break;
+                Ok(()) => break,
+                Err(MassStorageError::CommandFailed) => {
+                    match self.request_sense_with(transport).await? {
+                        Some(0x02) if matches!(transport, Transport::Discovery(_)) => {
+                            return Err(MassStorageError::NotReady);
+                        }
+                        Some(0x02 | 0x06) if attempt < 4 => transport.pause(100).await,
+                        Some(0x02) => return Err(MassStorageError::NotReady),
+                        _ => return Err(MassStorageError::CommandFailed),
+                    }
                 }
-                Err(error) => {
-                    log::debug!(
-                        "USB Mass Storage: TEST_UNIT_READY failed attempt {}: {:?}",
-                        attempt,
-                        error
-                    );
-                    readiness_error = error;
-                    // Delay 100ms between retries
-                    transport.pause(100).await;
-                }
+                Err(error) => return Err(error),
             }
-        }
-
-        if !ready {
-            log::error!("USB Mass Storage: device did not become ready");
-            return Err(readiness_error);
         }
 
         // Inquiry
@@ -349,16 +337,23 @@ impl UsbMassStorage {
             self.block_size
         );
 
-        self.read_only = self.query_write_protection(transport).await.unwrap_or(true);
+        self.read_only = self
+            .query_write_protection(transport)
+            .await?
+            .unwrap_or(true);
         // If cache durability cannot be established, keep this device read-only.
-        if !self.read_only
-            && self
+        if !self.read_only {
+            match self
                 .scsi_command_with(transport, &SYNCHRONIZE_CACHE, None, false)
                 .await
-                .is_err()
-        {
-            self.request_sense_with(transport).await;
-            self.read_only = true;
+            {
+                Ok(_) => {}
+                Err(MassStorageError::CommandFailed) => {
+                    self.request_sense_with(transport).await?;
+                    self.read_only = true;
+                }
+                Err(error) => return Err(error),
+            }
         }
 
         log::info!(
@@ -702,9 +697,12 @@ impl UsbMassStorage {
         Ok(())
     }
 
-    async fn request_sense_with(&mut self, transport: &mut Transport<'_>) -> Option<u8> {
+    async fn request_sense_with(
+        &mut self,
+        transport: &mut Transport<'_>,
+    ) -> Result<Option<u8>, MassStorageError> {
         let mut response = [0u8; 18];
-        let result = self
+        let result = match self
             .scsi_command_with(
                 transport,
                 &[scsi_cmd::REQUEST_SENSE, 0, 0, 0, 18, 0],
@@ -712,20 +710,27 @@ impl UsbMassStorage {
                 true,
             )
             .await
-            .ok()?;
+        {
+            Ok(result) => result,
+            Err(MassStorageError::CommandFailed) => return Ok(None),
+            Err(error) => return Err(error),
+        };
         if result.transferred < 3 {
-            return None;
+            return Ok(None);
         }
-        match response[0] & 0x7f {
+        Ok(match response[0] & 0x7f {
             0x70 | 0x71 => Some(response[2] & 0xf),
             0x72 | 0x73 => Some(response[1] & 0xf),
             _ => None,
-        }
+        })
     }
 
-    async fn query_write_protection(&mut self, transport: &mut Transport<'_>) -> Option<bool> {
-        let mut header6 = [0u8; 4];
-        if let Ok(result) = self
+    async fn query_write_protection(
+        &mut self,
+        transport: &mut Transport<'_>,
+    ) -> Result<Option<bool>, MassStorageError> {
+        let mut header6 = [0; 4];
+        match self
             .scsi_command_with(
                 transport,
                 &[scsi_cmd::MODE_SENSE_6, 8, 0x3f, 0, 4, 0],
@@ -733,16 +738,22 @@ impl UsbMassStorage {
                 true,
             )
             .await
-            && result.transferred == header6.len()
-            && result.residue == 0
-            && header6[0] >= 3
         {
-            return Some(header6[2] & 0x80 != 0);
+            Ok(result)
+                if result.transferred == header6.len()
+                    && result.residue == 0
+                    && header6[0] >= 3 =>
+            {
+                return Ok(Some(header6[2] & 0x80 != 0));
+            }
+            Ok(_) => {}
+            Err(MassStorageError::CommandFailed) => {
+                self.request_sense_with(transport).await?;
+            }
+            Err(error) => return Err(error),
         }
-        // Clear CHECK CONDITION before trying the alternative command.
-        self.request_sense_with(transport).await;
-        let mut header10 = [0u8; 8];
-        let result = self
+        let mut header10 = [0; 8];
+        match self
             .scsi_command_with(
                 transport,
                 &[scsi_cmd::MODE_SENSE_10, 8, 0x3f, 0, 0, 0, 0, 0, 8, 0],
@@ -750,11 +761,14 @@ impl UsbMassStorage {
                 true,
             )
             .await
-            .ok()?;
-        (result.transferred == header10.len()
-            && result.residue == 0
-            && u16::from_be_bytes([header10[0], header10[1]]) >= 6)
-            .then_some(header10[3] & 0x80 != 0)
+        {
+            Ok(result) => Ok((result.transferred == header10.len()
+                && result.residue == 0
+                && u16::from_be_bytes([header10[0], header10[1]]) >= 6)
+                .then_some(header10[3] & 0x80 != 0)),
+            Err(MassStorageError::CommandFailed) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     /// Read Capacity command
@@ -845,6 +859,8 @@ impl UsbMassStorage {
 
     fn request_sense(&mut self, controller: &mut dyn UsbController) -> Option<u8> {
         synchronous(self.request_sense_with(&mut Transport::Foreground(controller)))
+            .ok()
+            .flatten()
     }
 
     /// Maximum number of retries for failed SCSI read commands.
@@ -1377,37 +1393,32 @@ pub(super) fn remove(controller_id: usize, device_addr: u8) -> Option<NonZeroU64
 /// Initialize and register the mass storage device at `device_addr` on
 /// controller `controller_id`, unless it is already registered.
 ///
-/// # Returns
-/// `true` if the device is registered with media present.
-pub(super) async fn probe(pipe: Pipe) -> bool {
+/// Returns whether a new disk was published, or why the probe failed.
+pub(super) async fn probe(pipe: Pipe) -> Result<bool, MassStorageError> {
     let Pipe {
         controller: controller_id,
         address: device_addr,
     } = pipe;
     if is_registered(controller_id, device_addr) {
-        return false;
+        return Ok(false);
     }
-    log::info!("Found USB mass storage on controller {controller_id}, device {device_addr}");
-    let Some(Ok(mut device)) = super::with_controller(controller_id, |controller| {
+    let mut device = super::with_controller(controller_id, |controller| {
         UsbMassStorage::from_controller(controller, device_addr)
-    }) else {
-        return false;
-    };
+    })
+    .ok_or(UsbError::Disconnected)??;
     if let Err(error) = device.init(&mut Transport::Discovery(controller_id)).await {
         log::debug!("Failed to initialize USB mass storage: {error:?}");
-        return false;
+        return Err(error);
     }
     if device.num_blocks == 0 {
-        log::info!("USB Mass Storage: no media present, skipping");
-        return false;
+        return Err(MassStorageError::NotReady);
     }
-
     DEVICES.borrow_mut().push(RegisteredDevice {
         controller_id,
         attachment_id: allocate_attachment_id(),
         device,
     });
-    true
+    Ok(true)
 }
 
 /// Access a registered disk only when its full identity still matches.

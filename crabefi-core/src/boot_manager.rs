@@ -57,10 +57,10 @@ pub(crate) fn init_storage_subsystem<const NATIVE: bool>(with_usb: bool) {
     timestamp::record(timestamp::TS_CRABEFI_STORAGE_INIT_DONE);
 }
 
-/// Enumerate input devices behind freshly bound USB controllers.
+/// Drive boot-time discovery on freshly bound USB buses.
 fn init_usb_devices() {
     // Start polling only after EHCI has configured companion routing.
-    drivers::usb::rescan_companion_ports();
+    drivers::usb::settle_buses();
 }
 
 /// Whether USB controllers have been bound.

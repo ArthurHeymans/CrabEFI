@@ -15,6 +15,8 @@ use embassy_futures::select::select;
 
 const CONNECTION_TIMEOUT_MS: u64 = 1000;
 const MIGRATION_QUIET_MS: u64 = 500;
+const MAX_PORT_ATTEMPTS: usize = 3;
+const PORT_RETRY_MS: u64 = 250;
 const DEBOUNCE_MS: u64 = 100;
 const ROOT_POLL_MS: u64 = 25;
 const HUB_POLL_MS: u64 = 200;
@@ -267,9 +269,9 @@ pub(super) async fn settle() {
         return;
     }
     STARTUP_MOVED.set(false);
-    exec::wait_for(CONNECTION_TIMEOUT_MS, || {
+    wait_for_first_port(exec::sleep_ms(CONNECTION_TIMEOUT_MS), || {
         exec::poll_background();
-        false
+        STARTUP_ACTIVE.get() != 0
     })
     .await;
     // Finish activity already in flight. If an xHCI port lost a device
@@ -297,6 +299,24 @@ pub(super) async fn settle() {
             break;
         }
     }
+}
+
+// Check for activity before the deadline on every poll, including the last.
+async fn wait_for_first_port(
+    deadline: impl core::future::Future<Output = ()>,
+    mut started: impl FnMut() -> bool,
+) {
+    select(
+        poll_fn(|_| {
+            if started() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }),
+        deadline,
+    )
+    .await;
 }
 
 pub(super) async fn buses() {
@@ -394,7 +414,7 @@ trait PortOps {
     async fn connection(&self) -> Result<Connection, UsbError>;
     async fn clear_change(&self) -> Result<(), UsbError>;
     async fn bring_up(&self) -> Result<Option<u8>, UsbError>;
-    fn disconnected_during_bring_up(&self) {}
+    fn observe_failed_bring_up(&self) {}
     async fn attached(&self, address: u8, startup: StartupActivity<'_>);
     fn startup(&self) -> StartupActivity<'_>;
     async fn detach(&self, address: u8);
@@ -420,62 +440,82 @@ async fn port_task(port: impl PortOps) {
         }
 
         let startup = port.startup();
-        loop {
-            port.sleep(DEBOUNCE_MS).await;
-            match port.connection().await {
-                Ok(Connection {
-                    connected: true,
-                    changed: false,
-                }) => break,
-                Ok(Connection {
-                    connected: true,
-                    changed: true,
-                }) if port.clear_change().await.is_ok() => {}
-                _ => continue 'connect,
-            }
-        }
-
-        let address = match port.bring_up().await {
-            Ok(Some(address)) => address,
-            Ok(None) => continue,
-            Err(error) => {
-                port.disconnected_during_bring_up();
-                if matches!(error, UsbError::Disconnected) {
-                    continue;
+        let address = 'enumerate: {
+            for attempt in 1..=MAX_PORT_ATTEMPTS {
+                port.sleep(DEBOUNCE_MS).await;
+                match port.connection().await {
+                    Ok(Connection {
+                        connected: true,
+                        changed: false,
+                    }) => {}
+                    // A different attachment gets its own retry budget.
+                    _ => continue 'connect,
                 }
-                log::debug!("USB port enumeration failed: {error:?}; retrying");
-                drop(startup);
-                port.sleep(if matches!(error, UsbError::Timeout) {
-                    CONNECTION_TIMEOUT_MS
-                } else {
-                    250
-                })
-                .await;
-                continue;
+
+                match port.bring_up().await {
+                    Ok(Some(address)) => break 'enumerate address,
+                    Ok(None) => continue 'connect,
+                    Err(error) => {
+                        port.observe_failed_bring_up();
+                        if matches!(error, UsbError::Disconnected)
+                            && port
+                                .connection()
+                                .await
+                                .is_ok_and(|link| !link.connected || link.changed)
+                        {
+                            continue 'connect;
+                        }
+                        log::debug!(
+                            "USB port enumeration attempt {attempt}/{MAX_PORT_ATTEMPTS} failed: {error:?}"
+                        );
+                        if attempt != MAX_PORT_ATTEMPTS {
+                            let retry_ms = if matches!(error, UsbError::Timeout) {
+                                CONNECTION_TIMEOUT_MS
+                            } else {
+                                PORT_RETRY_MS
+                            };
+                            port.sleep(retry_ms).await;
+                        }
+                    }
+                }
             }
+            drop(startup);
+            wait_for_port_change(&port).await;
+            continue 'connect;
         };
 
         // Poll the parent first. On disconnect, cancellation drops any live
         // child tasks before the controller tears down the whole device tree.
-        select(
-            async {
-                loop {
-                    port.sleep(port.interval()).await;
-                    if let Ok(connection) = port.connection().await
-                        && (!connection.connected || connection.changed)
-                    {
-                        break;
-                    }
-                }
-            },
-            async {
-                port.attached(address, startup).await;
-                core::future::pending::<()>().await;
-            },
-        )
+        select(wait_for_port_change(&port), async {
+            port.attached(address, startup).await;
+            core::future::pending::<()>().await;
+        })
         .await;
         let _ = port.clear_change().await;
         port.detach(address).await;
+    }
+}
+
+async fn wait_for_port_change(port: &impl PortOps) {
+    loop {
+        port.sleep(port.interval()).await;
+        if let Ok(connection) = port.connection().await
+            && (!connection.connected || connection.changed)
+        {
+            return;
+        }
+    }
+}
+
+async fn retry_storage_probe(
+    port: &impl PortOps,
+    mut result: Result<(), super::mass_storage::MassStorageError>,
+    mut probe: impl AsyncFnMut() -> Result<(), super::mass_storage::MassStorageError>,
+) {
+    // Readiness is a positive response from the device, not a failed transfer.
+    while matches!(result, Err(super::mass_storage::MassStorageError::NotReady)) {
+        port.sleep(CONNECTION_TIMEOUT_MS).await;
+        result = probe().await;
     }
 }
 
@@ -495,8 +535,9 @@ impl Port {
     }
 
     fn root_command(self, command: RootCommand) {
+        debug_assert!(self.hub.is_none());
         with_port_controller(self.controller, |host| {
-            host.root_command(self.number, command)
+            host.root_command(self.root_number, command)
         });
     }
 
@@ -793,7 +834,7 @@ impl PortOps for Port {
         result
     }
 
-    fn disconnected_during_bring_up(&self) {
+    fn observe_failed_bring_up(&self) {
         #[cfg(feature = "xhci")]
         if self.kind == RootKind::Xhci && self.hub.is_none() && !self.root_status().connected {
             STARTUP_MOVED.set(true);
@@ -808,7 +849,11 @@ impl PortOps for Port {
         let Some(info) = super::bind_input(pipe).await else {
             return;
         };
-        let mut probe_pending = info.is_mass_storage && !super::publish_storage(pipe).await;
+        let storage = if info.is_mass_storage {
+            super::publish_storage(pipe).await
+        } else {
+            Ok(())
+        };
         if info.is_hub {
             let result = configure_hub(*self, pipe).await;
             match result {
@@ -835,12 +880,7 @@ impl PortOps for Port {
             }
         }
         drop(startup);
-        // Some drives remain connected while their media spins up. Retry
-        // discovery until media appears or the parent task sees disconnect.
-        while probe_pending {
-            exec::sleep_ms(CONNECTION_TIMEOUT_MS).await;
-            probe_pending = !super::publish_storage(pipe).await;
-        }
+        retry_storage_probe(self, storage, async || super::publish_storage(pipe).await).await;
     }
 
     async fn detach(&self, address: u8) {
@@ -1002,6 +1042,8 @@ mod tests {
         reset_for: Cell<u64>,
         startup_active: LocalCell<usize>,
         children: bool,
+        probe_media: bool,
+        probes: Cell<usize>,
         events: RefCell<Vec<(&'static str, u8)>>,
     }
 
@@ -1015,6 +1057,8 @@ mod tests {
                 reset_for: Cell::default(),
                 startup_active: LocalCell::new(0),
                 children: false,
+                probe_media: false,
+                probes: Cell::default(),
                 events: RefCell::default(),
             }
         }
@@ -1046,6 +1090,15 @@ mod tests {
         async fn attached(&self, address: u8, startup: StartupActivity<'_>) {
             self.events.borrow_mut().push(("attached", address));
             drop(startup);
+            if self.probe_media {
+                use super::super::mass_storage::MassStorageError;
+                self.probes.update(|n| n + 1);
+                retry_storage_probe(self, Err(MassStorageError::NotReady), async || {
+                    self.probes.update(|n| n + 1);
+                    Err(MassStorageError::Usb(UsbError::Timeout))
+                })
+                .await;
+            }
             if self.children {
                 self.events.borrow_mut().push(("attached", 2));
                 let _child_task = core::mem::DropGuard::new((), |()| {
@@ -1184,6 +1237,74 @@ mod tests {
         port.advance(DEBOUNCE_MS, task.as_mut());
         assert_eq!(port.attempted.get(), 2);
         assert_eq!(*port.events.borrow(), [("attached", 1)]);
+    }
+
+    #[test]
+    fn first_port_wait_ends_at_activity_or_the_deadline() {
+        // No real clock: hold the deadline pending while the port starts,
+        // then test the opposite case with the deadline already ready.
+        let started = Cell::new(false);
+        let mut wait =
+            core::pin::pin!(wait_for_first_port(core::future::pending(), || started.get()));
+        let cx = &mut Context::from_waker(Waker::noop());
+        assert!(wait.as_mut().poll(cx).is_pending());
+        started.set(true);
+        assert!(wait.as_mut().poll(cx).is_ready());
+        let mut wait = core::pin::pin!(wait_for_first_port(core::future::ready(()), || false));
+        assert!(wait.as_mut().poll(cx).is_ready());
+    }
+
+    #[test]
+    fn port_task_exhausts_attempts_then_retries_only_after_reconnect() {
+        let port = FakePort {
+            failures: Cell::new(MAX_PORT_ATTEMPTS),
+            ..FakePort::default()
+        };
+        let mut task = core::pin::pin!(port_task(&port));
+        port.set(true, true);
+        port.advance(0, task.as_mut());
+        for attempt in 1..=MAX_PORT_ATTEMPTS {
+            port.advance(DEBOUNCE_MS, task.as_mut());
+            assert_eq!(port.attempted.get(), attempt);
+            if attempt != MAX_PORT_ATTEMPTS {
+                port.advance(PORT_RETRY_MS, task.as_mut());
+            }
+        }
+        for _ in 0..5 {
+            port.advance(1000, task.as_mut());
+        }
+        assert_eq!(port.attempted.get(), MAX_PORT_ATTEMPTS);
+        assert!(port.events.borrow().is_empty());
+        port.set(false, true);
+        port.advance(ROOT_POLL_MS, task.as_mut());
+        port.set(true, true);
+        port.advance(ROOT_POLL_MS, task.as_mut());
+        port.advance(DEBOUNCE_MS, task.as_mut());
+        assert_eq!(*port.events.borrow(), [("attached", 1)]);
+    }
+
+    #[test]
+    fn storage_probe_retries_not_ready_but_stops_on_transport_failure_until_reconnect() {
+        let port = FakePort {
+            probe_media: true,
+            ..FakePort::default()
+        };
+        let mut task = core::pin::pin!(port_task(&port));
+        port.set(true, true);
+        port.advance(0, task.as_mut());
+        port.advance(DEBOUNCE_MS, task.as_mut());
+        assert_eq!(port.probes.get(), 1);
+        port.advance(CONNECTION_TIMEOUT_MS, task.as_mut());
+        port.advance(10 * CONNECTION_TIMEOUT_MS, task.as_mut());
+        assert_eq!(port.probes.get(), 2);
+        port.set(false, true);
+        port.advance(ROOT_POLL_MS, task.as_mut());
+        port.set(true, true);
+        port.advance(ROOT_POLL_MS, task.as_mut());
+        port.advance(DEBOUNCE_MS, task.as_mut());
+        assert_eq!(port.probes.get(), 3);
+        port.advance(CONNECTION_TIMEOUT_MS, task.as_mut());
+        assert_eq!(port.probes.get(), 4);
     }
 
     #[test]

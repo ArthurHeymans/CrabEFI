@@ -381,12 +381,12 @@ pub fn init_all() {
     // Initialize all controllers
     init();
 
-    rescan_companion_ports();
+    settle_buses();
 }
 
 /// Run the normal bus tasks after all companion controllers have been bound.
 /// In particular, UHCI must not touch its ports before EHCI sets CONFIGFLAG.
-pub fn rescan_companion_ports() {
+pub fn settle_buses() {
     crate::exec::block_on(port::settle());
 }
 
@@ -453,18 +453,16 @@ async fn bind_input(pipe: port::Pipe) -> Option<DeviceInfo> {
     Some(info)
 }
 
-async fn publish_storage(pipe: port::Pipe) -> bool {
-    if mass_storage::probe(pipe).await {
+async fn publish_storage(pipe: port::Pipe) -> Result<(), mass_storage::MassStorageError> {
+    if mass_storage::probe(pipe).await? {
         STORAGE_REVISION.update(|revision| *revision = revision.wrapping_add(1));
         log::info!(
             "USB: attached storage on controller {} device {}",
             pipe.controller,
             pipe.address
         );
-        true
-    } else {
-        false
     }
+    Ok(())
 }
 
 fn unbind_device(controller: usize, address: u8) {
