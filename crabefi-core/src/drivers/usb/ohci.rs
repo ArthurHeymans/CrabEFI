@@ -579,10 +579,10 @@ impl OhciController {
             invalidate_cache_range(ed_addr, 16);
             barrier::dma_read();
             // A failed SETUP/DATA TD halts the ED before STATUS runs.
-            let halted = unsafe { ptr::read_volatile(&raw const ed.head_td) }
-                & EndpointDescriptor::HEAD_HALTED
-                != 0;
-            if status_td.is_complete() || halted {
+            // For success, wait for HeadP to reach TailP: the controller
+            // may still be about to write HeadP after updating STATUS.
+            let head = unsafe { ptr::read_volatile(&raw const ed.head_td) };
+            if head & EndpointDescriptor::HEAD_HALTED != 0 || head & !0xf == ed.tail_td {
                 break true;
             }
             if timeout.is_expired() {
@@ -805,18 +805,22 @@ impl UsbController for OhciController {
             // Trigger bulk list
             self.regs().hccommandstatus.write(HCCOMMANDSTATUS::BLF::SET);
 
-            // Wait for completion
+            // The TD status can be published before the final ED writeback.
+            // Wait for the controller's HeadP, not just the TD condition code,
+            // before unlinking and rebuilding this ED for the next command.
             let timeout = Timeout::from_ms(5000);
-            while !timeout.is_expired() {
-                invalidate_cache_range(td_addr, 32);
+            let completed = loop {
+                invalidate_cache_range(ed_addr, 32);
                 barrier::dma_read();
-                if td.is_complete() {
-                    break;
+                let head = unsafe { ptr::read_volatile(&raw const ed.head_td) };
+                if head & EndpointDescriptor::HEAD_HALTED != 0 || head & !0xf == ed.tail_td {
+                    break true;
+                }
+                if timeout.is_expired() {
+                    break false;
                 }
                 core::hint::spin_loop();
-            }
-
-            let completed = td.is_complete();
+            };
             let resume_list = !completed && self.quiesce_list(false);
 
             // Remove from the list only after a timed-out controller has stopped

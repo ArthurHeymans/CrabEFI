@@ -620,8 +620,12 @@ impl UhciController {
                 }
             }
 
-            let sts = unsafe { ptr::read_volatile(&status_td.ctrl_sts) };
-            if sts & TransferDescriptor::CS_ACTIVE == 0 {
+            let sts = unsafe { ptr::read_volatile(&raw const status_td.ctrl_sts) };
+            invalidate_cache_range(self.qh, core::mem::size_of::<QueueHead>());
+            let retired = unsafe { ptr::read_volatile(&raw const qh.element_link) }
+                & QueueHead::TERMINATE
+                != 0;
+            if sts & TransferDescriptor::CS_ACTIVE == 0 && (retired || status_td.has_error()) {
                 break;
             }
             if timeout.is_expired() {
@@ -848,30 +852,40 @@ impl UsbController for UhciController {
             flush_cache_range(self.qh, core::mem::size_of::<QueueHead>());
             barrier::dma_write();
 
-            // Wait for completion
+            // UHCI clears TD.Active before writing the QH element link.
+            // Until the link is retired the controller could overwrite the
+            // next submission with this transfer's terminate pointer.
             let timeout = Timeout::from_ms(5000);
-            while !timeout.is_expired() {
+            let (completed, retired) = loop {
                 invalidate_cache_range(td_addr, 32);
+                invalidate_cache_range(self.qh, core::mem::size_of::<QueueHead>());
                 barrier::dma_read();
-                if !td.is_active() {
-                    break;
+                let status = unsafe { ptr::read_volatile(&raw const td.ctrl_sts) };
+                let retired = unsafe { ptr::read_volatile(&raw const qh.element_link) }
+                    & QueueHead::TERMINATE
+                    != 0;
+                if status & TransferDescriptor::CS_ACTIVE == 0
+                    && (retired || status & TransferDescriptor::CS_ERROR_MASK != 0)
+                {
+                    break (true, retired);
+                }
+                if timeout.is_expired() {
+                    break (false, false);
                 }
                 core::hint::spin_loop();
-            }
-
-            let completed = !td.is_active();
-            let halted = if completed {
+            };
+            let halted = if retired {
                 false
             } else {
                 let halted = self.stop_schedule();
                 if !halted {
-                    log::error!("UHCI: schedule did not halt after bulk timeout; resetting");
+                    log::error!("UHCI: schedule did not halt with an unretired bulk TD; resetting");
                     self.cleanup();
                 }
                 halted
             };
 
-            // Clear the QH only after a timed-out schedule has halted.
+            // An unretired QH may only be cleared after stopping its schedule.
             qh.element_link = QueueHead::TERMINATE;
             flush_cache_range(self.qh, core::mem::size_of::<QueueHead>());
             barrier::dma_write();
