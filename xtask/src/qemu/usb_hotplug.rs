@@ -13,10 +13,56 @@ use std::time::{Duration, Instant};
 
 const CONTROLLERS: [&str; 4] = ["qemu-xhci", "usb-ehci", "piix3-usb-uhci", "pci-ohci"];
 
+enum Topology {
+    Standalone(&'static str),
+    Companions { cold: bool },
+}
+
+impl Topology {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Standalone(model) => model,
+            Self::Companions { cold: false } => "ich9-ehci-companions-hot",
+            Self::Companions { cold: true } => "ich9-ehci-companions-cold",
+        }
+    }
+
+    fn add_args(&self, qemu: &mut Command) {
+        match self {
+            Self::Standalone(model) => {
+                qemu.args(["-device", &format!("{model},id=hotusb")]);
+            }
+            Self::Companions { cold } => {
+                qemu.args(["-device", "ich9-usb-ehci1,id=hotusb,addr=1d.7"]);
+                for index in 0..3 {
+                    let mut device = format!(
+                        "ich9-usb-uhci{},masterbus=hotusb.0,firstport={},addr=1d.{index}",
+                        index + 1,
+                        index * 2
+                    );
+                    if index == 0 {
+                        device.push_str(",multifunction=on");
+                    }
+                    qemu.args(["-device", &device]);
+                }
+                if *cold {
+                    qemu.args(["-device", "usb-storage,bus=hotusb.0,port=1,drive=hotdisk"]);
+                    qemu.args(["-device", "usb-hub,bus=hotusb.0,port=2"]);
+                    qemu.args(["-device", "usb-kbd,bus=hotusb.0,port=2.1"]);
+                }
+            }
+        }
+    }
+}
+
 pub(crate) fn run(config: &QemuConfig, disk: &Path) -> Result<()> {
     let timeout = Duration::from_secs(config.timeout_secs.unwrap_or(60));
     let mut failed = Vec::new();
-    for model in CONTROLLERS {
+    for topology in CONTROLLERS.into_iter().map(Topology::Standalone).chain([
+        Topology::Companions { cold: false },
+        Topology::Companions { cold: true },
+    ]) {
+        let model = topology.name();
         println!("USB hotplug: {model}");
         let temp = tempfile::tempdir()?;
         let serial = temp.path().join("serial.log");
@@ -38,14 +84,19 @@ pub(crate) fn run(config: &QemuConfig, disk: &Path) -> Result<()> {
             "-qmp",
             &format!("unix:{},server=on,wait=off", socket.display()),
         ]);
-        qemu.args(["-device", &format!("{model},id=hotusb")]);
         qemu.args(["-blockdev", &json!({ "driver": "raw", "node-name": "hotdisk", "file": { "driver": "file", "filename": disk } }).to_string()]);
+        topology.add_args(&mut qemu);
         qemu.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(fs::File::create(&stderr)?);
         let mut child = qemu.spawn().context("starting QEMU for USB hotplug")?;
-        let result = Scenario::new(&mut child, &serial, &socket, timeout)
-            .and_then(|mut scenario| scenario.exercise(model));
+        let result =
+            Scenario::new(&mut child, &serial, &socket, timeout).and_then(|mut scenario| {
+                match topology {
+                    Topology::Standalone(model) => scenario.exercise(model),
+                    Topology::Companions { cold } => scenario.exercise_companions(cold),
+                }
+            });
         cleanup_child(&mut child);
         match result {
             Ok(()) => println!("[PASS] USB hotplug {model}"),
@@ -175,6 +226,23 @@ impl<'a> Scenario<'a> {
         self.qmp.key("p")?;
         self.marker("USB HOTPLUG: received p by direct poll")?;
         self.marker("EFI app executed successfully!")
+    }
+
+    fn exercise_companions(&mut self, cold: bool) -> Result<()> {
+        if !cold {
+            self.marker("Found 0 boot entries")?;
+            self.add("usb-storage", "ehci-disk", "1", Some("hotdisk"))?;
+        }
+        // USB controller indices follow the fixture's PCI function order:
+        // the UHCI companions are 1d.0–2, and EHCI is 1d.7.
+        self.marker("USB: attached storage on controller 3")?;
+        if !cold {
+            self.add("usb-hub", "companion-hub", "2", None)?;
+            self.add("usb-kbd", "companion-keyboard", "2.1", None)?;
+        }
+        self.marker("EHCI: Port 1 has full-speed device, releasing to companion")?;
+        self.marker("USB: attached keyboard on controller 0")?;
+        self.marker("USB HOTPLUG: waiting for keyboard")
     }
 
     fn add(&mut self, driver: &str, id: &str, port: &str, drive: Option<&str>) -> Result<()> {
