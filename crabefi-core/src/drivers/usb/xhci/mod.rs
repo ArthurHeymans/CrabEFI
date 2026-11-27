@@ -126,6 +126,9 @@ pub struct XhciController {
     /// empty slot costs one pointer. All accesses use `.get()` / `.get_mut()`
     /// to safely handle out-of-range slot IDs without panicking.
     slots: alloc::vec::Vec<Option<Box<UsbSlot>>>,
+    /// Enabled slots without a published device context. A value of zero
+    /// denotes a root device; other values identify its upstream hub slot.
+    pending_parents: alloc::vec::Vec<Option<u8>>,
     /// Persistent interrupt TDs; their DMA buffers remain alive between polls.
     interrupt_polls: alloc::vec::Vec<bulk::InterruptPoll>,
 }

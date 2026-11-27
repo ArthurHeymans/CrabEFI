@@ -180,6 +180,11 @@ impl super::XhciController {
             .try_reserve_exact(max_slots + 1)
             .map_err(|_| XhciError::AllocationFailed)?;
         slots.resize_with(max_slots + 1, || None);
+        let mut pending_parents = alloc::vec::Vec::new();
+        pending_parents
+            .try_reserve_exact(max_slots + 1)
+            .map_err(|_| XhciError::AllocationFailed)?;
+        pending_parents.resize(max_slots + 1, None);
 
         let mut controller = Self {
             pci_address: pci_dev.address,
@@ -196,6 +201,7 @@ impl super::XhciController {
             event_ring: TrbRing::empty(), // Will be initialized in init()
             control_buffer: None,
             slots,
+            pending_parents,
             interrupt_polls: alloc::vec::Vec::new(),
         };
 

@@ -284,6 +284,9 @@ impl super::XhciController {
             log::error!("xHCI: slot ID {} outside tracked range", slot_id);
             return Err(XhciError::InvalidParameter);
         }
+        // Enable Slot already succeeded; record the route before any fallible
+        // allocation so an ancestor disconnect can reclaim the enabled slot.
+        self.pending_parents[slot_id as usize] = Some(route.parent_hub.map_or(0, |(hub, _)| hub));
         let is_superspeed = self.is_superspeed_port(route.root_port, speed);
         let transaction_translator =
             if !is_superspeed && let Some((hub_slot, hub_port)) = route.parent_hub {
@@ -379,6 +382,7 @@ impl super::XhciController {
             root_port: route.root_port,
             parent_hub: route.parent_hub,
         })?);
+        self.pending_parents[slot_id as usize] = None;
         core::mem::forget(pages);
 
         // SAFETY: the slot index is checked above and DCBAA is controller-owned.
@@ -414,6 +418,10 @@ impl super::XhciController {
         barrier::mmio_write();
         self.ring_doorbell(0, 0);
         let disabled = self.wait_command_completion().is_ok();
+        let was_pending = self.pending_parents[slot_id as usize].take().is_some();
+        if !disabled && was_pending {
+            log::warn!("xHCI: Disable Slot {slot_id} failed for an unaddressed device");
+        }
 
         self.clear_interrupt_polls_for_slot(slot_id, disabled);
 

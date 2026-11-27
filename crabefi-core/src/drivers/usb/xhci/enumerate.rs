@@ -105,8 +105,8 @@ pub(in crate::drivers::usb) async fn attach(
     speed: u8,
 ) -> Result<u8, UsbError> {
     port::transfer().await;
-    // Enable and address consecutively: once Address has been issued the slot
-    // is in the controller's tree and will be reclaimed if its hub is removed.
+    // Enable and address consecutively. The enabled slot is tracked even
+    // if allocating the address context fails before the command is issued.
     let (address, addressed) = controller(index, |host| {
         let route = route(host, hub, number)?;
         let address = host.enable_slot()?;
@@ -213,14 +213,15 @@ async fn configure_device(pipe: Pipe) -> Result<(), UsbError> {
 pub(in crate::drivers::usb) async fn detach(index: usize, address: u8) {
     loop {
         let next = with_xhci(index, |host| {
-            host.get_slot(address)?;
-            let mut leaf = address;
-            while let Some(child) =
-                host.find_slot(|slot| slot.parent_hub.is_some_and(|(parent, _)| parent == leaf))
+            if host.get_slot(address).is_none()
+                && host.pending_parents.get(address as usize)?.is_none()
             {
-                leaf = child;
+                return None;
             }
-            Some(leaf)
+            Some(teardown_leaf(address, |parent| {
+                host.find_slot(|slot| slot.parent_hub.is_some_and(|(hub, _)| hub == parent))
+                    .or_else(|| pending_child(&host.pending_parents, parent))
+            }))
         })
         .flatten();
         let Some(next) = next else {
@@ -233,6 +234,41 @@ pub(in crate::drivers::usb) async fn detach(index: usize, address: u8) {
             break;
         }
     }
+}
+
+fn pending_child(parents: &[Option<u8>], parent: u8) -> Option<u8> {
+    parents
+        .iter()
+        .position(|child| *child == Some(parent))
+        .and_then(|id| u8::try_from(id).ok())
+}
+
+fn teardown_leaf(mut slot: u8, mut child: impl FnMut(u8) -> Option<u8>) -> u8 {
+    while let Some(next) = child(slot) {
+        slot = next;
+    }
+    slot
+}
+
+#[cfg(test)]
+#[test]
+fn teardown_finds_unaddressed_child_after_its_attach_is_cancelled() {
+    // Addressed hub 2 has addressed child hub 3. Slot 5 was enabled
+    // beneath hub 3 but allocating its contexts failed before publication.
+    let mut pending = [None; 6];
+    pending[5] = Some(3);
+    let leaf = |pending: &[Option<u8>]| {
+        teardown_leaf(2, |parent| {
+            if parent == 2 {
+                Some(3)
+            } else {
+                pending_child(pending, parent)
+            }
+        })
+    };
+    assert_eq!(leaf(&pending), 5);
+    pending[5] = None;
+    assert_eq!(leaf(&pending), 3);
 }
 
 const SET_HUB_DEPTH: u8 = 0x0c;
