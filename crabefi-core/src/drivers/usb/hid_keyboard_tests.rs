@@ -1,5 +1,5 @@
 use super::*;
-use crate::drivers::usb::controller::{desc_type, request};
+use crate::drivers::usb::controller::{Direction, EndpointType, request};
 
 #[test]
 fn queued_tab_keeps_shift_after_a_release_report() {
@@ -27,6 +27,7 @@ struct Controller {
     class_indices: alloc::vec::Vec<u16>,
     descriptor: Option<alloc::vec::Vec<u8>>,
     boot_protocol_stalls: bool,
+    descriptor_stalls: bool,
 }
 
 impl Controller {
@@ -39,6 +40,7 @@ impl Controller {
             class_indices: alloc::vec::Vec::new(),
             descriptor: None,
             boot_protocol_stalls: false,
+            descriptor_stalls: false,
         }
     }
 }
@@ -46,14 +48,6 @@ impl Controller {
 impl UsbController for Controller {
     fn controller_type(&self) -> &'static str {
         "test"
-    }
-    fn hid_report_descriptor(
-        &mut self,
-        _: u8,
-        interface: u8,
-    ) -> Result<alloc::vec::Vec<u8>, UsbError> {
-        assert_eq!(interface, 3);
-        self.descriptor.clone().ok_or(UsbError::NotSupported)
     }
     fn control_transfer(
         &mut self,
@@ -66,14 +60,20 @@ impl UsbController for Controller {
     ) -> Result<usize, UsbError> {
         if request_type & req_type::TYPE_CLASS == 0 {
             assert_eq!(req, request::GET_DESCRIPTOR);
-            assert_eq!(value, (desc_type::CONFIGURATION as u16) << 8);
-            let config = [
-                9, 2, 25, 0, 1, 1, 0, 0x80, 50, 9, 4, 3, 0, 1, 3, 1, 1, 0, 7, 5, 0x81, 3, 8, 0, 10,
-            ];
-            let data = data.unwrap();
-            let length = data.len().min(config.len());
-            data[..length].copy_from_slice(&config[..length]);
-            return Ok(length);
+            if value >> 8 == u16::from(super::super::controller::desc_type::HID_REPORT)
+                && self.descriptor_stalls
+            {
+                return Err(UsbError::Stall);
+            }
+            return super::super::port::fake_hid_descriptor(
+                value,
+                index,
+                data.unwrap(),
+                3,
+                1,
+                1,
+                self.descriptor.as_deref(),
+            );
         }
         self.class_indices.push(index);
         if req == hid_request::SET_PROTOCOL && self.boot_protocol_stalls {
@@ -120,6 +120,36 @@ impl UsbController for Controller {
     }
 }
 
+fn bind_test_keyboard(controller: &mut Controller) -> UsbHidKeyboard {
+    crate::exec::block_on(bind_with(
+        Pipe {
+            controller: 0,
+            address: 1,
+        },
+        EndpointInfo {
+            number: 1,
+            direction: Direction::In,
+            transfer_type: EndpointType::Interrupt,
+            max_packet_size: 8,
+            interval: 10,
+            toggle: false,
+        },
+        async |r, data| controller.control_transfer(1, r.ty, r.request, r.value, r.index, data),
+    ))
+    .unwrap()
+}
+
+#[test]
+fn stalled_report_descriptor_can_still_use_boot_protocol() {
+    let mut controller = Controller::new();
+    controller.descriptor = Some(alloc::vec![0; 40]);
+    controller.descriptor_stalls = true;
+    let mut keyboard = bind_test_keyboard(&mut controller);
+    assert!(keyboard.report.is_none());
+    keyboard.poll_report(&mut controller);
+    assert_eq!(keyboard.keys.get_key(), Some(u16::from(b'a')));
+}
+
 #[test]
 fn stalled_boot_protocol_uses_the_keyboard_report_descriptor_and_report_id() {
     // Standard keyboard fields, with report ID 42 rather than boot layout.
@@ -131,11 +161,7 @@ fn stalled_boot_protocol_uses_the_keyboard_report_descriptor_and_report_id() {
     let mut controller = Controller::new();
     controller.descriptor = Some(descriptor.clone());
     controller.boot_protocol_stalls = true;
-    let mut keyboard = UsbHidKeyboard::new(0, 1, 1, 8, 10);
-    assert!(matches!(
-        keyboard.set_boot_protocol(&mut controller),
-        Err(UsbError::Stall)
-    ));
+    let mut keyboard = bind_test_keyboard(&mut controller);
     assert_eq!(keyboard.report_buffer.len(), 16);
     keyboard.report_buffer[..9].copy_from_slice(&[42, 0, 0, 0x52, 0, 0, 0, 0, 0]);
     let report = keyboard.decode_report(9).unwrap();
@@ -155,8 +181,7 @@ fn stalled_boot_protocol_uses_the_keyboard_report_descriptor_and_report_id() {
         0x06, 0, 0xff, 0x09, 1, 0xa1, 1, 0x85, 43, 0x75, 8, 0x95, 32, 0x09, 1, 0x81, 2, 0xc0,
     ]);
     controller.descriptor = Some(shared);
-    let mut keyboard = UsbHidKeyboard::new(0, 1, 1, 8, 10);
-    assert!(keyboard.set_boot_protocol(&mut controller).is_err());
+    let mut keyboard = bind_test_keyboard(&mut controller);
     assert_eq!(keyboard.report_buffer.len(), 40);
     keyboard.report_buffer[0] = 43;
     assert!(keyboard.decode_report(33).is_none());
@@ -166,14 +191,85 @@ fn stalled_boot_protocol_uses_the_keyboard_report_descriptor_and_report_id() {
     // Without an ID, the same stalled device uses an eight-byte report.
     descriptor.drain(6..8);
     controller.descriptor = Some(descriptor);
-    let mut keyboard = UsbHidKeyboard::new(0, 1, 1, 8, 10);
-    assert!(matches!(
-        keyboard.set_boot_protocol(&mut controller),
-        Err(UsbError::Stall)
-    ));
+    let mut keyboard = bind_test_keyboard(&mut controller);
     controller.report = [0, 0, 0x52, 0, 0, 0, 0, 0];
     keyboard.poll_report(&mut controller);
     assert_eq!(keyboard.keys.get_key(), Some(0x0100));
+}
+
+#[test]
+fn keyboard_polling_disables_and_releases_keys_after_repeated_errors() {
+    struct FailingController {
+        calls: usize,
+        fail: bool,
+    }
+    impl UsbController for FailingController {
+        fn controller_type(&self) -> &'static str {
+            "failing"
+        }
+        fn control_transfer(
+            &mut self,
+            _: u8,
+            _: u8,
+            _: u8,
+            _: u16,
+            _: u16,
+            data: Option<&mut [u8]>,
+        ) -> Result<usize, UsbError> {
+            self.calls += 1;
+            if self.fail {
+                return Err(UsbError::Timeout);
+            }
+            data.unwrap()[..8].copy_from_slice(&[0, 0, 4, 0, 0, 0, 0, 0]);
+            Ok(8)
+        }
+        fn interrupt_transfer(&mut self, _: u8, _: u8, _: &mut [u8]) -> Result<usize, UsbError> {
+            Err(UsbError::NotSupported)
+        }
+        fn bulk_transfer(
+            &mut self,
+            _: u8,
+            _: u8,
+            _: bool,
+            _: &mut [u8],
+        ) -> Result<usize, UsbError> {
+            unreachable!()
+        }
+        fn create_interrupt_queue(
+            &mut self,
+            _: u8,
+            _: u8,
+            _: bool,
+            _: u16,
+            _: u8,
+        ) -> Result<u32, UsbError> {
+            unreachable!()
+        }
+        fn poll_interrupt_queue(&mut self, _: u32, _: &mut [u8]) -> Option<usize> {
+            unreachable!()
+        }
+        fn destroy_interrupt_queue(&mut self, _: u32) {
+            unreachable!()
+        }
+    }
+
+    let mut keyboard = UsbHidKeyboard::new(0, 1, 1, 8, 10);
+    let mut controller = FailingController {
+        calls: 0,
+        fail: false,
+    };
+    keyboard.poll_report(&mut controller);
+    assert_eq!(keyboard.keys.get_key(), Some(u16::from(b'a')));
+    assert!(keyboard.keys.prev_report.is_key_pressed(4));
+
+    controller.fail = true;
+    for _ in 0..5 {
+        keyboard.poll_report(&mut controller);
+    }
+    // Stopped after MAX_CONSECUTIVE_ERRORS (3) + the 1 initial success = 4 total calls.
+    assert_eq!(controller.calls, 4);
+    assert!(keyboard.poll_disabled);
+    assert!(!keyboard.keys.prev_report.is_key_pressed(4));
 }
 
 #[test]
@@ -227,9 +323,7 @@ fn keyboard_arrays_resolve_selectors_and_reject_unsupported_widths() {
 #[test]
 fn composite_interface_is_used_for_all_class_requests() {
     let mut controller = Controller::new();
-    let mut keyboard = UsbHidKeyboard::new(0, 1, 1, 8, 10);
-    keyboard.set_boot_protocol(&mut controller).unwrap();
-    keyboard.set_idle(&mut controller, 0).unwrap();
+    let mut keyboard = bind_test_keyboard(&mut controller);
     keyboard.set_leds(&mut controller).unwrap();
     controller.supported = false;
     keyboard.poll_report(&mut controller);

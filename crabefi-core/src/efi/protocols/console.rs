@@ -449,6 +449,8 @@ extern "efiapi" fn text_input_read_key_stroke(
         return Status::INVALID_PARAMETER;
     }
 
+    crate::efi::poll_idle();
+
     with_state_mut(|console| {
         let input_state = &mut console.input;
 

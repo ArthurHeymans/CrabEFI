@@ -28,6 +28,16 @@ not an unbounded or post-seal general-purpose heap.
 8. EBS cleans up boot state and seals the image last.
 9. Image-local SVAM validates and physically commits per-section virtual mappings.
 
+## Cooperative firmware tasks
+
+`crabefi-core/src/exec.rs` implements cooperative polling without interrupts
+or wakers. Idle menu loops and EFI event/input polls give background tasks a
+turn. A hardware wait yields between polls; controller borrows never cross
+an await. The same USB port tasks drive boot discovery and hotplug, including
+ports behind external hubs. Individual control and bulk transfers still use
+synchronous controller waits. At OS handoff, polling stops without freeing
+pending tasks or changing the accepted EFI memory map.
+
 ## Boot filesystems
 
 `BlockRange` gives the filesystem reader byte access bounded to its partition.

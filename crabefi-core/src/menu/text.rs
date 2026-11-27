@@ -37,6 +37,18 @@ fn update_cursor(
     }
 }
 
+/// Result of running an interactive boot menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MenuAction {
+    /// User (or timeout) selected the entry at this index.
+    Selected(usize),
+    /// USB storage changed; re-discover entries and reopen the menu.
+    Refresh { interacted: bool },
+    /// Menu exited without selecting an entry.
+    #[cfg_attr(not(feature = "ui"), allow(dead_code))]
+    Exit,
+}
+
 /// Show the boot menu and wait for user selection
 ///
 /// # Arguments
@@ -49,10 +61,13 @@ fn update_cursor(
 /// Boot [`BootMenu::entry_for_boot`] for that index so a one-shot
 /// command-line edit made in the menu applies to this boot attempt.
 pub fn show_menu(menu: &mut BootMenu) -> Option<usize> {
-    show_menu_for_mode::<false>(menu)
+    match show_menu_for_mode::<false>(menu) {
+        MenuAction::Selected(index) => Some(index),
+        MenuAction::Refresh { .. } | MenuAction::Exit => None,
+    }
 }
 
-pub(crate) fn show_menu_for_mode<const NATIVE: bool>(menu: &mut BootMenu) -> Option<usize> {
+pub(crate) fn show_menu_for_mode<const NATIVE: bool>(menu: &mut BootMenu) -> MenuAction {
     let draw_menu = draw_menu::<NATIVE>;
     menu.clear_edited_cmdline();
     // An empty, indefinite menu still provides firmware/security settings.
@@ -90,13 +105,20 @@ pub(crate) fn show_menu_for_mode<const NATIVE: bool>(menu: &mut BootMenu) -> Opt
     #[cfg(feature = "ui")]
     let mut cursor_renderer = crate::cursor::CursorRenderer::new();
 
+    let storage_revision = crate::drivers::usb::storage_revision();
+    let mut interacted = false;
     loop {
+        crate::exec::poll_background();
         // Update mouse cursor on framebuffer
         #[cfg(feature = "ui")]
         update_cursor(&mut cursor_renderer, &fb_info);
         // Read input before the countdown can expire, so a key queued during
         // the last second still stops the automatic boot.
         let key = menu_common::read_key();
+        interacted |= key.is_some();
+        if storage_revision != crate::drivers::usb::storage_revision() {
+            return MenuAction::Refresh { interacted };
+        }
         // Any key stops the automatic boot, as in the graphical menu: only an
         // explicit choice boots after that. This also keeps a restricted boot
         // policy from timing out into an external entry the user merely moved
@@ -117,7 +139,7 @@ pub(crate) fn show_menu_for_mode<const NATIVE: bool>(menu: &mut BootMenu) -> Opt
 
             if remaining_seconds == 0 {
                 // Timeout - boot selected entry
-                return Some(menu.selected);
+                return MenuAction::Selected(menu.selected);
             }
         }
 
@@ -148,7 +170,7 @@ pub(crate) fn show_menu_for_mode<const NATIVE: bool>(menu: &mut BootMenu) -> Opt
                         log::error!("No entry at selected index {}", menu.selected);
                         draw_status("Error: No entry selected", &mut fb_console);
                     }
-                    return Some(menu.selected);
+                    return MenuAction::Selected(menu.selected);
                 }
                 KeyPress::Escape => {
                     // Future: file browser
@@ -206,7 +228,7 @@ pub(crate) fn show_menu_for_mode<const NATIVE: bool>(menu: &mut BootMenu) -> Opt
                                 let _ = msg.push_str("...");
                                 menu_common::clear_screen(&mut fb_console);
                                 draw_status(&msg, &mut fb_console);
-                                return Some(selected);
+                                return MenuAction::Selected(selected);
                             }
                             (EditResult::Confirmed, edited) => {
                                 menu.set_edited_cmdline(selected, edited);

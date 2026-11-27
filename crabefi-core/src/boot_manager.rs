@@ -57,19 +57,10 @@ pub(crate) fn init_storage_subsystem<const NATIVE: bool>(with_usb: bool) {
     timestamp::record(timestamp::TS_CRABEFI_STORAGE_INIT_DONE);
 }
 
-/// Enumerate input devices behind freshly bound USB controllers.
+/// Drive boot-time discovery on freshly bound USB buses.
 fn init_usb_devices() {
-    // Rescan UHCI/OHCI companion controller ports for devices that EHCI
-    // released after the initial scan (ICH8/9/10 chipsets initialize UHCI
-    // before EHCI due to PCI BDF ordering)
-    drivers::usb::rescan_companion_ports();
-
-    // Initialize USB keyboards (needs to happen after USB controllers are bound)
-    drivers::usb::init_keyboards_public();
-
-    // Initialize USB mice (needs to happen after USB controllers are bound)
-    #[cfg(feature = "ui")]
-    drivers::usb::init_mice();
+    // Start polling only after EHCI has configured companion routing.
+    drivers::usb::settle_buses();
 }
 
 /// Whether USB controllers have been bound.
@@ -343,15 +334,27 @@ fn show_boot_menu<const NATIVE: bool>(timeout_seconds: u32, firmware_ui_requeste
     // since the entries were listed) shows the menu again, rebuilt under the
     // current policy and waiting for the user.
     let mut countdown = Some(timeout_seconds);
-    while show_boot_menu_once::<NATIVE>(countdown, firmware_ui_requested) == MenuOutcome::Retry {
-        countdown = None;
+    loop {
+        let outcome = show_boot_menu_once::<NATIVE>(countdown, firmware_ui_requested);
+        if outcome == MenuOutcome::Done {
+            break;
+        }
+        countdown = countdown_after_rebuild(countdown, outcome);
     }
 }
 
 #[derive(PartialEq, Eq)]
 enum MenuOutcome {
     Done,
-    Retry,
+    RetryWithoutAutoboot,
+    Refresh { interacted: bool },
+}
+
+fn countdown_after_rebuild(configured: Option<u32>, outcome: MenuOutcome) -> Option<u32> {
+    match outcome {
+        MenuOutcome::Refresh { interacted: false } => configured,
+        _ => None,
+    }
 }
 
 /// `countdown` is the configured timeout, or `None` to wait for the user.
@@ -365,14 +368,18 @@ fn show_boot_menu_once<const NATIVE: bool>(
     let mut boot_menu = menu::discover_entries::<NATIVE>();
     // After a refused choice the user is in the menu on purpose, like an
     // explicit setup request: keep the menu even without media.
-    let keep_menu = firmware_ui_requested || countdown.is_none();
+    let keep_menu = firmware_ui_requested
+        || countdown.is_none()
+        || (usb_ready() && drivers::usb::controller_count() != 0);
 
     if boot_menu.entry_count() == 0 && !keep_menu {
         log::warn!("No bootable media found!");
 
         #[cfg(feature = "ui")]
-        if !NATIVE {
-            crate::ui::show_no_media_screen();
+        if !NATIVE
+            && let menu::MenuAction::Refresh { interacted } = crate::ui::show_no_media_screen()
+        {
+            return MenuOutcome::Refresh { interacted };
         }
 
         return MenuOutcome::Done;
@@ -428,8 +435,10 @@ fn show_boot_menu_once<const NATIVE: bool>(
     if keep_menu && boot_menu.entry_count() == 0 {
         #[cfg(feature = "ui")]
         if graphical {
-            crate::ui::show_no_media_screen();
-            return MenuOutcome::Done;
+            return match crate::ui::show_no_media_screen() {
+                menu::MenuAction::Refresh { interacted } => MenuOutcome::Refresh { interacted },
+                _ => MenuOutcome::Done,
+            };
         }
         // The text menu also exposes firmware/security settings without media.
     }
@@ -439,17 +448,23 @@ fn show_boot_menu_once<const NATIVE: bool>(
     // The graphical menu requires a framebuffer; the text menu also works
     // headlessly and will boot the selected entry when its timeout expires.
     #[cfg(feature = "ui")]
-    let selected = if graphical {
-        crate::ui::show_graphical_menu(&mut boot_menu)
+    let action = if graphical {
+        crate::ui::show_graphical_menu_action(&mut boot_menu)
     } else {
         menu::show_menu_for_mode::<NATIVE>(&mut boot_menu)
     };
     #[cfg(not(feature = "ui"))]
-    let selected = {
+    let action = {
         let _ = graphical;
         menu::show_menu_for_mode::<NATIVE>(&mut boot_menu)
     };
-    log::info!("Menu returned: {:?}", selected);
+    log::info!("Menu returned: {:?}", action);
+
+    let selected = match action {
+        menu::MenuAction::Selected(index) => Some(index),
+        menu::MenuAction::Refresh { interacted } => return MenuOutcome::Refresh { interacted },
+        menu::MenuAction::Exit => None,
+    };
 
     if let Some(selected_index) = selected {
         log::info!("Selected index: {}", selected_index);
@@ -466,7 +481,7 @@ fn show_boot_menu_once<const NATIVE: bool>(
                     entry.name,
                     if automatic { " on timeout" } else { "" }
                 );
-                return MenuOutcome::Retry;
+                return MenuOutcome::RetryWithoutAutoboot;
             }
             log::info!("Booting: {} from {}", entry.name, entry.path);
             log::info!("Entry kind: {:?}", entry.kind);
@@ -475,7 +490,7 @@ fn show_boot_menu_once<const NATIVE: bool>(
             log::warn!("boot_selected_entry returned - boot failed!");
             if NATIVE {
                 log::info!("Returning to native boot menu without autoboot");
-                return MenuOutcome::Retry;
+                return MenuOutcome::RetryWithoutAutoboot;
             }
         } else {
             log::error!("Failed to get entry at index {}", selected_index);
@@ -491,6 +506,27 @@ fn show_boot_menu_once<const NATIVE: bool>(
 #[cfg(test)]
 mod menu_configuration_tests {
     use super::menu_configuration;
+
+    #[test]
+    fn refresh_only_restarts_an_uninterrupted_countdown() {
+        use super::{MenuOutcome, countdown_after_rebuild};
+        assert_eq!(
+            countdown_after_rebuild(Some(7), MenuOutcome::Refresh { interacted: false }),
+            Some(7)
+        );
+        assert_eq!(
+            countdown_after_rebuild(Some(7), MenuOutcome::Refresh { interacted: true }),
+            None
+        );
+        assert_eq!(
+            countdown_after_rebuild(None, MenuOutcome::Refresh { interacted: false }),
+            None
+        );
+        assert_eq!(
+            countdown_after_rebuild(Some(7), MenuOutcome::RetryWithoutAutoboot),
+            None
+        );
+    }
 
     #[test]
     fn graphical_menu_requires_a_framebuffer() {

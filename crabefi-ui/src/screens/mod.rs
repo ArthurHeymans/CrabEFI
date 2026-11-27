@@ -36,14 +36,11 @@ pub enum NavItem {
 #[non_exhaustive]
 pub enum ScreenNav {
     Back,
+    Refresh,
     Reset,
     Nav(NavItem),
 }
-enum BootResult {
-    Selected(usize),
-    Reset,
-    Nav(NavItem),
-}
+type BootResult = core::ops::ControlFlow<Outcome, NavItem>;
 const NAV_ITEMS: &[(NavItem, &str)] = &[
     (NavItem::Boot, "Boot"),
     #[cfg(feature = "secure-boot")]
@@ -321,9 +318,8 @@ pub async fn show_graphical_menu<E: MenuEntry>(
     loop {
         let next = match screen {
             NavItem::Boot => match run_boot(fb, menu, default).await {
-                BootResult::Selected(i) => return Outcome::Boot(i),
-                BootResult::Reset => return Outcome::Reset,
-                BootResult::Nav(nav) => ScreenNav::Nav(nav),
+                BootResult::Break(outcome) => return outcome,
+                BootResult::Continue(nav) => ScreenNav::Nav(nav),
             },
             #[cfg(feature = "secure-boot")]
             NavItem::Security => secure_boot::show(fb).await,
@@ -331,6 +327,7 @@ pub async fn show_graphical_menu<E: MenuEntry>(
         };
         screen = match next {
             ScreenNav::Reset => return Outcome::Reset,
+            ScreenNav::Refresh => return Outcome::Refresh,
             ScreenNav::Back => NavItem::Boot,
             ScreenNav::Nav(nav) => nav,
         };
@@ -347,7 +344,7 @@ pub async fn show_no_media_screen(fb: &FramebufferInfo) -> Outcome {
                 fb,
                 NavItem::Boot,
                 "No bootable media",
-                "Connect a boot device, then restart. Security and Firmware settings remain available.",
+                "Connect a boot device to refresh the list. Security and Firmware settings remain available.",
             ).await,
             #[cfg(feature = "secure-boot")]
             NavItem::Security => secure_boot::show(fb).await,
@@ -355,6 +352,9 @@ pub async fn show_no_media_screen(fb: &FramebufferInfo) -> Outcome {
         };
         if matches!(next, ScreenNav::Reset) {
             return Outcome::Reset;
+        }
+        if matches!(next, ScreenNav::Refresh) {
+            return Outcome::Refresh;
         }
         match no_media_destination(nav, next) {
             Some(next) => nav = next,
@@ -365,7 +365,7 @@ pub async fn show_no_media_screen(fb: &FramebufferInfo) -> Outcome {
 
 fn no_media_destination(current: NavItem, result: ScreenNav) -> Option<NavItem> {
     match result {
-        ScreenNav::Reset => None,
+        ScreenNav::Reset | ScreenNav::Refresh => None,
         ScreenNav::Back if current == NavItem::Boot => None,
         ScreenNav::Back => Some(NavItem::Boot),
         ScreenNav::Nav(next) => Some(next),
@@ -430,12 +430,16 @@ pub async fn empty_screen(
     let mut focus = Focus::new(nav_item_index(nav));
     focus.group = Group::Actions;
     let mut hover = Hover::default();
+    let origin = fb.position();
     loop {
         cursor.hide(fb);
         let restart = empty_screen_paint(fb, nav, &focus, title, message);
         hover.reset();
         loop {
             poll_and_render_cursor(fb, &mut cursor);
+            if deliberate_pointer_motion(origin, fb.position()) {
+                fb.note_interaction();
+            }
             track_hover(fb, &mut cursor, &mut hover, Some((nav, &focus)));
             if let Some(key) = fb.key() {
                 let snapshot = focus;
@@ -483,6 +487,10 @@ pub async fn empty_screen(
             }
             if fb.reset_requested() {
                 return ScreenNav::Reset;
+            }
+            if nav == NavItem::Boot && fb.boot_entries_stale() {
+                cursor.hide(fb);
+                return ScreenNav::Refresh;
             }
             fb.wait_for_frame().await;
         }
@@ -1102,6 +1110,12 @@ async fn run_boot<E: MenuEntry>(
     let mut hover = Hover::default();
     let origin = fb.position();
     loop {
+        // A background poll during the previous frame may have removed the
+        // selected disk. Refresh before accepting input or expiring the timer.
+        if fb.boot_entries_stale() {
+            cursor.hide(fb);
+            return BootResult::Break(Outcome::Refresh);
+        }
         poll_and_render_cursor(fb, &mut cursor);
         // Tabs are not live while the command-line editor owns the keys.
         let tabs = state
@@ -1109,12 +1123,13 @@ async fn run_boot<E: MenuEntry>(
             .is_none()
             .then_some((NavItem::Boot, &state.focus));
         track_hover(fb, &mut cursor, &mut hover, tabs);
-        if deliberate_pointer_motion(origin, fb.position())
-            && cancel_boot_countdown(menu, &mut state)
-        {
-            keep_boot_selection_visible(fb, &mut state);
-            buttons = cursor.while_hidden(fb, || paint_boot(fb, menu, &state));
-            hover.reset();
+        if deliberate_pointer_motion(origin, fb.position()) {
+            fb.note_interaction();
+            if cancel_boot_countdown(menu, &mut state) {
+                keep_boot_selection_visible(fb, &mut state);
+                buttons = cursor.while_hidden(fb, || paint_boot(fb, menu, &state));
+                hover.reset();
+            }
         }
         let hovered = boot_hit(fb, menu, &state);
         if hovered != state.hovered {
@@ -1147,7 +1162,7 @@ async fn run_boot<E: MenuEntry>(
             match chrome_key(fb, key, &mut state.focus, NavItem::Boot, actions) {
                 Some(FocusEvent::Navigate(i)) => {
                     cursor.hide(fb);
-                    return BootResult::Nav(nav_at(i));
+                    return BootResult::Continue(nav_at(i));
                 }
                 // Space activates buttons, but never the one that boots.
                 Some(FocusEvent::Action(i)) if !(i == 0 && key == KeyPress::Char(' ')) => {
@@ -1215,7 +1230,7 @@ async fn run_boot<E: MenuEntry>(
             match activate {
                 Some(0) => {
                     cursor.hide(fb);
-                    return BootResult::Selected(state.sel);
+                    return BootResult::Break(Outcome::Boot(state.sel));
                 }
                 Some(_) => {
                     if let Some(entry) = menu.entries.get(state.sel)
@@ -1244,6 +1259,9 @@ async fn run_boot<E: MenuEntry>(
                                 )
                                 .await
                             };
+                            if fb.boot_entries_stale() {
+                                return BootResult::Break(Outcome::Refresh);
+                            }
                             if let Some(text) = edited {
                                 return apply_cmdline_and_boot(menu, state.sel, &text);
                             }
@@ -1268,13 +1286,13 @@ async fn run_boot<E: MenuEntry>(
             if state.countdown == 0 {
                 cursor.hide(fb);
                 observe_boot(fb, &state);
-                return BootResult::Selected(state.sel);
+                return BootResult::Break(Outcome::Boot(state.sel));
             }
             cursor.while_hidden(fb, || paint_boot_strip(fb, menu, &state));
         }
         observe_boot(fb, &state);
         if fb.reset_requested() {
-            return BootResult::Reset;
+            return BootResult::Break(Outcome::Reset);
         }
         fb.wait_for_frame().await;
     }
@@ -1296,7 +1314,7 @@ fn apply_cmdline_and_boot<E: MenuEntry>(
         }
         menu.set_edited_cmdline(index, edited);
     }
-    BootResult::Selected(index)
+    BootResult::Break(Outcome::Boot(index))
 }
 
 /// Keys while the details pane owns the one-shot command-line editor.
@@ -1398,6 +1416,106 @@ mod tests {
         }
         menu
     }
+    #[test]
+    fn stale_entries_win_on_the_countdown_expiry_frame() {
+        use alloc::rc::Rc;
+        use core::cell::Cell;
+        use core::future::Future;
+        use core::task::{Context, Poll, Waker};
+
+        struct Backend(Rc<Cell<u64>>);
+        impl crate::Backend for Backend {
+            fn poll_pointer(&mut self) -> (i32, i32) {
+                (0, 0)
+            }
+            fn read_key(&mut self) -> Option<KeyPress> {
+                None
+            }
+            fn now_ms(&self) -> u64 {
+                self.0.get()
+            }
+            fn poll_frame(&mut self, _: &mut Context<'_>) -> Poll<()> {
+                self.0.set(1000);
+                Poll::Ready(())
+            }
+            fn boot_entries_stale(&self) -> bool {
+                self.0.get() == 1000
+            }
+        }
+
+        let mut mem = std::vec![0u32; 800 * 600];
+        let fb = framebuffer(&mut mem, 800, 600);
+        let surface = crate::Surface::new(*fb, Backend(Rc::new(Cell::new(0))));
+        surface.set_pointer((0, 0));
+        let mut menu = boot_menu(1);
+        menu.set_timeout(1);
+        let mut task = core::pin::pin!(run_boot(&surface, &mut menu, 0));
+        assert!(matches!(
+            task.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(BootResult::Break(Outcome::Refresh))
+        ));
+    }
+
+    #[test]
+    fn narrow_cmdline_modal_refreshes_when_entries_become_stale() {
+        use alloc::rc::Rc;
+        use core::cell::Cell;
+        use core::future::Future;
+        use core::task::{Context, Poll, Waker};
+
+        struct Backend {
+            step: Rc<Cell<u8>>,
+        }
+        impl crate::Backend for Backend {
+            fn poll_pointer(&mut self) -> (i32, i32) {
+                (0, 0)
+            }
+            fn read_key(&mut self) -> Option<KeyPress> {
+                let s = self.step.get();
+                self.step.set(s + 1);
+                match s {
+                    0 => Some(KeyPress::Char('e')),
+                    1 => Some(KeyPress::Enter),
+                    _ => None,
+                }
+            }
+            fn now_ms(&self) -> u64 {
+                0
+            }
+            fn poll_frame(&mut self, _: &mut Context<'_>) -> Poll<()> {
+                Poll::Ready(())
+            }
+            fn boot_entries_stale(&self) -> bool {
+                // Becomes stale after the modal opens (step >= 1).
+                self.step.get() >= 1
+            }
+        }
+
+        // 640x480 is narrow (no side pane), so 'e' opens the modal editor.
+        let mut mem = std::vec![0u32; 640 * 480];
+        let fb = framebuffer(&mut mem, 640, 480);
+        let surface = crate::Surface::new(
+            *fb,
+            Backend {
+                step: Rc::new(Cell::new(0)),
+            },
+        );
+        surface.set_pointer((0, 0));
+        let mut menu = boot_menu(1);
+        let mut cmdline = heapless::String::new();
+        let _ = cmdline.push_str("console=ttyS0");
+        menu.entries[0].entry.kind = BootEntryKind::BlsLinux {
+            linux_path: heapless::String::new(),
+            initrd_paths: heapless::Vec::new(),
+            cmdline,
+        };
+        let mut task = core::pin::pin!(run_boot(&surface, &mut menu, 0));
+        assert!(matches!(
+            task.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(BootResult::Break(Outcome::Refresh))
+        ));
+    }
+
     #[test]
     fn page_navigation_is_bounded_and_handles_empty_lists() {
         assert_eq!(page_selection(KeyPress::End, 0, 40, 6), Some(39));

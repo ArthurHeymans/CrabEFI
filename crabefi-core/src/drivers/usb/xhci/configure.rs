@@ -1,7 +1,7 @@
 //! xHCI endpoint configuration by device class.
 
-use super::super::controller::{ConfigurationInfo, UsbController};
-use super::{TrbRing, XhciError};
+use super::super::controller::ConfigurationInfo;
+use super::{TrbRing, XhciError, slots::SlotPages};
 use crate::barrier;
 use crate::efi;
 use xhci::context::EndpointType;
@@ -33,27 +33,14 @@ mod tests {
 }
 
 impl super::XhciController {
-    /// Fetch and parse the full configuration descriptor for a device
-    pub(super) fn get_config_descriptor(
-        &mut self,
-        slot_id: u8,
-    ) -> Result<ConfigurationInfo, XhciError> {
-        self.read_configuration(slot_id).map_err(|error| {
-            log::warn!(
-                "xHCI: configuration descriptor for slot {}: {:?}",
-                slot_id,
-                error
-            );
-            XhciError::UsbError
-        })
-    }
-
     /// Configure a mass storage device
     ///
     /// Uses the shared parse_configuration() infrastructure from controller.rs
-    pub(super) fn configure_mass_storage(&mut self, slot_id: u8) -> Result<(), XhciError> {
-        let config_info = self.get_config_descriptor(slot_id)?;
-
+    pub(super) fn configure_mass_storage(
+        &mut self,
+        slot_id: u8,
+        config_info: &ConfigurationInfo,
+    ) -> Result<(), XhciError> {
         // Find mass storage interface
         let mut bulk_in = 0u8;
         let mut bulk_out = 0u8;
@@ -94,11 +81,8 @@ impl super::XhciController {
         }
 
         if !found || bulk_in == 0 || bulk_out == 0 {
-            return Err(XhciError::DeviceNotFound);
+            return Err(XhciError::InvalidParameter);
         }
-
-        // Set configuration
-        self.set_configuration(slot_id, config_info.configuration_value)?;
 
         // Configure endpoints
         self.configure_bulk_endpoints(
@@ -130,9 +114,11 @@ impl super::XhciController {
     /// Configure a HID keyboard device
     ///
     /// Uses the shared parse_configuration() infrastructure from controller.rs
-    pub(super) fn configure_hid_keyboard(&mut self, slot_id: u8) -> Result<(), XhciError> {
-        let config_info = self.get_config_descriptor(slot_id)?;
-
+    pub(super) fn configure_hid_keyboard(
+        &mut self,
+        slot_id: u8,
+        config_info: &ConfigurationInfo,
+    ) -> Result<(), XhciError> {
         // Find HID keyboard interface
         let mut interrupt_in = 0u8;
         let mut interrupt_max_packet = 0u16;
@@ -163,17 +149,7 @@ impl super::XhciController {
         }
 
         if !found || interrupt_in == 0 {
-            return Err(XhciError::DeviceNotFound);
-        }
-
-        // Do not reset another function's already-configured endpoints.
-        let already_configured = self
-            .slots
-            .get(slot_id as usize)
-            .and_then(Option::as_ref)
-            .is_some_and(|slot| slot.is_mass_storage || slot.is_hid_mouse);
-        if !already_configured {
-            self.set_configuration(slot_id, config_info.configuration_value)?;
+            return Err(XhciError::InvalidParameter);
         }
 
         self.configure_hid_interrupt_endpoint(
@@ -202,9 +178,11 @@ impl super::XhciController {
     /// Configure a HID mouse device.
     ///
     /// Configure the interrupt pipe, shared with HID keyboards.
-    pub(super) fn configure_hid_mouse(&mut self, slot_id: u8) -> Result<(), XhciError> {
-        let config_info = self.get_config_descriptor(slot_id)?;
-
+    pub(super) fn configure_hid_mouse(
+        &mut self,
+        slot_id: u8,
+        config_info: &ConfigurationInfo,
+    ) -> Result<(), XhciError> {
         let mut interrupt_in = 0u8;
         let mut interrupt_max_packet = 0u16;
         let mut interrupt_interval = 0u8;
@@ -225,19 +203,7 @@ impl super::XhciController {
         }
 
         if !found || interrupt_in == 0 {
-            return Err(XhciError::DeviceNotFound);
-        }
-
-        // Set configuration (only if not already set by keyboard config)
-        let already_configured = self
-            .slots
-            .get(slot_id as usize)
-            .and_then(|s| s.as_deref())
-            .map(|s| s.is_hid_keyboard || s.is_mass_storage)
-            .unwrap_or(false);
-
-        if !already_configured {
-            self.set_configuration(slot_id, config_info.configuration_value)?;
+            return Err(XhciError::InvalidParameter);
         }
 
         self.configure_hid_interrupt_endpoint(
@@ -276,51 +242,36 @@ impl super::XhciController {
         // (many mice stall GET_REPORT so we must use the interrupt pipe).
         let in_dci = (interrupt_in as usize * 2) + 1; // Interrupt IN → odd DCI
 
+        let context_size = self.context_size;
+        let slot = self.get_slot(slot_id).ok_or(XhciError::DeviceNotFound)?;
+        let max_packet = interrupt_max_packet & 0x7ff;
+        let max_burst = if !slot.is_superspeed && slot.speed == 3 {
+            ((interrupt_max_packet >> 11) & 3) as u8
+        } else {
+            0
+        };
+        if slot.transfer_rings[in_dci - 1].is_some() || max_packet == 0 || max_burst == 3 {
+            return Err(XhciError::InvalidParameter);
+        }
         let ring_mem = efi::allocate_pages(1).ok_or(XhciError::AllocationFailed)?;
         let ring_addr = ring_mem.as_ptr() as u64;
+        let pages = SlotPages([ring_addr, 0, 0]);
         let ring = TrbRing::new(ring_addr, 256);
-        let context_size = self.context_size;
-
+        let input = slot.input_context;
         {
-            let slot = self
-                .slots
-                .get_mut(slot_id as usize)
-                .and_then(|s| s.as_deref_mut())
-                .ok_or(XhciError::DeviceNotFound)?;
-
-            slot.transfer_rings[in_dci - 1] = Some(ring);
-
-            // Set up input context for Configure Endpoint
-            let input = slot.input_context;
             unsafe {
                 core::ptr::write_bytes(input, 0, Self::input_context_len(context_size));
             }
             Self::copy_device_slot_context(input, slot.device_context, context_size);
             let slot_ctx = Self::input_slot_context(input, context_size);
-            // Adding a second HID function must not hide a higher existing DCI.
             slot_ctx.set_context_entries(slot_ctx.context_entries().max(in_dci as u8));
             let control = Self::input_control_context(input, context_size);
             control.set_add_context_flag(0);
             control.set_add_context_flag(in_dci);
-
-            // Interrupt IN endpoint context (EP Type 7)
-            // Convert bInterval to xHCI interval exponent:
-            //   For LS/FS: period = 2^(Interval) * 125µs, bInterval is in ms
-            //   Use Interval such that 2^Interval ≈ bInterval * 8
-            //   For HS: bInterval already is exponent+1
             let xhci_interval = hid_interval(
                 if slot.is_superspeed { 4 } else { slot.speed },
                 interrupt_interval,
             );
-            let max_packet = interrupt_max_packet & 0x7ff;
-            let max_burst = if !slot.is_superspeed && slot.speed == 3 {
-                ((interrupt_max_packet >> 11) & 3) as u8
-            } else {
-                0
-            };
-            if max_packet == 0 || max_burst == 3 {
-                return Err(XhciError::InvalidParameter);
-            }
             let payload = max_packet * (max_burst as u16 + 1);
 
             let ep_ctx = Self::input_ep_context(input, context_size, in_dci - 1);
@@ -336,22 +287,25 @@ impl super::XhciController {
         }
 
         // Issue Configure Endpoint command
-        let input_ctx_ptr = self
-            .slots
-            .get(slot_id as usize)
-            .and_then(|s| s.as_deref())
-            .ok_or(XhciError::DeviceNotFound)?
-            .input_context as u64;
-
         let mut command = command::ConfigureEndpoint::new();
         command
-            .set_input_context_pointer(input_ctx_ptr)
+            .set_input_context_pointer(input as u64)
             .set_slot_id(slot_id);
 
         self.cmd_ring.enqueue(command, false);
         barrier::mmio_write();
         self.ring_doorbell(0, 0);
-        self.wait_command_completion()?;
+        let result = self.wait_command_completion();
+        if result.as_ref().is_err_and(|error| error.class_rejected()) {
+            return result.map(|_| ());
+        }
+        // On success the endpoint owns the ring. On ambiguous failure
+        // retain it for detach, which must confirm Disable Slot first.
+        self.get_slot_mut(slot_id)
+            .expect("slot lives during synchronous command")
+            .transfer_rings[in_dci - 1] = Some(ring);
+        core::mem::forget(pages);
+        result?;
 
         log::info!(
             "USB HID interrupt pipe configured on slot {}, EP {} (DCI {})",

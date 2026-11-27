@@ -74,7 +74,7 @@ fn ep0_max_packet(speed: u8, is_superspeed: bool) -> u16 {
 /// Unpublished slot pages. Partial allocations are safe to release until the
 /// DCBAA/Address Device command exposes them to hardware.
 #[derive(Default)]
-struct SlotPages([u64; 3]);
+pub(super) struct SlotPages(pub [u64; 3]);
 
 impl Drop for SlotPages {
     fn drop(&mut self) {
@@ -134,12 +134,98 @@ pub struct UsbSlot {
     pub interrupt_interval: u8,
     /// Is this a hub?
     pub is_hub: bool,
-    /// Number of downstream ports (if hub)
-    pub hub_ports: u8,
+    pub(super) sublinks: Option<super::speed::SublinkSpeeds>,
     /// Route string for this device (xHCI hub topology)
     pub route_string: u32,
     /// Root hub port this device chain starts from
     pub root_port: u8,
+    /// Parent hub `(hub_slot_id, hub_port)` if attached behind a hub.
+    pub parent_hub: Option<(u8, u8)>,
+}
+
+impl UsbSlot {
+    fn with_contexts(
+        slot_id: u8,
+        speed: u8,
+        route: SlotRoute,
+        is_superspeed: bool,
+        transaction_translator: Option<TransactionTranslator>,
+        [device_context, input_context]: [u64; 2],
+        transfer_rings: [Option<TrbRing>; 31],
+    ) -> Self {
+        Self {
+            slot_id,
+            device_context: device_context as *mut u8,
+            input_context: input_context as *mut u8,
+            transfer_rings,
+            device_desc: DeviceDescriptor::default(),
+            port: route.port,
+            speed,
+            is_superspeed,
+            transaction_translator,
+            is_mass_storage: false,
+            mass_storage_interface: 0,
+            bulk_in_ep: 0,
+            bulk_out_ep: 0,
+            bulk_in_max_packet: 0,
+            bulk_out_max_packet: 0,
+            is_hid_keyboard: false,
+            is_hid_mouse: false,
+            interrupt_in_ep: 0,
+            mouse_interrupt_in_ep: 0,
+            mouse_interrupt_max_packet: 0,
+            mouse_interrupt_interval: 0,
+            interrupt_max_packet: 0,
+            interrupt_interval: 0,
+            is_hub: false,
+            sublinks: None,
+            route_string: route.route_string,
+            root_port: route.root_port,
+            parent_hub: route.parent_hub,
+        }
+    }
+
+    pub(in crate::drivers::usb) fn device_info(&self) -> super::super::controller::DeviceInfo {
+        use super::super::controller::{DeviceInfo, UsbSpeed};
+        DeviceInfo {
+            address: self.slot_id,
+            speed: UsbSpeed::from_xhci(self.speed).unwrap_or(UsbSpeed::High),
+            vendor_id: self.device_desc.vendor_id,
+            product_id: self.device_desc.product_id,
+            device_class: self.device_desc.device_class,
+            is_mass_storage: self.is_mass_storage,
+            mass_storage_interface: self.mass_storage_interface,
+            is_hid: self.is_hid_keyboard
+                || self.is_hid_mouse
+                || self.device_desc.device_class == 0x03,
+            is_keyboard: self.is_hid_keyboard,
+            is_mouse: self.is_hid_mouse,
+            is_hub: self.is_hub,
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn interface_class_hub_remains_a_hub_in_device_info() {
+    let route = SlotRoute {
+        port: 0,
+        root_port: 0,
+        route_string: 0,
+        parent_hub: None,
+    };
+    let mut slot = UsbSlot::with_contexts(
+        1,
+        3,
+        route,
+        false,
+        None,
+        [0, 0],
+        core::array::from_fn(|_| None),
+    );
+    slot.is_hub = true; // Set by configuration from the interface descriptor.
+    assert_eq!(slot.device_desc.device_class, 0);
+    assert!(slot.device_info().is_hub);
 }
 
 /// Reset is valid only for a halted endpoint. A timed-out transfer can still
@@ -270,62 +356,7 @@ impl super::XhciController {
     }
 
     /// Address a device
-    pub(super) fn address_device(
-        &mut self,
-        slot_id: u8,
-        port: u8,
-        speed: u8,
-    ) -> Result<(), XhciError> {
-        self.address_slot(
-            slot_id,
-            speed,
-            SlotRoute {
-                port,
-                root_port: port,
-                route_string: 0,
-                parent_hub: None,
-            },
-        )
-    }
-
-    /// Address either a root or hub device, rolling back an enabled slot on error.
     pub(super) fn address_slot(
-        &mut self,
-        slot_id: u8,
-        speed: u8,
-        route: SlotRoute,
-    ) -> Result<(), XhciError> {
-        let result = self.prepare_address_slot(slot_id, speed, route);
-        if result.is_err() && slot_id != 0 {
-            let mut command = command::DisableSlot::new();
-            command.set_slot_id(slot_id);
-            self.cmd_ring.enqueue(command, false);
-            barrier::mmio_write();
-            self.ring_doorbell(0, 0);
-            if self.wait_command_completion().is_ok() {
-                // Only Disable Slot completion proves that a timed-out Address
-                // Device can no longer access its input/device context or ring.
-                if let Some(entry) = self.slots.get_mut(slot_id as usize)
-                    && let Some(slot) = entry.take()
-                {
-                    // SAFETY: the slot index was checked before publication.
-                    unsafe {
-                        core::ptr::write_volatile((self.dcbaa as *mut u64).add(slot_id as usize), 0)
-                    };
-                    let _pages = SlotPages([
-                        slot.device_context as u64,
-                        slot.input_context as u64,
-                        slot.transfer_rings[0].as_ref().map_or(0, |ring| ring.base),
-                    ]);
-                }
-            } else {
-                log::warn!("xHCI: retaining slot {} DMA after failed rollback", slot_id);
-            }
-        }
-        result
-    }
-
-    fn prepare_address_slot(
         &mut self,
         slot_id: u8,
         speed: u8,
@@ -338,6 +369,9 @@ impl super::XhciController {
             log::error!("xHCI: slot ID {} outside tracked range", slot_id);
             return Err(XhciError::InvalidParameter);
         }
+        // Enable Slot already succeeded; record the route before any fallible
+        // allocation so an ancestor disconnect can reclaim the enabled slot.
+        self.pending_parents[slot_id as usize] = Some(route.parent_hub.map_or(0, |(hub, _)| hub));
         let is_superspeed = self.is_superspeed_port(route.root_port, speed);
         let transaction_translator =
             if !is_superspeed && let Some((hub_slot, hub_port)) = route.parent_hub {
@@ -394,7 +428,7 @@ impl super::XhciController {
         let ring = TrbRing::new(transfer_ring, 256);
 
         // Track ownership before exposing any pages to the controller.
-        // Failed Address Device commands are rolled back by address_slot.
+        // Failed Address Device commands are rolled back by the port task.
         // Store slot info
         let mut transfer_rings: [Option<TrbRing>; 31] = core::array::from_fn(|_| None);
         transfer_rings[0] = Some(ring);
@@ -403,35 +437,16 @@ impl super::XhciController {
             .slots
             .get_mut(slot_id as usize)
             .ok_or(XhciError::NoFreeSlots)?;
-        *slot_entry = Some(try_box_slot(UsbSlot {
+        *slot_entry = Some(try_box_slot(UsbSlot::with_contexts(
             slot_id,
-            device_context: device_context as *mut u8,
-            input_context: input_context as *mut u8,
-            transfer_rings,
-            device_desc: DeviceDescriptor::default(),
-            port: route.port,
             speed,
+            route,
             is_superspeed,
             transaction_translator,
-            is_mass_storage: false,
-            mass_storage_interface: 0,
-            bulk_in_ep: 0,
-            bulk_out_ep: 0,
-            bulk_in_max_packet: 0,
-            bulk_out_max_packet: 0,
-            is_hid_keyboard: false,
-            is_hid_mouse: false,
-            interrupt_in_ep: 0,
-            mouse_interrupt_in_ep: 0,
-            mouse_interrupt_max_packet: 0,
-            mouse_interrupt_interval: 0,
-            interrupt_max_packet: 0,
-            interrupt_interval: 0,
-            is_hub: false,
-            hub_ports: 0,
-            route_string: route.route_string,
-            root_port: route.root_port,
-        })?);
+            [device_context, input_context],
+            transfer_rings,
+        ))?);
+        self.pending_parents[slot_id as usize] = None;
         core::mem::forget(pages);
 
         // SAFETY: the slot index is checked above and DCBAA is controller-owned.
@@ -449,9 +464,53 @@ impl super::XhciController {
         barrier::mmio_write();
         self.ring_doorbell(0, 0);
         self.wait_command_completion()?;
-        // SET_ADDRESS recovery interval (xHCI issues the USB request).
-        crate::time::delay_ms(2);
         Ok(())
+    }
+
+    /// Disable a slot before releasing DMA memory. The port task removes
+    /// downstream children first, yielding between Disable Slot commands.
+    pub(super) fn detach_slot(&mut self, slot_id: u8) {
+        if slot_id == 0 || usize::from(slot_id) >= self.slots.len() {
+            return;
+        }
+
+        log::info!("xHCI: Detaching slot {}", slot_id);
+
+        let mut command = command::DisableSlot::new();
+        command.set_slot_id(slot_id);
+        self.cmd_ring.enqueue(command, false);
+        barrier::mmio_write();
+        self.ring_doorbell(0, 0);
+        let disabled = self.wait_command_completion().is_ok();
+        let was_pending = self.pending_parents[slot_id as usize].take().is_some();
+        if !disabled && was_pending {
+            log::warn!("xHCI: Disable Slot {slot_id} failed for an unaddressed device");
+        }
+
+        self.clear_interrupt_polls_for_slot(slot_id, disabled);
+
+        if let Some(entry) = self.slots.get_mut(slot_id as usize)
+            && let Some(slot) = entry.take()
+        {
+            if disabled {
+                // SAFETY: slot_id is within the DCBAA allocated for `self.slots`.
+                unsafe {
+                    core::ptr::write_volatile((self.dcbaa as *mut u64).add(slot_id as usize), 0);
+                }
+                let _ = efi::allocator::free_pages(slot.device_context as u64, 1);
+                let _ = efi::allocator::free_pages(slot.input_context as u64, 1);
+                for ring in slot.transfer_rings.iter().flatten() {
+                    if ring.base != 0 {
+                        let _ = efi::allocator::free_pages(ring.base, 1);
+                    }
+                }
+            } else {
+                log::warn!(
+                    "xHCI: Disable Slot {} failed; retaining slot DMA pages",
+                    slot_id
+                );
+            }
+        }
     }
 }
 

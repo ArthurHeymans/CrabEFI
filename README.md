@@ -46,8 +46,10 @@ nix develop
 
 ## USB and pointing devices
 
-Connect USB boot drives and input devices **before starting CrabEFI**. USB
-hotplug/rescanning is not currently supported; restart after attaching a device.
+USB storage and input devices can be attached or removed while the firmware
+menu is active. The boot list refreshes automatically. EFI apps can receive
+input from hot-added keyboards and mice, but do not gain new Block I/O handles
+for disks attached while they are running.
 Native 4K logical sectors are supported, including GPT-partitioned USB storage.
 Hybrid ISO partitions must start and end on native logical-block boundaries;
 unaligned or out-of-device GPT ranges are rejected instead of rounded.

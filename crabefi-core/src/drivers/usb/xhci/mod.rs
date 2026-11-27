@@ -116,6 +116,8 @@ pub struct XhciController {
     erst: u64,
     /// Event ring
     event_ring: TrbRing,
+    /// Controller-owned EP0 staging, reused after completion or recovery.
+    control_buffer: Option<crate::efi::dma::DmaBuffer>,
     /// Active device slots, indexed by slot ID.
     ///
     /// Slot IDs are assigned by the controller (1-based). The table has one
@@ -124,6 +126,9 @@ pub struct XhciController {
     /// empty slot costs one pointer. All accesses use `.get()` / `.get_mut()`
     /// to safely handle out-of-range slot IDs without panicking.
     slots: alloc::vec::Vec<Option<Box<UsbSlot>>>,
+    /// Enabled slots without a published device context. A value of zero
+    /// denotes a root device; other values identify its upstream hub slot.
+    pending_parents: alloc::vec::Vec<Option<u8>>,
     /// Persistent interrupt TDs; their DMA buffers remain alive between polls.
     interrupt_polls: alloc::vec::Vec<bulk::InterruptPoll>,
 }
@@ -153,6 +158,23 @@ pub enum XhciError {
     StallError,
 }
 
+impl XhciError {
+    /// No command was issued, or Configure Endpoint returned a rejection
+    /// specific to the requested endpoints. The previously configured
+    /// endpoints are still usable. A lost command completion is not local.
+    fn class_rejected(&self) -> bool {
+        matches!(
+            self,
+            Self::InvalidParameter
+                | Self::AllocationFailed
+                | Self::CommandFailed(Ok(event::CompletionCode::ParameterError
+                    | event::CompletionCode::ResourceError
+                    | event::CompletionCode::BandwidthError
+                    | event::CompletionCode::SecondaryBandwidthError))
+        )
+    }
+}
+
 // SAFETY: XhciController contains DMA buffer pointers managed by the EFI page allocator.
 // The MMIO accessors and DMA buffers are:
 // 1. Backed by addresses that remain valid for the controller's lifetime
@@ -177,40 +199,7 @@ fn find_device_slot<T: ?Sized>(
     })
 }
 
-fn for_each_device_slot<T: ?Sized>(
-    slots: &[Option<impl core::ops::Deref<Target = T>>],
-    mut matches: impl FnMut(&T) -> bool,
-    f: &mut dyn FnMut(u8),
-) {
-    for (id, slot) in slots.iter().enumerate().skip(1) {
-        if slot.as_deref().is_some_and(&mut matches)
-            && let Ok(id) = u8::try_from(id)
-        {
-            f(id);
-        }
-    }
-}
-
 impl XhciController {
-    /// Find the first mass storage slot.
-    pub fn find_mass_storage(&self) -> Option<u8> {
-        self.find_slot(|slot| slot.is_mass_storage)
-    }
-
-    /// Visit every mass storage slot, including the highest one-based slot ID.
-    pub fn for_each_mass_storage(&self, f: &mut dyn FnMut(u8)) {
-        for_each_device_slot(&self.slots, |slot| slot.is_mass_storage, f);
-    }
-
-    /// Visit every matching slot, including the highest one-based slot ID.
-    pub(in crate::drivers::usb) fn for_each_slot(
-        &self,
-        matches: impl FnMut(&UsbSlot) -> bool,
-        f: &mut dyn FnMut(u8),
-    ) {
-        for_each_device_slot(&self.slots, matches, f);
-    }
-
     /// Search the actual slot table, including its highest one-based slot ID.
     pub(super) fn find_slot(&self, matches: impl FnMut(&UsbSlot) -> bool) -> Option<u8> {
         find_device_slot(&self.slots, matches)
@@ -357,19 +346,6 @@ mod tests {
         assert_eq!(find_device_slot(&slots[..MAX_SLOTS], |_| true), None);
         slots[2] = Some("mouse");
         assert_eq!(find_device_slot(&slots, |class| class == "mouse"), Some(2));
-    }
-
-    #[test]
-    fn mass_storage_discovery_visits_every_matching_slot() {
-        const MAX_SLOTS: usize = 255;
-        let mut slots: [Option<&str>; MAX_SLOTS + 1] = [None; MAX_SLOTS + 1];
-        slots[0] = Some("storage"); // Reserved slot must be ignored.
-        slots[1] = Some("storage");
-        slots[2] = Some("keyboard");
-        slots[MAX_SLOTS] = Some("storage");
-        let mut found = alloc::vec::Vec::new();
-        for_each_device_slot(&slots, |class| class == "storage", &mut |id| found.push(id));
-        assert_eq!(found, [1, MAX_SLOTS as u8]);
     }
 
     #[test]

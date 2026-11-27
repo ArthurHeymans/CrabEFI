@@ -7,7 +7,8 @@
 //! - USB HID Specification 1.11
 //! - libpayload usbhid.c
 
-use super::controller::{UsbController, UsbError, hid_request, req_type};
+use super::controller::{EndpointInfo, UsbController, UsbError, hid_request, req_type};
+use super::port::{Control, Pipe, hid_report};
 use crate::drivers::hid_descriptor::{input_capacity, input_size, parse};
 use crate::time::Timeout;
 use alloc::vec::Vec;
@@ -109,6 +110,10 @@ pub struct UsbHidKeyboard {
     pub(crate) keys: BootKeys,
     /// Earliest time of the next poll
     next_poll: Option<Timeout>,
+    /// Consecutive terminal poll failures
+    error_count: u8,
+    /// Stop polling after repeated terminal failures until replug
+    poll_disabled: bool,
     report_buffer: Vec<u8>,
     report: Option<crate::drivers::hid_report::Keyboard>,
 }
@@ -157,70 +162,28 @@ impl UsbHidKeyboard {
             interval,
             keys: BootKeys::default(),
             next_poll: None,
+            error_count: 0,
+            poll_disabled: false,
             report_buffer: alloc::vec![0; 8],
             report: None,
         }
     }
 
-    /// Set boot protocol mode
-    pub fn set_boot_protocol<C: UsbController + ?Sized>(
-        &mut self,
-        controller: &mut C,
-    ) -> Result<(), UsbError> {
-        self.interface_number =
-            controller.hid_interface_number(self.device_address, self.endpoint)?;
-        self.report = None;
-        // Fetch the descriptor even for boot keyboards. BMC gadgets may reject
-        // SET_PROTOCOL and retain report protocol; use their actual layout then.
-        if let Ok(bytes) =
-            controller.hid_report_descriptor(self.device_address, self.interface_number)
+    fn load_report(&mut self, bytes: &[u8]) {
+        if let Some(descriptor) = parse(bytes)
+            && let Some(capacity) = input_capacity(self.max_packet, input_size(&descriptor))
         {
-            log::debug!(
-                "USB keyboard {} report descriptor: {} bytes",
-                self.device_address,
-                bytes.len()
-            );
-            if let Some(descriptor) = parse(&bytes)
-                && let Some(capacity) = input_capacity(self.max_packet, input_size(&descriptor))
-            {
-                self.report = crate::drivers::hid_report::Keyboard::find(&descriptor);
-                if self.report.is_some() {
-                    self.report_buffer.resize(capacity, 0);
-                }
+            self.report = crate::drivers::hid_report::Keyboard::find(&descriptor);
+            if self.report.is_some() {
+                self.report_buffer.resize(capacity, 0);
             }
         }
-        // SET_PROTOCOL with protocol = 0 (boot protocol)
-        controller.control_transfer(
-            self.device_address,
-            req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_INTERFACE,
-            hid_request::SET_PROTOCOL,
-            0, // Boot protocol
-            self.interface_number as u16,
-            None,
-        )?;
-        // A successful switch means reports now have the fixed boot layout.
+    }
+
+    fn use_boot_report(&mut self) -> Result<(), UsbError> {
         let capacity = input_capacity(self.max_packet, 8).ok_or(UsbError::NotSupported)?;
         self.report_buffer.resize(capacity, 0);
         self.report = None;
-        Ok(())
-    }
-
-    /// Set idle rate (key repeat rate)
-    pub fn set_idle<C: UsbController + ?Sized>(
-        &mut self,
-        controller: &mut C,
-        rate_ms: u8,
-    ) -> Result<(), UsbError> {
-        // SET_IDLE with duration in 4ms units
-        let duration = rate_ms / 4;
-        controller.control_transfer(
-            self.device_address,
-            req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_INTERFACE,
-            hid_request::SET_IDLE,
-            (duration as u16) << 8, // Duration in high byte
-            self.interface_number as u16,
-            None,
-        )?;
         Ok(())
     }
 
@@ -687,50 +650,79 @@ impl BootKeys {
 /// USB keyboards typically have 8-10ms poll intervals
 const MIN_POLL_INTERVAL_MS: u64 = 8;
 
-/// Set up the boot-protocol keyboard at `device_addr`.
-pub fn init_keyboard<C: UsbController + ?Sized>(
-    controller: &mut C,
-    controller_idx: usize,
-    device_addr: u8,
+pub(super) async fn bind(pipe: Pipe) -> Result<UsbHidKeyboard, UsbError> {
+    let ep = super::with_controller(pipe.controller, |host| {
+        host.get_interrupt_endpoint(pipe.address)
+    })
+    .flatten()
+    .ok_or(UsbError::DeviceNotFound)?;
+    bind_with(pipe, ep, async |request, data| {
+        pipe.control(request, data).await
+    })
+    .await
+}
+
+async fn bind_with(
+    pipe: Pipe,
+    ep: EndpointInfo,
+    mut control: impl AsyncFnMut(Control, Option<&mut [u8]>) -> Result<usize, UsbError>,
 ) -> Result<UsbHidKeyboard, UsbError> {
-    let ep_info = controller
-        .get_interrupt_endpoint(device_addr)
-        .ok_or(UsbError::DeviceNotFound)?;
-
-    log::info!(
-        "USB HID keyboard found: device {}, endpoint {}, interval {}ms",
-        device_addr,
-        ep_info.number,
-        ep_info.interval
-    );
-
     let mut keyboard = UsbHidKeyboard::new(
-        controller_idx,
-        device_addr,
-        ep_info.number,
-        ep_info.max_packet_size,
-        ep_info.interval,
+        pipe.controller,
+        pipe.address,
+        ep.number,
+        ep.max_packet_size,
+        ep.interval,
     );
-
-    if let Err(e) = keyboard.set_boot_protocol(controller) {
-        // Never guess boot layout after a failed switch unless the descriptor
-        // supplies a usable report-protocol fallback.
-        if keyboard.report.is_none() {
-            return Err(e);
-        }
-        log::debug!("Boot protocol rejected: {:?}; using report descriptor", e);
+    let (interface, descriptor) = hid_report(ep.number, &mut control).await?;
+    keyboard.interface_number = interface;
+    if let Some(descriptor) = descriptor {
+        keyboard.load_report(&descriptor);
     }
-    // Set idle rate (30ms)
-    if let Err(e) = keyboard.set_idle(controller, 30) {
-        log::warn!("Failed to set idle rate: {:?}", e);
+    let request_type = req_type::TYPE_CLASS | req_type::RCPT_INTERFACE;
+    match control(
+        Control::new(
+            request_type,
+            hid_request::SET_PROTOCOL,
+            0,
+            u16::from(interface),
+        ),
+        None,
+    )
+    .await
+    {
+        Ok(_) => keyboard.use_boot_report()?,
+        Err(error) if matches!(error, UsbError::Timeout) || keyboard.report.is_none() => {
+            return Err(error);
+        }
+        Err(error) => log::debug!("Boot protocol rejected: {error:?}; using report descriptor"),
+    }
+    if let Err(error) = control(
+        Control::new(
+            request_type,
+            hid_request::SET_IDLE,
+            (30 / 4) << 8,
+            u16::from(interface),
+        ),
+        None,
+    )
+    .await
+    {
+        log::warn!("Failed to set idle rate: {error:?}");
     }
     Ok(keyboard)
 }
 
 impl UsbHidKeyboard {
+    const MAX_CONSECUTIVE_ERRORS: u8 = 3;
+    const ERROR_BACKOFF_MS: u64 = 500;
+
     /// Poll for a new report, at most every [`MIN_POLL_INTERVAL_MS`], and
     /// generate key repeats.
     fn poll<C: UsbController + ?Sized>(&mut self, controller: &mut C) {
+        if self.poll_disabled {
+            return;
+        }
         if self
             .next_poll
             .as_ref()
@@ -744,6 +736,9 @@ impl UsbHidKeyboard {
     }
 
     fn poll_report<C: UsbController + ?Sized>(&mut self, controller: &mut C) {
+        if self.poll_disabled {
+            return;
+        }
         // Most real keyboards require interrupt IN; GET_REPORT is only a legacy
         // controller fallback. A pending interrupt TD is not an all-keys-up report.
         let report_id = self
@@ -767,11 +762,32 @@ impl UsbHidKeyboard {
             result => result,
         };
 
-        // No completion, short report, or error: retain the held-key state.
-        if let Ok(length) = result
-            && let Some(report) = self.decode_report(length)
-        {
-            self.keys.process_report(&report);
+        match result {
+            Ok(length) => {
+                self.error_count = 0;
+                if let Some(report) = self.decode_report(length) {
+                    self.keys.process_report(&report);
+                }
+            }
+            Err(UsbError::Nak) => {
+                self.error_count = 0;
+            }
+            Err(error) => {
+                self.error_count = self.error_count.saturating_add(1);
+                // Release held keys so an unresponsive keyboard cannot repeat forever.
+                self.keys.process_report(&KeyboardReport::default());
+                if self.error_count >= Self::MAX_CONSECUTIVE_ERRORS {
+                    log::warn!(
+                        "USB keyboard {}: polling repeatedly failed ({:?}); disabling until replug",
+                        self.device_address,
+                        error
+                    );
+                    self.poll_disabled = true;
+                } else {
+                    self.next_poll = Some(Timeout::from_ms(Self::ERROR_BACKOFF_MS));
+                }
+                return;
+            }
         }
 
         self.keys.handle_repeat();
@@ -812,6 +828,10 @@ impl crate::drivers::keyboard_common::KeyboardDevice for UsbHidKeyboard {
 
     fn key_state(&mut self) -> crate::platform::KeyState {
         self.keys.efi_state()
+    }
+
+    fn usb_identity(&self) -> Option<(usize, u8)> {
+        Some((self.controller_idx, self.device_address))
     }
 }
 

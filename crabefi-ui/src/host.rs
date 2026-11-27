@@ -27,6 +27,7 @@ pub struct UiState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
     Boot(usize),
+    Refresh,
     Reset,
     Exit,
 }
@@ -115,6 +116,10 @@ pub trait Backend {
     fn set_text_size(&mut self, _size: TextSize) {}
     fn observe(&mut self, _state: UiState) {}
     fn observe_dialog(&mut self, _title: Option<&str>) {}
+    /// Whether the boot entries supplied to this surface need to be rebuilt.
+    fn boot_entries_stale(&self) -> bool {
+        false
+    }
 }
 
 /// A framebuffer and its host services. Drawing primitives still use the
@@ -124,6 +129,7 @@ pub struct Surface {
     backend: RefCell<Box<dyn Backend>>,
     pointer: Cell<(i32, i32)>,
     reset: Cell<bool>,
+    interacted: Cell<bool>,
     /// One Secure Boot snapshot per frame: firmware reads variables for it,
     /// and a single repaint consults it for every header chip and action row.
     security: Cell<Option<SecurityState>>,
@@ -147,6 +153,7 @@ impl Surface {
             backend: RefCell::new(Box::new(backend)),
             pointer: Cell::new((-1, -1)),
             reset: Cell::new(false),
+            interacted: Cell::new(false),
             security: Cell::new(None),
             dim: Cell::new(false),
             text_size: Cell::new(text_size),
@@ -194,7 +201,18 @@ impl Surface {
         DialogScope(self)
     }
     pub fn key(&self) -> Option<KeyPress> {
-        self.backend.borrow_mut().read_key()
+        let key = self.backend.borrow_mut().read_key();
+        if key.is_some() {
+            self.note_interaction();
+        }
+        key
+    }
+    pub(crate) fn note_interaction(&self) {
+        self.interacted.set(true);
+    }
+    /// Whether this menu session received input, even on the no-media page.
+    pub fn interacted(&self) -> bool {
+        self.interacted.get()
     }
     pub fn position(&self) -> (i32, i32) {
         self.pointer.get()
@@ -250,6 +268,9 @@ impl Surface {
     }
     pub fn observe_dialog(&self, title: Option<&str>) {
         self.backend.borrow_mut().observe_dialog(title);
+    }
+    pub fn boot_entries_stale(&self) -> bool {
+        self.backend.borrow().boot_entries_stale()
     }
 }
 

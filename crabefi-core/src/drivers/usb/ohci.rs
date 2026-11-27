@@ -16,12 +16,11 @@ use crate::time::{Timeout, wait_for};
 use core::ptr;
 use tock_registers::interfaces::{ReadWriteable, Readable, Writeable};
 
-use super::controller::{
-    Direction, SetupPacket, UsbController, UsbDevice, UsbError, UsbSpeed, enumerate_device,
-};
+use super::controller::{Direction, SetupPacket, UsbController, UsbDevice, UsbError, UsbSpeed};
 use super::ohci_regs::{
     self, HCCOMMANDSTATUS, HCCONTROL, HCREVISION, HCRHDESCRIPTORA, HCRHPORTSTATUS, HCRHSTATUS,
 };
+use super::port::{Control, PortController, RootCommand, RootKind, RootStatus};
 
 // ============================================================================
 // OHCI Data Structures
@@ -232,20 +231,20 @@ impl TransferDescriptor {
         }
     }
 
-    /// Get condition code
+    /// Get the DMA-updated condition code.
     pub fn condition_code(&self) -> u32 {
-        (self.control >> Self::CTRL_CC_SHIFT) & 0xF
+        (unsafe { ptr::read_volatile(&raw const self.control) } >> Self::CTRL_CC_SHIFT) & 0xF
     }
 
-    /// Check if TD is complete
+    /// OHCI reserves both 0xe and 0xf for unprocessed TDs.
     pub fn is_complete(&self) -> bool {
-        self.condition_code() != Self::CC_NOT_ACCESSED
+        self.condition_code() < Self::CC_NOT_ACCESSED
     }
 
-    /// Check if TD has error
+    /// Check if TD completed with a transfer error.
     pub fn has_error(&self) -> bool {
         let cc = self.condition_code();
-        cc != Self::CC_NO_ERROR && cc != Self::CC_NOT_ACCESSED && cc != Self::CC_DATA_UNDERRUN
+        cc < Self::CC_NOT_ACCESSED && cc != Self::CC_NO_ERROR && cc != Self::CC_DATA_UNDERRUN
     }
 }
 
@@ -344,7 +343,6 @@ impl OhciController {
         };
 
         controller.init().await?;
-        controller.enumerate_ports().await?;
 
         Ok(controller)
     }
@@ -472,101 +470,6 @@ impl OhciController {
         Ok(())
     }
 
-    /// Enumerate ports and attach devices
-    async fn enumerate_ports(&mut self) -> Result<(), UsbError> {
-        for port_num in 0..self.num_ports {
-            let port = self.port(port_num);
-            let portsc = port.portsc.get();
-
-            // Clear status change bits (W1C)
-            port.portsc.write(
-                HCRHPORTSTATUS::CSC::SET
-                    + HCRHPORTSTATUS::PESC::SET
-                    + HCRHPORTSTATUS::PSSC::SET
-                    + HCRHPORTSTATUS::OCIC::SET
-                    + HCRHPORTSTATUS::PRSC::SET,
-            );
-
-            // Check if device connected
-            if (portsc & HCRHPORTSTATUS::CCS.mask) == 0 {
-                continue;
-            }
-
-            let is_low_speed = (portsc & HCRHPORTSTATUS::LSDA.mask) != 0;
-            log::info!(
-                "OHCI: Device on port {} ({})",
-                port_num,
-                if is_low_speed {
-                    "low-speed"
-                } else {
-                    "full-speed"
-                }
-            );
-
-            // Reset the port
-            self.port(port_num).portsc.write(HCRHPORTSTATUS::PRS::SET);
-
-            // Wait for reset complete
-            exec::wait_for(100, || {
-                !self.port(port_num).portsc.is_set(HCRHPORTSTATUS::PRS)
-            })
-            .await;
-
-            exec::sleep_ms(10).await; // Recovery time
-
-            // Clear status change
-            self.port(port_num).portsc.write(HCRHPORTSTATUS::PRSC::SET);
-
-            // Check if enabled
-            if !self.port(port_num).portsc.is_set(HCRHPORTSTATUS::PES) {
-                log::warn!("OHCI: Port {} not enabled after reset", port_num);
-                continue;
-            }
-
-            // Enumerate the device
-            let speed = if is_low_speed {
-                UsbSpeed::Low
-            } else {
-                UsbSpeed::Full
-            };
-
-            if let Err(e) = self.attach_device(port_num, speed) {
-                log::error!("Failed to attach device on port {}: {:?}", port_num, e);
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Attach a device on a port
-    fn attach_device(&mut self, port: u8, speed: UsbSpeed) -> Result<(), UsbError> {
-        let address = self.next_address;
-        if address >= 128 {
-            return Err(UsbError::NoFreeSlots);
-        }
-
-        let slot = self
-            .devices
-            .iter()
-            .position(|h| h.is_none())
-            .ok_or(UsbError::NoFreeSlots)?;
-
-        let initial_device = UsbDevice::new(0, port, speed);
-
-        // Use the common enumeration helper with a closure for control transfers
-        let device = enumerate_device(
-            initial_device,
-            address,
-            |dev, req_type, req, value, index, data| {
-                self.control_transfer_internal(dev, req_type, req, value, index, data)
-            },
-        )?;
-
-        self.next_address += 1;
-        self.devices[slot] = Some(device);
-        Ok(())
-    }
-
     /// Internal control transfer
     fn control_transfer_internal(
         &mut self,
@@ -630,20 +533,18 @@ impl OhciController {
                 true,
                 (td_base + 32) as u32,
             );
-            *status_td = TransferDescriptor::status(!is_in, 0);
             status_td_addr = td_base + 32;
-
             ed.head_td = td_base as u32;
             ed.tail_td = (td_base + 48) as u32;
+            *status_td = TransferDescriptor::status(!is_in, ed.tail_td);
         } else {
             let status_td = unsafe { &mut *((td_base + 16) as *mut TransferDescriptor) };
 
             *setup_td = TransferDescriptor::setup(setup_addr as u32, (td_base + 16) as u32);
-            *status_td = TransferDescriptor::status(true, 0);
             status_td_addr = td_base + 16;
-
             ed.head_td = td_base as u32;
             ed.tail_td = (td_base + 32) as u32;
+            *status_td = TransferDescriptor::status(true, ed.tail_td);
         }
 
         flush_cache_range(setup_addr, 8);
@@ -673,16 +574,22 @@ impl OhciController {
         let status_td = unsafe { &*(status_td_addr as *const TransferDescriptor) };
         let timeout = Timeout::from_ms(5000);
 
-        while !timeout.is_expired() {
+        let completed = loop {
             invalidate_cache_range(status_td_addr, 16);
+            invalidate_cache_range(ed_addr, 16);
             barrier::dma_read();
-            if status_td.is_complete() {
-                break;
+            // A failed SETUP/DATA TD halts the ED before STATUS runs.
+            // For success, wait for HeadP to reach TailP: the controller
+            // may still be about to write HeadP after updating STATUS.
+            let head = unsafe { ptr::read_volatile(&raw const ed.head_td) };
+            if head & EndpointDescriptor::HEAD_HALTED != 0 || head & !0xf == ed.tail_td {
+                break true;
+            }
+            if timeout.is_expired() {
+                break false;
             }
             core::hint::spin_loop();
-        }
-
-        let completed = status_td.is_complete();
+        };
         let resume_list = !completed && self.quiesce_list(true);
 
         // Remove ED from the list only after a timed-out controller has stopped
@@ -702,12 +609,14 @@ impl OhciController {
             return Err(UsbError::Timeout);
         }
 
-        if setup_td.has_error() || status_td.has_error() {
-            let cc = if setup_td.has_error() {
-                setup_td.condition_code()
-            } else {
-                status_td.condition_code()
-            };
+        let data_td =
+            (data_len > 0).then(|| unsafe { &*((td_base + 16) as *const TransferDescriptor) });
+        let failed = [Some(&*setup_td), data_td, Some(status_td)]
+            .into_iter()
+            .flatten()
+            .find(|td| td.has_error());
+        if let Some(failed) = failed {
+            let cc = failed.condition_code();
             if cc == TransferDescriptor::CC_STALL {
                 return Err(UsbError::Stall);
             }
@@ -863,7 +772,13 @@ impl UsbController for OhciController {
 
             // Create TD for this chunk
             let td = unsafe { &mut *(td_addr as *mut TransferDescriptor) };
-            *td = TransferDescriptor::data(data_buffer as u32, chunk, is_in, toggle, 0);
+            *td = TransferDescriptor::data(
+                data_buffer as u32,
+                chunk,
+                is_in,
+                toggle,
+                (td_addr + 16) as u32,
+            );
             td.control &= !TransferDescriptor::CTRL_DI_NONE;
             td.control |= 0 << TransferDescriptor::CTRL_DI_SHIFT;
 
@@ -890,18 +805,22 @@ impl UsbController for OhciController {
             // Trigger bulk list
             self.regs().hccommandstatus.write(HCCOMMANDSTATUS::BLF::SET);
 
-            // Wait for completion
+            // The TD status can be published before the final ED writeback.
+            // Wait for the controller's HeadP, not just the TD condition code,
+            // before unlinking and rebuilding this ED for the next command.
             let timeout = Timeout::from_ms(5000);
-            while !timeout.is_expired() {
-                invalidate_cache_range(td_addr, 32);
+            let completed = loop {
+                invalidate_cache_range(ed_addr, 32);
                 barrier::dma_read();
-                if td.is_complete() {
-                    break;
+                let head = unsafe { ptr::read_volatile(&raw const ed.head_td) };
+                if head & EndpointDescriptor::HEAD_HALTED != 0 || head & !0xf == ed.tail_td {
+                    break true;
+                }
+                if timeout.is_expired() {
+                    break false;
                 }
                 core::hint::spin_loop();
-            }
-
-            let completed = td.is_complete();
+            };
             let resume_list = !completed && self.quiesce_list(false);
 
             // Remove from the list only after a timed-out controller has stopped
@@ -1025,5 +944,78 @@ impl OhciController {
         crate::time::delay_ms(10);
 
         log::debug!("OHCI cleanup complete");
+    }
+}
+
+impl PortController for OhciController {
+    fn root_ports(&self) -> (RootKind, u8) {
+        (RootKind::Ohci, self.num_ports)
+    }
+
+    fn legacy_devices(&mut self) -> Option<(&mut [Option<UsbDevice>], &mut u8)> {
+        Some((&mut self.devices, &mut self.next_address))
+    }
+
+    fn legacy_control(
+        &mut self,
+        device: &UsbDevice,
+        request: Control,
+        data: Option<&mut [u8]>,
+    ) -> Result<usize, UsbError> {
+        self.control_transfer_internal(
+            device,
+            request.ty,
+            request.request,
+            request.value,
+            request.index,
+            data,
+        )
+    }
+
+    fn root_status(&self, port: u8) -> RootStatus {
+        let status = self.port(port).portsc.extract();
+        RootStatus {
+            connected: status.is_set(HCRHPORTSTATUS::CCS),
+            changed: status.is_set(HCRHPORTSTATUS::CSC),
+            enabled: status.is_set(HCRHPORTSTATUS::PES),
+            resetting: status.is_set(HCRHPORTSTATUS::PRS),
+            low_speed: status.is_set(HCRHPORTSTATUS::LSDA),
+            ..RootStatus::default()
+        }
+    }
+
+    fn root_command(&mut self, port: u8, command: RootCommand) {
+        self.port(port).portsc.write(match command {
+            RootCommand::ClearChanges => {
+                HCRHPORTSTATUS::CSC::SET
+                    + HCRHPORTSTATUS::PESC::SET
+                    + HCRHPORTSTATUS::PSSC::SET
+                    + HCRHPORTSTATUS::OCIC::SET
+                    + HCRHPORTSTATUS::PRSC::SET
+            }
+            RootCommand::Reset => HCRHPORTSTATUS::PRS::SET,
+            RootCommand::AckReset => HCRHPORTSTATUS::PRSC::SET,
+            // Writing bit 0 clears Port Enable (reading it reports CCS).
+            RootCommand::Disable => HCRHPORTSTATUS::CCS::SET,
+            _ => unreachable!(),
+        });
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn ohci_transfer_descriptor_distinguishes_pending_and_completed_conditions() {
+    let mut td = TransferDescriptor::setup(0x1000, 0x1100);
+    assert_eq!(td.condition_code(), 0xf);
+    assert!(!td.is_complete());
+    assert!(!td.has_error());
+    for (cc, complete, error) in [
+        (0xe, false, false),
+        (TransferDescriptor::CC_NO_ERROR, true, false),
+        (TransferDescriptor::CC_STALL, true, true),
+    ] {
+        td.control = cc << TransferDescriptor::CTRL_CC_SHIFT;
+        assert_eq!(td.is_complete(), complete);
+        assert_eq!(td.has_error(), error);
     }
 }

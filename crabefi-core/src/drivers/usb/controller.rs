@@ -10,8 +10,8 @@
 //! - Device Class Drivers (MSC, HID) use the trait to communicate with devices
 //! - The core layer handles enumeration and device management
 
+use super::port::{self, Control};
 use crate::efi;
-use crate::time::Timeout;
 use core::ptr;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
@@ -605,6 +605,53 @@ pub struct UsbDeviceHandle {
     pub address: u8,
 }
 
+/// Allocate an unused USB address in `1..=127` for a legacy controller.
+pub fn allocate_legacy_address(devices: &[Option<UsbDevice>], next_address: &mut u8) -> Option<u8> {
+    let mut candidate = if (1..=127).contains(next_address) {
+        *next_address
+    } else {
+        1
+    };
+    for _ in 0..127 {
+        let in_use = devices.iter().flatten().any(|dev| dev.address == candidate);
+        let next = if candidate >= 127 { 1 } else { candidate + 1 };
+        if !in_use {
+            *next_address = next;
+            return Some(candidate);
+        }
+        candidate = next;
+    }
+    None
+}
+
+/// Recursively detach a legacy USB device and any downstream hub children.
+pub fn detach_legacy_device(
+    devices: &mut [Option<UsbDevice>],
+    addr: u8,
+    removed_devices: &mut alloc::vec::Vec<u8>,
+) {
+    let children: alloc::vec::Vec<u8> = devices
+        .iter()
+        .flatten()
+        .filter(|dev| dev.hub_addr == addr)
+        .map(|dev| dev.address)
+        .collect();
+    for child in children {
+        detach_legacy_device(devices, child, removed_devices);
+    }
+
+    let mut removed = false;
+    for slot in devices.iter_mut() {
+        if slot.as_ref().is_some_and(|dev| dev.address == addr) {
+            *slot = None;
+            removed = true;
+        }
+    }
+    if removed {
+        removed_devices.push(addr);
+    }
+}
+
 /// Trait for USB host controller drivers
 ///
 /// This trait abstracts the differences between xHCI, EHCI, OHCI, and UHCI
@@ -705,66 +752,6 @@ pub trait UsbController {
         Err(UsbError::NotSupported)
     }
 
-    /// Fetch a complete, bounded configuration; never parse a truncated prefix.
-    fn read_configuration(&mut self, device: u8) -> Result<ConfigurationInfo, UsbError> {
-        read_configuration_with(|buffer| {
-            self.control_transfer(
-                device,
-                req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
-                request::GET_DESCRIPTOR,
-                (desc_type::CONFIGURATION as u16) << 8,
-                0,
-                Some(buffer),
-            )
-        })
-    }
-
-    /// Resolve the interface owning a discovered HID interrupt endpoint.
-    /// Composite devices need this interface number in every HID class request.
-    fn hid_interface_number(&mut self, device: u8, endpoint: u8) -> Result<u8, UsbError> {
-        let config = self.read_configuration(device)?;
-        config.interfaces[..config.num_interfaces]
-            .iter()
-            .find(|iface| {
-                (iface.is_hid_keyboard() || iface.is_hid_mouse())
-                    && iface
-                        .find_interrupt_in()
-                        .is_some_and(|ep| ep.number == endpoint)
-            })
-            .map(|iface| iface.interface_number)
-            .ok_or(UsbError::DeviceNotFound)
-    }
-
-    /// Read the report descriptor for one active HID interface.
-    fn hid_report_descriptor(
-        &mut self,
-        device: u8,
-        interface: u8,
-    ) -> Result<alloc::vec::Vec<u8>, UsbError> {
-        let config = self.read_configuration(device)?;
-        let length = config.interfaces[..config.num_interfaces]
-            .iter()
-            .find(|iface| iface.interface_number == interface)
-            .map(|iface| usize::from(iface.hid_report_descriptor_length))
-            .ok_or(UsbError::DeviceNotFound)?;
-        if !(1..=4096).contains(&length) {
-            return Err(UsbError::NotSupported);
-        }
-        let mut descriptor = alloc::vec![0u8; length];
-        let actual = self.control_transfer(
-            device,
-            req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_INTERFACE,
-            request::GET_DESCRIPTOR,
-            u16::from(desc_type::HID_REPORT) << 8,
-            u16::from(interface),
-            Some(&mut descriptor),
-        )?;
-        if actual != length {
-            return Err(UsbError::InvalidParameter);
-        }
-        Ok(descriptor)
-    }
-
     /// Create an interrupt transfer queue
     ///
     /// # Arguments
@@ -815,36 +802,6 @@ pub trait UsbController {
         self.devices()
             .iter()
             .find_map(|h| h.as_ref().filter(|h| h.address == address))
-    }
-
-    /// Find the first mass storage device address/slot ID, if any.
-    fn find_mass_storage(&self) -> Option<u8> {
-        self.devices()
-            .iter()
-            .find_map(|h| h.as_ref().filter(|h| h.is_mass_storage).map(|h| h.address))
-    }
-
-    /// Visit every mass storage device address on this controller.
-    fn for_each_mass_storage(&self, f: &mut dyn FnMut(u8)) {
-        for_each_mass_storage_device(self.devices(), f);
-    }
-
-    /// Visit every HID boot keyboard address/slot ID on this controller.
-    fn for_each_hid_keyboard(&self, f: &mut dyn FnMut(u8)) {
-        self.devices()
-            .iter()
-            .flatten()
-            .filter(|device| device.is_hid_keyboard)
-            .for_each(|device| f(device.address));
-    }
-
-    /// Visit every HID boot mouse address/slot ID on this controller.
-    fn for_each_hid_mouse(&self, f: &mut dyn FnMut(u8)) {
-        self.devices()
-            .iter()
-            .flatten()
-            .filter(|device| device.is_hid_mouse)
-            .for_each(|device| f(device.address));
     }
 
     /// Get mouse interrupt endpoint info for a device
@@ -900,26 +857,33 @@ pub struct DeviceInfo {
 // Common USB Device State
 // ============================================================================
 
-fn for_each_mass_storage_device(devices: &[Option<UsbDevice>], f: &mut dyn FnMut(u8)) {
-    for device in devices.iter().flatten().filter(|d| d.is_mass_storage) {
-        f(device.address);
-    }
+#[cfg(test)]
+#[test]
+fn legacy_address_allocation_wraps_and_skips_in_use() {
+    let mut devices: [Option<UsbDevice>; 4] = core::array::from_fn(|_| None);
+    devices[0] = Some(UsbDevice::new(1, 0, UsbSpeed::High));
+    devices[1] = Some(UsbDevice::new(127, 1, UsbSpeed::High));
+    let mut next = 127;
+    assert_eq!(allocate_legacy_address(&devices, &mut next), Some(2));
+    assert_eq!(next, 3);
 }
 
 #[cfg(test)]
 #[test]
-fn legacy_mass_storage_discovery_visits_every_device() {
-    let mut first = UsbDevice::new(1, 0, UsbSpeed::High);
-    first.is_mass_storage = true;
-    let keyboard = UsbDevice::new(2, 1, UsbSpeed::High);
-    let mut second = UsbDevice::new(3, 2, UsbSpeed::High);
-    second.is_mass_storage = true;
-    let mut found = alloc::vec::Vec::new();
-    for_each_mass_storage_device(
-        &[Some(first), Some(keyboard), None, Some(second)],
-        &mut |addr| found.push(addr),
-    );
-    assert_eq!(found, [1, 3]);
+fn legacy_detach_removes_hub_children_recursively() {
+    let mut hub = UsbDevice::new(1, 0, UsbSpeed::High);
+    hub.is_hub = true;
+    let child = UsbDevice::new_on_hub(2, 1, UsbSpeed::Full, 1, 1);
+    let unrelated = UsbDevice::new(3, 1, UsbSpeed::High);
+    let mut devices = [Some(hub), Some(child), Some(unrelated)];
+    let mut events = alloc::vec::Vec::new();
+
+    detach_legacy_device(&mut devices, 1, &mut events);
+
+    assert_eq!(events, [2, 1]);
+    assert!(devices[0].is_none());
+    assert!(devices[1].is_none());
+    assert_eq!(devices[2].as_ref().map(|d| d.address), Some(3));
 }
 
 /// Common USB device state shared across EHCI/OHCI/UHCI controllers
@@ -949,8 +913,6 @@ pub struct UsbDevice {
     pub is_hid_mouse: bool,
     /// Is USB hub
     pub is_hub: bool,
-    /// Number of hub ports (if is_hub)
-    pub num_hub_ports: u8,
     /// Bulk IN endpoint
     pub bulk_in: Option<EndpointInfo>,
     /// Bulk OUT endpoint
@@ -985,7 +947,6 @@ impl UsbDevice {
             is_hid_keyboard: false,
             is_hid_mouse: false,
             is_hub: false,
-            num_hub_ports: 0,
             bulk_in: None,
             bulk_out: None,
             interrupt_in: None,
@@ -1189,12 +1150,8 @@ const MAX_CONFIGURATION_DESCRIPTOR_SIZE: usize = 4096;
 const MAX_CONFIGURATION_INTERFACES: usize = 8;
 const MAX_INTERFACE_ENDPOINTS: usize = 4;
 
-fn read_configuration_with(
-    mut read: impl FnMut(&mut [u8]) -> Result<usize, UsbError>,
-) -> Result<ConfigurationInfo, UsbError> {
-    let mut header = [0u8; 9];
-    if read(&mut header)? != header.len() || header[0] != 9 || header[1] != desc_type::CONFIGURATION
-    {
+pub(super) fn configuration_length(header: &[u8; 9], actual: usize) -> Result<usize, UsbError> {
+    if actual != header.len() || header[0] != 9 || header[1] != desc_type::CONFIGURATION {
         return Err(UsbError::InvalidParameter);
     }
     let length = u16::from_le_bytes([header[2], header[3]]) as usize;
@@ -1204,11 +1161,7 @@ fn read_configuration_with(
     if length > MAX_CONFIGURATION_DESCRIPTOR_SIZE {
         return Err(UsbError::NotSupported);
     }
-    let mut buffer = alloc::vec![0; length];
-    if read(&mut buffer)? != length {
-        return Err(UsbError::InvalidParameter);
-    }
-    parse_configuration_checked(&buffer)
+    Ok(length)
 }
 
 pub fn parse_configuration_checked(config_data: &[u8]) -> Result<ConfigurationInfo, UsbError> {
@@ -1502,75 +1455,45 @@ impl InterfaceInfo {
 ///
 /// # Returns
 /// The fully enumerated UsbDevice on success, or an error
-pub fn enumerate_device<F>(
+pub(super) async fn enumerate_device(
     mut device: UsbDevice,
     address: u8,
-    mut do_control: F,
-) -> Result<UsbDevice, UsbError>
-where
-    F: FnMut(&UsbDevice, u8, u8, u16, u16, Option<&mut [u8]>) -> Result<usize, UsbError>,
-{
-    if address >= 128 {
-        return Err(UsbError::NoFreeSlots);
+    mut control: impl AsyncFnMut(&UsbDevice, Control, Option<&mut [u8]>) -> Result<usize, UsbError>,
+) -> Result<UsbDevice, UsbError> {
+    let get_device = Control::descriptor(req_type::RCPT_DEVICE, desc_type::DEVICE, 0);
+    let mut short = [0; 8];
+    if control(&device, get_device, Some(&mut short)).await? != short.len() {
+        return Err(UsbError::InvalidParameter);
     }
-
-    // Step 1: Get initial device descriptor (first 8 bytes) to learn EP0 max packet size
-    let mut desc_buf = [0u8; 8];
-    do_control(
+    device.ep0_max_packet = u16::from(short[7].max(8));
+    control(
         &device,
-        req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
-        request::GET_DESCRIPTOR,
-        (desc_type::DEVICE as u16) << 8,
-        0,
-        Some(&mut desc_buf),
-    )?;
-
-    device.ep0_max_packet = desc_buf[7].max(8) as u16;
-
-    // Step 2: Set address
-    do_control(
-        &device,
-        req_type::DIR_OUT | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
-        request::SET_ADDRESS,
-        address as u16,
-        0,
+        Control::new(
+            req_type::RCPT_DEVICE,
+            request::SET_ADDRESS,
+            u16::from(address),
+            0,
+        ),
         None,
-    )?;
-
-    crate::time::delay_ms(2);
+    )
+    .await?;
+    crate::exec::sleep_ms(2).await;
     device.address = address;
 
-    // Step 3: Get full device descriptor (18 bytes)
-    let mut desc_buf = [0u8; 18];
-    do_control(
-        &device,
-        req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
-        request::GET_DESCRIPTOR,
-        (desc_type::DEVICE as u16) << 8,
-        0,
-        Some(&mut desc_buf),
-    )?;
-
-    device.device_desc = match DeviceDescriptor::read_from_prefix(&desc_buf) {
-        Ok((d, _)) => d,
-        Err(_) => return Err(UsbError::TransferFailed(0)),
-    };
-
+    let mut descriptor = [0; 18];
+    if control(&device, get_device, Some(&mut descriptor)).await? != descriptor.len() {
+        return Err(UsbError::InvalidParameter);
+    }
+    device.device_desc =
+        DeviceDescriptor::read_from_bytes(&descriptor).map_err(|_| UsbError::InvalidParameter)?;
     let vid = device.device_desc.vendor_id;
     let pid = device.device_desc.product_id;
     log::info!("  Device {}: VID={:04x} PID={:04x}", address, vid, pid);
 
-    // Step 4: Get configuration descriptor
-    device.config_info = read_configuration_with(|buffer| {
-        do_control(
-            &device,
-            req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
-            request::GET_DESCRIPTOR,
-            (desc_type::CONFIGURATION as u16) << 8,
-            0,
-            Some(buffer),
-        )
-    })?;
+    let get_config = Control::descriptor(req_type::RCPT_DEVICE, desc_type::CONFIGURATION, 0);
+    device.config_info =
+        port::read_configuration(async |buffer| control(&device, get_config, Some(buffer)).await)
+            .await?;
 
     // Check if this is a hub (device class)
     if device.device_desc.device_class == class::HUB {
@@ -1602,219 +1525,18 @@ where
 
     // Step 6: Set configuration
     if device.config_info.configuration_value > 0 {
-        do_control(
+        control(
             &device,
-            req_type::DIR_OUT | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
-            request::SET_CONFIGURATION,
-            device.config_info.configuration_value as u16,
-            0,
+            Control::new(
+                req_type::RCPT_DEVICE,
+                request::SET_CONFIGURATION,
+                u16::from(device.config_info.configuration_value),
+                0,
+            ),
             None,
-        )?;
+        )
+        .await?;
     }
 
     Ok(device)
-}
-
-// ============================================================================
-// Hub Enumeration Helper
-// ============================================================================
-
-/// Maximum number of downstream hub ports tracked per hub.
-///
-/// USB 2.0 compound devices may have up to 7 ports; USB 3.x hubs up to 15.
-/// 16 covers all realistic cases without heap allocation.
-const MAX_HUB_PORTS: usize = 16;
-
-/// Enumerate devices connected to an external USB hub.
-///
-/// Encapsulates the protocol sequence shared by EHCI and UHCI: fetch the hub
-/// descriptor, power all downstream ports, wait for power stabilisation, then
-/// for each port that has a device connected — clear the connection-change bit,
-/// issue a port reset, and record the result.
-///
-/// The second closure problem (two `&mut self` borrows at once) is avoided by
-/// returning the list of ready ports rather than calling a second closure
-/// inline. The caller iterates the returned list and enumerates each device
-/// separately, after `enumerate_hub_ports` has returned and released the
-/// `do_control` borrow.
-///
-/// # Arguments
-/// * `hub_device` - The hub's [`UsbDevice`] (used as the transfer target)
-/// * `do_control` - Performs a control transfer on behalf of the caller
-/// * `supports_high_speed` - `true` for EHCI; `false` for UHCI (USB 1.1 only)
-///
-/// # Returns
-/// `Ok((num_ports, ready_ports))` where `ready_ports` is the list of
-/// `(port, speed)` pairs for ports whose reset completed successfully.
-pub fn enumerate_hub_ports<C>(
-    hub_device: &UsbDevice,
-    mut do_control: C,
-    supports_high_speed: bool,
-) -> Result<(u8, heapless::Vec<(u8, UsbSpeed), MAX_HUB_PORTS>), UsbError>
-where
-    C: FnMut(&UsbDevice, u8, u8, u16, u16, Option<&mut [u8]>) -> Result<usize, UsbError>,
-{
-    // Fetch hub class descriptor (bmRequestType = 0xA0: D→H, Class, Device).
-    let mut hub_desc_buf = [0u8; 9];
-    do_control(
-        hub_device,
-        req_type::DIR_IN | req_type::TYPE_CLASS | req_type::RCPT_DEVICE,
-        request::GET_DESCRIPTOR,
-        (HUB_DESCRIPTOR_TYPE as u16) << 8,
-        0,
-        Some(&mut hub_desc_buf),
-    )?;
-
-    let (hub_desc, _) =
-        HubDescriptor::read_from_prefix(&hub_desc_buf).map_err(|_| UsbError::TransferFailed(0))?;
-    let num_ports = hub_desc.num_ports;
-    let power_on_delay = (hub_desc.power_on_to_power_good as u64) * 2; // 2 ms units
-
-    log::info!(
-        "  Hub has {} ports, power-on delay: {}ms",
-        num_ports,
-        power_on_delay
-    );
-
-    let mut ready_ports: heapless::Vec<(u8, UsbSpeed), MAX_HUB_PORTS> = heapless::Vec::new();
-
-    // Power on all downstream ports (SET_FEATURE PORT_POWER).
-    for port in 1..=num_ports {
-        let _ = do_control(
-            hub_device,
-            req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
-            request::SET_FEATURE,
-            hub_feature::PORT_POWER,
-            port as u16,
-            None,
-        );
-    }
-
-    // Wait for power to stabilise (spec minimum 100 ms).
-    crate::time::delay_ms(power_on_delay.max(100));
-
-    // Check each port for a connected device and enumerate it.
-    for port in 1..=num_ports {
-        let mut status_buf = [0u8; 4];
-        if do_control(
-            hub_device,
-            req_type::DIR_IN | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
-            request::GET_STATUS,
-            0,
-            port as u16,
-            Some(&mut status_buf),
-        )
-        .is_err()
-        {
-            continue;
-        }
-
-        let port_status = u16::from_le_bytes([status_buf[0], status_buf[1]]);
-        let port_change = u16::from_le_bytes([status_buf[2], status_buf[3]]);
-
-        log::debug!(
-            "  Hub port {} status: {:#06x}, change: {:#06x}",
-            port,
-            port_status,
-            port_change
-        );
-
-        if (port_status & hub_port_status::CONNECTION) == 0 {
-            continue;
-        }
-
-        log::info!("  Device detected on hub port {}", port);
-
-        // Clear the connection-change bit if set.
-        if port_change & hub_port_change::C_CONNECTION != 0 {
-            let _ = do_control(
-                hub_device,
-                req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
-                request::CLEAR_FEATURE,
-                hub_feature::C_PORT_CONNECTION,
-                port as u16,
-                None,
-            );
-        }
-
-        // Issue a port reset (SET_FEATURE PORT_RESET).
-        if do_control(
-            hub_device,
-            req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
-            request::SET_FEATURE,
-            hub_feature::PORT_RESET,
-            port as u16,
-            None,
-        )
-        .is_err()
-        {
-            continue;
-        }
-
-        // Wait at least 50 ms then poll for C_PORT_RESET.
-        crate::time::delay_ms(50);
-
-        let mut reset_complete = false;
-        let timeout = Timeout::from_ms(500);
-        while !timeout.is_expired() {
-            let mut status_buf = [0u8; 4];
-            if do_control(
-                hub_device,
-                req_type::DIR_IN | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
-                request::GET_STATUS,
-                0,
-                port as u16,
-                Some(&mut status_buf),
-            )
-            .is_err()
-            {
-                break;
-            }
-
-            let port_status = u16::from_le_bytes([status_buf[0], status_buf[1]]);
-            let port_change = u16::from_le_bytes([status_buf[2], status_buf[3]]);
-
-            if port_change & hub_port_change::C_RESET != 0 {
-                // Acknowledge the reset-complete change bit.
-                let _ = do_control(
-                    hub_device,
-                    req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
-                    request::CLEAR_FEATURE,
-                    hub_feature::C_PORT_RESET,
-                    port as u16,
-                    None,
-                );
-
-                if (port_status & hub_port_status::ENABLE) != 0 {
-                    // Determine device speed from port status bits.
-                    let speed = if supports_high_speed
-                        && (port_status & hub_port_status::HIGH_SPEED) != 0
-                    {
-                        UsbSpeed::High
-                    } else if (port_status & hub_port_status::LOW_SPEED) != 0 {
-                        UsbSpeed::Low
-                    } else {
-                        UsbSpeed::Full
-                    };
-
-                    log::info!("  Hub port {} reset complete, speed: {:?}", port, speed);
-
-                    crate::time::delay_ms(10); // USB spec reset-recovery time
-                    // Overflow is silently ignored: more than MAX_HUB_PORTS
-                    // ready devices on a single hub is not realistic.
-                    let _ = ready_ports.push((port, speed));
-                    reset_complete = true;
-                }
-                break;
-            }
-
-            crate::time::delay_ms(10);
-        }
-
-        if !reset_complete {
-            log::warn!("  Hub port {} reset timed out", port);
-        }
-    }
-
-    Ok((num_ports, ready_ports))
 }

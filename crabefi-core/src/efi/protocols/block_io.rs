@@ -135,6 +135,7 @@ extern "efiapi" fn block_io_read_blocks(
     .and_then(|read| read)
     {
         Ok(()) => Status::SUCCESS,
+        Err(crate::drivers::block::BlockError::NoMedia) => Status::NO_MEDIA,
         Err(error) => {
             log::error!(
                 "BlockIO.ReadBlocks: read failed at LBA {} ({} blocks): {}",
@@ -277,4 +278,33 @@ fn create_block_io_internal(
     );
 
     protocol_ptr
+}
+
+/// Mark all BlockIO protocol instances backed by a disconnected USB device as
+/// having no media and advance their `media_id` so subsequent reads return
+/// `EFI_MEDIA_CHANGED` / `EFI_NO_MEDIA`.
+pub fn mark_usb_removed(controller_id: usize, device_addr: u8, removed: core::num::NonZeroU64) {
+    INSTANCES.for_each(|protocol, ctx| {
+        if let StorageId::Usb {
+            controller_id: cid,
+            device_addr: addr,
+            attachment_id,
+        } = ctx.storage
+            && cid == controller_id
+            && addr == device_addr
+            && attachment_id == removed
+        {
+            ctx.media_id = ctx.media_id.wrapping_add(1);
+            if !protocol.media.is_null() {
+                // SAFETY: `protocol.media` was allocated mutably via
+                // `allocate_protocol_value_with_log` in `create_block_io_internal`
+                // and firmware owns updates to `media_present` / `media_id`.
+                let media = protocol.media.cast_mut();
+                unsafe {
+                    (*media).media_present = false;
+                    (*media).media_id = ctx.media_id;
+                }
+            }
+        }
+    });
 }

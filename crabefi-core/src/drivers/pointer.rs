@@ -33,6 +33,11 @@ pub trait PointerDevice {
     /// or `None` when idle. Must not wait for user input.
     fn poll(&mut self) -> Option<PointerReport>;
 
+    /// USB identity `(controller_idx, device_address)` if this is a USB pointer.
+    fn usb_identity(&self) -> Option<(usize, u8)> {
+        None
+    }
+
     /// Quiesce the device before ExitBootServices. Must not allocate or
     /// change the EFI memory map.
     fn stop(&mut self) {}
@@ -104,6 +109,26 @@ static PENDING: Local<Pending> = Local::new(Pending::new());
 /// Register a pointing device for the rest of boot services.
 pub fn register(device: Box<dyn PointerDevice>) {
     DEVICES.borrow_mut().push(Entry { device, buttons: 0 });
+}
+
+/// Whether a USB pointer with `(controller_idx, device_address)` is already registered.
+pub fn is_usb_registered(controller_idx: usize, device_address: u8) -> bool {
+    DEVICES
+        .borrow()
+        .iter()
+        .any(|entry| entry.device.usb_identity() == Some((controller_idx, device_address)))
+}
+
+/// Remove a disconnected USB pointer and release any buttons it held.
+pub fn unregister_usb(controller_idx: usize, device_address: u8) {
+    let mut devices = DEVICES.borrow_mut();
+    let before = devices.len();
+    devices.retain(|entry| entry.device.usb_identity() != Some((controller_idx, device_address)));
+    if devices.len() != before {
+        let buttons = devices.iter().fold(0, |level, entry| level | entry.buttons);
+        drop(devices);
+        PENDING.borrow_mut().buttons = buttons;
+    }
 }
 
 /// Whether any registered pointing device is ready, without consuming input.
@@ -225,5 +250,40 @@ mod tests {
         assert!(pending.is_ready());
         assert_eq!(pending.take().buttons, 0);
         assert!(!pending.is_ready());
+    }
+
+    struct FakeUsbPointer {
+        controller: usize,
+        addr: u8,
+        buttons: u32,
+    }
+
+    impl PointerDevice for FakeUsbPointer {
+        fn poll(&mut self) -> Option<PointerReport> {
+            Some(PointerReport {
+                buttons: self.buttons,
+                ..Default::default()
+            })
+        }
+
+        fn usb_identity(&self) -> Option<(usize, u8)> {
+            Some((self.controller, self.addr))
+        }
+    }
+
+    #[test]
+    fn unregistering_usb_pointer_releases_held_buttons() {
+        register(Box::new(FakeUsbPointer {
+            controller: 99,
+            addr: 5,
+            buttons: 1,
+        }));
+        assert!(is_usb_registered(99, 5));
+        poll();
+        assert_eq!(take().buttons, 1);
+
+        unregister_usb(99, 5);
+        assert!(!is_usb_registered(99, 5));
+        assert_eq!(take().buttons, 0);
     }
 }

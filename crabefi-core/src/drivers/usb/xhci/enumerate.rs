@@ -1,1242 +1,472 @@
-//! xHCI port enumeration and hubs.
+//! xHCI port registers, slot attachment, and hub routing.
 
-use super::super::controller::{
-    HUB_DESCRIPTOR_TYPE, hub_feature, hub_port_change, hub_port_status, req_type, request,
-};
-use super::XhciError;
+use super::super::controller::{DeviceDescriptor, UsbError, class, desc_type, req_type, request};
+use super::super::port::{self, Control, Pipe, PortController, RootCommand, RootKind, RootStatus};
+use super::super::{unbind_device, with_xhci};
+use super::slots::SlotRoute;
 use super::speed::{BOS_DESCRIPTOR_TYPE, BosHeader, LinkSpeed, SublinkSpeeds};
-use crate::barrier;
-use crate::exec::{self, BoxFuture};
-use crate::time::Timeout;
-use alloc::boxed::Box;
-use alloc::vec::Vec;
-use core::cell::RefCell;
+use super::{XhciController, XhciError};
+use crate::{barrier, exec};
 use xhci::ring::trb::command;
 use zerocopy::FromBytes;
-use zerocopy::byteorder::{LittleEndian, U32};
 
-const SUPER_SPEED_HUB_DESCRIPTOR_TYPE: u8 = 0x2a;
+impl PortController for XhciController {
+    fn root_ports(&self) -> (RootKind, u8) {
+        (RootKind::Xhci, self.num_ports)
+    }
+
+    fn root_status(&self, port: u8) -> RootStatus {
+        let status = self.portsc(port);
+        let speed_id = status.port_speed();
+        RootStatus {
+            connected: status.current_connect_status(),
+            changed: status.connect_status_change(),
+            enabled: status.port_enabled_disabled(),
+            link_state: status.port_link_state(),
+            speed_id,
+            superspeed: self.is_superspeed_port(port, speed_id),
+            reset_done: status.port_reset_change(),
+            warm_reset_done: status.warm_port_reset_change(),
+            ..RootStatus::default()
+        }
+    }
+
+    fn root_command(&mut self, port: u8, command: RootCommand) {
+        if matches!(command, RootCommand::ClearChanges) {
+            self.clear_port_changes(port);
+            return;
+        }
+        self.update_portsc(port, |reg| {
+            match command {
+                RootCommand::Reset => reg.set_port_reset(),
+                RootCommand::WarmReset => reg.set_warm_port_reset(),
+                RootCommand::AckReset => reg.clear_port_reset_change(),
+                RootCommand::AckWarmReset => reg.clear_warm_port_reset_change(),
+                _ => unreachable!(),
+            };
+        });
+    }
+
+    fn poll_bus(&mut self) {
+        // Consume Port Status Change events even with no active transfers.
+        // Root-port tasks observe their latched PORTSC bits directly.
+        let _ = self.poll_interrupt_events();
+    }
+}
+
+fn controller<T>(
+    index: usize,
+    operation: impl FnOnce(&mut XhciController) -> Result<T, XhciError>,
+) -> Result<T, UsbError> {
+    with_xhci(index, operation)
+        .ok_or(UsbError::Disconnected)?
+        .map_err(|error| match error {
+            XhciError::Timeout => UsbError::Timeout,
+            XhciError::DeviceNotFound => UsbError::DeviceNotFound,
+            XhciError::NoFreeSlots => UsbError::NoFreeSlots,
+            XhciError::InvalidParameter => UsbError::InvalidParameter,
+            XhciError::AllocationFailed => UsbError::AllocationFailed,
+            _ => {
+                log::debug!("xHCI enumeration: {error:?}");
+                UsbError::TransactionError
+            }
+        })
+}
+
+fn route(controller: &XhciController, hub: Option<u8>, port: u8) -> Result<SlotRoute, XhciError> {
+    if let Some(address) = hub {
+        let hub = controller
+            .get_slot(address)
+            .ok_or(XhciError::DeviceNotFound)?;
+        let depth = hub_depth(hub.route_string);
+        if depth >= 5 || !(1..=15).contains(&port) {
+            return Err(XhciError::InvalidParameter);
+        }
+        Ok(SlotRoute {
+            port,
+            root_port: hub.root_port,
+            route_string: hub.route_string | (u32::from(port) << (depth * 4)),
+            parent_hub: Some((address, port)),
+        })
+    } else {
+        Ok(SlotRoute {
+            port,
+            root_port: port,
+            route_string: 0,
+            parent_hub: None,
+        })
+    }
+}
+
+pub(in crate::drivers::usb) async fn attach(
+    index: usize,
+    hub: Option<u8>,
+    number: u8,
+    speed: u8,
+) -> Result<u8, UsbError> {
+    port::transfer().await;
+    // Enable and address consecutively. The enabled slot is tracked even
+    // if allocating the address context fails before the command is issued.
+    let (address, addressed) = controller(index, |host| {
+        let route = route(host, hub, number)?;
+        let address = host.enable_slot()?;
+        Ok((address, host.address_slot(address, speed, route)))
+    })?;
+    if let Err(error) = addressed {
+        port::transfer().await;
+        with_xhci(index, |host| host.detach_slot(address));
+        log::debug!("xHCI: addressing slot {address} failed: {error:?}");
+        return Err(if matches!(error, XhciError::Timeout) {
+            UsbError::Timeout
+        } else {
+            UsbError::TransactionError
+        });
+    }
+    port::note_startup_progress();
+    exec::sleep_ms(2).await; // SET_ADDRESS recovery
+    let pipe = Pipe {
+        controller: index,
+        address,
+    };
+    if let Err(error) = configure_device(pipe).await {
+        detach(index, address).await;
+        return Err(error);
+    }
+    Ok(address)
+}
+
+async fn configure_device(pipe: Pipe) -> Result<(), UsbError> {
+    let get_device = Control::descriptor(req_type::RCPT_DEVICE, desc_type::DEVICE, 0);
+    let full_speed = controller(pipe.controller, |host| {
+        let slot = host
+            .get_slot(pipe.address)
+            .ok_or(XhciError::DeviceNotFound)?;
+        Ok(!slot.is_superspeed && slot.speed == 1)
+    })?;
+    if full_speed {
+        let mut short = [0; 8];
+        if pipe.control(get_device, Some(&mut short)).await? != short.len() {
+            return Err(UsbError::InvalidParameter);
+        }
+        port::transfer().await;
+        controller(pipe.controller, |host| {
+            host.update_full_speed_ep0_max_packet(pipe.address, u16::from(short[7]))
+        })?;
+        port::note_startup_progress();
+    }
+    let mut descriptor = [0; 18];
+    if pipe.control(get_device, Some(&mut descriptor)).await? != descriptor.len() {
+        return Err(UsbError::InvalidParameter);
+    }
+    let descriptor =
+        DeviceDescriptor::read_from_bytes(&descriptor).map_err(|_| UsbError::InvalidParameter)?;
+    let vid = descriptor.vendor_id;
+    let pid = descriptor.product_id;
+    log::info!(
+        "  VID={vid:04x} PID={pid:04x} Class={:02x}",
+        descriptor.device_class
+    );
+    let config = pipe.configuration().await?;
+    let interfaces = &config.interfaces[..config.num_interfaces];
+    if config.configuration_value != 0 {
+        pipe.control(
+            Control::new(
+                req_type::RCPT_DEVICE,
+                request::SET_CONFIGURATION,
+                u16::from(config.configuration_value),
+                0,
+            ),
+            None,
+        )
+        .await?;
+    }
+    controller(pipe.controller, |host| {
+        let slot = host
+            .get_slot_mut(pipe.address)
+            .ok_or(XhciError::DeviceNotFound)?;
+        slot.device_desc = descriptor;
+        slot.is_hub = descriptor.device_class == class::HUB
+            || interfaces
+                .iter()
+                .any(|iface| iface.interface_class == class::HUB);
+        Ok(())
+    })?;
+    if interfaces.iter().any(|iface| iface.is_mass_storage()) {
+        port::transfer().await;
+        controller(pipe.controller, |host| {
+            optional_class(
+                pipe.address,
+                "mass storage",
+                host.configure_mass_storage(pipe.address, &config),
+            )
+        })?;
+        port::note_startup_progress();
+    }
+    if interfaces.iter().any(|iface| iface.is_hid_keyboard()) {
+        port::transfer().await;
+        controller(pipe.controller, |host| {
+            optional_class(
+                pipe.address,
+                "keyboard",
+                host.configure_hid_keyboard(pipe.address, &config),
+            )
+        })?;
+        port::note_startup_progress();
+    }
+    if interfaces.iter().any(|iface| iface.is_hid_mouse()) {
+        port::transfer().await;
+        controller(pipe.controller, |host| {
+            optional_class(
+                pipe.address,
+                "mouse",
+                host.configure_hid_mouse(pipe.address, &config),
+            )
+        })?;
+        port::note_startup_progress();
+    }
+    Ok(())
+}
+
+fn optional_class(
+    address: u8,
+    class: &str,
+    result: Result<(), XhciError>,
+) -> Result<(), XhciError> {
+    if let Err(error) = &result
+        && error.class_rejected()
+    {
+        log::warn!("xHCI slot {address}: skipping unusable {class} interface: {error:?}");
+        return Ok(());
+    }
+    result
+}
+
+#[cfg(test)]
+#[test]
+fn rejecting_a_secondary_function_does_not_abort_the_configured_device() {
+    use xhci::ring::trb::event::CompletionCode;
+    assert!(optional_class(1, "mass storage", Ok(())).is_ok());
+    assert!(optional_class(1, "keyboard", Err(XhciError::InvalidParameter)).is_ok());
+    assert!(
+        optional_class(
+            1,
+            "mouse",
+            Err(XhciError::CommandFailed(Ok(CompletionCode::BandwidthError)))
+        )
+        .is_ok()
+    );
+    assert!(matches!(
+        optional_class(1, "mouse", Err(XhciError::Timeout)),
+        Err(XhciError::Timeout)
+    ));
+}
+
+pub(in crate::drivers::usb) async fn detach(index: usize, address: u8) {
+    loop {
+        let next = with_xhci(index, |host| {
+            if host.get_slot(address).is_none()
+                && host.pending_parents.get(address as usize)?.is_none()
+            {
+                return None;
+            }
+            Some(teardown_leaf(address, |parent| {
+                host.find_slot(|slot| slot.parent_hub.is_some_and(|(hub, _)| hub == parent))
+                    .or_else(|| pending_child(&host.pending_parents, parent))
+            }))
+        })
+        .flatten();
+        let Some(next) = next else {
+            break;
+        };
+        port::transfer().await;
+        with_xhci(index, |host| host.detach_slot(next));
+        unbind_device(index, next);
+        if next == address {
+            break;
+        }
+    }
+}
+
+fn pending_child(parents: &[Option<u8>], parent: u8) -> Option<u8> {
+    parents
+        .iter()
+        .position(|child| *child == Some(parent))
+        .and_then(|id| u8::try_from(id).ok())
+}
+
+fn teardown_leaf(mut slot: u8, mut child: impl FnMut(u8) -> Option<u8>) -> u8 {
+    while let Some(next) = child(slot) {
+        slot = next;
+    }
+    slot
+}
+
+#[cfg(test)]
+#[test]
+fn teardown_finds_unaddressed_child_after_its_attach_is_cancelled() {
+    // Addressed hub 2 has addressed child hub 3. Slot 5 was enabled
+    // beneath hub 3 but allocating its contexts failed before publication.
+    let mut pending = [None; 6];
+    pending[5] = Some(3);
+    let leaf = |pending: &[Option<u8>]| {
+        teardown_leaf(2, |parent| {
+            if parent == 2 {
+                Some(3)
+            } else {
+                pending_child(pending, parent)
+            }
+        })
+    };
+    assert_eq!(leaf(&pending), 5);
+    pending[5] = None;
+    assert_eq!(leaf(&pending), 3);
+}
+
 const SET_HUB_DEPTH: u8 = 0x0c;
 
-/// Devices and cascaded hubs can reconnect after controller/port power-up.
-const CONNECTION_TIMEOUT_MS: u64 = 1000;
-/// USB 2.0 requires a stable connection for at least 100 ms before reset.
-const CONNECTION_DEBOUNCE_MS: u64 = 100;
-
-async fn debounce_root_connection(mut connected: impl FnMut() -> bool) -> bool {
-    let timeout = Timeout::from_ms(CONNECTION_TIMEOUT_MS);
-    let mut stable: Option<Timeout> = None;
-    loop {
-        if connected() {
-            let debounce = stable.get_or_insert_with(|| Timeout::from_ms(CONNECTION_DEBOUNCE_MS));
-            if debounce.is_expired() {
-                return true;
-            }
-        } else {
-            // A bounce restarts debounce; it is not a failed enumeration
-            // attempt that should consume one of the root port retries.
-            stable = None;
-        }
-        if timeout.is_expired() {
-            return false;
-        }
-        exec::sleep_ms(10).await;
-    }
-}
-
-/// Poll and acknowledge the hub's connection-change latch so even a bounce
-/// between status reads restarts the stable interval.
-async fn debounce_hub_connection(
-    mut connection: impl FnMut() -> Result<(bool, bool), XhciError>,
-) -> Result<bool, XhciError> {
-    let timeout = Timeout::from_ms(CONNECTION_TIMEOUT_MS);
-    let mut stable: Option<Timeout> = None;
-    loop {
-        let (connected, changed) = connection()?;
-        if !connected || changed {
-            stable = None;
-        }
-        if connected {
-            let debounce = stable.get_or_insert_with(|| Timeout::from_ms(CONNECTION_DEBOUNCE_MS));
-            if debounce.is_expired() {
-                return Ok(true);
-            }
-        }
-        if timeout.is_expired() {
-            return Ok(false);
-        }
-        exec::sleep_ms(10).await;
-    }
-}
-
-/// Hub scan coordination, shared by real enumeration and fake-port tests.
-/// Keep port iteration and retry/progress decisions here so the tests do not
-/// implement a second enumeration loop with its own tried-port bitmap.
-struct HubPortScan {
-    num_ports: u8,
-    next_port: u8,
-    tried: u16,
-    tried_before: u16,
-}
-
-impl HubPortScan {
-    fn new(num_ports: u8) -> Self {
-        Self {
-            num_ports,
-            next_port: 1,
-            tried: 0,
-            tried_before: 0,
-        }
-    }
-
-    fn next_port(&mut self) -> Option<u8> {
-        while self.next_port <= self.num_ports {
-            let port = self.next_port;
-            self.next_port += 1;
-            if self.tried & (1u16 << port) == 0 {
-                return Some(port);
-            }
-        }
-        None
-    }
-
-    fn mark_tried(&mut self, port: u8) {
-        self.tried |= 1u16 << port;
-    }
-
-    fn complete_pass(&mut self, final_pass: bool) -> bool {
-        let complete = hub_scan_complete(final_pass, self.tried_before, self.tried, self.num_ports);
-        self.tried_before = self.tried;
-        self.next_port = 1;
-        complete
-    }
-}
-
-fn hub_scan_complete(final_pass: bool, tried_before: u16, tried: u16, num_ports: u8) -> bool {
-    tried.count_ones() == u32::from(num_ports) || (final_pass && tried == tried_before)
-}
-
-fn hub_descriptor_type(is_superspeed: bool) -> u8 {
-    if is_superspeed {
-        SUPER_SPEED_HUB_DESCRIPTOR_TYPE
-    } else {
-        HUB_DESCRIPTOR_TYPE
-    }
-}
-
 fn hub_depth(route: u32) -> u16 {
-    (0..5)
-        .take_while(|tier| (route >> (tier * 4)) & 0xf != 0)
-        .count() as u16
+    ((u32::BITS - route.leading_zeros()).div_ceil(4)) as u16
 }
 
-fn usb2_downstream_speed(status: u16) -> u8 {
-    if status & hub_port_status::HIGH_SPEED != 0 {
-        3
-    } else if status & hub_port_status::LOW_SPEED != 0 {
-        2
+#[derive(Clone, Copy)]
+pub(in crate::drivers::usb) struct HubGeometry {
+    pub superspeed: bool,
+    depth: u16,
+    bcd_usb: u16,
+}
+
+pub(in crate::drivers::usb) fn hub_geometry(pipe: Pipe) -> Result<HubGeometry, UsbError> {
+    controller(pipe.controller, |host| {
+        let hub = host
+            .get_slot(pipe.address)
+            .ok_or(XhciError::DeviceNotFound)?;
+        Ok(HubGeometry {
+            superspeed: hub.is_superspeed,
+            depth: hub_depth(hub.route_string),
+            bcd_usb: hub.device_desc.bcd_usb,
+        })
+    })
+}
+
+pub(in crate::drivers::usb) async fn configure_hub(
+    pipe: Pipe,
+    hub: HubGeometry,
+    count: u8,
+) -> Result<(), UsbError> {
+    let sublinks = if hub.superspeed && hub.bcd_usb >= 0x0310 {
+        hub_sublink_speeds(pipe).await?
     } else {
-        1
+        None
+    };
+    if hub.superspeed {
+        pipe.control(
+            Control::new(
+                req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_DEVICE,
+                SET_HUB_DEPTH,
+                hub.depth,
+                0,
+            ),
+            None,
+        )
+        .await?;
     }
+    port::transfer().await;
+    controller(pipe.controller, |host| {
+        host.evaluate_hub_context(pipe.address, count)?;
+        host.get_slot_mut(pipe.address)
+            .ok_or(XhciError::DeviceNotFound)?
+            .sublinks = sublinks;
+        Ok(())
+    })
 }
 
-#[cfg(test)]
-mod hub_protocol_tests {
-    use super::*;
-
-    #[test]
-    fn hub_protocol_and_depth_follow_the_xhci_slot() {
-        assert_eq!(hub_descriptor_type(false), 0x29);
-        assert_eq!(hub_descriptor_type(true), 0x2a);
-        assert_eq!(hub_depth(0), 0);
-        assert_eq!(hub_depth(2), 1);
-        assert_eq!(hub_depth(0x321), 3);
+async fn hub_sublink_speeds(pipe: Pipe) -> Result<Option<SublinkSpeeds>, UsbError> {
+    let request = Control::descriptor(req_type::RCPT_DEVICE, BOS_DESCRIPTOR_TYPE, 0);
+    let mut header = [0; 5];
+    if pipe.control(request, Some(&mut header)).await? != header.len() {
+        return Err(UsbError::InvalidParameter);
     }
-
-    #[test]
-    fn hub_debounce_restarts_after_disconnect_or_latched_bounce() {
-        // The change latch also catches a disconnect/reconnect between polls.
-        for bounce in [(false, false), (true, true)] {
-            let mut polls = 0;
-            let mut stable_deadline = None;
-            assert!(
-                exec::block_on(debounce_hub_connection(|| {
-                    polls += 1;
-                    let sample = if polls == 2 { bounce } else { (true, false) };
-                    let stable_poll = if bounce.0 { 2 } else { 3 };
-                    if polls == stable_poll {
-                        stable_deadline = Some(Timeout::from_ms(CONNECTION_DEBOUNCE_MS));
-                    }
-                    Ok(sample)
-                }))
-                .unwrap()
-            );
-            assert!(stable_deadline.unwrap().is_expired());
-        }
+    let length = BosHeader::total_length(&header).map_err(|_| UsbError::InvalidParameter)?;
+    if length > 4096 {
+        return Err(UsbError::InvalidParameter);
     }
-
-    #[test]
-    fn hub_debounce_bounds_a_continuously_changing_connection() {
-        assert!(!exec::block_on(debounce_hub_connection(|| Ok((true, true)))).unwrap());
-    }
-
-    #[test]
-    fn hub_debounce_propagates_status_errors() {
-        assert!(matches!(
-            exec::block_on(debounce_hub_connection(|| Err(XhciError::InvalidParameter))),
-            Err(XhciError::InvalidParameter)
-        ));
-    }
-
-    #[test]
-    fn hub_final_pass_rescans_connections_during_nested_enumeration() {
-        let mut scan = HubPortScan::new(3);
-        let mut connected = 1u16 << 3;
-        let mut attached = Vec::new();
-        for pass in 0..3 {
-            while let Some(port) = scan.next_port() {
-                if connected & (1u16 << port) == 0 {
-                    continue;
-                }
-                scan.mark_tried(port);
-                attached.push(port);
-                // Nested enumeration on ports 3 and 2 lets an earlier port
-                // connect, after that port was already scanned this pass.
-                if port > 1 {
-                    connected |= 1u16 << (port - 1);
-                }
-            }
-            // The first nested enumeration ran past the discovery deadline.
-            if scan.complete_pass(pass > 0) {
-                assert_eq!(attached, [3, 2, 1]);
-                return;
-            }
-        }
-        panic!("hub scan did not terminate after trying every port");
-    }
-
-    #[test]
-    fn hub_scan_stops_after_a_quiet_final_pass() {
-        assert!(!hub_scan_complete(false, 0, 0, 3));
-        assert!(hub_scan_complete(true, 0, 0, 3));
-        assert!(hub_scan_complete(true, 0b1000, 0b1000, 3));
-        assert!(hub_scan_complete(false, 0, 0b1110, 3));
-    }
-
-    #[test]
-    fn usb2_port_speed_decodes_status_bits() {
-        assert_eq!(usb2_downstream_speed(hub_port_status::HIGH_SPEED), 3);
-        assert_eq!(usb2_downstream_speed(hub_port_status::LOW_SPEED), 2);
-        assert_eq!(usb2_downstream_speed(0), 1);
-    }
+    let mut bos = alloc::vec![0; length];
+    let received = pipe.control(request, Some(&mut bos)).await?;
+    SublinkSpeeds::from_bos(&bos[..received]).map_err(|_| UsbError::InvalidParameter)
 }
 
-/// How long enumeration waits for a device that left its root port during
-/// bring-up to show up on another one. A USB3 device first appears on its
-/// USB2 port and drops that connection once its SuperSpeed link trains.
-const MOVED_DEVICE_TIMEOUT_MS: u64 = 500;
-
-/// How often a root port is brought up again after its device left it.
-const MAX_PORT_RETRIES: u8 = 2;
-
-/// Root ports already brought up during enumeration.
-struct RootPortScan {
-    tried: Vec<bool>,
-    retries: Vec<u8>,
-    /// A device left its root port; new connections cannot be matched to it.
-    migration_seen: bool,
-}
-
-impl RootPortScan {
-    fn new(num_ports: u8) -> Self {
-        Self {
-            tried: alloc::vec![false; usize::from(num_ports)],
-            retries: alloc::vec![0; usize::from(num_ports)],
-            migration_seen: false,
-        }
-    }
-
-    /// The device of `port` left it during bring-up. A USB3 device can
-    /// connect to `port` again before its SuperSpeed link trains, and only
-    /// moves on after another reset there, so `port` is tried again, a
-    /// bounded number of times.
-    fn record_move(&mut self, port: u8) {
-        self.migration_seen = true;
-        let port = usize::from(port);
-        if self.retries[port] < MAX_PORT_RETRIES {
-            self.retries[port] += 1;
-            self.tried[port] = false;
-        }
-    }
-
-    fn untried(&self) -> impl Iterator<Item = u8> + '_ {
-        (0..self.tried.len())
-            .filter(|&port| !self.tried[port])
-            .map(|port| port as u8)
-    }
-
-    /// Connected ports that were not brought up yet; marks them as tried.
-    fn take_new_connections(&mut self, connected: impl Fn(u8) -> bool) -> Vec<u8> {
-        let ports: Vec<u8> = self.untried().filter(|&port| connected(port)).collect();
-        for &port in &ports {
-            self.tried[usize::from(port)] = true;
-        }
-        ports
-    }
-
-    fn has_new_connection(&self, connected: impl Fn(u8) -> bool) -> bool {
-        self.untried().any(connected)
-    }
-
-    /// Rescan immediately, then allow a fresh quiet window after any migration.
-    async fn wait_for_next_pass(&self, connected: impl Fn(u8) -> bool) -> bool {
-        // Without port-pair information, even a new SuperSpeed connection
-        // could be unrelated. Keep waiting until a whole window is quiet.
-        let wait_ms = if self.migration_seen {
-            MOVED_DEVICE_TIMEOUT_MS
-        } else {
-            0
-        };
-        self.wait_for_new_connection(Timeout::from_ms(wait_ms), connected)
-            .await
-    }
-
-    async fn wait_for_new_connection(
-        &self,
-        timeout: Timeout,
-        connected: impl Fn(u8) -> bool,
-    ) -> bool {
-        loop {
-            if self.has_new_connection(&connected) {
-                return true;
-            }
-            if timeout.is_expired() {
-                return self.has_new_connection(connected);
-            }
-            exec::yield_now().await;
-        }
-    }
-}
-
-/// A port whose device neither attached nor stayed connected lost it to
-/// another root port, e.g. a USB3 device moving to its SuperSpeed port.
-fn device_moved(attached: bool, still_connected: bool) -> bool {
-    !attached && !still_connected
-}
-
-#[cfg(test)]
-mod root_port_scan_tests {
-    use super::*;
-
-    #[test]
-    fn transient_disconnect_restarts_root_debounce() {
-        use core::cell::Cell;
-
-        let polls = Cell::new(0);
-        assert!(exec::block_on(debounce_root_connection(|| {
-            polls.set(polls.get() + 1);
-            polls.get() != 2
-        })));
-        assert!(polls.get() > 2);
-    }
-
-    #[test]
-    fn initial_scan_waits_for_a_late_root_connection() {
-        use core::cell::Cell;
-
-        let mut scan = RootPortScan::new(4);
-        assert!(scan.take_new_connections(|_| false).is_empty());
-        let polls = Cell::new(0);
-        assert!(exec::block_on(scan.wait_for_new_connection(
-            Timeout::from_ms(CONNECTION_TIMEOUT_MS),
-            |port| {
-                if port != 1 {
-                    return false;
-                }
-                polls.set(polls.get() + 1);
-                polls.get() > 2
-            }
-        )));
-        assert_eq!(scan.take_new_connections(|port| port == 1), [1]);
-        assert!(scan.take_new_connections(|port| port == 1).is_empty());
-    }
-
-    #[test]
-    fn usb3_device_moving_from_usb2_port_is_picked_up_in_a_second_pass() {
-        let mut scan = RootPortScan::new(26);
-
-        // A keyboard on port 3, a USB3 stick seen on its USB2 port 2.
-        let first = scan.take_new_connections(|port| port == 2 || port == 3);
-        assert_eq!(first, [2, 3]);
-
-        // Resetting port 2 makes the stick train on SuperSpeed port 18.
-        assert!(device_moved(false, false));
-        assert!(!device_moved(true, true));
-        assert!(scan.has_new_connection(|port| port == 18));
-
-        // Only the new connection is brought up, not the attached keyboard.
-        let second = scan.take_new_connections(|port| port == 3 || port == 18);
-        assert_eq!(second, [18]);
-        assert!(!scan.has_new_connection(|port| port == 3 || port == 18));
-    }
-
-    #[test]
-    fn staggered_migrations_get_fresh_wait_windows() {
-        use core::cell::Cell;
-
-        let mut scan = RootPortScan::new(26);
-        assert_eq!(
-            scan.take_new_connections(|port| port == 2 || port == 3),
-            [2, 3]
-        );
-        scan.record_move(2);
-        scan.record_move(3);
-
-        // Each SuperSpeed connection appears only after waiting. Attaching
-        // the first device must not end the wait for the second migration.
-        for port in [18, 19] {
-            let polls = Cell::new(0);
-            assert!(exec::block_on(scan.wait_for_next_pass(|p| {
-                if p != port {
-                    return false;
-                }
-                polls.set(polls.get() + 1);
-                polls.get() > 1
-            })));
-            assert_eq!(scan.take_new_connections(|p| p == port), [port]);
-        }
-
-        // Once a quiet window expires, an absent device cannot keep
-        // enumeration waiting, but an already-connected port is still found.
-        let expired = Timeout::from_raw(crate::time::read_counter());
-        assert!(!exec::block_on(
-            scan.wait_for_new_connection(expired, |_| false)
-        ));
-        assert!(exec::block_on(
-            scan.wait_for_new_connection(expired, |port| port == 20)
-        ));
-    }
-
-    #[test]
-    fn unrelated_connection_does_not_end_migration_wait() {
-        use core::cell::Cell;
-
-        let mut scan = RootPortScan::new(26);
-        assert_eq!(scan.take_new_connections(|port| port == 1), [1]);
-        scan.record_move(1);
-
-        // An unrelated device connects before the moved USB3 device.
-        assert_eq!(scan.take_new_connections(|port| port == 3), [3]);
-        assert!(scan.migration_seen);
-        let polls = Cell::new(0);
-        assert!(exec::block_on(scan.wait_for_next_pass(|port| {
-            if port != 18 {
-                return false;
-            }
-            polls.set(polls.get() + 1);
-            polls.get() > 1
-        })));
-        assert_eq!(scan.take_new_connections(|port| port == 18), [18]);
-    }
-
-    #[test]
-    fn connection_during_final_attachment_is_rescanned() {
-        let mut scan = RootPortScan::new(26);
-        assert_eq!(scan.take_new_connections(|port| port == 1), [1]);
-        scan.record_move(1);
-        assert_eq!(scan.take_new_connections(|port| port == 18), [18]);
-
-        // Another port connects while the last moved device is attached.
-        assert!(exec::block_on(scan.wait_for_next_pass(|port| port == 19)));
-        assert_eq!(scan.take_new_connections(|port| port == 19), [19]);
-    }
-
-    #[test]
-    fn no_migration_rescans_without_waiting() {
-        let mut scan = RootPortScan::new(4);
-        assert_eq!(scan.take_new_connections(|port| port == 1), [1]);
-        assert!(!scan.migration_seen);
-        assert!(exec::block_on(scan.wait_for_next_pass(|port| port == 2)));
-        assert_eq!(scan.take_new_connections(|port| port == 2), [2]);
-        assert!(!exec::block_on(scan.wait_for_next_pass(|_| false)));
-    }
-
-    #[test]
-    fn device_that_returns_to_its_port_is_tried_again() {
-        let mut scan = RootPortScan::new(26);
-        assert_eq!(scan.take_new_connections(|port| port == 1), [1]);
-        scan.record_move(1);
-        // The device connects to its USB2 port again before moving on.
-        assert_eq!(scan.take_new_connections(|port| port == 1), [1]);
-
-        // A device that keeps leaving its port is retried a bounded number
-        // of times.
-        scan.record_move(1);
-        assert_eq!(scan.take_new_connections(|port| port == 1), [1]);
-        scan.record_move(1);
-        assert!(scan.take_new_connections(|port| port == 1).is_empty());
-    }
-
-    #[test]
-    fn failed_device_that_stays_connected_is_not_retried() {
-        let mut scan = RootPortScan::new(4);
-
-        assert_eq!(scan.take_new_connections(|port| port == 1), [1]);
-        assert!(!device_moved(false, true));
-        assert!(scan.take_new_connections(|port| port == 1).is_empty());
-    }
-}
-
-impl super::XhciController {
-    fn hub_sublink_speeds(&mut self, slot_id: u8) -> Result<Option<SublinkSpeeds>, XhciError> {
-        let mut header = [0u8; 5];
-        let length = self.control_transfer(
-            slot_id,
-            req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
-            request::GET_DESCRIPTOR,
-            u16::from(BOS_DESCRIPTOR_TYPE) << 8,
-            0,
-            Some(&mut header),
-        )?;
-        if length != header.len() {
-            return Err(XhciError::InvalidParameter);
-        }
-        let length = BosHeader::total_length(&header)?;
-        if length > 4096 {
-            return Err(XhciError::InvalidParameter);
-        }
-        let mut bos = alloc::vec![0u8; length];
-        let received = self.control_transfer(
-            slot_id,
-            req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
-            request::GET_DESCRIPTOR,
-            u16::from(BOS_DESCRIPTOR_TYPE) << 8,
-            0,
-            Some(&mut bos),
-        )?;
-        SublinkSpeeds::from_bos(&bos[..received])
-    }
-
-    fn superspeed_hub_port_speed(
-        &mut self,
-        hub_slot: u8,
-        port: u8,
-        root_port: u8,
-        sublinks: Option<&SublinkSpeeds>,
-    ) -> Result<u8, XhciError> {
-        let link = if let Some(sublinks) = sublinks {
-            // USB 3.1+ ordinary port status always reports the legacy 5-Gbit/s
-            // encoding. Extended status supplies hub-local IDs and lane counts.
-            let mut status = [0u8; 8];
-            let length = self.control_transfer(
-                hub_slot,
-                req_type::DIR_IN | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
-                request::GET_STATUS,
-                2,
-                u16::from(port),
+pub(in crate::drivers::usb) async fn superspeed_hub_port_speed(
+    pipe: Pipe,
+    port: u8,
+) -> Result<u8, UsbError> {
+    let needs_extended = controller(pipe.controller, |host| {
+        Ok(host
+            .get_slot(pipe.address)
+            .ok_or(XhciError::DeviceNotFound)?
+            .sublinks
+            .is_some())
+    })?;
+    let mut status = [0; 8];
+    if needs_extended
+        && pipe
+            .control(
+                Control::new(
+                    req_type::DIR_IN | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+                    request::GET_STATUS,
+                    2,
+                    u16::from(port),
+                ),
                 Some(&mut status),
-            )?;
-            if length != status.len() {
-                return Err(XhciError::InvalidParameter);
-            }
-            let extended = U32::<LittleEndian>::read_from_bytes(&status[4..])
-                .unwrap()
-                .get();
+            )
+            .await?
+            != status.len()
+    {
+        return Err(UsbError::InvalidParameter);
+    }
+    controller(pipe.controller, |host| {
+        let slot = host
+            .get_slot(pipe.address)
+            .ok_or(XhciError::DeviceNotFound)?;
+        let link = if let Some(sublinks) = &slot.sublinks {
             sublinks
-                .port_speed(extended)
+                .port_speed(u32::from_le_bytes(status[4..].try_into().unwrap()))
                 .ok_or(XhciError::InvalidParameter)?
         } else {
             LinkSpeed::SUPER
         };
-        self.usb3_speed_id(root_port, link)
+        host.usb3_speed_id(slot.root_port, link)
             .ok_or(XhciError::InvalidParameter)
-    }
+    })
+}
 
-    /// Configure a hub device and enumerate its downstream ports.
-    ///
-    /// This mirrors the EHCI `enumerate_hub()` logic adapted for xHCI's
-    /// route-string-based addressing model.
-    ///
-    /// Boxed because hubs nest: attaching a hub port device may recurse here.
-    pub(super) fn configure_and_enumerate_hub(
-        &mut self,
-        hub_slot_id: u8,
-        root_port: u8,
-    ) -> BoxFuture<'_, Result<(), XhciError>> {
-        Box::pin(self.configure_and_enumerate_hub_inner(hub_slot_id, root_port))
-    }
-
-    async fn configure_and_enumerate_hub_inner(
-        &mut self,
-        hub_slot_id: u8,
-        root_port: u8,
-    ) -> Result<(), XhciError> {
-        // Get config descriptor to find hub interface and SET_CONFIGURATION
-        let config_info = self.get_config_descriptor(hub_slot_id)?;
-
-        // Verify this is actually a hub
-        let has_hub_iface = config_info.interfaces[..config_info.num_interfaces]
-            .iter()
-            .any(|i| i.interface_class == 0x09);
-        let is_hub_class = self
-            .slots
-            .get(hub_slot_id as usize)
-            .and_then(|s| s.as_deref())
-            .map(|s| s.device_desc.device_class == 0x09)
-            .unwrap_or(false);
-
-        if !is_hub_class && !has_hub_iface {
-            return Err(XhciError::DeviceNotFound);
-        }
-
-        // Set configuration (activates hub endpoints)
-        if config_info.configuration_value > 0 {
-            self.set_configuration(hub_slot_id, config_info.configuration_value)?;
-        }
-
-        let (hub_is_superspeed, bcd_usb, parent_route) = self
-            .slots
-            .get(hub_slot_id as usize)
-            .and_then(|slot| slot.as_deref())
-            .map(|slot| {
-                (
-                    slot.is_superspeed,
-                    slot.device_desc.bcd_usb,
-                    slot.route_string,
-                )
-            })
-            .ok_or(XhciError::DeviceNotFound)?;
-        // Get the descriptor belonging to this hub's bus protocol.
-        let mut hub_desc_buf = [0u8; 12];
-        self.control_transfer(
-            hub_slot_id,
-            req_type::DIR_IN | req_type::TYPE_CLASS | req_type::RCPT_DEVICE,
-            request::GET_DESCRIPTOR,
-            u16::from(hub_descriptor_type(hub_is_superspeed)) << 8,
-            0,
-            Some(&mut hub_desc_buf),
-        )?;
-
-        let num_ports = hub_desc_buf[2];
-        let power_delay = (hub_desc_buf[5] as u64) * 2; // PwrOn2PwrGood in 2ms units
-
-        if num_ports == 0 || num_ports > 15 {
-            log::debug!("Hub has {} ports, skipping", num_ports);
-            return Ok(());
-        }
-
-        log::info!(
-            "xHCI: Hub slot {} has {} ports, power delay {}ms",
-            hub_slot_id,
-            num_ports,
-            power_delay
-        );
-
-        let sublinks = if hub_is_superspeed && bcd_usb >= 0x0310 {
-            self.hub_sublink_speeds(hub_slot_id)?
-        } else {
-            None
-        };
-
-        if hub_is_superspeed {
-            self.control_transfer(
-                hub_slot_id,
-                req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_DEVICE,
-                SET_HUB_DEPTH,
-                hub_depth(parent_route),
-                0,
-                None,
-            )?;
-        }
-
-        // Mark slot as hub and store route info
-        if let Some(slot) = self
-            .slots
-            .get_mut(hub_slot_id as usize)
-            .and_then(|s| s.as_deref_mut())
-        {
-            slot.is_hub = true;
-            slot.hub_ports = num_ports;
-        }
-
-        // Update the hub's slot context via Evaluate Context so xHC knows
-        // this device is a hub (required for proper downstream routing).
-        self.evaluate_hub_context(hub_slot_id, num_ports)?;
-
-        // Power on all hub ports
-        for p in 1..=num_ports {
-            let _ = self.control_transfer(
-                hub_slot_id,
-                req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
-                request::SET_FEATURE,
-                hub_feature::PORT_POWER,
-                p as u16,
-                None,
-            );
-        }
-
-        exec::sleep_ms(power_delay.max(100)).await;
-
-        // A powered hub does not imply its children have connected yet.
-        // Rescan absent ports for a bounded window, without resetting devices
-        // we already tried. Nested enumeration can outlast the deadline, so
-        // rescan after any progress until a pass is quiet. The tried bitmap
-        // bounds these extra passes even after the deadline.
-        let timeout = Timeout::from_ms(CONNECTION_TIMEOUT_MS);
-        let mut scan = HubPortScan::new(num_ports);
-        let mut first_pass = true;
-        loop {
-            let final_pass = timeout.is_expired();
-            while let Some(p) = scan.next_port() {
-                let mut status_buf = [0u8; 4];
-                if let Err(error) = self.control_transfer(
-                    hub_slot_id,
-                    req_type::DIR_IN | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
-                    request::GET_STATUS,
-                    0,
-                    p as u16,
-                    Some(&mut status_buf),
-                ) {
-                    scan.mark_tried(p);
-                    log::warn!("Hub {} port {} status failed: {:?}", hub_slot_id, p, error);
-                    continue;
-                }
-
-                let port_status = u16::from_le_bytes([status_buf[0], status_buf[1]]);
-                if first_pass {
-                    log::debug!(
-                        "xHCI: Hub {} port {} status={:#06x} change={:#06x}",
-                        hub_slot_id,
-                        p,
-                        port_status,
-                        u16::from_le_bytes([status_buf[2], status_buf[3]])
-                    );
-                }
-                if (port_status & hub_port_status::CONNECTION) == 0 {
-                    continue;
-                }
-                let debounced = debounce_hub_connection(|| {
-                    let mut status = [0u8; 4];
-                    self.control_transfer(
-                        hub_slot_id,
-                        req_type::DIR_IN | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
-                        request::GET_STATUS,
-                        0,
-                        p as u16,
-                        Some(&mut status),
-                    )?;
-                    let connected = u16::from_le_bytes([status[0], status[1]])
-                        & hub_port_status::CONNECTION
-                        != 0;
-                    let changed = u16::from_le_bytes([status[2], status[3]])
-                        & hub_port_change::C_CONNECTION
-                        != 0;
-                    if changed {
-                        self.control_transfer(
-                            hub_slot_id,
-                            req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
-                            request::CLEAR_FEATURE,
-                            hub_feature::C_PORT_CONNECTION,
-                            p as u16,
-                            None,
-                        )?;
-                    }
-                    Ok((connected, changed))
-                })
-                .await;
-                scan.mark_tried(p);
-                match debounced {
-                    Ok(true) => {}
-                    Ok(false) => continue,
-                    Err(error) => {
-                        log::warn!(
-                            "Hub {} port {} debounce failed: {:?}",
-                            hub_slot_id,
-                            p,
-                            error
-                        );
-                        continue;
-                    }
-                }
-
-                log::info!("xHCI: Device on hub slot {} port {}", hub_slot_id, p);
-
-                // Reset the port
-                let _ = self.control_transfer(
-                    hub_slot_id,
-                    req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
-                    request::SET_FEATURE,
-                    hub_feature::PORT_RESET,
-                    p as u16,
-                    None,
-                );
-
-                exec::sleep_ms(60).await;
-
-                // Poll for reset completion
-                let timeout = crate::time::Timeout::from_ms(500);
-                let mut speed = 0u8;
-                let mut reset_ok = false;
-                // Check status after the deadline too: other controllers may
-                // delay this task past it.
-                loop {
-                    let mut sb = [0u8; 4];
-                    if self
-                        .control_transfer(
-                            hub_slot_id,
-                            req_type::DIR_IN | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
-                            request::GET_STATUS,
-                            0,
-                            p as u16,
-                            Some(&mut sb),
-                        )
-                        .is_err()
-                    {
-                        break;
-                    }
-                    let ps = u16::from_le_bytes([sb[0], sb[1]]);
-                    let pc = u16::from_le_bytes([sb[2], sb[3]]);
-
-                    if pc & 0x10 != 0 {
-                        // C_PORT_RESET
-                        let _ = self.control_transfer(
-                            hub_slot_id,
-                            req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
-                            request::CLEAR_FEATURE,
-                            hub_feature::C_PORT_RESET,
-                            p as u16,
-                            None,
-                        );
-                        if ps & hub_port_status::ENABLE != 0 {
-                            if hub_is_superspeed {
-                                match self.superspeed_hub_port_speed(
-                                    hub_slot_id,
-                                    p,
-                                    root_port,
-                                    sublinks.as_ref(),
-                                ) {
-                                    Ok(port_speed) => {
-                                        speed = port_speed;
-                                        reset_ok = true;
-                                    }
-                                    Err(error) => {
-                                        log::warn!("Hub port {} speed unavailable: {:?}", p, error)
-                                    }
-                                }
-                            } else {
-                                speed = usb2_downstream_speed(ps);
-                                reset_ok = true;
-                            }
-                        }
-                        break;
-                    }
-                    if timeout.is_expired() {
-                        break;
-                    }
-                    exec::sleep_ms(10).await;
-                }
-
-                if !reset_ok {
-                    log::debug!("Hub port {} reset failed", p);
-                    continue;
-                }
-
-                exec::sleep_ms(10).await;
-
-                // Build route string: parent's route | (port << (4 * tier))
-                // Find which nibble is the first zero (that's our tier)
-                let mut route = parent_route;
-                for tier in 0..5u32 {
-                    if (route >> (tier * 4)) & 0xF == 0 {
-                        route |= (p as u32 & 0xF) << (tier * 4);
-                        break;
-                    }
-                }
-
-                // Enable slot and address the downstream device
-                if let Err(e) = self
-                    .attach_device_on_hub(hub_slot_id, p, speed, route, root_port)
-                    .await
-                {
-                    log::warn!("Failed to attach device on hub port {}: {:?}", p, e);
-                }
-            }
-            first_pass = false;
-            if scan.complete_pass(final_pass) {
-                break;
-            }
-            exec::sleep_ms(10).await;
-        }
-
-        Ok(())
-    }
-
-    /// Issue an Evaluate Context command to inform the xHC that a device
-    /// is a hub (sets Hub flag and NumberOfPorts in the slot context).
-    pub(super) fn evaluate_hub_context(
-        &mut self,
-        slot_id: u8,
-        num_ports: u8,
-    ) -> Result<(), XhciError> {
-        let slot = self
-            .slots
-            .get(slot_id as usize)
-            .and_then(|s| s.as_deref())
-            .ok_or(XhciError::DeviceNotFound)?;
-
-        let input_ctx = slot.input_context;
-        unsafe {
-            core::ptr::write_bytes(input_ctx, 0, Self::input_context_len(self.context_size));
-        }
-        let control_ctx = Self::input_control_context(input_ctx, self.context_size);
-        control_ctx.set_add_context_flag(0);
-        Self::copy_device_slot_context(input_ctx, slot.device_context, self.context_size);
-        let slot_ctx = Self::input_slot_context(input_ctx, self.context_size);
+impl XhciController {
+    /// Inform the controller of the hub flag and downstream routing limits.
+    fn evaluate_hub_context(&mut self, address: u8, count: u8) -> Result<(), XhciError> {
+        let slot = self.get_slot(address).ok_or(XhciError::DeviceNotFound)?;
+        let input = slot.input_context;
+        unsafe { core::ptr::write_bytes(input, 0, Self::input_context_len(self.context_size)) };
+        Self::input_control_context(input, self.context_size).set_add_context_flag(0);
+        Self::copy_device_slot_context(input, slot.device_context, self.context_size);
+        let slot_ctx = Self::input_slot_context(input, self.context_size);
         slot_ctx.set_hub();
-        slot_ctx.set_number_of_ports(num_ports);
-        // Context entries must cover at least slot + EP0
-        slot_ctx.set_context_entries(1);
-
+        slot_ctx.set_number_of_ports(count);
         let mut command = command::EvaluateContext::new();
         command
-            .set_input_context_pointer(slot.input_context as u64)
-            .set_slot_id(slot_id);
-
+            .set_input_context_pointer(input as u64)
+            .set_slot_id(address);
         self.cmd_ring.enqueue(command, false);
         barrier::mmio_write();
         self.ring_doorbell(0, 0);
-
         self.wait_command_completion()?;
         Ok(())
     }
+}
 
-    /// Attach a device that is behind a USB hub.
-    pub(super) async fn attach_device_on_hub(
-        &mut self,
-        hub_slot_id: u8,
-        hub_port: u8,
-        speed: u8,
-        route_string: u32,
-        root_port: u8,
-    ) -> Result<(), XhciError> {
-        let slot_id = self.enable_slot()?;
-        self.address_slot(
-            slot_id,
-            speed,
-            super::slots::SlotRoute {
-                port: hub_port,
-                root_port,
-                route_string,
-                parent_hub: Some((hub_slot_id, hub_port)),
-            },
-        )?;
-
-        // Now enumerate the device (get descriptor, configure, etc.)
-        match self.get_device_descriptor(slot_id) {
-            Ok(desc) => {
-                let vid = desc.vendor_id;
-                let pid = desc.product_id;
-                let class = desc.device_class;
-                let num_configs = desc.num_configurations;
-                log::info!(
-                    "  Hub port device: VID={:04x} PID={:04x} Class={:02x}",
-                    vid,
-                    pid,
-                    class
-                );
-
-                if let Some(slot) = self
-                    .slots
-                    .get_mut(slot_id as usize)
-                    .and_then(|s| s.as_deref_mut())
-                {
-                    slot.device_desc = desc;
-                }
-
-                // Configure as storage / keyboard / mouse
-                if class == 0x08 || (class == 0x00 && num_configs > 0) {
-                    let _ = self.configure_mass_storage(slot_id);
-                }
-                if class == 0x03 || (class == 0x00 && num_configs > 0) {
-                    let _ = self.configure_hid_keyboard(slot_id);
-                    let _ = self.configure_hid_mouse(slot_id);
-                }
-
-                // Nested hub support (one level deep to keep it simple)
-                if class == 0x09
-                    && let Err(e) = self.configure_and_enumerate_hub(slot_id, root_port).await
-                {
-                    log::debug!("Nested hub enum failed: {:?}", e);
-                }
-            }
-            Err(e) => {
-                log::warn!("Failed to get descriptor for hub device: {:?}", e);
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Enumerate ports and attach devices
-    pub(super) async fn enumerate_ports(&mut self) -> Result<(), XhciError> {
-        let mut scan = RootPortScan::new(self.num_ports);
-        // The first root connection can arrive after the controller's short
-        // startup delay, even when no device has migrated between ports.
-        if !scan
-            .wait_for_new_connection(Timeout::from_ms(CONNECTION_TIMEOUT_MS), |port| {
-                self.portsc(port).current_connect_status()
-            })
-            .await
-        {
-            return Ok(());
-        }
-
-        loop {
-            let ports =
-                scan.take_new_connections(|port| self.portsc(port).current_connect_status());
-            if ports.is_empty() {
-                break;
-            }
-
-            // Link bring-up (debounce, resets) only touches each port's own
-            // PORTSC, so run it for all root ports at once. Device attachment
-            // goes through the shared command ring and stays sequential.
-            let link_up = {
-                let this = RefCell::new(&mut *self);
-                exec::join_all(
-                    ports
-                        .iter()
-                        .map(|&port| {
-                            Box::pin(Self::bring_up_root_port(&this, port)) as BoxFuture<'_, bool>
-                        })
-                        .collect(),
-                )
-                .await
-            };
-
-            for (port, up) in ports.into_iter().zip(link_up) {
-                let attached = up && self.attach_root_port_device(port).await;
-                if device_moved(attached, self.portsc(port).current_connect_status()) {
-                    log::debug!("Port {}: device disconnected during bring-up", port);
-                    scan.record_move(port);
-                }
-            }
-
-            // Rescan ports that connected during attachment. After a move,
-            // wait from the end of each pass: attaching the other devices
-            // can take longer than the wait, and new connections may be
-            // unrelated to the devices whose links are still training.
-            if !scan
-                .wait_for_next_pass(|port| self.portsc(port).current_connect_status())
-                .await
-            {
-                break;
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Debounce a root port connection and bring its link to U0/enabled.
-    ///
-    /// `this` is only borrowed between awaits so all ports can share it.
-    async fn bring_up_root_port(this: &RefCell<&mut Self>, port: u8) -> bool {
-        let portsc = || this.borrow().portsc(port);
-        let update_portsc =
-            |update: fn(&mut xhci::registers::operational::PortStatusAndControlRegister)| {
-                this.borrow_mut().update_portsc(port, update)
-            };
-
-        if !portsc().current_connect_status() {
-            return false;
-        }
-
-        if !debounce_root_connection(|| portsc().current_connect_status()).await {
-            return false;
-        }
-
-        let status = portsc();
-        let speed = status.port_speed();
-        let link_state = status.port_link_state();
-        let is_usb3 = this.borrow().is_superspeed_port(port, speed);
-        let speed_name = if is_usb3 {
-            "SuperSpeed"
-        } else {
-            match speed {
-                1 => "Full",
-                2 => "Low",
-                3 => "High",
-                _ => "Unknown",
-            }
-        };
-        let link_name = match link_state {
-            0 => "U0",
-            5 => "RxDetect",
-            7 => "Polling",
-            _ => "Other",
-        };
-        log::info!(
-            "USB device on port {}: {} speed, PLS={}",
-            port,
-            speed_name,
-            link_name
-        );
-
-        if link_state == 5 {
-            log::debug!("Port {}: RxDetect state (phantom device), skipping", port);
-            return false;
-        }
-
-        this.borrow_mut().clear_port_changes(port);
-
-        let status = portsc();
-        if is_usb3 && status.port_enabled_disabled() && status.port_link_state() == 0 {
-            log::debug!("Port {}: USB3 device already in U0, skipping reset", port);
-        } else if is_usb3 && status.port_link_state() == 7 {
-            log::debug!("Port {}: USB3 device in Polling, waiting for link", port);
-            let link_up = exec::wait_for(200, || {
-                let status = portsc();
-                status.port_link_state() == 0 && status.port_enabled_disabled()
-            })
-            .await;
-            if !link_up {
-                log::debug!(
-                    "Port {}: USB3 link training failed (PLS={}), skipping",
-                    port,
-                    portsc().port_link_state()
-                );
-                return false;
-            }
-        } else if !status.port_enabled_disabled() {
-            update_portsc(|portsc| {
-                portsc.set_port_reset();
-            });
-
-            if exec::wait_for(150, || portsc().port_reset_change()).await {
-                update_portsc(|portsc| {
-                    portsc.clear_port_reset_change();
-                });
-            }
-
-            if portsc().port_link_state() != 0 {
-                if !is_usb3 {
-                    log::debug!(
-                        "Port {}: link not up after reset (PLS={}), skipping",
-                        port,
-                        portsc().port_link_state()
-                    );
-                    return false;
-                }
-                log::debug!(
-                    "Port {}: USB3 normal reset failed (PLS={}), trying warm reset",
-                    port,
-                    portsc().port_link_state()
-                );
-                update_portsc(|portsc| {
-                    portsc.set_warm_port_reset();
-                });
-
-                if exec::wait_for(200, || portsc().warm_port_reset_change()).await {
-                    update_portsc(|portsc| {
-                        portsc.clear_warm_port_reset_change();
-                    });
-                }
-
-                if portsc().port_link_state() != 0 {
-                    log::debug!(
-                        "Port {}: link not up after warm reset (PLS={}), skipping",
-                        port,
-                        portsc().port_link_state()
-                    );
-                    return false;
-                }
-                log::debug!("Port {}: warm reset successful", port);
-            }
-        }
-
-        true
-    }
-
-    /// Address and configure the device behind an enabled root port.
-    ///
-    /// Returns `false` when the port no longer has an enabled device.
-    async fn attach_root_port_device(&mut self, port: u8) -> bool {
-        // USB2 speed is not reliable until reset has enabled the port.
-        let status = self.portsc(port);
-        if !status.current_connect_status() || !status.port_enabled_disabled() {
-            log::debug!("Port {}: no enabled device after bring-up", port);
-            return false;
-        }
-        let speed = status.port_speed();
-
-        // Enable slot and address device
-        match self.enable_slot() {
-            Ok(slot_id) => {
-                log::debug!("Enabled slot {}", slot_id);
-
-                if let Err(e) = self.address_device(slot_id, port, speed) {
-                    log::error!("Failed to address device on port {}: {:?}", port, e);
-                    let status = self.portsc(port);
-                    return status.current_connect_status() && status.port_enabled_disabled();
-                }
-
-                // Get device descriptor
-                match self.get_device_descriptor(slot_id) {
-                    Ok(desc) => {
-                        // Copy fields to avoid alignment issues
-                        let vid = desc.vendor_id;
-                        let pid = desc.product_id;
-                        let class = desc.device_class;
-                        let num_configs = desc.num_configurations;
-
-                        log::info!("  VID={:04x} PID={:04x} Class={:02x}", vid, pid, class);
-
-                        if let Some(slot) = self
-                            .slots
-                            .get_mut(slot_id as usize)
-                            .and_then(|s| s.as_deref_mut())
-                        {
-                            slot.device_desc = desc;
-                        }
-
-                        // Try to configure as mass storage (class 0x08)
-                        if (class == 0x08 || (class == 0x00 && num_configs > 0))
-                            && let Err(e) = self.configure_mass_storage(slot_id)
-                        {
-                            log::debug!("Not a mass storage device: {:?}", e);
-                        }
-
-                        // Try to configure as HID keyboard (class 0x03 or class 0x00)
-                        if (class == 0x03 || (class == 0x00 && num_configs > 0))
-                            && let Err(e) = self.configure_hid_keyboard(slot_id)
-                        {
-                            log::debug!("Not a HID keyboard: {:?}", e);
-                        }
-
-                        // Try to configure as HID mouse (class 0x03 or class 0x00)
-                        if (class == 0x03 || (class == 0x00 && num_configs > 0))
-                            && let Err(e) = self.configure_hid_mouse(slot_id)
-                        {
-                            log::debug!("Not a HID mouse: {:?}", e);
-                        }
-
-                        // If it's a hub, enumerate its downstream ports
-                        if (class == 0x09 || (class == 0x00 && num_configs > 0))
-                            && let Err(e) = self.configure_and_enumerate_hub(slot_id, port).await
-                        {
-                            log::debug!("Not a hub or hub enum failed: {:?}", e);
-                        }
-                    }
-                    Err(e) => {
-                        log::error!("Failed to get device descriptor: {:?}", e);
-                    }
-                }
-            }
-            Err(e) => {
-                log::error!("Failed to enable slot for port {}: {:?}", port, e);
-            }
-        }
-        let status = self.portsc(port);
-        status.current_connect_status() && status.port_enabled_disabled()
-    }
+#[cfg(test)]
+#[test]
+fn hub_depth_matches_route_tiers() {
+    assert_eq!(hub_depth(0), 0);
+    assert_eq!(hub_depth(1), 1);
+    assert_eq!(hub_depth(0x31), 2);
+    assert_eq!(hub_depth(0xf4321), 5);
 }

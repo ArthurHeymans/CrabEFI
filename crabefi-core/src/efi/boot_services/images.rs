@@ -1121,6 +1121,7 @@ fn signal_before_exit_boot_services_once() {
 fn notify_exit_boot_services() {
     // The key has been accepted and the map frozen, but firmware memory
     // has not been reclaimed yet. Exit handlers may not allocate or free.
+    crate::exec::stop_background();
     signal_event_group(&EFI_EVENT_GROUP_EXIT_BOOT_SERVICES);
 
     // Also signal any legacy EVT_SIGNAL_EXIT_BOOT_SERVICES events

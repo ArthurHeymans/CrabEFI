@@ -26,6 +26,7 @@ pub mod hid_mouse;
 pub mod mass_storage;
 pub mod ohci;
 pub mod ohci_regs;
+mod port;
 #[cfg(target_arch = "x86_64")]
 pub mod uhci;
 #[cfg(target_arch = "x86_64")]
@@ -131,6 +132,9 @@ static ALL_CONTROLLERS: Mutex<alloc::vec::Vec<UsbControllerHandle>> =
 /// Set once [`cleanup()`] has stopped every controller for OS handoff.
 static STOPPED: crate::cell::LocalCell<bool> = crate::cell::LocalCell::new(false);
 
+/// Changes when the set of available USB disks changes.
+static STORAGE_REVISION: crate::cell::LocalCell<u32> = crate::cell::LocalCell::new(0);
+
 // ============================================================================
 // Initialization
 // ============================================================================
@@ -179,6 +183,9 @@ fn store_controller<T>(
     };
     let controller_ptr = alloc.as_mut_ptr() as *mut T;
     unsafe { ptr::write(controller_ptr, controller) };
+    if controllers.is_empty() {
+        crate::exec::spawn(port::buses());
+    }
     controllers.push(wrap(controller_ptr));
     log::info!("  {} controller initialized", name);
     Ok(())
@@ -221,8 +228,7 @@ fn companion_slot(address: pci::PciAddress) -> (u16, u8, u8) {
     (address.segment(), address.bus(), address.device())
 }
 
-/// Bring up a USB host controller and enumerate its devices without
-/// registering it.
+/// Bring up a USB host controller without registering it.
 // Failures are logged at the error site; callers only branch on success.
 #[allow(clippy::result_unit_err)]
 pub async fn init_controller(dev: &pci::PciDevice) -> Result<InitializedController, ()> {
@@ -375,94 +381,13 @@ pub fn init_all() {
     // Initialize all controllers
     init();
 
-    // Initialize USB keyboards
-    init_keyboards();
+    settle_buses();
 }
 
-/// Enumerate UHCI companion controller ports (deferred phase)
-///
-/// On ICH8/9/10 chipsets, UHCI companion controllers appear at lower PCI BDFs
-/// than their EHCI companion (UHCI at functions 0-2, EHCI at function 7).
-/// Since PCI drivers bind in ascending BDF order, UHCI hardware is initialized
-/// before EHCI. EHCI must set CONFIGFLAG and release companion ports before
-/// UHCI can see the correct devices and speeds.
-///
-/// UHCI port enumeration is therefore deferred to this function, which must be
-/// called after all USB controllers are initialized (i.e., after
-/// `bind_drivers()`) but before keyboard/device discovery.
-pub fn rescan_companion_ports() {
-    let controllers = ALL_CONTROLLERS.lock();
-
-    for handle in controllers.iter() {
-        match handle {
-            #[cfg(target_arch = "x86_64")]
-            UsbControllerHandle::Uhci(ptr) => {
-                // SAFETY: pointer is valid for the firmware's lifetime and we hold
-                // the ALL_CONTROLLERS lock, serializing access.
-                let controller = unsafe { &mut **ptr };
-                controller.rescan_ports();
-            }
-            _ => {}
-        }
-    }
-}
-
-/// Initialize USB keyboards from all controllers
-///
-/// Can be called separately after controller initialization via the PCI
-/// driver model, or as part of `init_all()` for the legacy path.
-pub fn init_keyboards_public() {
-    init_keyboards();
-}
-
-/// Register every USB boot keyboard on every controller (internal)
-fn init_keyboards() {
-    let keyboards = {
-        let controllers = ALL_CONTROLLERS.lock();
-        let mut keyboards = alloc::vec::Vec::new();
-        for (idx, handle) in controllers.iter().enumerate() {
-            with_usb_controller!(handle, mut |controller| {
-                let mut addresses = alloc::vec::Vec::new();
-                controller.for_each_hid_keyboard(&mut |address| addresses.push(address));
-                for address in addresses {
-                    match hid_keyboard::init_keyboard(controller, idx, address) {
-                        Ok(keyboard) => keyboards.push(keyboard),
-                        Err(e) => log::warn!("USB keyboard {} unusable: {:?}", address, e),
-                    }
-                }
-            });
-        }
-        keyboards
-    };
-    // Registered devices poll through the controller list themselves.
-    for keyboard in keyboards {
-        crate::drivers::keyboard_common::register(Box::new(keyboard));
-    }
-}
-
-/// Register every USB boot mouse on every controller
-#[cfg(feature = "ui")]
-pub fn init_mice() {
-    let mice = {
-        let controllers = ALL_CONTROLLERS.lock();
-        let mut mice = alloc::vec::Vec::new();
-        for (idx, handle) in controllers.iter().enumerate() {
-            with_usb_controller!(handle, mut |controller| {
-                let mut addresses = alloc::vec::Vec::new();
-                controller.for_each_hid_mouse(&mut |address| addresses.push(address));
-                for address in addresses {
-                    match hid_mouse::init_mouse(controller, idx, address) {
-                        Ok(mouse) => mice.push(mouse),
-                        Err(e) => log::warn!("USB mouse {} unusable: {:?}", address, e),
-                    }
-                }
-            });
-        }
-        mice
-    };
-    for mouse in mice {
-        crate::drivers::pointer::register(Box::new(mouse));
-    }
+/// Run the normal bus tasks after all companion controllers have been bound.
+/// In particular, UHCI must not touch its ports before EHCI sets CONFIGFLAG.
+pub fn settle_buses() {
+    crate::exec::block_on(port::settle());
 }
 
 /// Clean up all USB controllers before ExitBootServices
@@ -471,6 +396,7 @@ pub fn init_mice() {
 /// USB drivers can properly initialize the controllers. Following
 /// libpayload's shutdown patterns for each controller type.
 pub fn cleanup() {
+    crate::exec::stop_background();
     log::info!("USB cleanup: stopping all controllers for OS handoff");
 
     let mut controllers = ALL_CONTROLLERS.lock();
@@ -490,23 +416,67 @@ pub fn controller_count() -> usize {
     ALL_CONTROLLERS.lock().len()
 }
 
-/// Find every mass storage device on every controller.
-///
-/// Returns `(controller_index, device_address)` pairs, or none once the
-/// controllers are stopped for OS handoff.
-pub fn find_mass_storage_devices() -> alloc::vec::Vec<(usize, u8)> {
-    let mut devices = alloc::vec::Vec::new();
-    if STOPPED.get() {
-        return devices;
-    }
-    let controllers = ALL_CONTROLLERS.lock();
+/// Revision of the set of USB disks, for consumers with cached entries.
+pub fn storage_revision() -> u32 {
+    STORAGE_REVISION.get()
+}
 
-    for (idx, handle) in controllers.iter().enumerate() {
-        with_usb_controller!(handle, |controller| {
-            controller.for_each_mass_storage(&mut |addr| devices.push((idx, addr)));
-        });
+async fn bind_input(pipe: port::Pipe) -> Option<DeviceInfo> {
+    let info = with_controller(pipe.controller, |c| c.get_device_info(pipe.address)).flatten()?;
+    if info.is_keyboard {
+        match hid_keyboard::bind(pipe).await {
+            Ok(keyboard) => {
+                crate::drivers::keyboard_common::register(Box::new(keyboard));
+                log::info!(
+                    "USB: attached keyboard on controller {} device {}",
+                    pipe.controller,
+                    pipe.address
+                );
+            }
+            Err(error) => log::warn!("USB keyboard {} unusable: {:?}", pipe.address, error),
+        }
     }
-    devices
+    #[cfg(feature = "ui")]
+    if info.is_mouse {
+        match hid_mouse::bind(pipe).await {
+            Ok(mouse) => {
+                crate::drivers::pointer::register(Box::new(mouse));
+                log::info!(
+                    "USB: attached mouse on controller {} device {}",
+                    pipe.controller,
+                    pipe.address
+                );
+            }
+            Err(error) => log::warn!("USB mouse {} unusable: {:?}", pipe.address, error),
+        }
+    }
+    Some(info)
+}
+
+async fn publish_storage(
+    pipe: port::Pipe,
+    startup: bool,
+) -> Result<(), mass_storage::MassStorageError> {
+    if mass_storage::probe(pipe, startup).await? {
+        STORAGE_REVISION.update(|revision| *revision = revision.wrapping_add(1));
+        log::info!(
+            "USB: attached storage on controller {} device {}",
+            pipe.controller,
+            pipe.address
+        );
+    }
+    Ok(())
+}
+
+fn unbind_device(controller: usize, address: u8) {
+    crate::drivers::keyboard_common::unregister_usb(controller, address);
+    #[cfg(feature = "ui")]
+    crate::drivers::pointer::unregister_usb(controller, address);
+    if let Some(attachment_id) = mass_storage::remove(controller, address) {
+        crate::efi::protocols::block_io::mark_usb_removed(controller, address, attachment_id);
+        STORAGE_REVISION.update(|revision| *revision = revision.wrapping_add(1));
+        log::info!("USB: detached storage on controller {controller} device {address}");
+    }
 }
 
 // ============================================================================
@@ -524,6 +494,25 @@ where
     let result = with_usb_controller!(handle, mut |controller| f(controller));
 
     Some(result)
+}
+
+fn with_port_controller<R>(
+    index: usize,
+    f: impl FnOnce(&mut dyn port::PortController) -> R,
+) -> Option<R> {
+    let controllers = ALL_CONTROLLERS.lock();
+    let handle = controllers.get(index)?;
+    Some(with_usb_controller!(handle, mut |controller| f(controller)))
+}
+
+#[cfg(feature = "xhci")]
+fn with_xhci<R>(index: usize, f: impl FnOnce(&mut XhciController) -> R) -> Option<R> {
+    let controllers = ALL_CONTROLLERS.lock();
+    let UsbControllerHandle::Xhci(ptr) = controllers.get(index)? else {
+        return None;
+    };
+    // SAFETY: the controller list owns the pointer and serializes access.
+    Some(f(unsafe { &mut **ptr }))
 }
 
 // ============================================================================
@@ -616,22 +605,6 @@ impl UsbController for XhciController {
 
     fn destroy_interrupt_queue(&mut self, _queue: u32) {}
 
-    fn find_mass_storage(&self) -> Option<u8> {
-        xhci::XhciController::find_mass_storage(self)
-    }
-
-    fn for_each_mass_storage(&self, f: &mut dyn FnMut(u8)) {
-        xhci::XhciController::for_each_mass_storage(self, f)
-    }
-
-    fn for_each_hid_keyboard(&self, f: &mut dyn FnMut(u8)) {
-        xhci::XhciController::for_each_slot(self, |slot| slot.is_hid_keyboard, f)
-    }
-
-    fn for_each_hid_mouse(&self, f: &mut dyn FnMut(u8)) {
-        xhci::XhciController::for_each_slot(self, |slot| slot.is_hid_mouse, f)
-    }
-
     fn get_mouse_interrupt_endpoint(&self, device: u8) -> Option<self::controller::EndpointInfo> {
         let slot = self.get_slot(device)?;
         if !slot.is_hid_mouse || slot.mouse_interrupt_in_ep == 0 {
@@ -649,23 +622,7 @@ impl UsbController for XhciController {
     }
 
     fn get_device_info(&self, device: u8) -> Option<self::controller::DeviceInfo> {
-        let slot = self.get_slot(device)?;
-        Some(self::controller::DeviceInfo {
-            address: device,
-            speed: self::controller::UsbSpeed::from_xhci(slot.speed)
-                .unwrap_or(self::controller::UsbSpeed::High),
-            vendor_id: slot.device_desc.vendor_id,
-            product_id: slot.device_desc.product_id,
-            device_class: slot.device_desc.device_class,
-            is_mass_storage: slot.is_mass_storage,
-            mass_storage_interface: slot.mass_storage_interface,
-            is_hid: slot.is_hid_keyboard
-                || slot.is_hid_mouse
-                || slot.device_desc.device_class == 0x03,
-            is_keyboard: slot.is_hid_keyboard,
-            is_mouse: slot.is_hid_mouse,
-            is_hub: slot.device_desc.device_class == 0x09,
-        })
+        self.get_slot(device).map(xhci::UsbSlot::device_info)
     }
 
     fn get_bulk_endpoints(

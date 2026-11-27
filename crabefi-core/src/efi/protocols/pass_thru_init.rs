@@ -289,17 +289,21 @@ fn init_ahci_pass_thru() {
 /// Initialize USB SCSI pass-through protocols
 pub(crate) fn init_usb_pass_thru() {
     log::info!("Scanning for USB mass storage devices...");
-    let devices = usb::find_mass_storage_devices();
+    let devices = usb::mass_storage::attachments();
     if devices.is_empty() {
         log::info!("No USB mass storage devices found for pass-through protocols");
     }
-    for (controller_index, device_addr) in devices {
-        init_usb_device_pass_thru(controller_index, device_addr);
+    for (controller_index, device_addr, attachment_id) in devices {
+        init_usb_device_pass_thru(controller_index, device_addr, attachment_id);
     }
 }
 
 /// Install USB SCSI pass-through protocols for one mass storage device
-fn init_usb_device_pass_thru(controller_index: usize, device_addr: u8) {
+fn init_usb_device_pass_thru(
+    controller_index: usize,
+    device_addr: u8,
+    attachment_id: core::num::NonZeroU64,
+) {
     log::info!(
         "Installing USB SCSI pass-through protocols for device {} on controller {}",
         device_addr,
@@ -335,6 +339,7 @@ fn init_usb_device_pass_thru(controller_index: usize, device_addr: u8) {
     let scsi_pass_thru = scsi_pass_thru::create_scsi_pass_thru_protocol(
         controller_index,
         device_addr,
+        attachment_id,
         pci_device,
         pci_function,
         usb_port,
@@ -352,6 +357,7 @@ fn init_usb_device_pass_thru(controller_index: usize, device_addr: u8) {
         StorageId::Usb {
             controller_id: controller_index,
             device_addr,
+            attachment_id,
         },
     );
     publish(

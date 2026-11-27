@@ -34,7 +34,16 @@ pub mod secure_boot {
 /// The F8 text size outlives each page's surface.
 static TEXT_SIZE: AtomicU8 = AtomicU8::new(0);
 
-struct FirmwareBackend;
+struct FirmwareBackend {
+    entries_revision: u32,
+}
+impl FirmwareBackend {
+    fn new() -> Self {
+        Self {
+            entries_revision: crate::drivers::usb::storage_revision(),
+        }
+    }
+}
 impl Backend for FirmwareBackend {
     fn poll_pointer(&mut self) -> (i32, i32) {
         crate::drivers::mouse_cursor::poll();
@@ -48,9 +57,14 @@ impl Backend for FirmwareBackend {
             / crate::time::counter_frequency().max(1) as u128) as u64
     }
     fn poll_frame(&mut self, _: &mut Context<'_>) -> Poll<()> {
+        crate::exec::poll_background();
         crate::time::delay_ms(8);
         Poll::Ready(())
     }
+    fn boot_entries_stale(&self) -> bool {
+        self.entries_revision != crate::drivers::usb::storage_revision()
+    }
+
     fn text_size(&self) -> TextSize {
         match TEXT_SIZE.load(Ordering::Relaxed) {
             1 => TextSize::Large,
@@ -130,7 +144,7 @@ impl Backend for FirmwareBackend {
 }
 
 pub(crate) fn surface(fb: &FramebufferConfig) -> Surface {
-    let surface = Surface::new(*fb, FirmwareBackend);
+    let surface = Surface::new(*fb, FirmwareBackend::new());
     surface.set_pointer(crate::drivers::mouse_cursor::position());
     surface
 }
@@ -149,36 +163,61 @@ pub(crate) fn finish(result: ScreenNav) -> ScreenNav {
 /// that index so a one-shot command-line edit made in the menu applies to
 /// this boot attempt.
 pub fn show_graphical_menu(menu: &mut crate::menu::BootMenu) -> Option<usize> {
+    match show_graphical_menu_action(menu) {
+        crate::menu::MenuAction::Selected(index) => Some(index),
+        crate::menu::MenuAction::Refresh { .. } | crate::menu::MenuAction::Exit => None,
+    }
+}
+
+pub(crate) fn show_graphical_menu_action(
+    menu: &mut crate::menu::BootMenu,
+) -> crate::menu::MenuAction {
     menu.clear_edited_cmdline();
-    let fb = crate::handoff::framebuffer()?;
+    let Some(fb) = crate::handoff::framebuffer() else {
+        return crate::menu::MenuAction::Exit;
+    };
     if !supports_framebuffer(&fb) {
-        return crate::menu::show_menu(menu);
+        return crate::menu::show_menu_for_mode::<false>(menu);
     }
     let surface = surface(&fb);
     match embassy_futures::block_on(shared::show_graphical_menu(&surface, &mut menu.menu)) {
-        Outcome::Boot(index) => Some(index),
+        Outcome::Boot(index) => crate::menu::MenuAction::Selected(index),
+        Outcome::Refresh => crate::menu::MenuAction::Refresh {
+            interacted: surface.interacted(),
+        },
         Outcome::Reset => crate::reset_system(),
-        Outcome::Exit => None,
+        Outcome::Exit => crate::menu::MenuAction::Exit,
     }
 }
-pub fn show_no_media_screen() {
+
+/// Show the no-media screen until the user leaves or the entry list changes.
+pub(crate) fn show_no_media_screen() -> crate::menu::MenuAction {
+    use crate::menu::MenuAction;
     let Some(fb) = crate::handoff::framebuffer() else {
-        return;
+        return MenuAction::Exit;
     };
     if !supports_framebuffer(&fb) {
-        no_media_text(&fb);
-        return;
+        return no_media_text(&fb);
     }
     let surface = surface(&fb);
-    if embassy_futures::block_on(shared::show_no_media_screen(&surface)) == Outcome::Reset {
-        crate::reset_system();
+    match embassy_futures::block_on(shared::show_no_media_screen(&surface)) {
+        Outcome::Reset => crate::reset_system(),
+        Outcome::Refresh => MenuAction::Refresh {
+            interacted: surface.interacted(),
+        },
+        Outcome::Boot(_) | Outcome::Exit => MenuAction::Exit,
     }
 }
-fn no_media_text(fb: &FramebufferConfig) {
+
+fn no_media_text(fb: &FramebufferConfig) -> crate::menu::MenuAction {
+    use crate::menu::MenuAction;
     use crate::menu_common::{self, KeyPress};
     let mut console = Some(crate::framebuffer_console::FramebufferConsole::new(fb));
     let mut redraw = true;
+    let storage_revision = crate::drivers::usb::storage_revision();
+    let mut interacted = false;
     loop {
+        crate::exec::poll_background();
         if redraw {
             menu_common::clear_screen(&mut console);
             menu_common::draw_header("No bootable media", &mut console, 80);
@@ -194,8 +233,13 @@ fn no_media_text(fb: &FramebufferConfig) {
             );
             redraw = false;
         }
-        match menu_common::read_key() {
-            Some(KeyPress::Escape) => return,
+        let key = menu_common::read_key();
+        interacted |= key.is_some();
+        if storage_revision != crate::drivers::usb::storage_revision() {
+            return MenuAction::Refresh { interacted };
+        }
+        match key {
+            Some(KeyPress::Escape) => return MenuAction::Exit,
             Some(KeyPress::Char('r' | 'R')) => crate::reset_system(),
             #[cfg(feature = "secure-boot")]
             Some(KeyPress::Char('s' | 'S')) => {

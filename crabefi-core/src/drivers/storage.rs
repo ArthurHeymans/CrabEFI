@@ -7,6 +7,7 @@
 
 use alloc::vec::Vec;
 use core::fmt::Write;
+use core::num::NonZeroU64;
 
 use heapless::String;
 
@@ -60,6 +61,7 @@ pub enum StorageId {
     Usb {
         controller_id: usize,
         device_addr: u8,
+        attachment_id: NonZeroU64,
     },
     /// SDHCI (SD card / eMMC)
     Sdhci { controller_id: usize },
@@ -144,22 +146,25 @@ pub fn devices() -> Vec<StorageDevice> {
         });
     }
 
-    for (controller_id, device_addr) in usb::find_mass_storage_devices() {
-        if !usb::mass_storage::probe(controller_id, device_addr) {
-            continue;
-        }
-        usb::mass_storage::with_device(controller_id, device_addr, |device, controller| {
-            push(StorageDevice {
-                id: StorageId::Usb {
-                    controller_id,
-                    device_addr,
-                },
-                pci: None,
-                info: usb_disk_info(device),
-                external: true,
-                label: label(format_args!("{} USB", controller.controller_type())),
-            });
-        });
+    for (controller_id, device_addr, attachment_id) in usb::mass_storage::attachments() {
+        usb::mass_storage::with_device(
+            controller_id,
+            device_addr,
+            attachment_id,
+            |device, controller| {
+                push(StorageDevice {
+                    id: StorageId::Usb {
+                        controller_id,
+                        device_addr,
+                        attachment_id,
+                    },
+                    pci: None,
+                    info: usb_disk_info(device),
+                    external: true,
+                    label: label(format_args!("{} USB", controller.controller_type())),
+                });
+            },
+        );
     }
 
     for controller_id in 0..sdhci::controller_count() {
@@ -259,18 +264,24 @@ fn with_disk_dyn(id: StorageId, f: &mut dyn FnMut(&mut dyn BlockDevice)) -> Resu
         StorageId::Usb {
             controller_id,
             device_addr,
-        } => usb::mass_storage::with_device(controller_id, device_addr, |device, controller| {
-            let info = usb_disk_info(device);
-            f(&mut Disk::new(
-                info,
-                UsbDisk {
-                    id,
-                    device,
-                    controller,
-                },
-            ));
-            Some(())
-        }),
+            attachment_id,
+        } => usb::mass_storage::with_device(
+            controller_id,
+            device_addr,
+            attachment_id,
+            |device, controller| {
+                let info = usb_disk_info(device);
+                f(&mut Disk::new(
+                    info,
+                    UsbDisk {
+                        id,
+                        device,
+                        controller,
+                    },
+                ));
+                Some(())
+            },
+        ),
         StorageId::Sdhci { controller_id } => sdhci::with_controller(controller_id, |controller| {
             if !controller.is_ready() {
                 return None;

@@ -38,12 +38,12 @@ fn reads_complete_configuration_with_hid_after_byte_256() {
         descriptors.extend_from_slice(&INTERRUPT_IN);
         let bytes = configuration(1, &descriptors);
         let mut requests = Vec::new();
-        let parsed = read_configuration_with(|buffer| {
+        let parsed = crate::exec::block_on(port::read_configuration(async |buffer| {
             requests.push(buffer.len());
             let length = buffer.len().min(bytes.len());
             buffer[..length].copy_from_slice(&bytes[..length]);
             Ok(length)
-        })
+        }))
         .unwrap();
         assert_eq!(requests, [9, bytes.len()]);
         assert_eq!(parsed.num_interfaces, 1);
@@ -143,7 +143,7 @@ fn truncated_and_malformed_configurations_are_rejected() {
     let mut short_descriptor = bytes.clone();
     short_descriptor[18] = 1;
     assert!(parse_configuration_checked(&short_descriptor).is_err());
-    let result = read_configuration_with(|buffer| {
+    let result = crate::exec::block_on(port::read_configuration(async |buffer| {
         let count = if buffer.len() == 9 {
             9
         } else {
@@ -151,15 +151,15 @@ fn truncated_and_malformed_configurations_are_rejected() {
         };
         buffer[..count].copy_from_slice(&bytes[..count]);
         Ok(count)
-    });
+    }));
     assert!(matches!(result, Err(UsbError::InvalidParameter)));
 
     let mut oversized_header = bytes[..9].to_vec();
     oversized_header[2..4].copy_from_slice(&4097u16.to_le_bytes());
-    let result = read_configuration_with(|buffer| {
+    let result = crate::exec::block_on(port::read_configuration(async |buffer| {
         assert_eq!(buffer.len(), 9); // Reject before allocating/fetching the body.
         buffer.copy_from_slice(&oversized_header);
         Ok(9)
-    });
+    }));
     assert!(matches!(result, Err(UsbError::NotSupported)));
 }

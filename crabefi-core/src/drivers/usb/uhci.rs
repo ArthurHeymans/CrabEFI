@@ -7,10 +7,8 @@
 //! - UHCI Design Guide Revision 1.1
 //! - libpayload uhci.c
 
-use super::controller::{
-    SetupPacket, UsbController, UsbDevice, UsbError, UsbSpeed, enumerate_device,
-    enumerate_hub_ports,
-};
+use super::controller::{SetupPacket, UsbController, UsbDevice, UsbError, UsbSpeed};
+use super::port::{Control, PortController, RootCommand, RootKind, RootStatus};
 use super::uhci_regs::{PORTSC, USBCMD, USBSTS, UhciRegs};
 use crate::arch::{flush_cache_range, invalidate_cache_range};
 use crate::barrier;
@@ -330,12 +328,7 @@ impl UhciController {
 
         controller.init().await?;
 
-        // Port enumeration is deferred to rescan_ports(), called after all
-        // USB controllers are initialized. On ICH8/9/10 chipsets, UHCI
-        // companion controllers appear at lower PCI BDFs than their EHCI
-        // companion, so they are initialized first.  EHCI must set
-        // CONFIGFLAG and release companion ports before UHCI can see
-        // the correct devices and speeds on its ports.
+        // Boot enumerates the bus after EHCI routes any companion ports.
 
         Ok(controller)
     }
@@ -344,6 +337,28 @@ impl UhciController {
     #[inline]
     fn regs(&self) -> UhciRegs {
         UhciRegs::new(self.io_base)
+    }
+
+    // Stop/start take at most 100 ms each, and reset recovery 160 ms.
+    // Reserve this time once, not once per packet of a bulk transfer.
+    const TRANSFER_WORK_MS: u64 = 5000 - 360;
+
+    /// Retire a QH before reusing its descriptors. On error UHCI can leave
+    /// the link on the failed TD, so clearing it requires a stopped schedule.
+    fn retire_qh(&mut self, retired: bool) {
+        let halted = !retired && self.stop_schedule();
+        if !retired && !halted {
+            log::error!("UHCI: schedule did not halt; resetting controller");
+            self.cleanup();
+        }
+        let qh = unsafe { &mut *(self.qh as *mut QueueHead) };
+        qh.element_link = QueueHead::TERMINATE;
+        flush_cache_range(self.qh, core::mem::size_of::<QueueHead>());
+        barrier::dma_write();
+        if halted && !self.start_schedule() {
+            log::error!("UHCI: schedule did not restart; resetting controller");
+            self.cleanup();
+        }
     }
 
     fn stop_schedule(&self) -> bool {
@@ -456,184 +471,6 @@ impl UhciController {
         exec::sleep_ms(100).await;
 
         log::info!("UHCI controller initialized");
-        Ok(())
-    }
-
-    /// Enumerate ports
-    fn enumerate_ports(&mut self) -> Result<(), UsbError> {
-        let regs = self.regs();
-
-        for port in 0..self.num_ports {
-            let portsc = regs.portsc(port);
-
-            // Clear status change bits (write-1-to-clear CSC and PEC)
-            portsc.modify(PORTSC::CSC::SET + PORTSC::PEC::SET);
-
-            if !portsc.is_set(PORTSC::CCS) {
-                continue;
-            }
-
-            let is_low_speed = portsc.is_set(PORTSC::LSDA);
-            log::info!(
-                "UHCI: Device on port {} ({})",
-                port,
-                if is_low_speed {
-                    "low-speed"
-                } else {
-                    "full-speed"
-                }
-            );
-
-            // Reset port
-            portsc.write(PORTSC::PR::SET);
-            crate::time::delay_ms(50);
-            portsc.set(0);
-            crate::time::delay_ms(10);
-
-            // Enable port
-            for _ in 0..10 {
-                if !portsc.is_set(PORTSC::CCS) {
-                    break;
-                }
-                if portsc.is_set(PORTSC::PE) {
-                    break;
-                }
-                portsc.modify(PORTSC::PE::SET);
-                crate::time::delay_ms(10);
-            }
-
-            if !portsc.is_set(PORTSC::PE) {
-                log::warn!("UHCI: Port {} not enabled", port);
-                continue;
-            }
-
-            // Clear status changes again
-            portsc.modify(PORTSC::CSC::SET + PORTSC::PEC::SET);
-
-            let speed = if is_low_speed {
-                UsbSpeed::Low
-            } else {
-                UsbSpeed::Full
-            };
-
-            if let Err(e) = self.attach_device(port, speed) {
-                log::error!("Failed to attach device on port {}: {:?}", port, e);
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Attach a device on a root hub port
-    fn attach_device(&mut self, port: u8, speed: UsbSpeed) -> Result<(), UsbError> {
-        let address = self.next_address;
-        if address >= 128 {
-            return Err(UsbError::NoFreeSlots);
-        }
-
-        let slot = self
-            .devices
-            .iter()
-            .position(|h| h.is_none())
-            .ok_or(UsbError::NoFreeSlots)?;
-
-        let initial_device = UsbDevice::new(0, port, speed);
-
-        // Use the common enumeration helper with a closure for control transfers
-        let device = enumerate_device(initial_device, address, |dev, rt, req, val, idx, data| {
-            self.control_transfer_internal(dev, rt, req, val, idx, data)
-        })?;
-
-        self.next_address += 1;
-
-        // Store the device and check if it's a hub
-        let is_hub = device.is_hub;
-        let hub_address = device.address;
-        self.devices[slot] = Some(device);
-
-        // If this is a hub, enumerate its downstream ports
-        if is_hub && let Err(e) = self.enumerate_hub(slot, hub_address) {
-            log::warn!("Failed to enumerate hub ports: {:?}", e);
-            // Don't fail the device attachment, hub is still registered
-        }
-
-        Ok(())
-    }
-
-    /// Attach a device connected through an external hub
-    ///
-    /// # Arguments
-    /// * `hub_port` - Hub port number (1-based)
-    /// * `speed` - Detected device speed
-    /// * `hub_addr` - USB address of the parent hub
-    /// * `hub_port_num` - Hub port number for tracking
-    fn attach_device_on_hub(
-        &mut self,
-        hub_port: u8,
-        speed: UsbSpeed,
-        hub_addr: u8,
-        hub_port_num: u8,
-    ) -> Result<(), UsbError> {
-        let address = self.next_address;
-        if address >= 128 {
-            return Err(UsbError::NoFreeSlots);
-        }
-
-        let slot = self
-            .devices
-            .iter()
-            .position(|h| h.is_none())
-            .ok_or(UsbError::NoFreeSlots)?;
-
-        let initial_device = UsbDevice::new_on_hub(0, hub_port, speed, hub_addr, hub_port_num);
-        let device = enumerate_device(initial_device, address, |dev, rt, req, val, idx, data| {
-            self.control_transfer_internal(dev, rt, req, val, idx, data)
-        })?;
-
-        self.next_address += 1;
-
-        // Store the device and check for nested hubs
-        let is_hub = device.is_hub;
-        let new_hub_address = device.address;
-        self.devices[slot] = Some(device);
-
-        if is_hub && let Err(e) = self.enumerate_hub(slot, new_hub_address) {
-            log::warn!("Failed to enumerate nested hub ports: {:?}", e);
-        }
-
-        Ok(())
-    }
-
-    /// Enumerate devices connected to an external USB hub.
-    ///
-    /// UHCI is USB 1.1 only so devices behind hubs are low-speed or
-    /// full-speed. Delegates to the shared [`enumerate_hub_ports`] helper.
-    fn enumerate_hub(&mut self, hub_slot: usize, hub_addr: u8) -> Result<(), UsbError> {
-        log::info!("UHCI: Enumerating hub at address {}", hub_addr);
-
-        let hub_device = self.devices[hub_slot]
-            .as_ref()
-            .ok_or(UsbError::DeviceNotFound)?
-            .clone();
-
-        let (num_ports, ready_ports) = enumerate_hub_ports(
-            &hub_device,
-            |dev, rt, req, val, idx, data| {
-                self.control_transfer_internal(dev, rt, req, val, idx, data)
-            },
-            false, // UHCI is USB 1.1: low-speed or full-speed only
-        )?;
-
-        if let Some(ref mut dev) = self.devices[hub_slot] {
-            dev.num_hub_ports = num_ports;
-        }
-
-        for (port, speed) in ready_ports {
-            if let Err(e) = self.attach_device_on_hub(port, speed, hub_addr, port) {
-                log::warn!("  Failed to attach device on hub port {}: {:?}", port, e);
-            }
-        }
-
         Ok(())
     }
 
@@ -784,12 +621,27 @@ impl UhciController {
 
         // Wait for status TD completion. CS_SPD stops vertical traversal on a
         // short packet, so redirect the QH to the status stage when that occurs.
-        let timeout = Timeout::from_ms(5000);
+        let timeout = Timeout::from_ms(Self::TRANSFER_WORK_MS);
         let mut repaired_short_packet = false;
-        loop {
+        let (result, retired) = loop {
             invalidate_cache_range(td_base, 32 * (num_data_tds + 2));
+            invalidate_cache_range(self.qh, core::mem::size_of::<QueueHead>());
             barrier::dma_read();
-
+            let retired = unsafe { ptr::read_volatile(&raw const qh.element_link) }
+                & QueueHead::TERMINATE
+                != 0;
+            let status = unsafe { ptr::read_volatile(&raw const status_td.ctrl_sts) };
+            let setup = unsafe {
+                let td = setup_td_addr as *const TransferDescriptor;
+                ptr::read_volatile(&raw const (*td).ctrl_sts)
+            };
+            let data_statuses = (0..num_data_tds).map(|index| unsafe {
+                let td = (first_data_td_addr + index as u64 * 32) as *const TransferDescriptor;
+                ptr::read_volatile(&raw const (*td).ctrl_sts)
+            });
+            if let Some(result) = control_completion(setup, data_statuses, status, retired) {
+                break (result, retired);
+            }
             if is_in && !repaired_short_packet {
                 for i in 0..num_data_tds.saturating_sub(1) {
                     let td_addr = first_data_td_addr + (i as u64) * 32;
@@ -805,63 +657,15 @@ impl UhciController {
                 }
             }
 
-            let sts = unsafe { ptr::read_volatile(&status_td.ctrl_sts) };
-            if sts & TransferDescriptor::CS_ACTIVE == 0 {
-                break;
-            }
             if timeout.is_expired() {
-                let halted = self.stop_schedule();
-                if !halted {
-                    log::error!("UHCI: schedule did not halt after control timeout; resetting");
-                    self.cleanup();
-                }
-                qh.element_link = QueueHead::TERMINATE;
-                flush_cache_range(self.qh, core::mem::size_of::<QueueHead>());
-                barrier::dma_write();
-                if halted && !self.start_schedule() {
-                    log::error!("UHCI: schedule did not restart after control timeout");
-                    self.cleanup();
-                }
-                return Err(UsbError::Timeout);
+                break (Err(UsbError::Timeout), retired);
             }
             core::hint::spin_loop();
-        }
-
-        // Clear QH
-        qh.element_link = QueueHead::TERMINATE;
-        flush_cache_range(self.qh, core::mem::size_of::<QueueHead>());
-        barrier::dma_write();
-
+        };
+        self.retire_qh(retired);
+        result?;
         invalidate_cache_range(td_base, 32 * (num_data_tds + 2));
-
-        // Check setup TD and all data TDs for errors
-        let setup_td = unsafe { &*(setup_td_addr as *const TransferDescriptor) };
-        if setup_td.has_error() {
-            return Err(if setup_td.is_stalled() {
-                UsbError::Stall
-            } else {
-                UsbError::TransactionError
-            });
-        }
-        for i in 0..num_data_tds {
-            let td_addr = first_data_td_addr + (i as u64) * 32;
-            let td = unsafe { &*(td_addr as *const TransferDescriptor) };
-            if td.has_error() {
-                return Err(if td.is_stalled() {
-                    UsbError::Stall
-                } else {
-                    UsbError::TransactionError
-                });
-            }
-        }
-        let status_sts = unsafe { ptr::read_volatile(&status_td.ctrl_sts) };
-        if status_sts & TransferDescriptor::CS_ERROR_MASK != 0 {
-            return Err(if status_sts & TransferDescriptor::CS_STALLED != 0 {
-                UsbError::Stall
-            } else {
-                UsbError::TransactionError
-            });
-        }
+        barrier::dma_read();
 
         // Copy received data for IN transfers
         if let Some(d) = data
@@ -905,6 +709,85 @@ impl UhciController {
     /// Get PCI address
     pub fn pci_address(&self) -> PciAddress {
         self.pci_address
+    }
+}
+
+/// Active TD errors can still be retried by UHCI. Only an inactive TD
+/// reports a terminal error, even if STATUS was never reached.
+fn control_completion(
+    setup: u32,
+    data: impl Iterator<Item = u32>,
+    status: u32,
+    retired: bool,
+) -> Option<Result<(), UsbError>> {
+    for td in core::iter::once(setup)
+        .chain(data)
+        .chain(core::iter::once(status))
+    {
+        if td & TransferDescriptor::CS_ACTIVE == 0 && td & TransferDescriptor::CS_ERROR_MASK != 0 {
+            return Some(Err(if td & TransferDescriptor::CS_STALLED != 0 {
+                UsbError::Stall
+            } else {
+                UsbError::TransactionError
+            }));
+        }
+    }
+    (retired && status & TransferDescriptor::CS_ACTIVE == 0).then_some(Ok(()))
+}
+
+#[cfg(test)]
+mod control_tests {
+    use super::*;
+
+    #[test]
+    fn terminal_setup_stall_does_not_wait_for_status() {
+        assert!(matches!(
+            control_completion(
+                TransferDescriptor::CS_STALLED,
+                [TransferDescriptor::CS_ACTIVE].into_iter(),
+                TransferDescriptor::CS_ACTIVE,
+                false
+            ),
+            Some(Err(UsbError::Stall))
+        ));
+    }
+    #[test]
+    fn terminal_data_stall_does_not_wait_for_status() {
+        assert!(matches!(
+            control_completion(
+                0,
+                [0, TransferDescriptor::CS_STALLED].into_iter(),
+                TransferDescriptor::CS_ACTIVE,
+                false
+            ),
+            Some(Err(UsbError::Stall))
+        ));
+    }
+    #[test]
+    fn status_error_is_terminal_even_without_link_retirement() {
+        assert!(matches!(
+            control_completion(
+                0,
+                [0].into_iter(),
+                TransferDescriptor::CS_CRC_TIMEOUT,
+                false
+            ),
+            Some(Err(UsbError::TransactionError))
+        ));
+        assert!(control_completion(0, [0].into_iter(), 0, false).is_none());
+        assert!(matches!(
+            control_completion(0, [0].into_iter(), 0, true),
+            Some(Ok(()))
+        ));
+        assert!(
+            control_completion(
+                0,
+                [TransferDescriptor::CS_ACTIVE | TransferDescriptor::CS_CRC_TIMEOUT].into_iter(),
+                TransferDescriptor::CS_ACTIVE,
+                false
+            )
+            .is_none()
+        );
     }
 }
 
@@ -990,7 +873,11 @@ impl UsbController for UhciController {
             dev.bulk_out_toggle
         };
 
+        let timeout = Timeout::from_ms(Self::TRANSFER_WORK_MS);
         while offset < data.len() {
+            if timeout.is_expired() {
+                return Err(UsbError::Timeout);
+            }
             let chunk = (data.len() - offset).min(max_per_td);
 
             // Copy data for OUT
@@ -1033,37 +920,28 @@ impl UsbController for UhciController {
             flush_cache_range(self.qh, core::mem::size_of::<QueueHead>());
             barrier::dma_write();
 
-            // Wait for completion
-            let timeout = Timeout::from_ms(5000);
-            while !timeout.is_expired() {
+            // UHCI clears TD.Active before writing the QH element link.
+            // Until the link is retired the controller could overwrite the
+            // next submission with this transfer's terminate pointer.
+            let (completed, retired) = loop {
                 invalidate_cache_range(td_addr, 32);
+                invalidate_cache_range(self.qh, core::mem::size_of::<QueueHead>());
                 barrier::dma_read();
-                if !td.is_active() {
-                    break;
+                let status = unsafe { ptr::read_volatile(&raw const td.ctrl_sts) };
+                let retired = unsafe { ptr::read_volatile(&raw const qh.element_link) }
+                    & QueueHead::TERMINATE
+                    != 0;
+                if status & TransferDescriptor::CS_ACTIVE == 0
+                    && (retired || status & TransferDescriptor::CS_ERROR_MASK != 0)
+                {
+                    break (true, retired);
+                }
+                if timeout.is_expired() {
+                    break (false, false);
                 }
                 core::hint::spin_loop();
-            }
-
-            let completed = !td.is_active();
-            let halted = if completed {
-                false
-            } else {
-                let halted = self.stop_schedule();
-                if !halted {
-                    log::error!("UHCI: schedule did not halt after bulk timeout; resetting");
-                    self.cleanup();
-                }
-                halted
             };
-
-            // Clear the QH only after a timed-out schedule has halted.
-            qh.element_link = QueueHead::TERMINATE;
-            flush_cache_range(self.qh, core::mem::size_of::<QueueHead>());
-            barrier::dma_write();
-            if halted && !self.start_schedule() {
-                log::error!("UHCI: schedule did not restart after bulk timeout");
-                self.cleanup();
-            }
+            self.retire_qh(retired);
 
             invalidate_cache_range(td_addr, 32);
 
@@ -1138,21 +1016,6 @@ impl UsbController for UhciController {
 }
 
 impl UhciController {
-    /// Enumerate ports (deferred initialization)
-    ///
-    /// On ICH8/9/10 chipsets, UHCI companion controllers are initialized before
-    /// their EHCI companion due to PCI BDF ordering (UHCI at functions 0-2,
-    /// EHCI at function 7). EHCI must set CONFIGFLAG and release companion ports
-    /// before UHCI can see correct devices and speeds on its ports.
-    ///
-    /// This is called from `rescan_companion_ports()` after all USB controllers
-    /// have been initialized, ensuring EHCI has already released its companions.
-    pub fn rescan_ports(&mut self) {
-        if let Err(e) = self.enumerate_ports() {
-            log::error!("UHCI: Port enumeration failed: {:?}", e);
-        }
-    }
-
     /// Clean up the controller before handing off to the OS
     ///
     /// This must be called before ExitBootServices to ensure Linux's UHCI
@@ -1183,4 +1046,81 @@ impl UhciController {
 
         log::debug!("UHCI cleanup complete");
     }
+}
+
+impl PortController for UhciController {
+    fn root_ports(&self) -> (RootKind, u8) {
+        (RootKind::Uhci, self.num_ports)
+    }
+
+    fn legacy_devices(&mut self) -> Option<(&mut [Option<UsbDevice>], &mut u8)> {
+        Some((&mut self.devices, &mut self.next_address))
+    }
+
+    fn legacy_control(
+        &mut self,
+        device: &UsbDevice,
+        request: Control,
+        data: Option<&mut [u8]>,
+    ) -> Result<usize, UsbError> {
+        self.control_transfer_internal(
+            device,
+            request.ty,
+            request.request,
+            request.value,
+            request.index,
+            data,
+        )
+    }
+
+    fn root_status(&self, port: u8) -> RootStatus {
+        let status = self.regs().portsc(port).extract();
+        RootStatus {
+            connected: status.is_set(PORTSC::CCS),
+            changed: status.is_set(PORTSC::CSC),
+            enabled: status.is_set(PORTSC::PE),
+            low_speed: status.is_set(PORTSC::LSDA),
+            ..RootStatus::default()
+        }
+    }
+
+    fn root_command(&mut self, port: u8, command: RootCommand) {
+        let reg = self.regs().portsc(port);
+        reg.set(root_port_write(reg.get(), command));
+    }
+}
+
+fn root_port_write(status: u16, command: RootCommand) -> u16 {
+    let w1c = PORTSC::CSC::SET + PORTSC::PEC::SET;
+    let clear_suspend = matches!(command, RootCommand::Reset | RootCommand::EndReset);
+    let command = match command {
+        RootCommand::ClearChanges => w1c,
+        RootCommand::Reset => PORTSC::PR::SET + PORTSC::PE::CLEAR,
+        RootCommand::EndReset => PORTSC::PR::CLEAR,
+        RootCommand::Enable => PORTSC::PE::SET,
+        RootCommand::Disable => PORTSC::PR::CLEAR + PORTSC::PE::CLEAR,
+        _ => unreachable!(),
+    };
+    // Reset matches the original PR-only write followed by zero;
+    // never preserve suspend or resume signalling from a previous owner.
+    let clear = if clear_suspend {
+        w1c + PORTSC::SUSPEND::SET + PORTSC::RD::SET
+    } else {
+        w1c
+    };
+    command.modify(status & !clear.value)
+}
+
+#[cfg(test)]
+#[test]
+fn port_reset_does_not_keep_firmware_suspend_or_ack_connection_change() {
+    let status = (PORTSC::SUSPEND::SET + PORTSC::RD::SET + PORTSC::CSC::SET).value;
+    assert_eq!(
+        root_port_write(status, RootCommand::Reset),
+        PORTSC::PR::SET.value
+    );
+    assert_eq!(
+        root_port_write(status | PORTSC::PR::SET.value, RootCommand::EndReset),
+        0
+    );
 }

@@ -68,6 +68,19 @@ impl<Proto, Ctx: Copy> Registry<Proto, Ctx> {
         None
     }
 
+    /// Visit every registered instance without unlinking any entries.
+    pub fn for_each(&self, mut f: impl FnMut(&Proto, &mut Ctx)) {
+        let mut cursor = *self.head.borrow();
+        while !cursor.is_null() {
+            // SAFETY: every link is an initialized registered allocation that
+            // stays live while we hold no conflicting mutable borrows.
+            unsafe {
+                f(&(*cursor).protocol, &mut (*cursor).ctx);
+                cursor = (*cursor).next;
+            }
+        }
+    }
+
     /// Unregister `protocol` and return its allocation to the pool.
     ///
     /// Call this when publishing an instance fails (for example a rejected

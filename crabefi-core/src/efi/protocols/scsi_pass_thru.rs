@@ -8,6 +8,7 @@
 //! advanced storage operations via USB.
 
 use core::ffi::c_void;
+use core::num::NonZeroU64;
 
 use r_efi::efi::{Event, Guid, Status};
 use r_efi::protocols::device_path::Protocol as DevicePathProtocol;
@@ -183,6 +184,7 @@ struct ScsiPassThruContext {
     controller_index: usize,
     /// USB device address (slot ID)
     device_addr: u8,
+    attachment_id: NonZeroU64,
     /// PCI device number
     pci_device: u8,
     /// PCI function number
@@ -250,61 +252,54 @@ extern "efiapi" fn scsi_pass_thru(
     }
 
     // Execute the SCSI command via USB mass storage
-    let result = usb::with_controller(ctx.controller_index, |controller| {
-        // Create a temporary mass storage device wrapper
-        match usb::UsbMassStorage::new(controller, ctx.device_addr) {
-            Ok(mut device) => {
-                // Determine data direction and execute command
-                match packet.data_direction {
-                    DATA_DIRECTION_READ => {
-                        if !packet.in_data_buffer.is_null() && packet.in_transfer_length > 0 {
-                            let buffer = unsafe {
-                                core::slice::from_raw_parts_mut(
-                                    packet.in_data_buffer as *mut u8,
-                                    packet.in_transfer_length as usize,
-                                )
-                            };
-                            // Call the SCSI command helper
-                            execute_scsi_read(&mut device, controller, cdb, buffer, packet)
-                        } else {
-                            Status::INVALID_PARAMETER
-                        }
-                    }
-                    DATA_DIRECTION_WRITE => {
-                        if !packet.out_data_buffer.is_null() && packet.out_transfer_length > 0 {
-                            let buffer = unsafe {
-                                core::slice::from_raw_parts(
-                                    packet.out_data_buffer as *const u8,
-                                    packet.out_transfer_length as usize,
-                                )
-                            };
-                            // Call the SCSI command helper
-                            execute_scsi_write(&mut device, controller, cdb, buffer, packet)
-                        } else {
-                            Status::INVALID_PARAMETER
-                        }
-                    }
-                    _ => {
-                        log::warn!(
-                            "ScsiPassThru: unsupported data direction {}",
-                            packet.data_direction
-                        );
-                        Status::UNSUPPORTED
+    usb::mass_storage::with_device(
+        ctx.controller_index,
+        ctx.device_addr,
+        ctx.attachment_id,
+        |device, controller| {
+            match packet.data_direction {
+                DATA_DIRECTION_READ => {
+                    if !packet.in_data_buffer.is_null() && packet.in_transfer_length > 0 {
+                        let buffer = unsafe {
+                            core::slice::from_raw_parts_mut(
+                                packet.in_data_buffer as *mut u8,
+                                packet.in_transfer_length as usize,
+                            )
+                        };
+                        // Call the SCSI command helper
+                        execute_scsi_read(device, controller, cdb, buffer, packet)
+                    } else {
+                        Status::INVALID_PARAMETER
                     }
                 }
+                DATA_DIRECTION_WRITE => {
+                    if !packet.out_data_buffer.is_null() && packet.out_transfer_length > 0 {
+                        let buffer = unsafe {
+                            core::slice::from_raw_parts(
+                                packet.out_data_buffer as *const u8,
+                                packet.out_transfer_length as usize,
+                            )
+                        };
+                        // Call the SCSI command helper
+                        execute_scsi_write(device, controller, cdb, buffer, packet)
+                    } else {
+                        Status::INVALID_PARAMETER
+                    }
+                }
+                _ => {
+                    log::warn!(
+                        "ScsiPassThru: unsupported data direction {}",
+                        packet.data_direction
+                    );
+                    Status::UNSUPPORTED
+                }
             }
-            Err(e) => {
-                log::error!(
-                    "ScsiPassThru: failed to create mass storage device: {:?}",
-                    e
-                );
-                packet.host_adapter_status = HOST_ADAPTER_OTHER;
-                Status::DEVICE_ERROR
-            }
-        }
-    });
-
-    result.unwrap_or(Status::DEVICE_ERROR)
+        },
+    )
+    .unwrap_or_else(|| {
+        packet.host_adapter_status = HOST_ADAPTER_OTHER;
+        Status::NO_MEDIA
+    })
 }
 
 /// Execute a SCSI read command (data from device)
@@ -633,6 +628,7 @@ pub(super) fn discard_unpublished(protocol: *mut ExtScsiPassThruProtocol) {
 pub fn create_scsi_pass_thru_protocol(
     controller_index: usize,
     device_addr: u8,
+    attachment_id: NonZeroU64,
     pci_device: u8,
     pci_function: u8,
     usb_port: u8,
@@ -669,6 +665,7 @@ pub fn create_scsi_pass_thru_protocol(
         ScsiPassThruContext {
             controller_index,
             device_addr,
+            attachment_id,
             pci_device,
             pci_function,
             usb_port,

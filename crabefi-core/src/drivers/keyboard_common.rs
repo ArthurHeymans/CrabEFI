@@ -57,6 +57,11 @@ pub trait KeyboardDevice {
         KeyState::default()
     }
 
+    /// USB identity `(controller_idx, device_address)` if this is a USB keyboard.
+    fn usb_identity(&self) -> Option<(usize, u8)> {
+        None
+    }
+
     /// Hand the device to the OS. Must not allocate or change the EFI memory
     /// map.
     fn stop(&mut self) {}
@@ -67,6 +72,21 @@ static DEVICES: Local<Vec<Box<dyn KeyboardDevice>>> = Local::new(Vec::new());
 /// Register a keyboard for the rest of boot services.
 pub fn register(device: Box<dyn KeyboardDevice>) {
     DEVICES.borrow_mut().push(device);
+}
+
+/// Whether a USB keyboard with `(controller_idx, device_address)` is already registered.
+pub fn is_usb_registered(controller_idx: usize, device_address: u8) -> bool {
+    DEVICES
+        .borrow()
+        .iter()
+        .any(|device| device.usb_identity() == Some((controller_idx, device_address)))
+}
+
+/// Remove a disconnected USB keyboard from the registry.
+pub fn unregister_usb(controller_idx: usize, device_address: u8) {
+    DEVICES
+        .borrow_mut()
+        .retain(|device| device.usb_identity() != Some((controller_idx, device_address)));
 }
 
 /// Run `f` on the registered devices without holding a borrow across their
@@ -154,5 +174,39 @@ impl KeyboardDevice for PlatformKeyboard {
 
     fn key_state(&mut self) -> KeyState {
         self.0.key_state()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct FakeUsbKeyboard {
+        controller: usize,
+        addr: u8,
+    }
+
+    impl KeyboardDevice for FakeUsbKeyboard {
+        fn read_key(&mut self) -> Option<Key> {
+            None
+        }
+
+        fn usb_identity(&self) -> Option<(usize, u8)> {
+            Some((self.controller, self.addr))
+        }
+    }
+
+    #[test]
+    fn usb_keyboard_register_and_unregister() {
+        assert!(!is_usb_registered(99, 7));
+        register(Box::new(FakeUsbKeyboard {
+            controller: 99,
+            addr: 7,
+        }));
+        assert!(is_usb_registered(99, 7));
+        assert!(!is_usb_registered(99, 8));
+
+        unregister_usb(99, 7);
+        assert!(!is_usb_registered(99, 7));
     }
 }

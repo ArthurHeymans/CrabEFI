@@ -45,14 +45,6 @@ impl UsbController for Controller {
             toggle: false,
         })
     }
-    fn hid_interface_number(&mut self, device: u8, endpoint: u8) -> Result<u8, UsbError> {
-        assert_eq!((device, endpoint), (2, self.endpoint));
-        Ok(self.interface)
-    }
-    fn hid_report_descriptor(&mut self, device: u8, interface: u8) -> Result<Vec<u8>, UsbError> {
-        assert_eq!((device, interface), (2, self.interface));
-        self.descriptor.clone().ok_or(UsbError::NotSupported)
-    }
     fn control_transfer(
         &mut self,
         device: u8,
@@ -63,6 +55,18 @@ impl UsbController for Controller {
         data: Option<&mut [u8]>,
     ) -> Result<usize, UsbError> {
         assert_eq!(device, 2);
+        if kind & req_type::TYPE_CLASS == 0 {
+            assert_eq!(request, super::super::controller::request::GET_DESCRIPTOR);
+            return super::super::port::fake_hid_descriptor(
+                value,
+                interface,
+                data.unwrap(),
+                self.interface,
+                self.endpoint,
+                2,
+                self.descriptor.as_deref(),
+            );
+        }
         assert_eq!(interface, u16::from(self.interface));
         self.requests.push((request, value, interface));
         if request == hid_request::GET_REPORT {
@@ -124,10 +128,28 @@ impl UsbController for Controller {
     }
 }
 
+fn bind_test_mouse(
+    controller: &mut Controller,
+    controller_index: usize,
+    address: u8,
+) -> Result<UsbHidMouse, UsbError> {
+    let ep = controller.get_mouse_interrupt_endpoint(address).unwrap();
+    crate::exec::block_on(bind_with(
+        Pipe {
+            controller: controller_index,
+            address,
+        },
+        ep,
+        async |r, data| {
+            controller.control_transfer(address, r.ty, r.request, r.value, r.index, data)
+        },
+    ))
+}
+
 #[test]
 fn absolute_bmc_mouse_polls_six_bytes_despite_class_stalls() {
     let mut controller = Controller::new(ABSOLUTE_MOUSE, &[1, 0xff, 0x7f, 0, 0, 0], 6, 6);
-    let mut mouse = init_mouse(&mut controller, 1, 2).unwrap();
+    let mut mouse = bind_test_mouse(&mut controller, 1, 2).unwrap();
     assert_eq!(
         controller.requests,
         [
@@ -163,7 +185,7 @@ fn relative_wheel_mice_work_with_different_endpoint_packets() {
             usize::from(packet),
         );
         controller.class_stalls = false;
-        let mut mouse = init_mouse(&mut controller, 0, 2).unwrap();
+        let mut mouse = bind_test_mouse(&mut controller, 0, 2).unwrap();
         mouse.poll_controller(&mut controller);
         let report = mouse.pending.take().unwrap();
         assert_eq!(
@@ -179,7 +201,7 @@ fn bmc_mouse_interface_endpoint_and_packet_are_not_hardcoded() {
     let mut controller = Controller::new(ABSOLUTE_MOUSE, &[0, 0, 0, 0xff, 0x7f, 0], 8, 8);
     controller.interface = 5;
     controller.endpoint = 7;
-    let mut mouse = init_mouse(&mut controller, 3, 2).unwrap();
+    let mut mouse = bind_test_mouse(&mut controller, 3, 2).unwrap();
     mouse.poll_controller(&mut controller);
     assert_eq!(mouse.pending.take().unwrap().absolute, Some((0, u16::MAX)));
     assert_eq!(
@@ -196,7 +218,7 @@ fn absolute_report_ids_work_without_a_vendor_specific_layout() {
     let mut descriptor = ABSOLUTE_MOUSE.to_vec();
     descriptor.splice(6..6, [0x85, 7]);
     let mut controller = Controller::new(&descriptor, &[7, 2, 0, 0, 0xff, 0x7f, 0], 8, 8);
-    let mut mouse = init_mouse(&mut controller, 0, 2).unwrap();
+    let mut mouse = bind_test_mouse(&mut controller, 0, 2).unwrap();
     mouse.poll_controller(&mut controller);
     let report = mouse.pending.take().unwrap();
     assert_eq!(report.absolute, Some((0, u16::MAX)));
@@ -209,7 +231,7 @@ fn boot_fallback_requires_a_successful_protocol_switch() {
         let mut controller = Controller::new(&[], &[1, 0xfe, 7], packet, usize::from(packet));
         controller.descriptor = None;
         controller.class_stalls = false;
-        let mut mouse = init_mouse(&mut controller, 0, 2).unwrap();
+        let mut mouse = bind_test_mouse(&mut controller, 0, 2).unwrap();
         assert_eq!(controller.requests[0], (hid_request::SET_PROTOCOL, 0, 1));
         mouse.poll_controller(&mut controller);
         let report = mouse.pending.take().unwrap();
@@ -221,7 +243,7 @@ fn boot_fallback_requires_a_successful_protocol_switch() {
     let mut controller = Controller::new(&[], &[0; 3], 8, 8);
     controller.descriptor = None;
     assert!(matches!(
-        init_mouse(&mut controller, 0, 2),
+        bind_test_mouse(&mut controller, 0, 2),
         Err(UsbError::Stall)
     ));
 }
@@ -234,7 +256,7 @@ fn legacy_controller_get_report_uses_the_interface_and_report_id() {
     controller.interrupts_supported = false;
     controller.class_stalls = false;
     controller.interface = 4;
-    let mut mouse = init_mouse(&mut controller, 0, 2).unwrap();
+    let mut mouse = bind_test_mouse(&mut controller, 0, 2).unwrap();
     mouse.poll_controller(&mut controller);
     assert_eq!(
         controller.requests.last(),
@@ -253,7 +275,7 @@ fn unrelated_report_ids_fit_and_do_not_prevent_later_pointer_input() {
     let mut vendor = [0; 33];
     vendor[0] = 8;
     let mut controller = Controller::new(&descriptor, &vendor, 8, 40);
-    let mut mouse = init_mouse(&mut controller, 0, 2).unwrap();
+    let mut mouse = bind_test_mouse(&mut controller, 0, 2).unwrap();
     mouse.poll_controller(&mut controller);
     assert!(mouse.pending.is_none());
     controller.report = Some(alloc::vec![7, 1, 0xff, 0x7f, 0, 0, 0]);
@@ -277,11 +299,11 @@ fn split_mouse_reports_and_oversized_axes_require_boot_fallback() {
     for descriptor in [split, wide] {
         let mut controller = Controller::new(&descriptor, &[0; 3], 8, 8);
         assert!(matches!(
-            init_mouse(&mut controller, 0, 2),
+            bind_test_mouse(&mut controller, 0, 2),
             Err(UsbError::Stall)
         ));
         controller.class_stalls = false;
-        let mouse = init_mouse(&mut controller, 0, 2).unwrap();
+        let mouse = bind_test_mouse(&mut controller, 0, 2).unwrap();
         assert!(mouse.report.is_none());
     }
 }
