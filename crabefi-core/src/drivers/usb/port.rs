@@ -590,15 +590,15 @@ struct Hub {
     #[cfg(feature = "xhci")]
     superspeed: bool,
     upstream: Option<Rc<Hub>>,
-    status_failures: LocalCell<u8>,
+    transport_failures: LocalCell<u8>,
     quarantine: Local<Option<DefaultAddress>>,
 }
 
-const HUB_STATUS_FAILURE_LIMIT: u8 = 2;
+const HUB_TRANSPORT_FAILURE_LIMIT: u8 = 2;
 
 impl Hub {
     fn parked(&self) -> bool {
-        self.status_failures.get() >= HUB_STATUS_FAILURE_LIMIT
+        self.transport_failures.get() >= HUB_TRANSPORT_FAILURE_LIMIT
             || self.quarantine.borrow().is_some()
             || self.upstream.as_ref().is_some_and(|hub| hub.parked())
     }
@@ -621,14 +621,12 @@ impl Hub {
         }
     }
 
-    fn observe_status(&self, ok: bool) {
-        if ok {
-            self.status_failures.set(0);
-        } else {
-            self.status_failures.update(|count| *count += 1);
-            if self.status_failures.get() == HUB_STATUS_FAILURE_LIMIT {
+    fn note_transport_failure(&self) {
+        if !self.parked() {
+            self.transport_failures.update(|count| *count += 1);
+            if self.parked() {
                 log::warn!(
-                    "USB hub {} no longer answers port status; monitoring its upstream port only",
+                    "USB hub {} repeatedly failed requests; monitoring its upstream port only",
                     self.address
                 );
             }
@@ -821,7 +819,7 @@ impl Port {
         if !upstream.connected || upstream.changed {
             return Err(UsbError::Disconnected);
         }
-        Pipe {
+        let result = Pipe {
             controller: self.controller,
             address: hub.address,
         }
@@ -833,7 +831,18 @@ impl Port {
                 u16::from(self.number),
             ),
             data,
-        )
+        );
+        // GET_STATUS also needs to validate the returned length. Count
+        // other failed requests here so a hub that answers status but
+        // times out clearing a change latch cannot hang every idle poll.
+        if request != super::controller::request::GET_STATUS
+            && result
+                .as_ref()
+                .is_err_and(|error| !matches!(error, UsbError::Stall | UsbError::NotSupported))
+        {
+            hub.note_transport_failure();
+        }
+        result
     }
 
     async fn hub_status(&self) -> Result<(u16, u16), UsbError> {
@@ -851,8 +860,9 @@ impl Port {
                 u16::from_le_bytes([buf[2], buf[3]]),
             ))
         });
-        if !hub.parked() && self.root_status().connected && !self.root_status().changed {
-            hub.observe_status(result.is_ok());
+        let upstream = self.root_status();
+        if result.is_err() && upstream.connected && !upstream.changed {
+            hub.note_transport_failure();
         }
         result
     }
@@ -1263,7 +1273,7 @@ async fn configure_hub(parent: &Port, pipe: Pipe) -> Result<(Rc<Hub>, u8, u64), 
     let hub = Rc::new(Hub {
         address: pipe.address,
         upstream: parent.hub.clone(),
-        status_failures: LocalCell::new(0),
+        transport_failures: LocalCell::new(0),
         quarantine: Local::new(None),
         #[cfg(feature = "xhci")]
         superspeed,
@@ -1618,22 +1628,19 @@ mod tests {
     }
 
     #[test]
-    fn hub_status_failures_park_the_whole_hub_until_replaced() {
+    fn hub_transport_failures_park_the_whole_hub_until_replaced() {
         let hub = Rc::new(Hub {
             address: 1,
             upstream: None,
-            status_failures: LocalCell::new(0),
+            transport_failures: LocalCell::new(0),
             quarantine: Local::new(None),
             #[cfg(feature = "xhci")]
             superspeed: false,
         });
         let sibling = hub.clone();
-        hub.observe_status(false);
+        hub.note_transport_failure();
         assert!(!sibling.parked());
-        sibling.observe_status(true);
-        hub.observe_status(false);
-        assert!(!sibling.parked());
-        sibling.observe_status(false);
+        sibling.note_transport_failure();
         assert!(hub.parked());
     }
 
@@ -1646,7 +1653,7 @@ mod tests {
             let hub = Hub {
                 address: 1,
                 upstream: None,
-                status_failures: LocalCell::new(0),
+                transport_failures: LocalCell::new(0),
                 quarantine: Local::new(None),
                 #[cfg(feature = "xhci")]
                 superspeed: false,
