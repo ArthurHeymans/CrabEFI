@@ -43,7 +43,7 @@ pub(crate) enum MenuAction {
     /// User (or timeout) selected the entry at this index.
     Selected(usize),
     /// USB storage changed; re-discover entries and reopen the menu.
-    Refresh,
+    Refresh { interacted: bool },
     /// Menu exited without selecting an entry.
     #[cfg_attr(not(feature = "ui"), allow(dead_code))]
     Exit,
@@ -63,7 +63,7 @@ pub(crate) enum MenuAction {
 pub fn show_menu(menu: &mut BootMenu) -> Option<usize> {
     match show_menu_for_mode::<false>(menu) {
         MenuAction::Selected(index) => Some(index),
-        MenuAction::Refresh | MenuAction::Exit => None,
+        MenuAction::Refresh { .. } | MenuAction::Exit => None,
     }
 }
 
@@ -106,17 +106,19 @@ pub(crate) fn show_menu_for_mode<const NATIVE: bool>(menu: &mut BootMenu) -> Men
     let mut cursor_renderer = crate::cursor::CursorRenderer::new();
 
     let storage_revision = crate::drivers::usb::storage_revision();
+    let mut interacted = false;
     loop {
         crate::exec::poll_background();
-        if storage_revision != crate::drivers::usb::storage_revision() {
-            return MenuAction::Refresh;
-        }
         // Update mouse cursor on framebuffer
         #[cfg(feature = "ui")]
         update_cursor(&mut cursor_renderer, &fb_info);
         // Read input before the countdown can expire, so a key queued during
         // the last second still stops the automatic boot.
         let key = menu_common::read_key();
+        interacted |= key.is_some();
+        if storage_revision != crate::drivers::usb::storage_revision() {
+            return MenuAction::Refresh { interacted };
+        }
         // Any key stops the automatic boot, as in the graphical menu: only an
         // explicit choice boots after that. This also keeps a restricted boot
         // policy from timing out into an external entry the user merely moved

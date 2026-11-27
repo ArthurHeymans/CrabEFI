@@ -165,7 +165,7 @@ pub(crate) fn finish(result: ScreenNav) -> ScreenNav {
 pub fn show_graphical_menu(menu: &mut crate::menu::BootMenu) -> Option<usize> {
     match show_graphical_menu_action(menu) {
         crate::menu::MenuAction::Selected(index) => Some(index),
-        crate::menu::MenuAction::Refresh | crate::menu::MenuAction::Exit => None,
+        crate::menu::MenuAction::Refresh { .. } | crate::menu::MenuAction::Exit => None,
     }
 }
 
@@ -182,17 +182,19 @@ pub(crate) fn show_graphical_menu_action(
     let surface = surface(&fb);
     match embassy_futures::block_on(shared::show_graphical_menu(&surface, &mut menu.menu)) {
         Outcome::Boot(index) => crate::menu::MenuAction::Selected(index),
-        Outcome::Refresh => crate::menu::MenuAction::Refresh,
+        Outcome::Refresh => crate::menu::MenuAction::Refresh {
+            interacted: surface.interacted(),
+        },
         Outcome::Reset => crate::reset_system(),
         Outcome::Exit => crate::menu::MenuAction::Exit,
     }
 }
 
-/// Show the no-media screen. Returns `true` if USB storage changed and the
-/// caller should re-run boot entry discovery.
-pub fn show_no_media_screen() -> bool {
+/// Show the no-media screen until the user leaves or the entry list changes.
+pub(crate) fn show_no_media_screen() -> crate::menu::MenuAction {
+    use crate::menu::MenuAction;
     let Some(fb) = crate::handoff::framebuffer() else {
-        return false;
+        return MenuAction::Exit;
     };
     if !supports_framebuffer(&fb) {
         return no_media_text(&fb);
@@ -200,21 +202,22 @@ pub fn show_no_media_screen() -> bool {
     let surface = surface(&fb);
     match embassy_futures::block_on(shared::show_no_media_screen(&surface)) {
         Outcome::Reset => crate::reset_system(),
-        Outcome::Refresh => true,
-        Outcome::Boot(_) | Outcome::Exit => false,
+        Outcome::Refresh => MenuAction::Refresh {
+            interacted: surface.interacted(),
+        },
+        Outcome::Boot(_) | Outcome::Exit => MenuAction::Exit,
     }
 }
 
-fn no_media_text(fb: &FramebufferConfig) -> bool {
+fn no_media_text(fb: &FramebufferConfig) -> crate::menu::MenuAction {
+    use crate::menu::MenuAction;
     use crate::menu_common::{self, KeyPress};
     let mut console = Some(crate::framebuffer_console::FramebufferConsole::new(fb));
     let mut redraw = true;
     let storage_revision = crate::drivers::usb::storage_revision();
+    let mut interacted = false;
     loop {
         crate::exec::poll_background();
-        if storage_revision != crate::drivers::usb::storage_revision() {
-            return true;
-        }
         if redraw {
             menu_common::clear_screen(&mut console);
             menu_common::draw_header("No bootable media", &mut console, 80);
@@ -230,8 +233,13 @@ fn no_media_text(fb: &FramebufferConfig) -> bool {
             );
             redraw = false;
         }
-        match menu_common::read_key() {
-            Some(KeyPress::Escape) => return false,
+        let key = menu_common::read_key();
+        interacted |= key.is_some();
+        if storage_revision != crate::drivers::usb::storage_revision() {
+            return MenuAction::Refresh { interacted };
+        }
+        match key {
+            Some(KeyPress::Escape) => return MenuAction::Exit,
             Some(KeyPress::Char('r' | 'R')) => crate::reset_system(),
             #[cfg(feature = "secure-boot")]
             Some(KeyPress::Char('s' | 'S')) => {

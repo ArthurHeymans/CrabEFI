@@ -129,6 +129,7 @@ pub struct Surface {
     backend: RefCell<Box<dyn Backend>>,
     pointer: Cell<(i32, i32)>,
     reset: Cell<bool>,
+    interacted: Cell<bool>,
     /// One Secure Boot snapshot per frame: firmware reads variables for it,
     /// and a single repaint consults it for every header chip and action row.
     security: Cell<Option<SecurityState>>,
@@ -152,6 +153,7 @@ impl Surface {
             backend: RefCell::new(Box::new(backend)),
             pointer: Cell::new((-1, -1)),
             reset: Cell::new(false),
+            interacted: Cell::new(false),
             security: Cell::new(None),
             dim: Cell::new(false),
             text_size: Cell::new(text_size),
@@ -199,7 +201,18 @@ impl Surface {
         DialogScope(self)
     }
     pub fn key(&self) -> Option<KeyPress> {
-        self.backend.borrow_mut().read_key()
+        let key = self.backend.borrow_mut().read_key();
+        if key.is_some() {
+            self.note_interaction();
+        }
+        key
+    }
+    pub(crate) fn note_interaction(&self) {
+        self.interacted.set(true);
+    }
+    /// Whether this menu session received input, even on the no-media page.
+    pub fn interacted(&self) -> bool {
+        self.interacted.get()
     }
     pub fn position(&self) -> (i32, i32) {
         self.pointer.get()

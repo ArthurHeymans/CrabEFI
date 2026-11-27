@@ -344,7 +344,7 @@ pub async fn show_no_media_screen(fb: &FramebufferInfo) -> Outcome {
                 fb,
                 NavItem::Boot,
                 "No bootable media",
-                "Connect a boot device, then restart. Security and Firmware settings remain available.",
+                "Connect a boot device to refresh the list. Security and Firmware settings remain available.",
             ).await,
             #[cfg(feature = "secure-boot")]
             NavItem::Security => secure_boot::show(fb).await,
@@ -430,12 +430,16 @@ pub async fn empty_screen(
     let mut focus = Focus::new(nav_item_index(nav));
     focus.group = Group::Actions;
     let mut hover = Hover::default();
+    let origin = fb.position();
     loop {
         cursor.hide(fb);
         let restart = empty_screen_paint(fb, nav, &focus, title, message);
         hover.reset();
         loop {
             poll_and_render_cursor(fb, &mut cursor);
+            if deliberate_pointer_motion(origin, fb.position()) {
+                fb.note_interaction();
+            }
             track_hover(fb, &mut cursor, &mut hover, Some((nav, &focus)));
             if let Some(key) = fb.key() {
                 let snapshot = focus;
@@ -1113,12 +1117,13 @@ async fn run_boot<E: MenuEntry>(
             .is_none()
             .then_some((NavItem::Boot, &state.focus));
         track_hover(fb, &mut cursor, &mut hover, tabs);
-        if deliberate_pointer_motion(origin, fb.position())
-            && cancel_boot_countdown(menu, &mut state)
-        {
-            keep_boot_selection_visible(fb, &mut state);
-            buttons = cursor.while_hidden(fb, || paint_boot(fb, menu, &state));
-            hover.reset();
+        if deliberate_pointer_motion(origin, fb.position()) {
+            fb.note_interaction();
+            if cancel_boot_countdown(menu, &mut state) {
+                keep_boot_selection_visible(fb, &mut state);
+                buttons = cursor.while_hidden(fb, || paint_boot(fb, menu, &state));
+                hover.reset();
+            }
         }
         let hovered = boot_hit(fb, menu, &state);
         if hovered != state.hovered {
