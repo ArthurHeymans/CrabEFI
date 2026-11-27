@@ -14,6 +14,8 @@ use core::{future::poll_fn, task::Poll};
 use embassy_futures::select::select;
 
 const CONNECTION_TIMEOUT_MS: u64 = 1000;
+/// Boot never waits longer than this for USB, whatever the bus is doing.
+const BOOT_DISCOVERY_CAP_MS: u64 = 10_000;
 const MIGRATION_QUIET_MS: u64 = 500;
 const MAX_PORT_ATTEMPTS: usize = 3;
 const PORT_RETRY_MS: u64 = 250;
@@ -419,7 +421,8 @@ pub(super) async fn settle() {
     })
     .await;
     let now_ms = || crate::time::read_counter() / (crate::time::counter_frequency() / 1000).max(1);
-    let mut drain = BootDrain::new(now_ms(), STARTUP_PROGRESS.get());
+    let started_ms = now_ms();
+    let mut drain = BootDrain::new(started_ms, STARTUP_PROGRESS.get());
     poll_fn(|_| {
         exec::poll_background();
         let handoff = COMPANION_HANDOFF.get();
@@ -438,6 +441,15 @@ pub(super) async fn settle() {
             companions_ready,
             quiet_ms,
         ) {
+            let active = STARTUP_ACTIVE.get();
+            if active != 0 {
+                // Discovery continues in the background; boot does not wait.
+                log::warn!(
+                    "USB: boot stopped waiting after {} ms with {} port(s) still busy",
+                    now_ms().saturating_sub(started_ms),
+                    active
+                );
+            }
             Poll::Ready(())
         } else {
             Poll::Pending
@@ -447,12 +459,14 @@ pub(super) async fn settle() {
 }
 
 struct BootDrain {
+    started_ms: u64,
     last_ms: u64,
     progress: u64,
 }
 impl BootDrain {
     fn new(now_ms: u64, progress: u64) -> Self {
         Self {
+            started_ms: now_ms,
             last_ms: now_ms,
             progress,
         }
@@ -467,12 +481,17 @@ impl BootDrain {
         quiet_ms: u64,
     ) -> bool {
         if progress != self.progress {
-            *self = Self::new(now_ms, progress);
+            self.last_ms = now_ms;
+            self.progress = progress;
         }
         let idle_ms = now_ms.saturating_sub(self.last_ms);
         // A wedged transfer does not renew discovery indefinitely. On an
-        // answering device each completed stage renews this window.
-        idle_ms >= CONNECTION_TIMEOUT_MS || (active == 0 && companions_ready && idle_ms >= quiet_ms)
+        // answering device each completed stage renews this window, but
+        // only up to the cap: a port that keeps "progressing" without ever
+        // finishing must not hold the boot.
+        now_ms.saturating_sub(self.started_ms) >= BOOT_DISCOVERY_CAP_MS
+            || idle_ms >= CONNECTION_TIMEOUT_MS
+            || (active == 0 && companions_ready && idle_ms >= quiet_ms)
     }
 }
 
@@ -661,6 +680,8 @@ trait PortOps {
     fn upstream_parked(&self) -> bool {
         false
     }
+    /// The port stops retrying until its connection changes.
+    fn report_parked(&self, _error: &UsbError) {}
     async fn sleep(&self, ms: u64) {
         exec::sleep_ms(ms).await;
     }
@@ -704,17 +725,23 @@ async fn port_task(port: impl PortOps, mut initial_scan: Option<StartupActivity<
                     Ok(None) => continue 'connect,
                     Err(error) => {
                         port.observe_failed_bring_up();
-                        if matches!(error, UsbError::Disconnected)
-                            && port
-                                .connection()
-                                .await
-                                .is_ok_and(|link| !link.connected || link.changed)
-                        {
-                            continue 'connect;
+                        match port.connection().await {
+                            // Only a device that left gets a new budget. A
+                            // change latched while it stayed connected can be
+                            // caused by our own reset: restarting on it would
+                            // reset the port forever.
+                            Ok(link) if !link.connected => continue 'connect,
+                            Ok(link) if link.changed => {
+                                let _ = port.clear_change().await;
+                            }
+                            _ => {}
                         }
                         log::debug!(
                             "USB port enumeration attempt {attempt}/{MAX_PORT_ATTEMPTS} failed: {error:?}"
                         );
+                        if attempt == MAX_PORT_ATTEMPTS {
+                            port.report_parked(&error);
+                        }
                         if attempt != MAX_PORT_ATTEMPTS {
                             let retry_ms = if matches!(error, UsbError::Timeout) {
                                 CONNECTION_TIMEOUT_MS
@@ -740,6 +767,20 @@ async fn port_task(port: impl PortOps, mut initial_scan: Option<StartupActivity<
         .await;
         let _ = port.clear_change().await;
         port.detach(address).await;
+    }
+}
+
+/// Interpret the connection sampled right after our own port reset.
+///
+/// Real UHCI root ports latch a connect-status change when reset is released
+/// (QEMU's do not), and the device that answered the reset is still there.
+/// Returns whether that latch has to be acknowledged; a replacement during
+/// the reset leaves the port disabled and fails enumeration instead.
+fn reset_latched_change(link: Connection) -> Result<bool, UsbError> {
+    if link.connected {
+        Ok(link.changed)
+    } else {
+        Err(UsbError::Disconnected)
     }
 }
 
@@ -1091,9 +1132,8 @@ impl PortOps for Port {
             let Some(speed) = self.reset().await? else {
                 return Ok(None);
             };
-            let connection = self.connection().await?;
-            if !connection.connected || connection.changed {
-                return Err(UsbError::Disconnected);
+            if reset_latched_change(self.connection().await?)? {
+                self.clear_change().await?;
             }
             match speed {
                 PortSpeed::Legacy(speed) => self.attach_legacy(speed).await.map(Some),
@@ -1209,6 +1249,17 @@ impl PortOps for Port {
 
     fn upstream_parked(&self) -> bool {
         self.hub.as_ref().is_some_and(|hub| hub.parked())
+    }
+
+    fn report_parked(&self, error: &UsbError) {
+        log::warn!(
+            "USB: controller {} {}port {} gave up after {} attempts ({:?}); waiting for replug",
+            self.controller,
+            if self.hub.is_some() { "hub " } else { "root " },
+            self.number,
+            MAX_PORT_ATTEMPTS,
+            error
+        );
     }
 
     fn interval(&self) -> u64 {
@@ -1365,6 +1416,9 @@ mod tests {
         connection: Cell<Connection>,
         attempted: Cell<usize>,
         failures: Cell<usize>,
+        /// Every bring-up latches a change while the device stays connected,
+        /// as a real UHCI root port does when reset is released.
+        reset_latches_change: bool,
         reset_for: Cell<u64>,
         startup_active: LocalCell<usize>,
         children: bool,
@@ -1380,6 +1434,7 @@ mod tests {
                 connection: Cell::default(),
                 attempted: Cell::default(),
                 failures: Cell::default(),
+                reset_latches_change: false,
                 reset_for: Cell::default(),
                 startup_active: LocalCell::new(0),
                 children: false,
@@ -1405,6 +1460,10 @@ mod tests {
             self.attempted.update(|n| n + 1);
             self.sleep(self.reset_for.get()).await;
             if !self.connection.get().connected {
+                return Err(UsbError::Disconnected);
+            }
+            if self.reset_latches_change {
+                self.set(true, true);
                 return Err(UsbError::Disconnected);
             }
             if self.failures.get() != 0 {
@@ -1674,6 +1733,50 @@ mod tests {
             assert!(next.as_mut().poll(cx).is_pending());
         }
         assert!(next.as_mut().poll(cx).is_ready());
+    }
+
+    #[test]
+    fn boot_wait_is_capped_even_while_a_port_keeps_reporting_progress() {
+        // The R500 failure: a root port reset forever, each round counted
+        // as progress, and boot never left discovery.
+        let mut drain = BootDrain::new(0, 0);
+        let mut progress = 0;
+        let mut now = 0;
+        while now + 200 < BOOT_DISCOVERY_CAP_MS {
+            now += 200;
+            progress += 1;
+            assert!(!drain.settled(now, progress, 1, true, 0));
+        }
+        assert!(drain.settled(BOOT_DISCOVERY_CAP_MS, progress + 1, 1, true, 0));
+    }
+
+    #[test]
+    fn change_latched_by_our_own_reset_is_not_a_disconnect() {
+        let link = |connected, changed| Connection { connected, changed };
+        assert!(matches!(reset_latched_change(link(true, true)), Ok(true)));
+        assert!(matches!(reset_latched_change(link(true, false)), Ok(false)));
+        assert!(matches!(
+            reset_latched_change(link(false, true)),
+            Err(UsbError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn port_task_does_not_restart_forever_on_a_change_it_caused() {
+        let port = FakePort {
+            reset_latches_change: true,
+            ..FakePort::default()
+        };
+        let mut task = core::pin::pin!(port_task(&port, None));
+        port.set(true, true);
+        port.advance(0, task.as_mut());
+        for _ in 0..200 {
+            port.advance(50, task.as_mut());
+        }
+        // Three attempts for this attachment, then parked until replug.
+        assert_eq!(port.attempted.get(), MAX_PORT_ATTEMPTS);
+        assert_eq!(port.startup_active.get(), 0);
+        assert!(port.events.borrow().is_empty());
     }
 
     #[test]
