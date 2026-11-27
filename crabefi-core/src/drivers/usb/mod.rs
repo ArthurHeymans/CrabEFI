@@ -131,6 +131,16 @@ static ALL_CONTROLLERS: Mutex<alloc::vec::Vec<UsbControllerHandle>> =
 /// Set once [`cleanup()`] has stopped every controller for OS handoff.
 static STOPPED: crate::cell::LocalCell<bool> = crate::cell::LocalCell::new(false);
 
+/// Incremented whenever a USB mass storage device is hotplugged or removed.
+static STORAGE_GENERATION: crate::cell::LocalCell<u32> = crate::cell::LocalCell::new(0);
+
+/// Rate-limit timer for [`poll()`] so tight idle/EFI loops stay fast.
+static NEXT_HOTPLUG_POLL: crate::cell::LocalCell<Option<crate::time::Timeout>> =
+    crate::cell::LocalCell::new(None);
+
+/// Minimum interval between USB hotplug polls (ms).
+const HOTPLUG_POLL_INTERVAL_MS: u64 = 25;
+
 // ============================================================================
 // Initialization
 // ============================================================================
@@ -490,6 +500,135 @@ pub fn controller_count() -> usize {
     ALL_CONTROLLERS.lock().len()
 }
 
+/// Current generation counter for USB mass storage topology changes.
+pub fn storage_generation() -> u32 {
+    STORAGE_GENERATION.get()
+}
+
+/// Poll all USB controllers for hotplugged or removed devices.
+///
+/// Rate-limited to [`HOTPLUG_POLL_INTERVAL_MS`] so callers in tight UI or
+/// `WaitForEvent` loops can invoke it freely. Newly attached keyboards and
+/// mice are registered automatically; removed devices are unregistered and
+/// torn down.
+///
+/// Returns `true` if any USB mass storage device was attached or removed.
+pub fn poll() -> bool {
+    if STOPPED.get() {
+        return false;
+    }
+    if let Some(next) = NEXT_HOTPLUG_POLL.get()
+        && !next.is_expired()
+    {
+        return false;
+    }
+    NEXT_HOTPLUG_POLL.set(Some(crate::time::Timeout::from_ms(
+        HOTPLUG_POLL_INTERVAL_MS,
+    )));
+
+    let count = ALL_CONTROLLERS.lock().len();
+    if count == 0 {
+        return false;
+    }
+
+    let mut storage_changed = false;
+    let mut events = alloc::vec::Vec::new();
+
+    for idx in 0..count {
+        events.clear();
+        {
+            let controllers = ALL_CONTROLLERS.lock();
+            if let Some(handle) = controllers.get(idx) {
+                with_usb_controller!(handle, mut |controller| {
+                    controller.poll_hotplug(&mut events);
+                });
+            }
+        }
+
+        for event in events.iter().copied() {
+            match event {
+                controller::UsbHotplugEvent::Detached(addr) => {
+                    crate::drivers::keyboard_common::unregister_usb(idx, addr);
+                    #[cfg(feature = "ui")]
+                    crate::drivers::pointer::unregister_usb(idx, addr);
+                    if mass_storage::remove(idx, addr) {
+                        storage_changed = true;
+                    }
+                    crate::efi::protocols::block_io::mark_usb_removed(idx, addr);
+                }
+                controller::UsbHotplugEvent::Attached(addr) => {
+                    if attach_hotplug_device(idx, addr) {
+                        storage_changed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if storage_changed {
+        STORAGE_GENERATION.set(STORAGE_GENERATION.get().wrapping_add(1));
+    }
+    storage_changed
+}
+
+/// Bind class drivers to a newly hotplugged USB device.
+/// Returns `true` if a mass storage device with media became available.
+fn attach_hotplug_device(controller_idx: usize, device_addr: u8) -> bool {
+    let Some(info) = with_controller(controller_idx, |c| c.get_device_info(device_addr)).flatten()
+    else {
+        return false;
+    };
+
+    if info.is_keyboard
+        && !crate::drivers::keyboard_common::is_usb_registered(controller_idx, device_addr)
+    {
+        let keyboard = with_controller(controller_idx, |controller| {
+            hid_keyboard::init_keyboard(controller, controller_idx, device_addr)
+        });
+        match keyboard {
+            Some(Ok(kbd)) => {
+                crate::drivers::keyboard_common::register(Box::new(kbd));
+                log::info!(
+                    "USB: Hotplugged keyboard on controller {} device {}",
+                    controller_idx,
+                    device_addr
+                );
+            }
+            Some(Err(e)) => {
+                log::warn!("USB hotplugged keyboard {} unusable: {:?}", device_addr, e);
+            }
+            None => {}
+        }
+    }
+
+    #[cfg(feature = "ui")]
+    if info.is_mouse && !crate::drivers::pointer::is_usb_registered(controller_idx, device_addr) {
+        let mouse = with_controller(controller_idx, |controller| {
+            hid_mouse::init_mouse(controller, controller_idx, device_addr)
+        });
+        match mouse {
+            Some(Ok(mouse)) => {
+                crate::drivers::pointer::register(Box::new(mouse));
+                log::info!(
+                    "USB: Hotplugged mouse on controller {} device {}",
+                    controller_idx,
+                    device_addr
+                );
+            }
+            Some(Err(e)) => {
+                log::warn!("USB hotplugged mouse {} unusable: {:?}", device_addr, e);
+            }
+            None => {}
+        }
+    }
+
+    if info.is_mass_storage {
+        return mass_storage::probe(controller_idx, device_addr);
+    }
+
+    false
+}
+
 /// Find every mass storage device on every controller.
 ///
 /// Returns `(controller_index, device_address)` pairs, or none once the
@@ -715,5 +854,9 @@ impl UsbController for XhciController {
             interval: slot.interrupt_interval,
             toggle: false,
         })
+    }
+
+    fn poll_hotplug(&mut self, events: &mut alloc::vec::Vec<self::controller::UsbHotplugEvent>) {
+        xhci::XhciController::poll_hotplug(self, events);
     }
 }

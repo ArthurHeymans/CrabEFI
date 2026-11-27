@@ -160,7 +160,23 @@ impl super::XhciController {
             .any(|poll| poll.capture(raw))
     }
 
-    fn poll_interrupt_events(&mut self) -> Result<(), XhciError> {
+    pub(super) fn clear_interrupt_polls_for_slot(&mut self, slot_id: u8, slot_disabled: bool) {
+        let mut idx = 0;
+        while idx < self.interrupt_polls.len() {
+            if self.interrupt_polls[idx].slot == slot_id {
+                let mut poll = self.interrupt_polls.swap_remove(idx);
+                if slot_disabled {
+                    // Disable Slot completion proved the controller stopped
+                    // all endpoints on this slot, so the DMA buffer is safe to free.
+                    poll.td = 0;
+                }
+            } else {
+                idx += 1;
+            }
+        }
+    }
+
+    pub(super) fn poll_interrupt_events(&mut self) -> Result<(), XhciError> {
         // Bounded even if hardware keeps publishing events while we poll.
         // Command/bulk operations are synchronous and never overlap this poll.
         for _ in 0..self.event_ring.size {
@@ -170,8 +186,9 @@ impl super::XhciController {
             };
             if !self.capture_interrupt_event(raw) {
                 match event::Allowed::try_from(raw) {
-                    // USB hotplug is not implemented, as in the synchronous waiters.
-                    Ok(event::Allowed::PortStatusChange(_)) => {}
+                    Ok(event::Allowed::PortStatusChange(_)) => {
+                        self.port_change_pending = true;
+                    }
                     Ok(event::Allowed::HostController(host)) => {
                         return Err(XhciError::TransferFailed(host.completion_code()));
                     }

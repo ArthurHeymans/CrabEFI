@@ -27,6 +27,7 @@ pub struct UiState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
     Boot(usize),
+    Refresh,
     Reset,
     Exit,
 }
@@ -115,6 +116,10 @@ pub trait Backend {
     fn set_text_size(&mut self, _size: TextSize) {}
     fn observe(&mut self, _state: UiState) {}
     fn observe_dialog(&mut self, _title: Option<&str>) {}
+    /// Returns `true` when hotplug storage changes require rebuilding the boot menu.
+    fn storage_changed(&mut self) -> bool {
+        false
+    }
 }
 
 /// A framebuffer and its host services. Drawing primitives still use the
@@ -250,6 +255,9 @@ impl Surface {
     }
     pub fn observe_dialog(&self, title: Option<&str>) {
         self.backend.borrow_mut().observe_dialog(title);
+    }
+    pub fn storage_changed(&self) -> bool {
+        self.backend.borrow_mut().storage_changed()
     }
 }
 

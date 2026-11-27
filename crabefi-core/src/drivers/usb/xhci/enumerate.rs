@@ -1,7 +1,8 @@
 //! xHCI port enumeration and hubs.
 
 use super::super::controller::{
-    HUB_DESCRIPTOR_TYPE, hub_feature, hub_port_change, hub_port_status, req_type, request,
+    HUB_DESCRIPTOR_TYPE, UsbHotplugEvent, hub_feature, hub_port_change, hub_port_status, req_type,
+    request,
 };
 use super::XhciError;
 use super::speed::{BOS_DESCRIPTOR_TYPE, BosHeader, LinkSpeed, SublinkSpeeds};
@@ -238,6 +239,31 @@ const MOVED_DEVICE_TIMEOUT_MS: u64 = 500;
 
 /// How often a root port is brought up again after its device left it.
 const MAX_PORT_RETRIES: u8 = 2;
+
+/// Per-root-port hotplug state machine for non-blocking runtime polling.
+#[derive(Clone, Copy)]
+pub(super) enum RootPortState {
+    /// No device attached.
+    Empty,
+    /// Connection seen; waiting for a stable USB 2.0 debounce window.
+    Debouncing {
+        stable_since: Timeout,
+        deadline: Timeout,
+    },
+    /// USB3 port in Polling state; waiting for link training to reach U0.
+    LinkTraining { deadline: Timeout },
+    /// Port reset asserted; waiting for Port Reset Change.
+    Resetting { is_usb3: bool, deadline: Timeout },
+    /// USB3 warm port reset asserted; waiting for Warm Port Reset Change.
+    WarmResetting { deadline: Timeout },
+    /// Device attached and active at `slot_id`.
+    Attached { slot_id: u8 },
+    /// Enumeration failed while connected; wait for disconnect before retrying.
+    Failed,
+}
+
+/// How often attached hubs are polled for downstream port connect/disconnect.
+const HUB_POLL_INTERVAL_MS: u64 = 200;
 
 /// Root ports already brought up during enumeration.
 struct RootPortScan {
@@ -931,6 +957,13 @@ impl super::XhciController {
             },
         )?;
 
+        // Record child slot in parent hub's port table for hotplug tracking.
+        if let Some(hub) = self.get_slot_mut(hub_slot_id)
+            && usize::from(hub_port) < hub.hub_port_slots.len()
+        {
+            hub.hub_port_slots[usize::from(hub_port)] = slot_id;
+        }
+
         // Now enumerate the device (get descriptor, configure, etc.)
         match self.get_device_descriptor(slot_id) {
             Ok(desc) => {
@@ -1034,7 +1067,478 @@ impl super::XhciController {
             }
         }
 
+        self.sync_root_port_states();
         Ok(())
+    }
+
+    /// Populate `self.root_ports` from the slots attached during initial boot.
+    fn sync_root_port_states(&mut self) {
+        self.root_ports
+            .resize(usize::from(self.num_ports), RootPortState::Empty);
+        for port in 0..self.num_ports {
+            let connected = self.portsc(port).current_connect_status();
+            self.root_ports[usize::from(port)] = if connected {
+                RootPortState::Failed
+            } else {
+                RootPortState::Empty
+            };
+        }
+        for (id, slot) in self.slots.iter().enumerate().skip(1) {
+            if let Some(slot) = slot.as_deref()
+                && slot.parent_hub.is_none()
+                && usize::from(slot.root_port) < self.root_ports.len()
+                && let Ok(slot_id) = u8::try_from(id)
+            {
+                self.root_ports[usize::from(slot.root_port)] = RootPortState::Attached { slot_id };
+            }
+        }
+    }
+
+    /// Snapshot which slot IDs are currently occupied.
+    fn occupied_slots(&self) -> Vec<bool> {
+        self.slots.iter().map(Option::is_some).collect()
+    }
+
+    /// Emit `Attached` events for every slot that became occupied since `before`.
+    fn emit_new_slots(&self, before: &[bool], events: &mut Vec<UsbHotplugEvent>) {
+        for (id, slot) in self.slots.iter().enumerate().skip(1) {
+            if slot.is_some()
+                && !before.get(id).copied().unwrap_or(false)
+                && let Ok(slot_id) = u8::try_from(id)
+            {
+                events.push(UsbHotplugEvent::Attached(slot_id));
+            }
+        }
+    }
+
+    /// Advance non-blocking hotplug state for all root ports and attached hubs.
+    pub(in crate::drivers::usb) fn poll_hotplug(&mut self, events: &mut Vec<UsbHotplugEvent>) {
+        // Drain any pending Port Status Change / interrupt completions.
+        let _ = self.poll_interrupt_events();
+        self.port_change_pending = false;
+
+        let num_ports = self.num_ports.min(self.root_ports.len() as u8);
+        for port in 0..num_ports {
+            self.poll_root_port(port, events);
+        }
+
+        // Periodically poll attached hubs for downstream connect/disconnect.
+        let poll_hubs = self.next_hub_poll.as_ref().is_none_or(Timeout::is_expired);
+        if poll_hubs {
+            self.next_hub_poll = Some(Timeout::from_ms(HUB_POLL_INTERVAL_MS));
+            self.poll_hubs(events);
+        }
+    }
+
+    fn poll_root_port(&mut self, port: u8, events: &mut Vec<UsbHotplugEvent>) {
+        let status = self.portsc(port);
+        let connected = status.current_connect_status();
+        let csc = status.connect_status_change();
+        let state = self.root_ports[usize::from(port)];
+
+        match state {
+            RootPortState::Attached { slot_id } => {
+                if !connected || csc {
+                    log::info!(
+                        "xHCI: Port {} disconnected (slot {}, ccs={}, csc={})",
+                        port,
+                        slot_id,
+                        connected,
+                        csc
+                    );
+                    self.clear_port_changes(port);
+                    self.detach_slot(slot_id, events);
+                    self.root_ports[usize::from(port)] = if connected {
+                        RootPortState::Debouncing {
+                            stable_since: Timeout::from_ms(CONNECTION_DEBOUNCE_MS),
+                            deadline: Timeout::from_ms(CONNECTION_TIMEOUT_MS),
+                        }
+                    } else {
+                        RootPortState::Empty
+                    };
+                }
+            }
+            RootPortState::Empty => {
+                if connected {
+                    if csc {
+                        self.update_portsc(port, |p| {
+                            p.clear_connect_status_change();
+                        });
+                    }
+                    self.root_ports[usize::from(port)] = RootPortState::Debouncing {
+                        stable_since: Timeout::from_ms(CONNECTION_DEBOUNCE_MS),
+                        deadline: Timeout::from_ms(CONNECTION_TIMEOUT_MS),
+                    };
+                }
+            }
+            RootPortState::Debouncing {
+                stable_since,
+                deadline,
+            } => {
+                if !connected {
+                    self.clear_port_changes(port);
+                    self.root_ports[usize::from(port)] = RootPortState::Empty;
+                } else if csc {
+                    self.update_portsc(port, |p| {
+                        p.clear_connect_status_change();
+                    });
+                    self.root_ports[usize::from(port)] = RootPortState::Debouncing {
+                        stable_since: Timeout::from_ms(CONNECTION_DEBOUNCE_MS),
+                        deadline,
+                    };
+                } else if stable_since.is_expired() {
+                    self.begin_root_port_bringup(port, events);
+                } else if deadline.is_expired() {
+                    self.root_ports[usize::from(port)] = RootPortState::Failed;
+                }
+            }
+            RootPortState::LinkTraining { deadline } => {
+                if !connected {
+                    self.clear_port_changes(port);
+                    self.root_ports[usize::from(port)] = RootPortState::Empty;
+                } else if status.port_link_state() == 0 && status.port_enabled_disabled() {
+                    self.finish_root_port_attach(port, events);
+                } else if deadline.is_expired() {
+                    log::debug!(
+                        "xHCI: Port {} USB3 link training timed out (PLS={})",
+                        port,
+                        status.port_link_state()
+                    );
+                    self.root_ports[usize::from(port)] = RootPortState::Failed;
+                }
+            }
+            RootPortState::Resetting { is_usb3, deadline } => {
+                if !connected {
+                    self.clear_port_changes(port);
+                    self.root_ports[usize::from(port)] = RootPortState::Empty;
+                } else if status.port_reset_change() || deadline.is_expired() {
+                    if status.port_reset_change() {
+                        self.update_portsc(port, |p| {
+                            p.clear_port_reset_change();
+                        });
+                    }
+                    let after = self.portsc(port);
+                    if after.port_link_state() == 0 && after.port_enabled_disabled() {
+                        self.finish_root_port_attach(port, events);
+                    } else if is_usb3 {
+                        log::debug!(
+                            "xHCI: Port {} USB3 reset PLS={}, trying warm reset",
+                            port,
+                            after.port_link_state()
+                        );
+                        self.update_portsc(port, |p| {
+                            p.set_warm_port_reset();
+                        });
+                        self.root_ports[usize::from(port)] = RootPortState::WarmResetting {
+                            deadline: Timeout::from_ms(200),
+                        };
+                    } else {
+                        self.root_ports[usize::from(port)] = if after.current_connect_status() {
+                            RootPortState::Failed
+                        } else {
+                            RootPortState::Empty
+                        };
+                    }
+                }
+            }
+            RootPortState::WarmResetting { deadline } => {
+                if !connected {
+                    self.clear_port_changes(port);
+                    self.root_ports[usize::from(port)] = RootPortState::Empty;
+                } else if status.warm_port_reset_change() || deadline.is_expired() {
+                    if status.warm_port_reset_change() {
+                        self.update_portsc(port, |p| {
+                            p.clear_warm_port_reset_change();
+                        });
+                    }
+                    let after = self.portsc(port);
+                    if after.port_link_state() == 0 && after.port_enabled_disabled() {
+                        self.finish_root_port_attach(port, events);
+                    } else {
+                        self.root_ports[usize::from(port)] = if after.current_connect_status() {
+                            RootPortState::Failed
+                        } else {
+                            RootPortState::Empty
+                        };
+                    }
+                }
+            }
+            RootPortState::Failed => {
+                if !connected {
+                    self.clear_port_changes(port);
+                    self.root_ports[usize::from(port)] = RootPortState::Empty;
+                }
+            }
+        }
+    }
+
+    fn begin_root_port_bringup(&mut self, port: u8, events: &mut Vec<UsbHotplugEvent>) {
+        let status = self.portsc(port);
+        let speed = status.port_speed();
+        let link_state = status.port_link_state();
+        let is_usb3 = self.is_superspeed_port(port, speed);
+
+        if link_state == 5 {
+            // RxDetect: phantom connection
+            self.root_ports[usize::from(port)] = RootPortState::Failed;
+            return;
+        }
+
+        self.clear_port_changes(port);
+
+        let status = self.portsc(port);
+        if is_usb3 && status.port_enabled_disabled() && status.port_link_state() == 0 {
+            self.finish_root_port_attach(port, events);
+        } else if is_usb3 && status.port_link_state() == 7 {
+            self.root_ports[usize::from(port)] = RootPortState::LinkTraining {
+                deadline: Timeout::from_ms(200),
+            };
+        } else if !status.port_enabled_disabled() {
+            self.update_portsc(port, |p| {
+                p.set_port_reset();
+            });
+            self.root_ports[usize::from(port)] = RootPortState::Resetting {
+                is_usb3,
+                deadline: Timeout::from_ms(150),
+            };
+        } else {
+            self.finish_root_port_attach(port, events);
+        }
+    }
+
+    fn finish_root_port_attach(&mut self, port: u8, events: &mut Vec<UsbHotplugEvent>) {
+        let before = self.occupied_slots();
+        let attached = exec::block_on(self.attach_root_port_device(port));
+        let root_slot = self
+            .slots
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find_map(|(id, slot)| {
+                let slot = slot.as_deref()?;
+                (slot.parent_hub.is_none() && slot.root_port == port)
+                    .then(|| u8::try_from(id).ok())
+                    .flatten()
+            });
+
+        if attached && let Some(slot_id) = root_slot {
+            log::info!(
+                "xHCI: Hotplugged device on port {} (slot {})",
+                port,
+                slot_id
+            );
+            self.root_ports[usize::from(port)] = RootPortState::Attached { slot_id };
+            self.emit_new_slots(&before, events);
+        } else {
+            // Clean up any partial slot allocated before a mid-attach disconnect.
+            if let Some(slot_id) = root_slot {
+                let mut discarded = Vec::new();
+                self.detach_slot(slot_id, &mut discarded);
+            }
+            self.root_ports[usize::from(port)] = if self.portsc(port).current_connect_status() {
+                RootPortState::Failed
+            } else {
+                RootPortState::Empty
+            };
+        }
+    }
+
+    fn poll_hubs(&mut self, events: &mut Vec<UsbHotplugEvent>) {
+        let hubs: Vec<(u8, u8, u8, bool, u16, u32)> = self
+            .slots
+            .iter()
+            .enumerate()
+            .skip(1)
+            .filter_map(|(id, slot)| {
+                let slot = slot.as_deref()?;
+                if !slot.is_hub || slot.hub_ports == 0 {
+                    return None;
+                }
+                let slot_id = u8::try_from(id).ok()?;
+                Some((
+                    slot_id,
+                    slot.hub_ports,
+                    slot.root_port,
+                    slot.is_superspeed,
+                    slot.device_desc.bcd_usb,
+                    slot.route_string,
+                ))
+            })
+            .collect();
+
+        for (hub_slot_id, num_ports, root_port, hub_is_superspeed, bcd_usb, parent_route) in hubs {
+            if self.get_slot(hub_slot_id).is_none() {
+                continue;
+            }
+            for p in 1..=num_ports.min(15) {
+                let mut status_buf = [0u8; 4];
+                if self
+                    .control_transfer(
+                        hub_slot_id,
+                        req_type::DIR_IN | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+                        request::GET_STATUS,
+                        0,
+                        u16::from(p),
+                        Some(&mut status_buf),
+                    )
+                    .is_err()
+                {
+                    break;
+                }
+                let ps = u16::from_le_bytes([status_buf[0], status_buf[1]]);
+                let pc = u16::from_le_bytes([status_buf[2], status_buf[3]]);
+                let connected = ps & hub_port_status::CONNECTION != 0;
+                let changed = pc & hub_port_change::C_CONNECTION != 0;
+                if changed {
+                    let _ = self.control_transfer(
+                        hub_slot_id,
+                        req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+                        request::CLEAR_FEATURE,
+                        hub_feature::C_PORT_CONNECTION,
+                        u16::from(p),
+                        None,
+                    );
+                }
+
+                let existing_child = self
+                    .get_slot(hub_slot_id)
+                    .map_or(0, |hub| hub.hub_port_slots[usize::from(p)]);
+
+                if existing_child != 0 && (!connected || changed) {
+                    log::info!(
+                        "xHCI: Hub {} port {} disconnected (slot {})",
+                        hub_slot_id,
+                        p,
+                        existing_child
+                    );
+                    self.detach_slot(existing_child, events);
+                }
+
+                let still_empty = self
+                    .get_slot(hub_slot_id)
+                    .is_some_and(|hub| hub.hub_port_slots[usize::from(p)] == 0);
+                if connected && still_empty {
+                    let sublinks = if hub_is_superspeed && bcd_usb >= 0x0310 {
+                        self.hub_sublink_speeds(hub_slot_id).ok().flatten()
+                    } else {
+                        None
+                    };
+                    self.hotplug_hub_port(
+                        hub_slot_id,
+                        p,
+                        root_port,
+                        hub_is_superspeed,
+                        parent_route,
+                        sublinks.as_ref(),
+                        events,
+                    );
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn hotplug_hub_port(
+        &mut self,
+        hub_slot_id: u8,
+        p: u8,
+        root_port: u8,
+        hub_is_superspeed: bool,
+        parent_route: u32,
+        sublinks: Option<&SublinkSpeeds>,
+        events: &mut Vec<UsbHotplugEvent>,
+    ) {
+        log::info!(
+            "xHCI: Hotplugging device on hub slot {} port {}",
+            hub_slot_id,
+            p
+        );
+        let _ = self.control_transfer(
+            hub_slot_id,
+            req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+            request::SET_FEATURE,
+            hub_feature::PORT_RESET,
+            u16::from(p),
+            None,
+        );
+        crate::time::delay_ms(60);
+
+        let timeout = Timeout::from_ms(500);
+        let mut speed = 0u8;
+        let mut reset_ok = false;
+        loop {
+            let mut sb = [0u8; 4];
+            if self
+                .control_transfer(
+                    hub_slot_id,
+                    req_type::DIR_IN | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+                    request::GET_STATUS,
+                    0,
+                    u16::from(p),
+                    Some(&mut sb),
+                )
+                .is_err()
+            {
+                break;
+            }
+            let ps = u16::from_le_bytes([sb[0], sb[1]]);
+            let pc = u16::from_le_bytes([sb[2], sb[3]]);
+            if pc & hub_port_change::C_RESET != 0 {
+                let _ = self.control_transfer(
+                    hub_slot_id,
+                    req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_OTHER,
+                    request::CLEAR_FEATURE,
+                    hub_feature::C_PORT_RESET,
+                    u16::from(p),
+                    None,
+                );
+                if ps & hub_port_status::ENABLE != 0 {
+                    if hub_is_superspeed {
+                        if let Ok(port_speed) =
+                            self.superspeed_hub_port_speed(hub_slot_id, p, root_port, sublinks)
+                        {
+                            speed = port_speed;
+                            reset_ok = true;
+                        }
+                    } else {
+                        speed = usb2_downstream_speed(ps);
+                        reset_ok = true;
+                    }
+                }
+                break;
+            }
+            if timeout.is_expired() {
+                break;
+            }
+            crate::time::delay_ms(10);
+        }
+
+        if !reset_ok {
+            return;
+        }
+        crate::time::delay_ms(10);
+
+        let mut route = parent_route;
+        for tier in 0..5u32 {
+            if (route >> (tier * 4)) & 0xF == 0 {
+                route |= (u32::from(p) & 0xF) << (tier * 4);
+                break;
+            }
+        }
+
+        let before = self.occupied_slots();
+        if let Err(e) =
+            exec::block_on(self.attach_device_on_hub(hub_slot_id, p, speed, route, root_port))
+        {
+            log::warn!(
+                "xHCI: Hub {} port {} hotplug failed: {:?}",
+                hub_slot_id,
+                p,
+                e
+            );
+            return;
+        }
+        self.emit_new_slots(&before, events);
     }
 
     /// Debounce a root port connection and bring its link to U0/enabled.

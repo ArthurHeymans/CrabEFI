@@ -22,7 +22,7 @@ mod text;
 pub use discovery::discover_boot_entries;
 pub(crate) use discovery::discover_entries;
 pub use text::show_menu;
-pub(crate) use text::show_menu_for_mode;
+pub(crate) use text::{MenuAction, show_menu_for_mode};
 
 use crate::drivers::pci::PciAddress;
 use crate::drivers::storage::{StorageDevice, StorageId};
@@ -103,6 +103,7 @@ fn storage_identity(id: StorageId) -> alloc::string::String {
         StorageId::Usb {
             controller_id,
             device_addr,
+            ..
         } => alloc::format!("USB controller {controller_id}, device {device_addr}"),
         StorageId::Sdhci { controller_id } => {
             alloc::format!("{} {controller_id}", id.description())
@@ -240,7 +241,8 @@ mod disk_detail_tests {
         assert!(
             storage_identity(StorageId::Usb {
                 controller_id: 4,
-                device_addr: 5
+                device_addr: 5,
+                generation: 1,
             })
             .contains("controller 4")
         );

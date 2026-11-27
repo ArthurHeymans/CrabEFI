@@ -813,6 +813,10 @@ impl crate::drivers::keyboard_common::KeyboardDevice for UsbHidKeyboard {
     fn key_state(&mut self) -> crate::platform::KeyState {
         self.keys.efi_state()
     }
+
+    fn usb_identity(&self) -> Option<(usize, u8)> {
+        Some((self.controller_idx, self.device_address))
+    }
 }
 
 impl BootKeys {

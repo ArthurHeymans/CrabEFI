@@ -371,8 +371,8 @@ fn show_boot_menu_once<const NATIVE: bool>(
         log::warn!("No bootable media found!");
 
         #[cfg(feature = "ui")]
-        if !NATIVE {
-            crate::ui::show_no_media_screen();
+        if !NATIVE && crate::ui::show_no_media_screen() {
+            return MenuOutcome::Retry;
         }
 
         return MenuOutcome::Done;
@@ -428,8 +428,11 @@ fn show_boot_menu_once<const NATIVE: bool>(
     if keep_menu && boot_menu.entry_count() == 0 {
         #[cfg(feature = "ui")]
         if graphical {
-            crate::ui::show_no_media_screen();
-            return MenuOutcome::Done;
+            return if crate::ui::show_no_media_screen() {
+                MenuOutcome::Retry
+            } else {
+                MenuOutcome::Done
+            };
         }
         // The text menu also exposes firmware/security settings without media.
     }
@@ -439,17 +442,23 @@ fn show_boot_menu_once<const NATIVE: bool>(
     // The graphical menu requires a framebuffer; the text menu also works
     // headlessly and will boot the selected entry when its timeout expires.
     #[cfg(feature = "ui")]
-    let selected = if graphical {
-        crate::ui::show_graphical_menu(&mut boot_menu)
+    let action = if graphical {
+        crate::ui::show_graphical_menu_action(&mut boot_menu)
     } else {
         menu::show_menu_for_mode::<NATIVE>(&mut boot_menu)
     };
     #[cfg(not(feature = "ui"))]
-    let selected = {
+    let action = {
         let _ = graphical;
         menu::show_menu_for_mode::<NATIVE>(&mut boot_menu)
     };
-    log::info!("Menu returned: {:?}", selected);
+    log::info!("Menu returned: {:?}", action);
+
+    let selected = match action {
+        menu::MenuAction::Selected(index) => Some(index),
+        menu::MenuAction::Refresh => return MenuOutcome::Retry,
+        menu::MenuAction::Exit => None,
+    };
 
     if let Some(selected_index) = selected {
         log::info!("Selected index: {}", selected_index);

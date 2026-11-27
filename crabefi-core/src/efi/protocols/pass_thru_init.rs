@@ -352,6 +352,7 @@ fn init_usb_device_pass_thru(controller_index: usize, device_addr: u8) {
         StorageId::Usb {
             controller_id: controller_index,
             device_addr,
+            generation: 0,
         },
     );
     publish(

@@ -155,6 +155,7 @@ extern "efiapi" fn storage_security_receive_data(
         StorageId::Usb {
             controller_id,
             device_addr,
+            ..
         } => usb_security_receive(
             controller_id,
             device_addr,
@@ -265,6 +266,7 @@ extern "efiapi" fn storage_security_send_data(
         StorageId::Usb {
             controller_id,
             device_addr,
+            ..
         } => usb_security_send(
             controller_id,
             device_addr,

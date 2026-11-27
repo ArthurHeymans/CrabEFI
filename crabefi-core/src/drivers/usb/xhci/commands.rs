@@ -58,7 +58,10 @@ impl super::XhciController {
                         }
                         return Err(XhciError::CommandFailed(completion_code));
                     }
-                    Ok(event::Allowed::PortStatusChange(_)) => continue,
+                    Ok(event::Allowed::PortStatusChange(_)) => {
+                        self.port_change_pending = true;
+                        continue;
+                    }
                     Ok(event::Allowed::HostController(host)) => {
                         log::error!(
                             "xHCI: Host Controller Event (fatal HSE), cc={:?}",
@@ -133,6 +136,10 @@ impl super::XhciController {
                     continue;
                 }
                 match event::Allowed::try_from(raw) {
+                    Ok(event::Allowed::PortStatusChange(_)) => {
+                        self.port_change_pending = true;
+                        continue;
+                    }
                     Ok(event::Allowed::TransferEvent(transfer_event)) => {
                         let event_slot = (raw[3] >> 24) as u8;
                         let event_dci = ((raw[3] >> 16) & 0x1f) as u8;

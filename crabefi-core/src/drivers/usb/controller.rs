@@ -605,6 +605,225 @@ pub struct UsbDeviceHandle {
     pub address: u8,
 }
 
+/// Hotplug event produced by a USB host controller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UsbHotplugEvent {
+    /// A newly enumerated device is ready at `address` (slot ID for xHCI).
+    Attached(u8),
+    /// The device previously at `address` has been disconnected and torn down.
+    Detached(u8),
+}
+
+/// Non-blocking per-root-port hotplug state for legacy controllers (EHCI/OHCI/UHCI).
+#[derive(Clone, Copy)]
+pub enum LegacyPortState {
+    /// No device attached.
+    Empty,
+    /// Connection seen; waiting for a stable 100 ms USB debounce window.
+    Debouncing {
+        stable_since: Timeout,
+        deadline: Timeout,
+    },
+    /// Device attached and active.
+    Attached,
+    /// Enumeration failed while connected; wait for disconnect before retrying.
+    Failed,
+}
+
+/// Action returned by [`LegacyPortState::step`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LegacyPortAction {
+    /// Keep waiting.
+    None,
+    /// Clear the port's connect-status-change bit.
+    ClearCsc,
+    /// Port disconnected (or bounced while attached); detach its device tree.
+    Detach,
+    /// Debounce finished; reset and attach the newly connected device.
+    Attach,
+}
+
+/// USB 2.0 debounce window for legacy root ports (ms).
+const LEGACY_DEBOUNCE_MS: u64 = 100;
+/// Maximum time a bouncing port stays in `Debouncing` before giving up (ms).
+const LEGACY_DEBOUNCE_TIMEOUT_MS: u64 = 1000;
+/// Hub hotplug poll interval for legacy controllers (ms).
+pub const LEGACY_HUB_POLL_INTERVAL_MS: u64 = 200;
+
+impl LegacyPortState {
+    /// Advance one legacy root port's state machine given its current `CCS` and `CSC` bits.
+    pub fn step(&mut self, connected: bool, csc: bool) -> LegacyPortAction {
+        match *self {
+            Self::Attached => {
+                if !connected || csc {
+                    *self = if connected {
+                        Self::Debouncing {
+                            stable_since: Timeout::from_ms(LEGACY_DEBOUNCE_MS),
+                            deadline: Timeout::from_ms(LEGACY_DEBOUNCE_TIMEOUT_MS),
+                        }
+                    } else {
+                        Self::Empty
+                    };
+                    LegacyPortAction::Detach
+                } else {
+                    LegacyPortAction::None
+                }
+            }
+            Self::Empty => {
+                if connected {
+                    *self = Self::Debouncing {
+                        stable_since: Timeout::from_ms(LEGACY_DEBOUNCE_MS),
+                        deadline: Timeout::from_ms(LEGACY_DEBOUNCE_TIMEOUT_MS),
+                    };
+                    if csc {
+                        LegacyPortAction::ClearCsc
+                    } else {
+                        LegacyPortAction::None
+                    }
+                } else if csc {
+                    LegacyPortAction::ClearCsc
+                } else {
+                    LegacyPortAction::None
+                }
+            }
+            Self::Debouncing {
+                stable_since,
+                deadline,
+            } => {
+                if !connected {
+                    *self = Self::Empty;
+                    LegacyPortAction::ClearCsc
+                } else if csc {
+                    *self = Self::Debouncing {
+                        stable_since: Timeout::from_ms(LEGACY_DEBOUNCE_MS),
+                        deadline,
+                    };
+                    LegacyPortAction::ClearCsc
+                } else if stable_since.is_expired() {
+                    LegacyPortAction::Attach
+                } else if deadline.is_expired() {
+                    *self = Self::Failed;
+                    LegacyPortAction::None
+                } else {
+                    LegacyPortAction::None
+                }
+            }
+            Self::Failed => {
+                if !connected {
+                    *self = Self::Empty;
+                    LegacyPortAction::ClearCsc
+                } else {
+                    LegacyPortAction::None
+                }
+            }
+        }
+    }
+}
+
+/// Allocate an unused USB address in `1..=127` for a legacy controller.
+pub fn allocate_legacy_address(devices: &[Option<UsbDevice>], next_address: &mut u8) -> Option<u8> {
+    let mut candidate = if (1..=127).contains(next_address) {
+        *next_address
+    } else {
+        1
+    };
+    for _ in 0..127 {
+        let in_use = devices.iter().flatten().any(|dev| dev.address == candidate);
+        let next = if candidate >= 127 { 1 } else { candidate + 1 };
+        if !in_use {
+            *next_address = next;
+            return Some(candidate);
+        }
+        candidate = next;
+    }
+    None
+}
+
+/// Snapshot all currently assigned addresses in a legacy device table.
+pub fn snapshot_legacy_addresses(devices: &[Option<UsbDevice>]) -> alloc::vec::Vec<u8> {
+    devices.iter().flatten().map(|dev| dev.address).collect()
+}
+
+/// Emit `Attached` events for every device in `devices` whose address was not in `before`.
+pub fn emit_new_legacy_devices(
+    devices: &[Option<UsbDevice>],
+    before: &[u8],
+    events: &mut alloc::vec::Vec<UsbHotplugEvent>,
+) {
+    for dev in devices.iter().flatten() {
+        if !before.contains(&dev.address) {
+            events.push(UsbHotplugEvent::Attached(dev.address));
+        }
+    }
+}
+
+/// Recursively detach a legacy USB device and any downstream hub children.
+pub fn detach_legacy_device(
+    devices: &mut [Option<UsbDevice>],
+    addr: u8,
+    events: &mut alloc::vec::Vec<UsbHotplugEvent>,
+) {
+    let children: alloc::vec::Vec<u8> = devices
+        .iter()
+        .flatten()
+        .filter(|dev| dev.hub_addr == addr)
+        .map(|dev| dev.address)
+        .collect();
+    for child in children {
+        detach_legacy_device(devices, child, events);
+    }
+
+    let mut removed = false;
+    for slot in devices.iter_mut() {
+        if slot.as_ref().is_some_and(|dev| dev.address == addr) {
+            *slot = None;
+            removed = true;
+        }
+    }
+    if removed {
+        events.push(UsbHotplugEvent::Detached(addr));
+    }
+}
+
+/// Detach any root-port device (and its downstream hub tree) attached to `port`.
+pub fn detach_legacy_root_port(
+    devices: &mut [Option<UsbDevice>],
+    port: u8,
+    events: &mut alloc::vec::Vec<UsbHotplugEvent>,
+) {
+    let root_addrs: alloc::vec::Vec<u8> = devices
+        .iter()
+        .flatten()
+        .filter(|dev| dev.hub_addr == 0 && dev.port == port)
+        .map(|dev| dev.address)
+        .collect();
+    for addr in root_addrs {
+        detach_legacy_device(devices, addr, events);
+    }
+}
+
+/// Sync legacy root-port states from the initial device table.
+pub fn sync_legacy_port_states(
+    devices: &[Option<UsbDevice>],
+    states: &mut [LegacyPortState],
+    mut is_connected: impl FnMut(u8) -> bool,
+) {
+    for (port, state) in states.iter_mut().enumerate() {
+        let port_u8 = port as u8;
+        let has_device = devices
+            .iter()
+            .flatten()
+            .any(|dev| dev.hub_addr == 0 && dev.port == port_u8);
+        *state = if has_device {
+            LegacyPortState::Attached
+        } else if is_connected(port_u8) {
+            LegacyPortState::Failed
+        } else {
+            LegacyPortState::Empty
+        };
+    }
+}
+
 /// Trait for USB host controller drivers
 ///
 /// This trait abstracts the differences between xHCI, EHCI, OHCI, and UHCI
@@ -867,6 +1086,10 @@ pub trait UsbController {
     fn get_interrupt_endpoint(&self, device: u8) -> Option<EndpointInfo> {
         self.get_device(device).and_then(|h| h.interrupt_in)
     }
+
+    /// Advance non-blocking hotplug state (port debounce, resets, disconnects)
+    /// and append any newly attached or detached device addresses to `events`.
+    fn poll_hotplug(&mut self, _events: &mut alloc::vec::Vec<UsbHotplugEvent>) {}
 }
 
 /// Device information
@@ -920,6 +1143,62 @@ fn legacy_mass_storage_discovery_visits_every_device() {
         &mut |addr| found.push(addr),
     );
     assert_eq!(found, [1, 3]);
+}
+
+#[cfg(test)]
+#[test]
+fn legacy_address_allocation_wraps_and_skips_in_use() {
+    let mut devices: [Option<UsbDevice>; 4] = core::array::from_fn(|_| None);
+    devices[0] = Some(UsbDevice::new(1, 0, UsbSpeed::High));
+    devices[1] = Some(UsbDevice::new(127, 1, UsbSpeed::High));
+    let mut next = 127;
+    assert_eq!(allocate_legacy_address(&devices, &mut next), Some(2));
+    assert_eq!(next, 3);
+}
+
+#[cfg(test)]
+#[test]
+fn legacy_detach_removes_hub_children_recursively() {
+    let mut hub = UsbDevice::new(1, 0, UsbSpeed::High);
+    hub.is_hub = true;
+    let child = UsbDevice::new_on_hub(2, 1, UsbSpeed::Full, 1, 1);
+    let unrelated = UsbDevice::new(3, 1, UsbSpeed::High);
+    let mut devices = [Some(hub), Some(child), Some(unrelated)];
+    let mut events = alloc::vec::Vec::new();
+
+    detach_legacy_root_port(&mut devices, 0, &mut events);
+
+    assert_eq!(
+        events,
+        [UsbHotplugEvent::Detached(2), UsbHotplugEvent::Detached(1)]
+    );
+    assert!(devices[0].is_none());
+    assert!(devices[1].is_none());
+    assert_eq!(devices[2].as_ref().map(|d| d.address), Some(3));
+}
+
+#[cfg(test)]
+#[test]
+fn legacy_port_state_handles_connect_detach_and_failed_recovery() {
+    let mut state = LegacyPortState::Empty;
+    assert_eq!(state.step(false, false), LegacyPortAction::None);
+    assert_eq!(state.step(true, true), LegacyPortAction::ClearCsc);
+    assert!(matches!(state, LegacyPortState::Debouncing { .. }));
+
+    // Disconnecting during debounce returns to Empty.
+    assert_eq!(state.step(false, false), LegacyPortAction::ClearCsc);
+    assert!(matches!(state, LegacyPortState::Empty));
+
+    // Disconnecting while attached emits Detach and resets to Empty.
+    state = LegacyPortState::Attached;
+    assert_eq!(state.step(false, true), LegacyPortAction::Detach);
+    assert!(matches!(state, LegacyPortState::Empty));
+
+    // A Failed port recovers once disconnected.
+    state = LegacyPortState::Failed;
+    assert_eq!(state.step(true, false), LegacyPortAction::None);
+    assert_eq!(state.step(false, false), LegacyPortAction::ClearCsc);
+    assert!(matches!(state, LegacyPortState::Empty));
 }
 
 /// Common USB device state shared across EHCI/OHCI/UHCI controllers

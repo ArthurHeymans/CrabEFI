@@ -1211,16 +1211,47 @@ impl UsbMassStorage {
 /// An initialized mass storage device and the controller it is attached to.
 struct RegisteredDevice {
     controller_id: usize,
+    generation: u32,
     device: UsbMassStorage,
 }
 
 /// Initialized mass storage devices.
 static DEVICES: Local<alloc::vec::Vec<RegisteredDevice>> = Local::new(alloc::vec::Vec::new());
 
+/// Monotonic generation counter so reused USB slot IDs / addresses cannot alias
+/// previously removed disks.
+static NEXT_GENERATION: crate::cell::LocalCell<u32> = crate::cell::LocalCell::new(1);
+
+fn alloc_generation() -> u32 {
+    let generation = NEXT_GENERATION.get();
+    NEXT_GENERATION.set(generation.wrapping_add(1).max(1));
+    generation
+}
+
 fn is_registered(controller_id: usize, device_addr: u8) -> bool {
     DEVICES.borrow().iter().any(|registered| {
         registered.controller_id == controller_id && registered.device.device_addr == device_addr
     })
+}
+
+/// Return the generation tag of a registered USB mass storage device.
+pub fn generation(controller_id: usize, device_addr: u8) -> Option<u32> {
+    DEVICES.borrow().iter().find_map(|registered| {
+        (registered.controller_id == controller_id && registered.device.device_addr == device_addr)
+            .then_some(registered.generation)
+    })
+}
+
+/// Remove a disconnected mass storage device from the registry.
+///
+/// Returns `true` if a registered device was removed.
+pub fn remove(controller_id: usize, device_addr: u8) -> bool {
+    let mut devices = DEVICES.borrow_mut();
+    let before = devices.len();
+    devices.retain(|registered| {
+        !(registered.controller_id == controller_id && registered.device.device_addr == device_addr)
+    });
+    devices.len() != before
 }
 
 /// Initialize and register the mass storage device at `device_addr` on
@@ -1255,6 +1286,7 @@ pub fn probe(controller_id: usize, device_addr: u8) -> bool {
 
     DEVICES.borrow_mut().push(RegisteredDevice {
         controller_id,
+        generation: alloc_generation(),
         device,
     });
     true
@@ -1274,6 +1306,28 @@ pub fn with_device<R>(
         let registered = devices.iter_mut().find(|registered| {
             registered.controller_id == controller_id
                 && registered.device.device_addr == device_addr
+        })?;
+        Some(f(&mut registered.device, controller))
+    })
+    .flatten()
+}
+
+/// Access a registered mass storage device only if its generation matches.
+///
+/// Prevents a stale `StorageId::Usb` from accessing a newly plugged device
+/// that reused the same slot ID or USB address.
+pub fn with_device_generation<R>(
+    controller_id: usize,
+    device_addr: u8,
+    expected_generation: u32,
+    f: impl FnOnce(&mut UsbMassStorage, &mut dyn UsbController) -> R,
+) -> Option<R> {
+    super::with_controller(controller_id, |controller| {
+        let mut devices = DEVICES.borrow_mut();
+        let registered = devices.iter_mut().find(|registered| {
+            registered.controller_id == controller_id
+                && registered.device.device_addr == device_addr
+                && (expected_generation == 0 || registered.generation == expected_generation)
         })?;
         Some(f(&mut registered.device, controller))
     })

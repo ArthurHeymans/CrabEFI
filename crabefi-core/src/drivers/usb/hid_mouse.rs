@@ -211,6 +211,10 @@ impl PointerDevice for UsbHidMouse {
         })?;
         self.pending.take()
     }
+
+    fn usb_identity(&self) -> Option<(usize, u8)> {
+        Some((self.controller_idx, self.device_address))
+    }
 }
 
 #[cfg(test)]

@@ -196,6 +196,9 @@ impl super::XhciController {
             event_ring: TrbRing::empty(), // Will be initialized in init()
             slots,
             interrupt_polls: alloc::vec::Vec::new(),
+            root_ports: alloc::vec![super::enumerate::RootPortState::Empty; usize::from(num_ports)],
+            port_change_pending: false,
+            next_hub_poll: None,
         };
 
         controller.init().await?;

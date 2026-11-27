@@ -36,11 +36,13 @@ pub enum NavItem {
 #[non_exhaustive]
 pub enum ScreenNav {
     Back,
+    Refresh,
     Reset,
     Nav(NavItem),
 }
 enum BootResult {
     Selected(usize),
+    Refresh,
     Reset,
     Nav(NavItem),
 }
@@ -322,6 +324,7 @@ pub async fn show_graphical_menu<E: MenuEntry>(
         let next = match screen {
             NavItem::Boot => match run_boot(fb, menu, default).await {
                 BootResult::Selected(i) => return Outcome::Boot(i),
+                BootResult::Refresh => return Outcome::Refresh,
                 BootResult::Reset => return Outcome::Reset,
                 BootResult::Nav(nav) => ScreenNav::Nav(nav),
             },
@@ -331,6 +334,7 @@ pub async fn show_graphical_menu<E: MenuEntry>(
         };
         screen = match next {
             ScreenNav::Reset => return Outcome::Reset,
+            ScreenNav::Refresh => return Outcome::Refresh,
             ScreenNav::Back => NavItem::Boot,
             ScreenNav::Nav(nav) => nav,
         };
@@ -356,6 +360,9 @@ pub async fn show_no_media_screen(fb: &FramebufferInfo) -> Outcome {
         if matches!(next, ScreenNav::Reset) {
             return Outcome::Reset;
         }
+        if matches!(next, ScreenNav::Refresh) {
+            return Outcome::Refresh;
+        }
         match no_media_destination(nav, next) {
             Some(next) => nav = next,
             None => return Outcome::Exit,
@@ -365,7 +372,7 @@ pub async fn show_no_media_screen(fb: &FramebufferInfo) -> Outcome {
 
 fn no_media_destination(current: NavItem, result: ScreenNav) -> Option<NavItem> {
     match result {
-        ScreenNav::Reset => None,
+        ScreenNav::Reset | ScreenNav::Refresh => None,
         ScreenNav::Back if current == NavItem::Boot => None,
         ScreenNav::Back => Some(NavItem::Boot),
         ScreenNav::Nav(next) => Some(next),
@@ -483,6 +490,10 @@ pub async fn empty_screen(
             }
             if fb.reset_requested() {
                 return ScreenNav::Reset;
+            }
+            if nav == NavItem::Boot && fb.storage_changed() {
+                cursor.hide(fb);
+                return ScreenNav::Refresh;
             }
             fb.wait_for_frame().await;
         }
@@ -1275,6 +1286,10 @@ async fn run_boot<E: MenuEntry>(
         observe_boot(fb, &state);
         if fb.reset_requested() {
             return BootResult::Reset;
+        }
+        if state.edit.is_none() && fb.storage_changed() {
+            cursor.hide(fb);
+            return BootResult::Refresh;
         }
         fb.wait_for_frame().await;
     }

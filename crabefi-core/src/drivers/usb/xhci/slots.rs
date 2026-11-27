@@ -140,6 +140,10 @@ pub struct UsbSlot {
     pub route_string: u32,
     /// Root hub port this device chain starts from
     pub root_port: u8,
+    /// Parent hub `(hub_slot_id, hub_port)` if attached behind a hub.
+    pub parent_hub: Option<(u8, u8)>,
+    /// Downstream child slot IDs indexed by 1-based hub port (0 = empty).
+    pub hub_port_slots: [u8; 16],
 }
 
 /// Reset is valid only for a halted endpoint. A timed-out transfer can still
@@ -431,6 +435,8 @@ impl super::XhciController {
             hub_ports: 0,
             route_string: route.route_string,
             root_port: route.root_port,
+            parent_hub: route.parent_hub,
+            hub_port_slots: [0; 16],
         })?);
         core::mem::forget(pages);
 
@@ -452,6 +458,80 @@ impl super::XhciController {
         // SET_ADDRESS recovery interval (xHCI issues the USB request).
         crate::time::delay_ms(2);
         Ok(())
+    }
+
+    /// Tear down a disconnected device slot (and any downstream hub children),
+    /// releasing its xHCI slot, interrupt DMA buffers, and context/ring pages.
+    pub(super) fn detach_slot(
+        &mut self,
+        slot_id: u8,
+        events: &mut alloc::vec::Vec<super::super::controller::UsbHotplugEvent>,
+    ) {
+        if slot_id == 0 || self.get_slot(slot_id).is_none() {
+            return;
+        }
+
+        // Recursively detach downstream hub children first.
+        let children: alloc::vec::Vec<u8> = self
+            .slots
+            .iter()
+            .enumerate()
+            .skip(1)
+            .filter_map(|(id, slot)| {
+                let slot = slot.as_deref()?;
+                (slot.parent_hub.is_some_and(|(hub, _)| hub == slot_id))
+                    .then(|| u8::try_from(id).ok())
+                    .flatten()
+            })
+            .collect();
+        for child_id in children {
+            self.detach_slot(child_id, events);
+        }
+
+        // Clear parent hub's port mapping if this slot was behind a hub.
+        if let Some((hub_slot, hub_port)) = self.get_slot(slot_id).and_then(|s| s.parent_hub)
+            && let Some(hub) = self.get_slot_mut(hub_slot)
+            && usize::from(hub_port) < hub.hub_port_slots.len()
+            && hub.hub_port_slots[usize::from(hub_port)] == slot_id
+        {
+            hub.hub_port_slots[usize::from(hub_port)] = 0;
+        }
+
+        log::info!("xHCI: Detaching slot {}", slot_id);
+
+        let mut command = command::DisableSlot::new();
+        command.set_slot_id(slot_id);
+        self.cmd_ring.enqueue(command, false);
+        barrier::mmio_write();
+        self.ring_doorbell(0, 0);
+        let disabled = self.wait_command_completion().is_ok();
+
+        self.clear_interrupt_polls_for_slot(slot_id, disabled);
+
+        if let Some(entry) = self.slots.get_mut(slot_id as usize)
+            && let Some(slot) = entry.take()
+        {
+            if disabled {
+                // SAFETY: slot_id is within the DCBAA allocated for `self.slots`.
+                unsafe {
+                    core::ptr::write_volatile((self.dcbaa as *mut u64).add(slot_id as usize), 0);
+                }
+                let _ = efi::allocator::free_pages(slot.device_context as u64, 1);
+                let _ = efi::allocator::free_pages(slot.input_context as u64, 1);
+                for ring in slot.transfer_rings.iter().flatten() {
+                    if ring.base != 0 {
+                        let _ = efi::allocator::free_pages(ring.base, 1);
+                    }
+                }
+            } else {
+                log::warn!(
+                    "xHCI: Disable Slot {} failed; retaining slot DMA pages",
+                    slot_id
+                );
+            }
+        }
+
+        events.push(super::super::controller::UsbHotplugEvent::Detached(slot_id));
     }
 }
 
