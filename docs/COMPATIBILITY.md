@@ -43,9 +43,17 @@ feature.
   CRL distribution points are logged for diagnostics only, as there is no
   network stack.
 
+## USB hotplug
+
+The boot menu discovers hot-added disks and removes entries for disconnected
+disks. EFI apps can use hot-added input devices, but disks connected while an
+app is running do not get new EFI Block I/O handles. QEMU covers storage behind
+external hubs on xHCI, UHCI, and OHCI. QEMU's `usb-hub` is full-speed and cannot
+be attached to standalone `usb-ehci`; the EHCI hotplug test uses root-attached
+devices only.
+
 ## Not supported
 
-- USB hotplug; restart after attaching a device
 - USB alternate interface settings other than the default
 - xHCI interrupt queues
 - SMBus/I²C-only touchpads
