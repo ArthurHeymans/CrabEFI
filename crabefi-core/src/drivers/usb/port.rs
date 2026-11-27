@@ -1346,13 +1346,11 @@ impl PortOps for Port {
             }
         }
         .await;
-        let reservation = guard.reservation.take();
-        if result.is_err()
-            && guard.submitted
-            && let Some(reservation) = reservation
-        {
+        if result.is_err() && guard.submitted && guard.reservation.is_some() {
             // Never release address zero on a failed reset or SET_ADDRESS
-            // while this device can still answer it.
+            // while this device can still answer it. Keep the reservation in
+            // `guard` across the cleanup awaits so cancellation still
+            // quarantines it on the root-attached hub.
             if let Some(hub) = &self.hub {
                 let _ = self
                     .hub_feature(request::CLEAR_FEATURE, hub_feature::PORT_ENABLE)
@@ -1361,11 +1359,16 @@ impl PortOps for Port {
                     status & hub_port_status::CONNECTION == 0
                         || status & hub_port_status::ENABLE == 0
                 });
-                hub.root_hub()
-                    .isolate_or_quarantine(reservation, isolated, self.root_status());
+                if let Some(reservation) = guard.reservation.take() {
+                    hub.root_hub()
+                        .isolate_or_quarantine(reservation, isolated, self.root_status());
+                }
             } else {
+                guard.submitted = false;
                 self.root_command(RootCommand::Disable);
             }
+        } else {
+            guard.submitted = false;
         }
         result
     }
