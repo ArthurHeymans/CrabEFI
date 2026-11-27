@@ -31,6 +31,8 @@ macro_rules! warn { ($($arg:tt)*) => { log_at!(warn, $($arg)*) }; }
 macro_rules! info { ($($arg:tt)*) => { log_at!(info, $($arg)*) }; }
 macro_rules! debug { ($($arg:tt)*) => { log_at!(debug, $($arg)*) }; }
 
+use core::ops::RangeInclusive;
+
 use heapless::Vec;
 use r_efi::efi;
 
@@ -59,6 +61,15 @@ pub enum AllocateType {
     AllocateMaxAddress = 1,
     /// Allocate pages at exact specified address
     AllocateAddress = 2,
+}
+
+/// End of the allowed range that [`MemoryMap::allocate_pages_in_range`] fills first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Placement {
+    /// Lowest fitting address.
+    Lowest,
+    /// Highest fitting address, as for AllocateAnyPages.
+    Highest,
 }
 
 /// Rejected [`AllocateType`] value from an EFI caller.
@@ -977,8 +988,12 @@ impl<const ENTRIES: usize, const OWNERS: usize, const ADDRESS_LIMIT: u64>
             return status;
         }
         let address = match alloc_type {
-            AllocateType::AllocateAnyPages => self.find_free_pages(num_pages, 0, u64::MAX),
-            AllocateType::AllocateMaxAddress => self.find_free_pages(num_pages, 0, *memory),
+            AllocateType::AllocateAnyPages => {
+                self.find_free_pages(num_pages, 0..=u64::MAX, PAGE_SIZE, Placement::Highest)
+            }
+            AllocateType::AllocateMaxAddress => {
+                self.find_free_pages(num_pages, 0..=*memory, PAGE_SIZE, Placement::Highest)
+            }
             AllocateType::AllocateAddress => {
                 if !memory.is_multiple_of(PAGE_SIZE) {
                     return efi::Status::INVALID_PARAMETER;
@@ -1326,31 +1341,32 @@ impl<const ENTRIES: usize, const OWNERS: usize, const ADDRESS_LIMIT: u64>
         }
     }
 
-    /// Allocate pages wholly contained in an inclusive physical-address range.
+    /// Allocate pages wholly contained in an inclusive physical-address range,
+    /// starting at a multiple of `alignment` (a power of two; at least a page).
     pub fn allocate_pages_in_range(
         &mut self,
         memory_type: MemoryType,
         num_pages: u64,
-        min_address: u64,
-        max_address: u64,
-        memory: &mut u64,
-    ) -> efi::Status {
-        if let Err(status) = self.require_active() {
-            return status;
+        range: RangeInclusive<u64>,
+        alignment: u64,
+        placement: Placement,
+    ) -> Result<u64, efi::Status> {
+        if !alignment.is_power_of_two() {
+            return Err(efi::Status::INVALID_PARAMETER);
         }
-        let Some(mut address) = self.find_free_pages(num_pages, min_address, max_address) else {
-            return efi::Status::OUT_OF_RESOURCES;
-        };
-        let status = self.allocate_pages(
+        self.require_active()?;
+        let mut address = self
+            .find_free_pages(num_pages, range, alignment, placement)
+            .ok_or(efi::Status::OUT_OF_RESOURCES)?;
+        match self.allocate_pages(
             AllocateType::AllocateAddress,
             memory_type,
             num_pages,
             &mut address,
-        );
-        if status == efi::Status::SUCCESS {
-            *memory = address;
+        ) {
+            efi::Status::SUCCESS => Ok(address),
+            status => Err(status),
         }
-        status
     }
 
     /// Allocate one contiguous runtime image and privately split its leading
@@ -1370,7 +1386,7 @@ impl<const ENTRIES: usize, const OWNERS: usize, const ADDRESS_LIMIT: u64>
         }
         self.require_active()?;
         let placement = self
-            .find_free_pages(image_pages, 0, u64::MAX)
+            .find_free_pages(image_pages, 0..=u64::MAX, PAGE_SIZE, Placement::Highest)
             .and_then(|address| PageRange::from_bytes(address, image_pages))
             .ok_or(efi::Status::OUT_OF_RESOURCES)?;
         let source = self
@@ -1456,39 +1472,41 @@ impl<const ENTRIES: usize, const OWNERS: usize, const ADDRESS_LIMIT: u64>
         false
     }
 
-    /// Find free pages that fit the requirements
-    fn find_free_pages(&self, num_pages: u64, min_addr: u64, max_addr: u64) -> Option<u64> {
+    /// Find `num_pages` of free memory wholly inside the inclusive `range`,
+    /// starting at a multiple of the power-of-two `alignment`.
+    fn find_free_pages(
+        &self,
+        num_pages: u64,
+        range: RangeInclusive<u64>,
+        alignment: u64,
+        placement: Placement,
+    ) -> Option<u64> {
+        let mask = alignment.max(PAGE_SIZE) - 1;
         let size = num_pages.checked_mul(PAGE_SIZE)?;
-        let min_addr = min_addr.checked_add(PAGE_SIZE - 1)? & !(PAGE_SIZE - 1);
 
         // EFI AllocateMaxAddress is inclusive: the final byte of the entire
         // allocation must be no greater than the caller's maximum address.
-        let max_addr = max_addr.min(ADDRESS_LIMIT);
+        let max_addr = (*range.end()).min(ADDRESS_LIMIT);
         let max_end = max_addr.checked_add(1);
 
-        // Search from high to low addresses (prefer high memory within the limit).
-        for entry in self.entries.iter().rev() {
-            if entry.get_memory_type() != Some(MemoryType::ConventionalMemory)
-                || entry.physical_start > max_addr
-                || entry.end() <= min_addr
-            {
-                continue;
+        let fit = |entry: &MemoryDescriptor| {
+            if entry.get_memory_type() != Some(MemoryType::ConventionalMemory) {
+                return None;
             }
-
-            let usable_end = max_end.map_or(entry.end(), |end| entry.end().min(end));
-            let usable_start = entry.physical_start.max(min_addr);
-            let minimum_end = usable_start.checked_add(size)?;
-            if usable_end < minimum_end {
-                continue;
+            let start = entry.physical_start.max(*range.start()).checked_add(mask)? & !mask;
+            let end = max_end.map_or(entry.end(), |end| entry.end().min(end));
+            if start.checked_add(size)? > end {
+                return None;
             }
-
-            let address = (usable_end - size) & !(PAGE_SIZE - 1);
-            if address >= usable_start {
-                return Some(address);
-            }
+            Some(match placement {
+                Placement::Lowest => start,
+                Placement::Highest => (end - size) & !mask,
+            })
+        };
+        match placement {
+            Placement::Lowest => self.entries.iter().find_map(fit),
+            Placement::Highest => self.entries.iter().rev().find_map(fit),
         }
-
-        None
     }
 
     /// Carve out a region from existing memory and mark it as a new type

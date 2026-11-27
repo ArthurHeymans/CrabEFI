@@ -653,3 +653,85 @@ fn fresh_map_starts_at_key_one_and_enforces_const_address_limit() {
     );
     assert!(addr + PAGE_SIZE - 1 <= LIMIT);
 }
+
+#[test]
+fn aligned_range_allocation_skips_r500_ramstage_reservation() {
+    const MIB: u64 = 0x10_0000;
+    let mut map = MemoryMap::<16, 8>::new();
+    map.init_from_platform(&[
+        MemoryRegion {
+            base: MIB,
+            size: 0x3f0_0000,
+            region_type: RegionType::Ram,
+        },
+        MemoryRegion {
+            base: 0x400_0000,
+            size: 0x116_4000,
+            region_type: RegionType::Reserved,
+        },
+        MemoryRegion {
+            base: 0x516_4000,
+            size: 0x7000_0000,
+            region_type: RegionType::Ram,
+        },
+    ]);
+    let kernel_pages = 0x443_a000 / PAGE_SIZE;
+    let below_4g = 16 * MIB..=0xffff_ffff;
+
+    // A NixOS kernel's 68 MiB workspace does not fit between 16 MiB and the
+    // reservation, so it goes to the first 2 MiB boundary after it.
+    let kernel = map.allocate_pages_in_range(
+        MemoryType::LoaderData,
+        kernel_pages,
+        below_4g.clone(),
+        2 * MIB,
+        Placement::Lowest,
+    );
+    assert_eq!(kernel, Ok(0x520_0000));
+    let small = map.allocate_pages_in_range(
+        MemoryType::LoaderData,
+        32 * MIB / PAGE_SIZE,
+        below_4g,
+        2 * MIB,
+        Placement::Lowest,
+    );
+    assert_eq!(small, Ok(16 * MIB));
+
+    // Highest placement fits below the inclusive limit and skips taken pages.
+    let initrd = map.allocate_pages_in_range(
+        MemoryType::LoaderData,
+        8 * MIB / PAGE_SIZE,
+        MIB..=0x37ff_ffff,
+        2 * MIB,
+        Placement::Highest,
+    );
+    assert_eq!(initrd, Ok(0x3780_0000));
+    let low = map.allocate_pages_in_range(
+        MemoryType::LoaderData,
+        8 * MIB / PAGE_SIZE,
+        MIB..=0x520_0000 - 1,
+        2 * MIB,
+        Placement::Highest,
+    );
+    assert_eq!(low, Ok(0x380_0000));
+
+    for (alignment, placement) in [(3, Placement::Lowest), (0, Placement::Highest)] {
+        let result = map.allocate_pages_in_range(
+            MemoryType::LoaderData,
+            1,
+            0..=u64::MAX,
+            alignment,
+            placement,
+        );
+        assert_eq!(result, Err(efi::Status::INVALID_PARAMETER));
+    }
+    let too_high = map.allocate_pages_in_range(
+        MemoryType::LoaderData,
+        kernel_pages,
+        0xffe0_0000..=0xffff_ffff,
+        2 * MIB,
+        Placement::Lowest,
+    );
+    assert_eq!(too_high, Err(efi::Status::OUT_OF_RESOURCES));
+    map.check_well_formed().unwrap();
+}
