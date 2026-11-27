@@ -146,40 +146,7 @@ impl Pipe {
         .ok_or(UsbError::Disconnected)?
     }
 
-    pub(super) async fn hid_report(self, endpoint: u8) -> Result<(u8, Option<Vec<u8>>), UsbError> {
-        let config = self.configuration().await?;
-        let iface = config.interfaces[..config.num_interfaces]
-            .iter()
-            .find(|iface| {
-                (iface.is_hid_keyboard() || iface.is_hid_mouse())
-                    && iface
-                        .find_interrupt_in()
-                        .is_some_and(|ep| ep.number == endpoint)
-            })
-            .ok_or(UsbError::DeviceNotFound)?;
-        let number = iface.interface_number;
-        let length = usize::from(iface.hid_report_descriptor_length);
-        if !(1..=4096).contains(&length) {
-            return Ok((number, None));
-        }
-        let mut data = alloc::vec![0; length];
-        let result = self
-            .control(
-                Control::descriptor(
-                    req_type::RCPT_INTERFACE,
-                    desc_type::HID_REPORT,
-                    u16::from(number),
-                ),
-                Some(&mut data),
-            )
-            .await;
-        match result {
-            Ok(actual) if actual == length => Ok((number, Some(data))),
-            Err(UsbError::Timeout) => Err(UsbError::Timeout),
-            _ => Ok((number, None)),
-        }
-    }
-
+    #[cfg(feature = "xhci")]
     pub(super) async fn configuration(self) -> Result<ConfigurationInfo, UsbError> {
         read_configuration(async |buffer| {
             self.control(
@@ -190,6 +157,114 @@ impl Pipe {
         })
         .await
     }
+}
+
+pub(super) async fn hid_report(
+    endpoint: u8,
+    control: &mut impl AsyncFnMut(Control, Option<&mut [u8]>) -> Result<usize, UsbError>,
+) -> Result<(u8, Option<Vec<u8>>), UsbError> {
+    let config = read_configuration(async |buffer| {
+        control(
+            Control::descriptor(req_type::RCPT_DEVICE, desc_type::CONFIGURATION, 0),
+            Some(buffer),
+        )
+        .await
+    })
+    .await?;
+    let iface = config.interfaces[..config.num_interfaces]
+        .iter()
+        .find(|iface| {
+            (iface.is_hid_keyboard() || iface.is_hid_mouse())
+                && iface
+                    .find_interrupt_in()
+                    .is_some_and(|ep| ep.number == endpoint)
+        })
+        .ok_or(UsbError::DeviceNotFound)?;
+    let number = iface.interface_number;
+    let length = usize::from(iface.hid_report_descriptor_length);
+    if !(1..=4096).contains(&length) {
+        return Ok((number, None));
+    }
+    let mut data = alloc::vec![0; length];
+    let result = control(
+        Control::descriptor(
+            req_type::RCPT_INTERFACE,
+            desc_type::HID_REPORT,
+            u16::from(number),
+        ),
+        Some(&mut data),
+    )
+    .await;
+    match result {
+        Ok(actual) if actual == length => Ok((number, Some(data))),
+        Err(UsbError::Timeout) => Err(UsbError::Timeout),
+        _ => Ok((number, None)),
+    }
+}
+
+#[cfg(test)]
+pub(super) fn fake_hid_descriptor(
+    value: u16,
+    index: u16,
+    data: &mut [u8],
+    interface: u8,
+    endpoint: u8,
+    protocol: u8,
+    report: Option<&[u8]>,
+) -> Result<usize, UsbError> {
+    let length = u16::try_from(report.map_or(0, <[u8]>::len))
+        .unwrap()
+        .to_le_bytes();
+    let config = [
+        9,
+        desc_type::CONFIGURATION,
+        34,
+        0,
+        1,
+        1,
+        0,
+        0x80,
+        50,
+        9,
+        desc_type::INTERFACE,
+        interface,
+        0,
+        1,
+        3,
+        1,
+        protocol,
+        0,
+        9,
+        desc_type::HID,
+        0x11,
+        1,
+        0,
+        1,
+        desc_type::HID_REPORT,
+        length[0],
+        length[1],
+        7,
+        desc_type::ENDPOINT,
+        0x80 | endpoint,
+        3,
+        8,
+        0,
+        10,
+    ];
+    let bytes = match (value >> 8) as u8 {
+        desc_type::CONFIGURATION => {
+            assert_eq!(index, 0);
+            &config
+        }
+        desc_type::HID_REPORT => {
+            assert_eq!(index, u16::from(interface));
+            report.ok_or(UsbError::NotSupported)?
+        }
+        _ => unreachable!("unexpected descriptor request"),
+    };
+    let count = bytes.len().min(data.len());
+    data[..count].copy_from_slice(&bytes[..count]);
+    Ok(count)
 }
 
 pub(super) async fn read_configuration(

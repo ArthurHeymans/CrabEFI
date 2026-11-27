@@ -7,8 +7,8 @@
 //! - USB HID Specification 1.11
 //! - libpayload usbhid.c
 
-use super::controller::{UsbController, UsbError, hid_request, req_type};
-use super::port::{Control, Pipe};
+use super::controller::{EndpointInfo, UsbController, UsbError, hid_request, req_type};
+use super::port::{Control, Pipe, hid_report};
 use crate::drivers::hid_descriptor::{input_capacity, input_size, parse};
 use crate::time::Timeout;
 use alloc::vec::Vec;
@@ -163,33 +163,6 @@ impl UsbHidKeyboard {
         }
     }
 
-    /// Set boot protocol mode
-    pub fn set_boot_protocol<C: UsbController + ?Sized>(
-        &mut self,
-        controller: &mut C,
-    ) -> Result<(), UsbError> {
-        self.interface_number =
-            controller.hid_interface_number(self.device_address, self.endpoint)?;
-        self.report = None;
-        // Fetch the descriptor even for boot keyboards. BMC gadgets may reject
-        // SET_PROTOCOL and retain report protocol; use their actual layout then.
-        if let Ok(bytes) =
-            controller.hid_report_descriptor(self.device_address, self.interface_number)
-        {
-            self.load_report(&bytes);
-        }
-        // SET_PROTOCOL with protocol = 0 (boot protocol)
-        controller.control_transfer(
-            self.device_address,
-            req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_INTERFACE,
-            hid_request::SET_PROTOCOL,
-            0, // Boot protocol
-            self.interface_number as u16,
-            None,
-        )?;
-        self.use_boot_report()
-    }
-
     fn load_report(&mut self, bytes: &[u8]) {
         if let Some(descriptor) = parse(bytes)
             && let Some(capacity) = input_capacity(self.max_packet, input_size(&descriptor))
@@ -205,25 +178,6 @@ impl UsbHidKeyboard {
         let capacity = input_capacity(self.max_packet, 8).ok_or(UsbError::NotSupported)?;
         self.report_buffer.resize(capacity, 0);
         self.report = None;
-        Ok(())
-    }
-
-    /// Set idle rate (key repeat rate)
-    pub fn set_idle<C: UsbController + ?Sized>(
-        &mut self,
-        controller: &mut C,
-        rate_ms: u8,
-    ) -> Result<(), UsbError> {
-        // SET_IDLE with duration in 4ms units
-        let duration = rate_ms / 4;
-        controller.control_transfer(
-            self.device_address,
-            req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_INTERFACE,
-            hid_request::SET_IDLE,
-            (duration as u16) << 8, // Duration in high byte
-            self.interface_number as u16,
-            None,
-        )?;
         Ok(())
     }
 
@@ -690,52 +644,23 @@ impl BootKeys {
 /// USB keyboards typically have 8-10ms poll intervals
 const MIN_POLL_INTERVAL_MS: u64 = 8;
 
-/// Set up the boot-protocol keyboard at `device_addr`.
-pub fn init_keyboard<C: UsbController + ?Sized>(
-    controller: &mut C,
-    controller_idx: usize,
-    device_addr: u8,
-) -> Result<UsbHidKeyboard, UsbError> {
-    let ep_info = controller
-        .get_interrupt_endpoint(device_addr)
-        .ok_or(UsbError::DeviceNotFound)?;
-
-    log::info!(
-        "USB HID keyboard found: device {}, endpoint {}, interval {}ms",
-        device_addr,
-        ep_info.number,
-        ep_info.interval
-    );
-
-    let mut keyboard = UsbHidKeyboard::new(
-        controller_idx,
-        device_addr,
-        ep_info.number,
-        ep_info.max_packet_size,
-        ep_info.interval,
-    );
-
-    if let Err(e) = keyboard.set_boot_protocol(controller) {
-        // Never guess boot layout after a failed switch unless the descriptor
-        // supplies a usable report-protocol fallback.
-        if keyboard.report.is_none() {
-            return Err(e);
-        }
-        log::debug!("Boot protocol rejected: {:?}; using report descriptor", e);
-    }
-    // Set idle rate (30ms)
-    if let Err(e) = keyboard.set_idle(controller, 30) {
-        log::warn!("Failed to set idle rate: {:?}", e);
-    }
-    Ok(keyboard)
-}
-
 pub(super) async fn bind(pipe: Pipe) -> Result<UsbHidKeyboard, UsbError> {
     let ep = super::with_controller(pipe.controller, |host| {
         host.get_interrupt_endpoint(pipe.address)
     })
     .flatten()
     .ok_or(UsbError::DeviceNotFound)?;
+    bind_with(pipe, ep, async |request, data| {
+        pipe.control(request, data).await
+    })
+    .await
+}
+
+async fn bind_with(
+    pipe: Pipe,
+    ep: EndpointInfo,
+    mut control: impl AsyncFnMut(Control, Option<&mut [u8]>) -> Result<usize, UsbError>,
+) -> Result<UsbHidKeyboard, UsbError> {
     let mut keyboard = UsbHidKeyboard::new(
         pipe.controller,
         pipe.address,
@@ -743,23 +668,22 @@ pub(super) async fn bind(pipe: Pipe) -> Result<UsbHidKeyboard, UsbError> {
         ep.max_packet_size,
         ep.interval,
     );
-    let (interface, descriptor) = pipe.hid_report(ep.number).await?;
+    let (interface, descriptor) = hid_report(ep.number, &mut control).await?;
     keyboard.interface_number = interface;
     if let Some(descriptor) = descriptor {
         keyboard.load_report(&descriptor);
     }
     let request_type = req_type::TYPE_CLASS | req_type::RCPT_INTERFACE;
-    match pipe
-        .control(
-            Control::new(
-                request_type,
-                hid_request::SET_PROTOCOL,
-                0,
-                u16::from(interface),
-            ),
-            None,
-        )
-        .await
+    match control(
+        Control::new(
+            request_type,
+            hid_request::SET_PROTOCOL,
+            0,
+            u16::from(interface),
+        ),
+        None,
+    )
+    .await
     {
         Ok(_) => keyboard.use_boot_report()?,
         Err(error) if matches!(error, UsbError::Timeout) || keyboard.report.is_none() => {
@@ -767,17 +691,16 @@ pub(super) async fn bind(pipe: Pipe) -> Result<UsbHidKeyboard, UsbError> {
         }
         Err(error) => log::debug!("Boot protocol rejected: {error:?}; using report descriptor"),
     }
-    if let Err(error) = pipe
-        .control(
-            Control::new(
-                request_type,
-                hid_request::SET_IDLE,
-                (30 / 4) << 8,
-                u16::from(interface),
-            ),
-            None,
-        )
-        .await
+    if let Err(error) = control(
+        Control::new(
+            request_type,
+            hid_request::SET_IDLE,
+            (30 / 4) << 8,
+            u16::from(interface),
+        ),
+        None,
+    )
+    .await
     {
         log::warn!("Failed to set idle rate: {error:?}");
     }

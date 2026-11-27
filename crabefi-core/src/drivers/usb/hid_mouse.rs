@@ -5,7 +5,7 @@
 //! packet, then babbles because that next packet cannot fit the remaining TD.
 
 use super::controller::{EndpointInfo, UsbController, UsbError, hid_request, req_type};
-use super::port::{Control, Pipe};
+use super::port::{Control, Pipe, hid_report};
 use crate::drivers::hid_descriptor::{input_capacity, input_size, parse};
 use crate::drivers::hid_report::Mouse;
 use crate::drivers::pointer::{PointerDevice, PointerReport};
@@ -130,91 +130,46 @@ impl UsbHidMouse {
     }
 }
 
-/// Register a mouse in report protocol when its descriptor can be decoded,
-/// otherwise require a successful switch to the fixed boot mouse protocol.
-pub fn init_mouse<C: UsbController + ?Sized>(
-    controller: &mut C,
-    controller_idx: usize,
-    device_addr: u8,
-) -> Result<UsbHidMouse, UsbError> {
-    let ep = controller
-        .get_mouse_interrupt_endpoint(device_addr)
-        .ok_or(UsbError::DeviceNotFound)?;
-    let interface = controller.hid_interface_number(device_addr, ep.number)?;
-    let descriptor = controller
-        .hid_report_descriptor(device_addr, interface)
-        .ok();
-    let mouse = mouse_for_interface(
-        Pipe {
-            controller: controller_idx,
-            address: device_addr,
-        },
-        ep,
-        interface,
-        descriptor.as_deref(),
-    )?;
-    let protocol = u16::from(mouse.report.is_some());
-    if let Err(error) = controller.control_transfer(
-        device_addr,
-        req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_INTERFACE,
-        hid_request::SET_PROTOCOL,
-        protocol,
-        u16::from(interface),
-        None,
-    ) {
-        if mouse.report.is_none() {
-            return Err(error);
-        }
-        // Some BMC gadgets reject this optional request but remain in their
-        // power-on report protocol. We have their descriptor, not a boot guess.
-        log::debug!(
-            "USB mouse {} SET_PROTOCOL rejected: {:?}; using report descriptor",
-            device_addr,
-            error
-        );
-    }
-    let _ = controller.control_transfer(
-        device_addr,
-        req_type::DIR_OUT | req_type::TYPE_CLASS | req_type::RCPT_INTERFACE,
-        hid_request::SET_IDLE,
-        0,
-        u16::from(interface),
-        None,
-    );
-    Ok(mouse)
-}
-
 pub(super) async fn bind(pipe: Pipe) -> Result<UsbHidMouse, UsbError> {
     let ep = super::with_controller(pipe.controller, |host| {
         host.get_mouse_interrupt_endpoint(pipe.address)
     })
     .flatten()
     .ok_or(UsbError::DeviceNotFound)?;
-    let (interface, descriptor) = pipe.hid_report(ep.number).await?;
+    bind_with(pipe, ep, async |request, data| {
+        pipe.control(request, data).await
+    })
+    .await
+}
+
+async fn bind_with(
+    pipe: Pipe,
+    ep: EndpointInfo,
+    mut control: impl AsyncFnMut(Control, Option<&mut [u8]>) -> Result<usize, UsbError>,
+) -> Result<UsbHidMouse, UsbError> {
+    let (interface, descriptor) = hid_report(ep.number, &mut control).await?;
     let mouse = mouse_for_interface(pipe, ep, interface, descriptor.as_deref())?;
     let protocol = u16::from(mouse.report.is_some());
     let ty = req_type::TYPE_CLASS | req_type::RCPT_INTERFACE;
-    if let Err(error) = pipe
-        .control(
-            Control::new(
-                ty,
-                hid_request::SET_PROTOCOL,
-                protocol,
-                u16::from(interface),
-            ),
-            None,
-        )
-        .await
+    if let Err(error) = control(
+        Control::new(
+            ty,
+            hid_request::SET_PROTOCOL,
+            protocol,
+            u16::from(interface),
+        ),
+        None,
+    )
+    .await
         && (matches!(error, UsbError::Timeout) || mouse.report.is_none())
     {
         return Err(error);
     }
-    let _ = pipe
-        .control(
-            Control::new(ty, hid_request::SET_IDLE, 0, u16::from(interface)),
-            None,
-        )
-        .await;
+    let _ = control(
+        Control::new(ty, hid_request::SET_IDLE, 0, u16::from(interface)),
+        None,
+    )
+    .await;
     Ok(mouse)
 }
 

@@ -752,66 +752,6 @@ pub trait UsbController {
         Err(UsbError::NotSupported)
     }
 
-    /// Fetch a complete, bounded configuration; never parse a truncated prefix.
-    fn read_configuration(&mut self, device: u8) -> Result<ConfigurationInfo, UsbError> {
-        read_configuration_with(|buffer| {
-            self.control_transfer(
-                device,
-                req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
-                request::GET_DESCRIPTOR,
-                (desc_type::CONFIGURATION as u16) << 8,
-                0,
-                Some(buffer),
-            )
-        })
-    }
-
-    /// Resolve the interface owning a discovered HID interrupt endpoint.
-    /// Composite devices need this interface number in every HID class request.
-    fn hid_interface_number(&mut self, device: u8, endpoint: u8) -> Result<u8, UsbError> {
-        let config = self.read_configuration(device)?;
-        config.interfaces[..config.num_interfaces]
-            .iter()
-            .find(|iface| {
-                (iface.is_hid_keyboard() || iface.is_hid_mouse())
-                    && iface
-                        .find_interrupt_in()
-                        .is_some_and(|ep| ep.number == endpoint)
-            })
-            .map(|iface| iface.interface_number)
-            .ok_or(UsbError::DeviceNotFound)
-    }
-
-    /// Read the report descriptor for one active HID interface.
-    fn hid_report_descriptor(
-        &mut self,
-        device: u8,
-        interface: u8,
-    ) -> Result<alloc::vec::Vec<u8>, UsbError> {
-        let config = self.read_configuration(device)?;
-        let length = config.interfaces[..config.num_interfaces]
-            .iter()
-            .find(|iface| iface.interface_number == interface)
-            .map(|iface| usize::from(iface.hid_report_descriptor_length))
-            .ok_or(UsbError::DeviceNotFound)?;
-        if !(1..=4096).contains(&length) {
-            return Err(UsbError::NotSupported);
-        }
-        let mut descriptor = alloc::vec![0u8; length];
-        let actual = self.control_transfer(
-            device,
-            req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_INTERFACE,
-            request::GET_DESCRIPTOR,
-            u16::from(desc_type::HID_REPORT) << 8,
-            u16::from(interface),
-            Some(&mut descriptor),
-        )?;
-        if actual != length {
-            return Err(UsbError::InvalidParameter);
-        }
-        Ok(descriptor)
-    }
-
     /// Create an interrupt transfer queue
     ///
     /// # Arguments
@@ -862,36 +802,6 @@ pub trait UsbController {
         self.devices()
             .iter()
             .find_map(|h| h.as_ref().filter(|h| h.address == address))
-    }
-
-    /// Find the first mass storage device address/slot ID, if any.
-    fn find_mass_storage(&self) -> Option<u8> {
-        self.devices()
-            .iter()
-            .find_map(|h| h.as_ref().filter(|h| h.is_mass_storage).map(|h| h.address))
-    }
-
-    /// Visit every mass storage device address on this controller.
-    fn for_each_mass_storage(&self, f: &mut dyn FnMut(u8)) {
-        for_each_mass_storage_device(self.devices(), f);
-    }
-
-    /// Visit every HID boot keyboard address/slot ID on this controller.
-    fn for_each_hid_keyboard(&self, f: &mut dyn FnMut(u8)) {
-        self.devices()
-            .iter()
-            .flatten()
-            .filter(|device| device.is_hid_keyboard)
-            .for_each(|device| f(device.address));
-    }
-
-    /// Visit every HID boot mouse address/slot ID on this controller.
-    fn for_each_hid_mouse(&self, f: &mut dyn FnMut(u8)) {
-        self.devices()
-            .iter()
-            .flatten()
-            .filter(|device| device.is_hid_mouse)
-            .for_each(|device| f(device.address));
     }
 
     /// Get mouse interrupt endpoint info for a device
@@ -946,28 +856,6 @@ pub struct DeviceInfo {
 // ============================================================================
 // Common USB Device State
 // ============================================================================
-
-fn for_each_mass_storage_device(devices: &[Option<UsbDevice>], f: &mut dyn FnMut(u8)) {
-    for device in devices.iter().flatten().filter(|d| d.is_mass_storage) {
-        f(device.address);
-    }
-}
-
-#[cfg(test)]
-#[test]
-fn legacy_mass_storage_discovery_visits_every_device() {
-    let mut first = UsbDevice::new(1, 0, UsbSpeed::High);
-    first.is_mass_storage = true;
-    let keyboard = UsbDevice::new(2, 1, UsbSpeed::High);
-    let mut second = UsbDevice::new(3, 2, UsbSpeed::High);
-    second.is_mass_storage = true;
-    let mut found = alloc::vec::Vec::new();
-    for_each_mass_storage_device(
-        &[Some(first), Some(keyboard), None, Some(second)],
-        &mut |addr| found.push(addr),
-    );
-    assert_eq!(found, [1, 3]);
-}
 
 #[cfg(test)]
 #[test]
@@ -1261,19 +1149,6 @@ impl<'a> Iterator for DescriptorIterator<'a> {
 const MAX_CONFIGURATION_DESCRIPTOR_SIZE: usize = 4096;
 const MAX_CONFIGURATION_INTERFACES: usize = 8;
 const MAX_INTERFACE_ENDPOINTS: usize = 4;
-
-fn read_configuration_with(
-    mut read: impl FnMut(&mut [u8]) -> Result<usize, UsbError>,
-) -> Result<ConfigurationInfo, UsbError> {
-    let mut header = [0u8; 9];
-    let actual = read(&mut header)?;
-    let length = configuration_length(&header, actual)?;
-    let mut buffer = alloc::vec![0; length];
-    if read(&mut buffer)? != length {
-        return Err(UsbError::InvalidParameter);
-    }
-    parse_configuration_checked(&buffer)
-}
 
 pub(super) fn configuration_length(header: &[u8; 9], actual: usize) -> Result<usize, UsbError> {
     if actual != header.len() || header[0] != 9 || header[1] != desc_type::CONFIGURATION {
