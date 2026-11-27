@@ -50,7 +50,9 @@ pub extern "efiapi" fn efi_main(_image_handle: Handle, system_table: *mut System
     }
 
     #[cfg(feature = "hotplug-input")]
-    if let Err(status) = wait_for_hotplug_key(system_table) {
+    if let Err(status) = wait_for_hotplug_key(system_table, true)
+        .and_then(|()| wait_for_hotplug_key(system_table, false))
+    {
         return status;
     }
 
@@ -100,7 +102,7 @@ pub extern "efiapi" fn efi_main(_image_handle: Handle, system_table: *mut System
 }
 
 #[cfg(feature = "hotplug-input")]
-fn wait_for_hotplug_key(system_table: *mut SystemTable) -> Result<(), Status> {
+fn wait_for_hotplug_key(system_table: *mut SystemTable, use_events: bool) -> Result<(), Status> {
     use r_efi::protocols::simple_text_input::InputKey;
 
     let (input, output, boot_services) = unsafe {
@@ -120,18 +122,26 @@ fn wait_for_hotplug_key(system_table: *mut SystemTable) -> Result<(), Status> {
         }
         unsafe { ((*output).output_string)(output, chars.as_mut_ptr()) };
     };
-    print("USB HOTPLUG: waiting for keyboard\r\n");
+    let (expected, done) = if use_events {
+        print("USB HOTPLUG: waiting for keyboard\r\n");
+        (b'h', "USB HOTPLUG: received h\r\n")
+    } else {
+        print("USB HOTPLUG: polling ReadKeyStroke\r\n");
+        (b'p', "USB HOTPLUG: received p by direct poll\r\n")
+    };
     let (mut event, mut index) = (unsafe { (*input).wait_for_key }, 0);
     loop {
-        let status = unsafe { ((*boot_services).wait_for_event)(1, &mut event, &mut index) };
-        if status != Status::SUCCESS {
-            return Err(status);
+        if use_events {
+            let status = unsafe { ((*boot_services).wait_for_event)(1, &mut event, &mut index) };
+            if status != Status::SUCCESS {
+                return Err(status);
+            }
         }
         let mut key = InputKey::default();
         if unsafe { ((*input).read_key_stroke)(input, &mut key) } == Status::SUCCESS
-            && key.unicode_char == u16::from(b'h')
+            && key.unicode_char == u16::from(expected)
         {
-            print("USB HOTPLUG: received h\r\n");
+            print(done);
             return Ok(());
         }
     }

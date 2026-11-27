@@ -102,6 +102,8 @@ extern "efiapi" fn text_input_ex_read_key_stroke(
         return Status::INVALID_PARAMETER;
     }
 
+    crate::efi::poll_idle();
+
     // Get current shift/toggle state (always valid, even if no key pressed)
     let (shift_state, toggle_state) = keyboard::get_efi_key_state();
 

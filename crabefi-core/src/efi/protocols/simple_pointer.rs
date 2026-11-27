@@ -133,6 +133,8 @@ unsafe extern "efiapi" fn pointer_get_state(
         return Status::INVALID_PARAMETER;
     }
 
+    crate::efi::poll_idle();
+
     // Report motion and button-only transitions.
     pointer::poll();
     if !pointer::is_ready() {

@@ -28,6 +28,12 @@ pub mod varstore;
 use r_efi::efi::Guid;
 use r_efi::efi::{self, Status};
 
+/// Give cooperative firmware work a turn while an EFI app polls for input.
+/// Call before borrowing the input registries: discovery can add/remove devices.
+fn poll_idle() {
+    crate::exec::poll_background();
+}
+
 /// Initialize the EFI environment from platform configuration.
 pub fn init_from_platform(config: &mut crate::platform::PlatformConfig) {
     log::info!("Initializing EFI environment (platform path)...");

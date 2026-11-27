@@ -25,14 +25,12 @@ pub(crate) fn run(config: &QemuConfig, disk: &Path) -> Result<()> {
         let mut qemu = Command::new("qemu-system-x86_64");
         // Ensure that the app can only get keyboard input from the hotplugged
         // USB device rather than the usual QEMU PS/2 keyboard.
-        qemu.args([
-            "-machine",
-            "q35,usb=off,i8042=off",
-            "-cpu",
-            "max",
-            "-m",
-            "2G",
-        ]);
+        qemu.args(["-machine", "q35,usb=off,i8042=off", "-m", "2G"]);
+        if !config.disable_kvm && super::is_kvm_available() {
+            qemu.args(["-enable-kvm", "-cpu", "host"]);
+        } else {
+            qemu.args(["-cpu", "max"]);
+        }
         add_x86_boot_args(&mut qemu, &config.coreboot_rom, CaptureScenario::BootSmoke);
         qemu.args(["-display", "none", "-monitor", "none"]);
         qemu.args(["-serial", &format!("file:{}", serial.display())]);
@@ -166,6 +164,12 @@ impl<'a> Scenario<'a> {
         self.marker("USB: attached keyboard")?;
         self.qmp.key("h")?;
         self.marker("USB HOTPLUG: received h")?;
+        self.marker("USB HOTPLUG: polling ReadKeyStroke")?;
+        self.qmp.delete("app-keyboard")?;
+        self.add("usb-kbd", "poll-keyboard", "1", None)?;
+        self.marker("USB: attached keyboard")?;
+        self.qmp.key("p")?;
+        self.marker("USB HOTPLUG: received p by direct poll")?;
         self.marker("EFI app executed successfully!")
     }
 

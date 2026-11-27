@@ -362,7 +362,7 @@ pub(super) extern "efiapi" fn check_event(event: efi::Event) -> Status {
     // Poll hardware without holding a table borrow: platform input can reenter.
     // Background discovery can register new input devices. It does not
     // publish Block I/O handles for storage added while this app runs.
-    crate::exec::poll_background();
+    crate::efi::poll_idle();
     let ready = match event_id {
         KEYBOARD_EVENT_ID => crate::efi::protocols::console::keyboard_check_ready(),
         #[cfg(feature = "ui")]
