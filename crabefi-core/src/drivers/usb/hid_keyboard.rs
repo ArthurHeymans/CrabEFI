@@ -110,6 +110,10 @@ pub struct UsbHidKeyboard {
     pub(crate) keys: BootKeys,
     /// Earliest time of the next poll
     next_poll: Option<Timeout>,
+    /// Consecutive terminal poll failures
+    error_count: u8,
+    /// Stop polling after repeated terminal failures until replug
+    poll_disabled: bool,
     report_buffer: Vec<u8>,
     report: Option<crate::drivers::hid_report::Keyboard>,
 }
@@ -158,6 +162,8 @@ impl UsbHidKeyboard {
             interval,
             keys: BootKeys::default(),
             next_poll: None,
+            error_count: 0,
+            poll_disabled: false,
             report_buffer: alloc::vec![0; 8],
             report: None,
         }
@@ -708,9 +714,15 @@ async fn bind_with(
 }
 
 impl UsbHidKeyboard {
+    const MAX_CONSECUTIVE_ERRORS: u8 = 3;
+    const ERROR_BACKOFF_MS: u64 = 500;
+
     /// Poll for a new report, at most every [`MIN_POLL_INTERVAL_MS`], and
     /// generate key repeats.
     fn poll<C: UsbController + ?Sized>(&mut self, controller: &mut C) {
+        if self.poll_disabled {
+            return;
+        }
         if self
             .next_poll
             .as_ref()
@@ -724,6 +736,9 @@ impl UsbHidKeyboard {
     }
 
     fn poll_report<C: UsbController + ?Sized>(&mut self, controller: &mut C) {
+        if self.poll_disabled {
+            return;
+        }
         // Most real keyboards require interrupt IN; GET_REPORT is only a legacy
         // controller fallback. A pending interrupt TD is not an all-keys-up report.
         let report_id = self
@@ -747,11 +762,32 @@ impl UsbHidKeyboard {
             result => result,
         };
 
-        // No completion, short report, or error: retain the held-key state.
-        if let Ok(length) = result
-            && let Some(report) = self.decode_report(length)
-        {
-            self.keys.process_report(&report);
+        match result {
+            Ok(length) => {
+                self.error_count = 0;
+                if let Some(report) = self.decode_report(length) {
+                    self.keys.process_report(&report);
+                }
+            }
+            Err(UsbError::Nak) => {
+                self.error_count = 0;
+            }
+            Err(error) => {
+                self.error_count = self.error_count.saturating_add(1);
+                // Release held keys so an unresponsive keyboard cannot repeat forever.
+                self.keys.process_report(&KeyboardReport::default());
+                if self.error_count >= Self::MAX_CONSECUTIVE_ERRORS {
+                    log::warn!(
+                        "USB keyboard {}: polling repeatedly failed ({:?}); disabling until replug",
+                        self.device_address,
+                        error
+                    );
+                    self.poll_disabled = true;
+                } else {
+                    self.next_poll = Some(Timeout::from_ms(Self::ERROR_BACKOFF_MS));
+                }
+                return;
+            }
         }
 
         self.keys.handle_repeat();

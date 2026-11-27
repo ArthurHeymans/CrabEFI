@@ -73,6 +73,7 @@ fn boot_order(
     config: &QemuConfig,
     disk: &Path,
     topology: &Topology,
+    behind_hub: bool,
     timeout: Duration,
 ) -> Result<()> {
     let temp = tempfile::tempdir()?;
@@ -124,14 +125,14 @@ fn boot_order(
         ),
     ]);
     topology.add_args(&mut qemu);
-    let port = match topology {
-        Topology::Standalone(_) => "1",
-        Topology::Companions { .. } => {
-            // QEMU mass storage supports high and full speed. Put it behind
-            // a full-speed hub so EHCI hands that root port to UHCI.
-            qemu.args(["-device", "usb-hub,bus=hotusb.0,port=2"]);
-            "2.1"
-        }
+    let port = if behind_hub || matches!(topology, Topology::Companions { .. }) {
+        // QEMU mass storage supports high and full speed. Put it behind
+        // a full-speed hub so EHCI hands that root port to UHCI, or to test
+        // cold boot behind a hub on xHCI.
+        qemu.args(["-device", "usb-hub,bus=hotusb.0,port=2"]);
+        "2.1"
+    } else {
+        "1"
     };
     qemu.args([
         "-device",
@@ -219,16 +220,17 @@ pub(crate) fn run(config: &QemuConfig, disk: &Path) -> Result<()> {
             }
         }
     }
-    for topology in [
-        Topology::Standalone("qemu-xhci"),
-        Topology::Standalone("usb-ehci"),
-        Topology::Companions { cold: false },
+    for (topology, behind_hub, label) in [
+        (Topology::Standalone("qemu-xhci"), false, "qemu-xhci"),
+        (Topology::Standalone("qemu-xhci"), true, "qemu-xhci-hub"),
+        (Topology::Standalone("usb-ehci"), false, "usb-ehci"),
+        (
+            Topology::Companions { cold: false },
+            true,
+            "ich9-uhci-full-speed",
+        ),
     ] {
-        let label = match &topology {
-            Topology::Companions { .. } => "ich9-uhci-full-speed",
-            _ => topology.name(),
-        };
-        match boot_order(config, disk, &topology, timeout) {
+        match boot_order(config, disk, &topology, behind_hub, timeout) {
             Ok(()) => println!("[PASS] USB cold BootOrder {label}"),
             Err(error) => {
                 eprintln!("[FAIL] USB cold BootOrder {label}: {error:#}");

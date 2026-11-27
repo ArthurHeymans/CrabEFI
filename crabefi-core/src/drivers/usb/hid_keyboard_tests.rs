@@ -198,6 +198,81 @@ fn stalled_boot_protocol_uses_the_keyboard_report_descriptor_and_report_id() {
 }
 
 #[test]
+fn keyboard_polling_disables_and_releases_keys_after_repeated_errors() {
+    struct FailingController {
+        calls: usize,
+        fail: bool,
+    }
+    impl UsbController for FailingController {
+        fn controller_type(&self) -> &'static str {
+            "failing"
+        }
+        fn control_transfer(
+            &mut self,
+            _: u8,
+            _: u8,
+            _: u8,
+            _: u16,
+            _: u16,
+            data: Option<&mut [u8]>,
+        ) -> Result<usize, UsbError> {
+            self.calls += 1;
+            if self.fail {
+                return Err(UsbError::Timeout);
+            }
+            data.unwrap()[..8].copy_from_slice(&[0, 0, 4, 0, 0, 0, 0, 0]);
+            Ok(8)
+        }
+        fn interrupt_transfer(&mut self, _: u8, _: u8, _: &mut [u8]) -> Result<usize, UsbError> {
+            Err(UsbError::NotSupported)
+        }
+        fn bulk_transfer(
+            &mut self,
+            _: u8,
+            _: u8,
+            _: bool,
+            _: &mut [u8],
+        ) -> Result<usize, UsbError> {
+            unreachable!()
+        }
+        fn create_interrupt_queue(
+            &mut self,
+            _: u8,
+            _: u8,
+            _: bool,
+            _: u16,
+            _: u8,
+        ) -> Result<u32, UsbError> {
+            unreachable!()
+        }
+        fn poll_interrupt_queue(&mut self, _: u32, _: &mut [u8]) -> Option<usize> {
+            unreachable!()
+        }
+        fn destroy_interrupt_queue(&mut self, _: u32) {
+            unreachable!()
+        }
+    }
+
+    let mut keyboard = UsbHidKeyboard::new(0, 1, 1, 8, 10);
+    let mut controller = FailingController {
+        calls: 0,
+        fail: false,
+    };
+    keyboard.poll_report(&mut controller);
+    assert_eq!(keyboard.keys.get_key(), Some(u16::from(b'a')));
+    assert!(keyboard.keys.prev_report.is_key_pressed(4));
+
+    controller.fail = true;
+    for _ in 0..5 {
+        keyboard.poll_report(&mut controller);
+    }
+    // Stopped after MAX_CONSECUTIVE_ERRORS (3) + the 1 initial success = 4 total calls.
+    assert_eq!(controller.calls, 4);
+    assert!(keyboard.poll_disabled);
+    assert!(!keyboard.keys.prev_report.is_key_pressed(4));
+}
+
+#[test]
 fn interrupt_reports_preserve_keys_when_pending_or_short() {
     let mut controller = Controller::new();
     let mut keyboard = UsbHidKeyboard::new(0, 1, 1, 8, 10);

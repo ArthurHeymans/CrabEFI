@@ -122,6 +122,7 @@ pub(in crate::drivers::usb) async fn attach(
             UsbError::TransactionError
         });
     }
+    port::note_startup_progress();
     exec::sleep_ms(2).await; // SET_ADDRESS recovery
     let pipe = Pipe {
         controller: index,
@@ -151,6 +152,7 @@ async fn configure_device(pipe: Pipe) -> Result<(), UsbError> {
         controller(pipe.controller, |host| {
             host.update_full_speed_ep0_max_packet(pipe.address, u16::from(short[7]))
         })?;
+        port::note_startup_progress();
     }
     let mut descriptor = [0; 18];
     if pipe.control(get_device, Some(&mut descriptor)).await? != descriptor.len() {
@@ -198,6 +200,7 @@ async fn configure_device(pipe: Pipe) -> Result<(), UsbError> {
                 host.configure_mass_storage(pipe.address, &config),
             )
         })?;
+        port::note_startup_progress();
     }
     if interfaces.iter().any(|iface| iface.is_hid_keyboard()) {
         port::transfer().await;
@@ -208,6 +211,7 @@ async fn configure_device(pipe: Pipe) -> Result<(), UsbError> {
                 host.configure_hid_keyboard(pipe.address, &config),
             )
         })?;
+        port::note_startup_progress();
     }
     if interfaces.iter().any(|iface| iface.is_hid_mouse()) {
         port::transfer().await;
@@ -218,6 +222,7 @@ async fn configure_device(pipe: Pipe) -> Result<(), UsbError> {
                 host.configure_hid_mouse(pipe.address, &config),
             )
         })?;
+        port::note_startup_progress();
     }
     Ok(())
 }

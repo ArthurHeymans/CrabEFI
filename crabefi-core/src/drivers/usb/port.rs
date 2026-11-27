@@ -564,7 +564,7 @@ pub(super) async fn buses() {
                             #[cfg(test)]
                             test_root: None,
                         },
-                        false,
+                        0,
                     );
                 }
             }
@@ -586,9 +586,10 @@ struct PortTasks {
 }
 
 impl PortTasks {
-    fn add(&mut self, port: Port, scan_hub: bool) {
-        let initial_scan = scan_hub.then(|| StartupActivity::new(&STARTUP_ACTIVE));
-        self.ports.push(Box::pin(port_task(port, initial_scan)));
+    fn add(&mut self, port: Port, initial_scans: u8) {
+        let initial_scan = (initial_scans != 0).then(|| StartupActivity::new(&STARTUP_ACTIVE));
+        self.ports
+            .push(Box::pin(port_task(port, initial_scans, initial_scan)));
     }
 
     fn poll(&mut self, cx: &mut core::task::Context<'_>) {
@@ -620,7 +621,7 @@ struct Hub {
     quarantine: Local<Option<DefaultAddress>>,
 }
 
-const HUB_TRANSPORT_FAILURE_LIMIT: u8 = 2;
+const HUB_TRANSPORT_FAILURE_LIMIT: u8 = 3;
 
 impl Hub {
     fn parked(&self) -> bool {
@@ -644,6 +645,12 @@ impl Hub {
                 "USB hub {} port disable unconfirmed; quarantining address zero until disconnect",
                 self.address
             );
+        }
+    }
+
+    fn note_transport_success(&self) {
+        if !self.parked() {
+            self.transport_failures.set(0);
         }
     }
 
@@ -704,21 +711,47 @@ trait PortOps {
     }
 }
 
-async fn port_task(port: impl PortOps, mut initial_scan: Option<StartupActivity<'_>>) {
+async fn port_task(
+    port: impl PortOps,
+    mut initial_scans: u8,
+    mut initial_scan: Option<StartupActivity<'_>>,
+) {
     'connect: loop {
+        let mut clear_failures = 0usize;
         loop {
             if let Ok(connection) = port.connection().await {
-                if connection.changed && port.clear_change().await.is_err() {
-                    port.sleep(port.interval()).await;
-                    continue;
+                if connection.changed {
+                    match port.clear_change().await {
+                        Ok(()) => clear_failures = 0,
+                        Err(error) => {
+                            clear_failures += 1;
+                            if clear_failures >= MAX_PORT_ATTEMPTS {
+                                initial_scans = 0;
+                                drop(initial_scan.take());
+                                port.report_parked(&error);
+                                wait_for_replug(&port, false).await;
+                                continue 'connect;
+                            }
+                            port.sleep(port.interval()).await;
+                            continue;
+                        }
+                    }
+                } else {
+                    clear_failures = 0;
                 }
                 if connection.connected {
+                    initial_scans = 0;
                     break;
                 }
-                if initial_scan.take().is_some() {
+                if let Some(left) = initial_scans.checked_sub(1) {
+                    initial_scans = left;
                     note_startup_progress();
+                    if initial_scans == 0 {
+                        drop(initial_scan.take());
+                    }
                 }
             } else if port.upstream_parked() {
+                initial_scans = 0;
                 drop(initial_scan.take());
             }
             port.sleep(port.interval()).await;
@@ -726,12 +759,16 @@ async fn port_task(port: impl PortOps, mut initial_scan: Option<StartupActivity<
 
         let startup = initial_scan.take().unwrap_or_else(|| port.startup());
         let address = 'enumerate: {
+            let mut change_cleared = false;
             for attempt in 1..=MAX_PORT_ATTEMPTS {
                 port.sleep(DEBOUNCE_MS).await;
                 let link = port.connection().await;
                 let unstable = matches!(&link, Ok(link) if link.changed);
                 let result = match link {
-                    Ok(link) if !link.connected => continue 'connect,
+                    Ok(link) if !link.connected => {
+                        port.observe_failed_bring_up();
+                        continue 'connect;
+                    }
                     Ok(link) if !link.changed => port.bring_up(attempt > 1).await,
                     Ok(_) => Err(UsbError::NotReady),
                     Err(error) => Err(error),
@@ -749,8 +786,14 @@ async fn port_task(port: impl PortOps, mut initial_scan: Option<StartupActivity<
                             Ok(link) if !link.connected => continue 'connect,
                             Ok(link) if link.changed => {
                                 let _ = port.clear_change().await;
+                                change_cleared = false;
                             }
-                            _ => {}
+                            Ok(_) => {
+                                change_cleared = true;
+                            }
+                            Err(_) => {
+                                change_cleared = false;
+                            }
                         }
                         log::debug!(
                             "USB port enumeration attempt {attempt}/{MAX_PORT_ATTEMPTS} failed: {error:?}"
@@ -770,15 +813,15 @@ async fn port_task(port: impl PortOps, mut initial_scan: Option<StartupActivity<
                 }
             }
             drop(startup);
-            // A connected change latch can be stuck. Only a sampled
-            // disconnect gives a parked port another retry budget.
-            wait_for_port_change(&port, false).await;
+            // A parked port wakes on disconnect, or on a fresh change once the
+            // change latch has been observed clear.
+            wait_for_replug(&port, change_cleared).await;
             continue 'connect;
         };
 
-        // Poll the parent first. On disconnect, cancellation drops any live
-        // child tasks before the controller tears down the whole device tree.
-        select(wait_for_port_change(&port, true), async {
+        // Poll the parent first. On disconnect or upstream hub parking,
+        // cancellation drops any live child tasks before teardown.
+        select(wait_for_port_change(&port), async {
             port.attached(address, startup).await;
             core::future::pending::<()>().await;
         })
@@ -788,13 +831,37 @@ async fn port_task(port: impl PortOps, mut initial_scan: Option<StartupActivity<
     }
 }
 
-async fn wait_for_port_change(port: &impl PortOps, detect_replacement: bool) {
+async fn wait_for_port_change(port: &impl PortOps) {
     loop {
         port.sleep(port.interval()).await;
+        if port.upstream_parked() {
+            return;
+        }
         if let Ok(connection) = port.connection().await
-            && (!connection.connected || (detect_replacement && connection.changed))
+            && (!connection.connected || connection.changed)
         {
             return;
+        }
+    }
+}
+
+async fn wait_for_replug(port: &impl PortOps, mut change_cleared: bool) {
+    loop {
+        port.sleep(port.interval()).await;
+        if port.upstream_parked() {
+            return;
+        }
+        if let Ok(connection) = port.connection().await {
+            if !connection.connected {
+                return;
+            }
+            if connection.changed {
+                if change_cleared {
+                    return;
+                }
+            } else {
+                change_cleared = true;
+            }
         }
     }
 }
@@ -852,6 +919,7 @@ impl Port {
         request: u8,
         value: u16,
         data: Option<&mut [u8]>,
+        submitted: Option<&mut bool>,
     ) -> Result<usize, UsbError> {
         let hub = self.hub.as_ref().ok_or(UsbError::InvalidParameter)?;
         if hub.parked() {
@@ -867,6 +935,9 @@ impl Port {
         if !upstream.connected || upstream.changed {
             return Err(UsbError::Disconnected);
         }
+        if let Some(submitted) = submitted {
+            *submitted = true;
+        }
         let result = Pipe {
             controller: self.controller,
             address: hub.address,
@@ -881,14 +952,16 @@ impl Port {
             data,
         );
         // GET_STATUS also needs to validate the returned length. Count
-        // other failed requests here so a hub that answers status but
-        // times out clearing a change latch cannot hang every idle poll.
-        if request != super::controller::request::GET_STATUS
-            && result
-                .as_ref()
-                .is_err_and(|error| !matches!(error, UsbError::Stall | UsbError::NotSupported))
-        {
-            hub.note_transport_failure();
+        // consecutive transport failures here so a hub that answers status
+        // but times out clearing a change latch cannot hang every idle poll.
+        if request != super::controller::request::GET_STATUS {
+            match &result {
+                Ok(_) => hub.note_transport_success(),
+                Err(error) if !matches!(error, UsbError::Stall | UsbError::NotSupported) => {
+                    hub.note_transport_failure();
+                }
+                Err(_) => {}
+            }
         }
         result
     }
@@ -897,7 +970,13 @@ impl Port {
         let hub = self.hub.as_ref().ok_or(UsbError::InvalidParameter)?;
         let mut buf = [0; 4];
         let result = self
-            .hub_control(req_type::DIR_IN, request::GET_STATUS, 0, Some(&mut buf))
+            .hub_control(
+                req_type::DIR_IN,
+                request::GET_STATUS,
+                0,
+                Some(&mut buf),
+                None,
+            )
             .await;
         let result = result.and_then(|length| {
             if length != buf.len() {
@@ -908,23 +987,37 @@ impl Port {
                 u16::from_le_bytes([buf[2], buf[3]]),
             ))
         });
-        let upstream = self.root_status();
-        if result.is_err() && upstream.connected && !upstream.changed {
-            hub.note_transport_failure();
+        if result.is_ok() {
+            hub.note_transport_success();
+        } else {
+            let upstream = self.root_status();
+            if upstream.connected && !upstream.changed {
+                hub.note_transport_failure();
+            }
         }
         result
     }
 
     async fn hub_feature(&self, request: u8, feature: u16) -> Result<(), UsbError> {
-        self.hub_control(req_type::DIR_OUT, request, feature, None)
+        self.hub_control(req_type::DIR_OUT, request, feature, None, None)
             .await
             .map(|_| ())
     }
 
-    async fn reset(&self, _retry: bool) -> Result<Option<PortSpeed>, UsbError> {
+    async fn reset(
+        &self,
+        _retry: bool,
+        reset_submitted: &mut bool,
+    ) -> Result<Option<PortSpeed>, UsbError> {
         if let Some(_hub) = self.hub.as_ref() {
-            self.hub_feature(request::SET_FEATURE, hub_feature::PORT_RESET)
-                .await?;
+            self.hub_control(
+                req_type::DIR_OUT,
+                request::SET_FEATURE,
+                hub_feature::PORT_RESET,
+                None,
+                Some(reset_submitted),
+            )
+            .await?;
             exec::sleep_ms(60).await;
             let deadline = Timeout::from_ms(500);
             loop {
@@ -989,6 +1082,7 @@ impl Port {
                     self.root_command(RootCommand::Handoff);
                     return Ok(None);
                 }
+                *reset_submitted = true;
                 self.root_command(RootCommand::Reset);
                 exec::sleep_ms(50).await;
                 self.root_command(RootCommand::EndReset);
@@ -1017,6 +1111,7 @@ impl Port {
                 Ok(Some(PortSpeed::Legacy(UsbSpeed::High)))
             }
             RootKind::Ohci => {
+                *reset_submitted = true;
                 self.root_command(RootCommand::Reset);
                 exec::wait_for(100, || !self.root_status().resetting).await;
                 exec::sleep_ms(10).await;
@@ -1031,6 +1126,7 @@ impl Port {
             }
             #[cfg(target_arch = "x86_64")]
             RootKind::Uhci => {
+                *reset_submitted = true;
                 self.root_command(RootCommand::Reset);
                 exec::sleep_ms(50).await;
                 self.root_command(RootCommand::EndReset);
@@ -1173,8 +1269,9 @@ impl PortOps for Port {
         if real_port {
             note_startup_progress();
         }
+        let mut reset_submitted = false;
         let result = async {
-            let Some(speed) = self.reset(retry).await? else {
+            let Some(speed) = self.reset(retry, &mut reset_submitted).await? else {
                 // If EHCI still owns the port, PO did not take effect.
                 // Treat it as a failed attempt, not a new connection.
                 return if self.root_status().connected {
@@ -1202,20 +1299,20 @@ impl PortOps for Port {
         }
         .await;
         if result.is_err()
+            && reset_submitted
             && let Some(reservation) = reservation
         {
             // Never release address zero on a failed reset or SET_ADDRESS
             // while this device can still answer it.
             if let Some(hub) = &self.hub {
-                let disabled = self
+                let _ = self
                     .hub_feature(request::CLEAR_FEATURE, hub_feature::PORT_ENABLE)
-                    .await
-                    .is_ok()
-                    && self
-                        .hub_status()
-                        .await
-                        .is_ok_and(|(status, _)| status & hub_port_status::ENABLE == 0);
-                hub.isolate_or_quarantine(reservation, disabled, self.root_status());
+                    .await;
+                let isolated = self.hub_status().await.is_ok_and(|(status, _)| {
+                    status & hub_port_status::CONNECTION == 0
+                        || status & hub_port_status::ENABLE == 0
+                });
+                hub.isolate_or_quarantine(reservation, isolated, self.root_status());
             } else {
                 self.root_command(RootCommand::Disable);
             }
@@ -1257,11 +1354,11 @@ impl PortOps for Port {
                                 number,
                                 ..self.clone()
                             },
-                            true,
+                            2,
                         );
                     }
-                    // The child scan or attach activities now hold discovery;
-                    // an empty powered hub needs no second connection window.
+                    // Each child port samples twice (one HUB_POLL_MS apart)
+                    // before releasing its boot-discovery guard.
                     drop(startup);
                     tasks.run().await;
                     return;
@@ -1369,6 +1466,7 @@ async fn configure_hub(parent: &Port, pipe: Pipe) -> Result<(Rc<Hub>, u8, u64), 
     #[cfg(feature = "xhci")]
     if let Some(geometry) = geometry {
         super::xhci::enumerate::configure_hub(pipe, geometry, ports).await?;
+        note_startup_progress();
     }
     let hub = Rc::new(Hub {
         address: pipe.address,
@@ -1426,9 +1524,18 @@ async fn reset_xhci(
         .await;
     } else if force_reset || !initial.enabled {
         // Disabling the previous slot does not reset the USB device's
-        // address. On a retry, reset even an enabled link already in U0.
+        // address. On a retry, clear any stale completion bit first and
+        // require completion of this reset (or warm reset).
+        if force_reset {
+            if initial.reset_done {
+                command(RootCommand::AckReset);
+            }
+            if initial.warm_reset_done {
+                command(RootCommand::AckWarmReset);
+            }
+        }
         command(RootCommand::Reset);
-        exec::wait_for(RESET_MS, || {
+        let reset_completed = exec::wait_for(RESET_MS, || {
             let now = status();
             !now.connected || now.reset_done
         })
@@ -1437,16 +1544,29 @@ async fn reset_xhci(
         if now.reset_done {
             command(RootCommand::AckReset);
         }
-        if now.connected && initial.superspeed && (!now.enabled || now.link_state != 0) {
+        let mut confirmed = reset_completed && now.reset_done;
+        if now.connected
+            && initial.superspeed
+            && (!now.enabled || now.link_state != 0 || (force_reset && !confirmed))
+        {
             command(RootCommand::WarmReset);
-            exec::wait_for(LINK_MS, || {
+            let warm_completed = exec::wait_for(LINK_MS, || {
                 let now = status();
                 !now.connected || now.warm_reset_done
             })
             .await;
-            if status().warm_reset_done {
+            let now = status();
+            if now.warm_reset_done {
                 command(RootCommand::AckWarmReset);
             }
+            confirmed = confirmed || (warm_completed && now.warm_reset_done);
+        }
+        let now = status();
+        if !now.connected {
+            return Err(UsbError::Disconnected);
+        }
+        if force_reset && !confirmed {
+            return Err(UsbError::NotReady);
         }
     }
     let now = status();
@@ -1475,6 +1595,9 @@ mod tests {
         /// as a real UHCI root port does when reset is released.
         reset_latches_change: bool,
         relatches_on_clear: bool,
+        clear_change_fails: Cell<bool>,
+        upstream_parked: Cell<bool>,
+        failed_observations: Cell<usize>,
         reset_for: Cell<u64>,
         startup_active: LocalCell<usize>,
         children: bool,
@@ -1492,6 +1615,9 @@ mod tests {
                 failures: Cell::default(),
                 reset_latches_change: false,
                 relatches_on_clear: false,
+                clear_change_fails: Cell::default(),
+                upstream_parked: Cell::default(),
+                failed_observations: Cell::default(),
                 reset_for: Cell::default(),
                 startup_active: LocalCell::new(0),
                 children: false,
@@ -1504,14 +1630,26 @@ mod tests {
 
     impl PortOps for &FakePort {
         async fn connection(&self) -> Result<Connection, UsbError> {
+            if self.upstream_parked.get() {
+                return Err(UsbError::NotReady);
+            }
             Ok(self.connection.get())
         }
         async fn clear_change(&self) -> Result<(), UsbError> {
+            if self.clear_change_fails.get() {
+                return Err(UsbError::Stall);
+            }
             self.connection.update(|mut s| {
                 s.changed = self.relatches_on_clear;
                 s
             });
             Ok(())
+        }
+        fn observe_failed_bring_up(&self) {
+            self.failed_observations.update(|n| n + 1);
+        }
+        fn upstream_parked(&self) -> bool {
+            self.upstream_parked.get()
         }
         async fn bring_up(&self, _retry: bool) -> Result<Option<u8>, UsbError> {
             self.attempted.update(|n| n + 1);
@@ -1592,7 +1730,7 @@ mod tests {
     #[test]
     fn port_task_accepts_late_first_connection_and_detaches() {
         let port = FakePort::default();
-        let mut task = core::pin::pin!(port_task(&port, None));
+        let mut task = core::pin::pin!(port_task(&port, 0, None));
         port.advance(0, task.as_mut());
         port.advance(900, task.as_mut());
         assert!(port.events.borrow().is_empty());
@@ -1609,7 +1747,7 @@ mod tests {
     fn port_task_restarts_debounce_on_latched_bounce() {
         let port = FakePort::default();
         port.set(true, true);
-        let mut task = core::pin::pin!(port_task(&port, None));
+        let mut task = core::pin::pin!(port_task(&port, 0, None));
         port.advance(0, task.as_mut());
         port.set(true, true);
         port.advance(DEBOUNCE_MS, task.as_mut());
@@ -1626,8 +1764,8 @@ mod tests {
             ..FakePort::default()
         };
         let usb3 = FakePort::default();
-        let mut old = core::pin::pin!(port_task(&usb2, None));
-        let mut new = core::pin::pin!(port_task(&usb3, None));
+        let mut old = core::pin::pin!(port_task(&usb2, 0, None));
+        let mut new = core::pin::pin!(port_task(&usb3, 0, None));
         usb2.set(true, true);
         usb2.advance(0, old.as_mut());
         usb3.advance(0, new.as_mut());
@@ -1648,7 +1786,7 @@ mod tests {
             reset_for: Cell::new(70),
             ..FakePort::default()
         };
-        let mut task = core::pin::pin!(port_task(&port, None));
+        let mut task = core::pin::pin!(port_task(&port, 0, None));
         port.set(true, true);
         port.advance(0, task.as_mut());
         port.advance(DEBOUNCE_MS, task.as_mut());
@@ -1670,7 +1808,7 @@ mod tests {
             ..FakePort::default()
         };
         port.set(true, true);
-        let mut task = core::pin::pin!(port_task(&port, None));
+        let mut task = core::pin::pin!(port_task(&port, 0, None));
         port.advance(0, task.as_mut());
         port.advance(DEBOUNCE_MS, task.as_mut());
         assert_eq!(port.attempted.get(), 1);
@@ -1755,8 +1893,17 @@ mod tests {
         });
         let sibling = hub.clone();
         hub.note_transport_failure();
-        assert!(!sibling.parked());
         sibling.note_transport_failure();
+        assert!(!sibling.parked());
+        // A successful request clears transient failures before parking.
+        hub.note_transport_success();
+        hub.note_transport_failure();
+        sibling.note_transport_failure();
+        assert!(!hub.parked());
+        // Three consecutive failures park the hub permanently.
+        hub.note_transport_failure();
+        assert!(hub.parked());
+        hub.note_transport_success();
         assert!(hub.parked());
     }
 
@@ -1857,7 +2004,7 @@ mod tests {
             relatches_on_clear: true,
             ..FakePort::default()
         };
-        let mut task = core::pin::pin!(port_task(&port, None));
+        let mut task = core::pin::pin!(port_task(&port, 0, None));
         port.set(true, true);
         port.advance(0, task.as_mut());
         assert_eq!(port.startup_active.get(), 1);
@@ -1885,7 +2032,7 @@ mod tests {
             reset_latches_change: true,
             ..FakePort::default()
         };
-        let mut task = core::pin::pin!(port_task(&port, None));
+        let mut task = core::pin::pin!(port_task(&port, 0, None));
         port.set(true, true);
         port.advance(0, task.as_mut());
         for _ in 0..200 {
@@ -1950,7 +2097,7 @@ mod tests {
             failures: Cell::new(MAX_PORT_ATTEMPTS),
             ..FakePort::default()
         };
-        let mut task = core::pin::pin!(port_task(&port, None));
+        let mut task = core::pin::pin!(port_task(&port, 0, None));
         port.set(true, true);
         port.advance(0, task.as_mut());
         for attempt in 1..=MAX_PORT_ATTEMPTS {
@@ -1979,7 +2126,7 @@ mod tests {
             probe_media: true,
             ..FakePort::default()
         };
-        let mut task = core::pin::pin!(port_task(&port, None));
+        let mut task = core::pin::pin!(port_task(&port, 0, None));
         port.set(true, true);
         port.advance(0, task.as_mut());
         port.advance(DEBOUNCE_MS, task.as_mut());
@@ -2003,7 +2150,7 @@ mod tests {
             children: true,
             ..FakePort::default()
         };
-        let mut task = core::pin::pin!(port_task(&port, None));
+        let mut task = core::pin::pin!(port_task(&port, 0, None));
         port.set(true, true);
         port.advance(0, task.as_mut());
         port.advance(DEBOUNCE_MS, task.as_mut());
@@ -2102,5 +2249,131 @@ mod tests {
             )),
             Err(UsbError::NotReady)
         ));
+    }
+
+    #[cfg(feature = "xhci")]
+    #[test]
+    fn xhci_forced_reset_fails_when_u0_never_completes_reset() {
+        // Stale PRC is cleared before Reset; without a new PRC, forced reset
+        // must fail even though the link stays enabled in U0.
+        let status = Cell::new(RootStatus {
+            connected: true,
+            enabled: true,
+            reset_done: true,
+            speed_id: 3,
+            ..RootStatus::default()
+        });
+        let acks = Cell::new(0);
+        let resets = Cell::new(0);
+        let result = exec::block_on(reset_xhci(
+            || status.get(),
+            |cmd| {
+                status.update(|mut s| {
+                    match cmd {
+                        RootCommand::AckReset => {
+                            acks.set(acks.get() + 1);
+                            s.reset_done = false;
+                        }
+                        RootCommand::Reset => {
+                            resets.set(resets.get() + 1);
+                        }
+                        _ => panic!("unexpected command"),
+                    }
+                    s
+                });
+            },
+            true,
+        ));
+        assert!(matches!(result, Err(UsbError::NotReady)));
+        assert_eq!(acks.get(), 1);
+        assert_eq!(resets.get(), 1);
+    }
+
+    #[test]
+    fn hub_child_keeps_startup_active_across_second_post_power_sample() {
+        let port = FakePort::default();
+        let initial = Some(StartupActivity::new(&port.startup_active));
+        let mut task = core::pin::pin!(port_task(&port, 2, initial));
+        let mut drain = BootDrain::new(0, 0);
+        // Sample 1: disconnected, must keep startup active until sample 2.
+        port.advance(0, task.as_mut());
+        assert_eq!(port.startup_active.get(), 1);
+        assert!(!drain.settled(0, 1, port.startup_active.get(), true, 0));
+        // Device connects between sample 1 and sample 2.
+        port.set(true, true);
+        port.advance(ROOT_POLL_MS, task.as_mut());
+        assert_eq!(port.startup_active.get(), 1);
+        assert!(!drain.settled(ROOT_POLL_MS, 1, port.startup_active.get(), true, 0));
+        port.advance(DEBOUNCE_MS, task.as_mut());
+        assert_eq!(*port.events.borrow(), [("attached", 1)]);
+        assert_eq!(port.startup_active.get(), 0);
+        assert!(drain.settled(
+            ROOT_POLL_MS + DEBOUNCE_MS,
+            2,
+            port.startup_active.get(),
+            true,
+            0
+        ));
+    }
+
+    #[test]
+    fn attached_child_detaches_when_upstream_hub_is_parked() {
+        let port = FakePort::default();
+        let mut task = core::pin::pin!(port_task(&port, 0, None));
+        port.set(true, true);
+        port.advance(0, task.as_mut());
+        port.advance(DEBOUNCE_MS, task.as_mut());
+        assert_eq!(*port.events.borrow(), [("attached", 1)]);
+        port.upstream_parked.set(true);
+        port.advance(ROOT_POLL_MS, task.as_mut());
+        assert_eq!(*port.events.borrow(), [("attached", 1), ("detached", 1)]);
+    }
+
+    #[test]
+    fn stalled_clear_change_parks_port_within_retry_budget() {
+        let port = FakePort::default();
+        port.clear_change_fails.set(true);
+        port.set(true, true);
+        let initial = Some(StartupActivity::new(&port.startup_active));
+        let mut task = core::pin::pin!(port_task(&port, 2, initial));
+        for _ in 0..MAX_PORT_ATTEMPTS {
+            port.advance(ROOT_POLL_MS, task.as_mut());
+        }
+        assert_eq!(port.startup_active.get(), 0);
+        assert_eq!(port.attempted.get(), 0);
+    }
+
+    #[test]
+    fn exhausted_port_wakes_on_replug_between_polls() {
+        let port = FakePort {
+            failures: Cell::new(MAX_PORT_ATTEMPTS),
+            ..FakePort::default()
+        };
+        let mut task = core::pin::pin!(port_task(&port, 0, None));
+        port.set(true, true);
+        port.advance(0, task.as_mut());
+        for attempt in 1..=MAX_PORT_ATTEMPTS {
+            port.advance(DEBOUNCE_MS, task.as_mut());
+            assert_eq!(port.attempted.get(), attempt);
+            if attempt != MAX_PORT_ATTEMPTS {
+                port.advance(PORT_RETRY_MS, task.as_mut());
+            }
+        }
+        // Swap bad device for good device between polls (connected=true, changed=true).
+        port.set(true, true);
+        port.advance(ROOT_POLL_MS, task.as_mut());
+        port.advance(DEBOUNCE_MS, task.as_mut());
+        assert_eq!(*port.events.borrow(), [("attached", 1)]);
+    }
+
+    #[test]
+    fn debounce_disconnect_notifies_migration_observer() {
+        let port = FakePort::default();
+        let mut task = core::pin::pin!(port_task(&port, 0, None));
+        port.set(true, true);
+        port.advance(0, task.as_mut());
+        port.set(false, true);
+        port.advance(DEBOUNCE_MS, task.as_mut());
+        assert_eq!(port.failed_observations.get(), 1);
     }
 }

@@ -452,8 +452,6 @@ pub struct EhciController {
     bulk_qtd: u64,
     /// Whether bulk QH is linked to async schedule
     bulk_qh_linked: bool,
-    /// Async schedule is enabled
-    async_schedule_enabled: bool,
 }
 
 impl EhciController {
@@ -551,7 +549,6 @@ impl EhciController {
             bulk_qh,
             bulk_qtd,
             bulk_qh_linked: false,
-            async_schedule_enabled: false,
         };
 
         // Take ownership from BIOS
@@ -955,13 +952,12 @@ impl EhciController {
         // Run one-shot control transfers on a quiet async schedule, matching
         // libpayload/U-Boot. ICH7-era EHCI can otherwise keep stale async-list
         // state around transient QHs.
-        if self.op().usbcmd.is_set(USBCMD::ASE) {
+        if self.op().usbcmd.is_set(USBCMD::ASE) || self.op().usbsts.is_set(USBSTS::ASS) {
             self.op().usbcmd.modify(USBCMD::ASE::CLEAR);
             if !self.wait_async_schedule(false, &timeout) {
                 log::warn!("EHCI: Async schedule failed to stop before control transfer");
                 return Err(UsbError::Timeout);
             }
-            self.async_schedule_enabled = false;
         }
 
         // Link QH into async schedule (insert after async head)
@@ -1015,14 +1011,18 @@ impl EhciController {
         self.op().usbcmd.modify(USBCMD::ASE::SET);
         if !self.wait_async_schedule(true, &timeout) {
             log::error!("EHCI: Async schedule failed to start");
+            self.op().usbcmd.modify(USBCMD::ASE::CLEAR);
             async_qh.qh_link = old_link;
             barrier::dma_write();
             flush_cache_range(self.async_qh, 4);
             return Err(UsbError::Timeout);
         }
-        self.async_schedule_enabled = true;
 
         // Wait for transfer completion
+        const ERROR_MASK: u32 = Qtd::TOKEN_STATUS_HALTED
+            | Qtd::TOKEN_STATUS_BUFFER_ERR
+            | Qtd::TOKEN_STATUS_BABBLE
+            | Qtd::TOKEN_STATUS_XACT_ERR;
         let mut poll_count = 0u32;
         while !timeout.is_expired() {
             // Invalidate cache to see updates from EHCI DMA
@@ -1039,14 +1039,13 @@ impl EhciController {
 
             // Check if setup qTD completed (ACTIVE bit cleared)
             if (setup_token & Qtd::TOKEN_STATUS_ACTIVE) == 0 {
+                if (setup_token & ERROR_MASK) != 0 {
+                    break;
+                }
                 // Setup done, check if we need to wait for data/status
                 if data_len > 0 {
                     let qtd_data = unsafe { &*(qtd_data_addr as *const Qtd) };
                     let data_token = qtd_data.token;
-                    const ERROR_MASK: u32 = Qtd::TOKEN_STATUS_HALTED
-                        | Qtd::TOKEN_STATUS_BUFFER_ERR
-                        | Qtd::TOKEN_STATUS_BABBLE
-                        | Qtd::TOKEN_STATUS_XACT_ERR;
                     if (data_token & ERROR_MASK) != 0 {
                         break;
                     }
@@ -1086,7 +1085,6 @@ impl EhciController {
         if !wait_for(100, || !self.op().usbsts.is_set(USBSTS::ASS)) {
             log::warn!("EHCI: Async schedule failed to stop after control transfer");
         }
-        self.async_schedule_enabled = false;
 
         // Invalidate caches one more time to get final state
         invalidate_cache_range(qtd_setup_addr, 64);
@@ -1110,11 +1108,6 @@ impl EhciController {
         };
 
         // Check for errors (HALTED, BABBLE, BUFFER_ERR, XACT_ERR)
-        const ERROR_MASK: u32 = Qtd::TOKEN_STATUS_HALTED
-            | Qtd::TOKEN_STATUS_BUFFER_ERR
-            | Qtd::TOKEN_STATUS_BABBLE
-            | Qtd::TOKEN_STATUS_XACT_ERR;
-
         if (final_setup_token & ERROR_MASK) != 0
             || (final_data_token & ERROR_MASK) != 0
             || (final_status_token & ERROR_MASK) != 0
@@ -1266,11 +1259,13 @@ impl EhciController {
 
         barrier::mmio_write();
 
-        // Enable async schedule if not already enabled
-        if !self.async_schedule_enabled {
+        // Enable async schedule if not already running in hardware.
+        if !self.op().usbcmd.is_set(USBCMD::ASE) || !self.op().usbsts.is_set(USBSTS::ASS) {
             self.op().usbcmd.modify(USBCMD::ASE::SET);
-            if self.wait_async_schedule(true, &timeout) {
-                self.async_schedule_enabled = true;
+            if !self.wait_async_schedule(true, &timeout) {
+                log::warn!("EHCI: Async schedule failed to start for bulk transfer");
+                self.unlink_bulk_qh();
+                return Err(UsbError::Timeout);
             }
         }
 

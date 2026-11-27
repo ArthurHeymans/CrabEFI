@@ -52,6 +52,11 @@ external hubs on xHCI, UHCI, and OHCI. QEMU's `usb-hub` is full-speed and cannot
 be attached to standalone `usb-ehci`; the EHCI hotplug test uses root-attached
 devices only.
 
+UHCI, EHCI, and OHCI do not implement interrupt transfers yet, so USB keyboards
+and mice on those controllers are polled with `GET_REPORT`. Many real keyboards
+and mice do not report live release state through `GET_REPORT`, which can leave
+keys repeating after release; xHCI reads interrupt endpoints and is unaffected.
+
 ## Not supported
 
 - USB alternate interface settings other than the default

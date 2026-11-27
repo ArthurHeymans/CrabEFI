@@ -1259,6 +1259,9 @@ async fn run_boot<E: MenuEntry>(
                                 )
                                 .await
                             };
+                            if fb.boot_entries_stale() {
+                                return BootResult::Break(Outcome::Refresh);
+                            }
                             if let Some(text) = edited {
                                 return apply_cmdline_and_boot(menu, state.sel, &text);
                             }
@@ -1446,6 +1449,66 @@ mod tests {
         surface.set_pointer((0, 0));
         let mut menu = boot_menu(1);
         menu.set_timeout(1);
+        let mut task = core::pin::pin!(run_boot(&surface, &mut menu, 0));
+        assert!(matches!(
+            task.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(BootResult::Break(Outcome::Refresh))
+        ));
+    }
+
+    #[test]
+    fn narrow_cmdline_modal_refreshes_when_entries_become_stale() {
+        use alloc::rc::Rc;
+        use core::cell::Cell;
+        use core::future::Future;
+        use core::task::{Context, Poll, Waker};
+
+        struct Backend {
+            step: Rc<Cell<u8>>,
+        }
+        impl crate::Backend for Backend {
+            fn poll_pointer(&mut self) -> (i32, i32) {
+                (0, 0)
+            }
+            fn read_key(&mut self) -> Option<KeyPress> {
+                let s = self.step.get();
+                self.step.set(s + 1);
+                match s {
+                    0 => Some(KeyPress::Char('e')),
+                    1 => Some(KeyPress::Enter),
+                    _ => None,
+                }
+            }
+            fn now_ms(&self) -> u64 {
+                0
+            }
+            fn poll_frame(&mut self, _: &mut Context<'_>) -> Poll<()> {
+                Poll::Ready(())
+            }
+            fn boot_entries_stale(&self) -> bool {
+                // Becomes stale after the modal opens (step >= 1).
+                self.step.get() >= 1
+            }
+        }
+
+        // 640x480 is narrow (no side pane), so 'e' opens the modal editor.
+        let mut mem = std::vec![0u32; 640 * 480];
+        let fb = framebuffer(&mut mem, 640, 480);
+        let surface = crate::Surface::new(
+            *fb,
+            Backend {
+                step: Rc::new(Cell::new(0)),
+            },
+        );
+        surface.set_pointer((0, 0));
+        let mut menu = boot_menu(1);
+        let mut cmdline = heapless::String::new();
+        let _ = cmdline.push_str("console=ttyS0");
+        menu.entries[0].entry.kind = BootEntryKind::BlsLinux {
+            linux_path: heapless::String::new(),
+            initrd_paths: heapless::Vec::new(),
+            cmdline,
+        };
         let mut task = core::pin::pin!(run_boot(&surface, &mut menu, 0));
         assert!(matches!(
             task.as_mut().poll(&mut Context::from_waker(Waker::noop())),
