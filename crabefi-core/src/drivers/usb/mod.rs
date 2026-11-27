@@ -453,8 +453,11 @@ async fn bind_input(pipe: port::Pipe) -> Option<DeviceInfo> {
     Some(info)
 }
 
-async fn publish_storage(pipe: port::Pipe) -> Result<(), mass_storage::MassStorageError> {
-    if mass_storage::probe(pipe).await? {
+async fn publish_storage(
+    pipe: port::Pipe,
+    startup: bool,
+) -> Result<(), mass_storage::MassStorageError> {
+    if mass_storage::probe(pipe, startup).await? {
         STORAGE_REVISION.update(|revision| *revision = revision.wrapping_add(1));
         log::info!(
             "USB: attached storage on controller {} device {}",

@@ -129,7 +129,11 @@ impl Pipe {
         data: Option<&mut [u8]>,
     ) -> Result<usize, UsbError> {
         transfer().await;
-        self.control_now(request, data)
+        let result = self.control_now(request, data);
+        if result.is_ok() {
+            note_startup_progress();
+        }
+        result
     }
 
     fn control_now(self, request: Control, data: Option<&mut [u8]>) -> Result<usize, UsbError> {
@@ -374,18 +378,35 @@ impl Drop for DefaultAddress {
     }
 }
 
+static STARTUP_PROGRESS: LocalCell<u64> = LocalCell::new(0);
+static COMPANION_HANDOFF: LocalCell<u64> = LocalCell::new(0);
+static COMPANION_SCANS: Local<Vec<u64>> = Local::new(Vec::new());
+
+/// Record successful discovery stages, not background status monitoring.
+pub(super) fn note_startup_progress() {
+    STARTUP_PROGRESS.update(|progress| *progress = progress.wrapping_add(1));
+}
+
 static STARTUP_ACTIVE: LocalCell<usize> = LocalCell::new(0);
 static STARTUP_MOVED: LocalCell<bool> = LocalCell::new(false);
 struct StartupActivity<'a>(&'a LocalCell<usize>);
 impl<'a> StartupActivity<'a> {
     fn new(active: &'a LocalCell<usize>) -> Self {
         active.update(|n| *n += 1);
+        // Fake ports have their own activity counter and never touch the
+        // firmware's single-hart state from test threads.
+        if core::ptr::eq(active, &STARTUP_ACTIVE) {
+            note_startup_progress();
+        }
         Self(active)
     }
 }
 impl Drop for StartupActivity<'_> {
     fn drop(&mut self) {
         self.0.update(|n| *n -= 1);
+        if core::ptr::eq(self.0, &STARTUP_ACTIVE) {
+            note_startup_progress();
+        }
     }
 }
 
@@ -401,30 +422,61 @@ pub(super) async fn settle() {
         STARTUP_ACTIVE.get() != 0
     })
     .await;
-    // Finish activity already in flight. If an xHCI port lost a device
-    // during bring-up, wait for a quiet interval even when a different port
-    // is already attached: any new connection might be the migrated one.
-    let deadline = Timeout::from_ms(CONNECTION_TIMEOUT_MS);
-    let mut saw_migration = false;
-    loop {
-        exec::wait_for(CONNECTION_TIMEOUT_MS, || {
-            exec::poll_background();
-            STARTUP_ACTIVE.get() == 0 || deadline.is_expired()
-        })
-        .await;
-        saw_migration |= STARTUP_MOVED.get();
-        STARTUP_MOVED.set(false);
-        if deadline.is_expired() || !saw_migration {
-            break;
+    let now_ms = || crate::time::read_counter() / (crate::time::counter_frequency() / 1000).max(1);
+    let mut drain = BootDrain::new(now_ms(), STARTUP_PROGRESS.get());
+    poll_fn(|_| {
+        exec::poll_background();
+        let handoff = COMPANION_HANDOFF.get();
+        let companions_ready = COMPANION_SCANS.borrow().iter().all(|last| *last == handoff);
+        let quiet_ms = if STARTUP_MOVED.get() {
+            MIGRATION_QUIET_MS
+        } else if handoff != 0 {
+            ROOT_POLL_MS * 2
+        } else {
+            0
+        };
+        if drain.settled(
+            now_ms(),
+            STARTUP_PROGRESS.get(),
+            STARTUP_ACTIVE.get(),
+            companions_ready,
+            quiet_ms,
+        ) {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
         }
-        if !exec::wait_for(MIGRATION_QUIET_MS, || {
-            exec::poll_background();
-            STARTUP_ACTIVE.get() != 0 || STARTUP_MOVED.get() || deadline.is_expired()
-        })
-        .await
-        {
-            break;
+    })
+    .await;
+}
+
+struct BootDrain {
+    last_ms: u64,
+    progress: u64,
+}
+impl BootDrain {
+    fn new(now_ms: u64, progress: u64) -> Self {
+        Self {
+            last_ms: now_ms,
+            progress,
         }
+    }
+
+    fn settled(
+        &mut self,
+        now_ms: u64,
+        progress: u64,
+        active: usize,
+        companions_ready: bool,
+        quiet_ms: u64,
+    ) -> bool {
+        if progress != self.progress {
+            *self = Self::new(now_ms, progress);
+        }
+        let idle_ms = now_ms.saturating_sub(self.last_ms);
+        // A wedged transfer does not renew discovery indefinitely. On an
+        // answering device each completed stage renews this window.
+        idle_ms >= CONNECTION_TIMEOUT_MS || (active == 0 && companions_ready && idle_ms >= quiet_ms)
     }
 }
 
@@ -459,13 +511,31 @@ pub(super) async fn buses() {
                     .borrow_mut()
                     .push(Rc::new(LocalCell::new(false)));
                 for number in 0..count {
-                    ports.add(Port {
-                        controller,
-                        kind,
-                        number,
-                        root_number: number,
-                        hub: None,
+                    // Keep a fresh sample from every OHCI/UHCI root port
+                    // before declaring an EHCI ownership handoff settled.
+                    let companion_scan = match kind {
+                        RootKind::Ohci => true,
+                        #[cfg(target_arch = "x86_64")]
+                        RootKind::Uhci => true,
+                        _ => false,
+                    }
+                    .then(|| {
+                        let mut scans = COMPANION_SCANS.borrow_mut();
+                        let index = scans.len();
+                        scans.push(COMPANION_HANDOFF.get());
+                        index
                     });
+                    ports.add(
+                        Port {
+                            controller,
+                            kind,
+                            number,
+                            root_number: number,
+                            hub: None,
+                            companion_scan,
+                        },
+                        false,
+                    );
                 }
             }
         }
@@ -486,8 +556,9 @@ struct PortTasks {
 }
 
 impl PortTasks {
-    fn add(&mut self, port: Port) {
-        self.ports.push(Box::pin(port_task(port)));
+    fn add(&mut self, port: Port, scan_hub: bool) {
+        let initial_scan = scan_hub.then(|| StartupActivity::new(&STARTUP_ACTIVE));
+        self.ports.push(Box::pin(port_task(port, initial_scan)));
     }
 
     fn poll(&mut self, cx: &mut core::task::Context<'_>) {
@@ -567,6 +638,7 @@ struct Port {
     kind: RootKind,
     number: u8,
     root_number: u8,
+    companion_scan: Option<usize>,
     hub: Option<Rc<Hub>>,
 }
 
@@ -592,12 +664,15 @@ trait PortOps {
     fn startup(&self) -> StartupActivity<'_>;
     async fn detach(&self, address: u8);
     fn interval(&self) -> u64;
+    fn upstream_parked(&self) -> bool {
+        false
+    }
     async fn sleep(&self, ms: u64) {
         exec::sleep_ms(ms).await;
     }
 }
 
-async fn port_task(port: impl PortOps) {
+async fn port_task(port: impl PortOps, mut initial_scan: Option<StartupActivity<'_>>) {
     'connect: loop {
         loop {
             if let Ok(connection) = port.connection().await {
@@ -608,11 +683,14 @@ async fn port_task(port: impl PortOps) {
                 if connection.connected {
                     break;
                 }
+                drop(initial_scan.take());
+            } else if port.upstream_parked() {
+                drop(initial_scan.take());
             }
             port.sleep(port.interval()).await;
         }
 
-        let startup = port.startup();
+        let startup = initial_scan.take().unwrap_or_else(|| port.startup());
         let address = 'enumerate: {
             for attempt in 1..=MAX_PORT_ATTEMPTS {
                 port.sleep(DEBOUNCE_MS).await;
@@ -709,6 +787,10 @@ impl Port {
 
     fn root_command(&self, command: RootCommand) {
         debug_assert!(self.hub.is_none());
+        if matches!(command, RootCommand::Handoff) {
+            COMPANION_HANDOFF.update(|epoch| *epoch = epoch.wrapping_add(1));
+            note_startup_progress();
+        }
         with_port_controller(self.controller, |host| {
             host.root_command(self.root_number, command)
         });
@@ -931,7 +1013,9 @@ impl Port {
                 with_port_controller(self.controller, |host| {
                     host.legacy_control(device, request, data)
                 })
-                .ok_or(UsbError::Disconnected)?
+                .ok_or(UsbError::Disconnected)
+                .and_then(|result| result)
+                .inspect(|_| note_startup_progress())
             })
             .await?;
         with_port_controller(self.controller, |host| {
@@ -956,6 +1040,14 @@ impl PortOps for Port {
             })
         } else {
             let status = self.root_status();
+            if let Some(index) = self.companion_scan {
+                let mut scans = COMPANION_SCANS.borrow_mut();
+                let epoch = COMPANION_HANDOFF.get();
+                if scans[index] != epoch {
+                    scans[index] = epoch;
+                    note_startup_progress();
+                }
+            }
             Ok(Connection {
                 connected: status.connected,
                 changed: status.changed,
@@ -1032,6 +1124,7 @@ impl PortOps for Port {
         #[cfg(feature = "xhci")]
         if self.kind == RootKind::Xhci && self.hub.is_none() && !self.root_status().connected {
             STARTUP_MOVED.set(true);
+            note_startup_progress();
         }
     }
 
@@ -1044,7 +1137,7 @@ impl PortOps for Port {
             return;
         };
         let storage = if info.is_mass_storage {
-            super::publish_storage(pipe).await
+            super::publish_storage(pipe, true).await
         } else {
             Ok(())
         };
@@ -1055,17 +1148,19 @@ impl PortOps for Port {
                     exec::sleep_ms(delay.max(100)).await;
                     let mut tasks = PortTasks::default();
                     for number in 1..=ports {
-                        tasks.add(Self {
-                            hub: Some(hub.clone()),
-                            number,
-                            ..self.clone()
-                        });
+                        tasks.add(
+                            Self {
+                                hub: Some(hub.clone()),
+                                number,
+                                ..self.clone()
+                            },
+                            true,
+                        );
                     }
-                    exec::join(tasks.run(), async move {
-                        exec::sleep_ms(CONNECTION_TIMEOUT_MS).await;
-                        drop(startup);
-                    })
-                    .await;
+                    // The child scan or attach activities now hold discovery;
+                    // an empty powered hub needs no second connection window.
+                    drop(startup);
+                    tasks.run().await;
                     return;
                 }
                 Err(error) => {
@@ -1074,7 +1169,10 @@ impl PortOps for Port {
             }
         }
         drop(startup);
-        retry_storage_probe(self, storage, async || super::publish_storage(pipe).await).await;
+        retry_storage_probe(self, storage, async || {
+            super::publish_storage(pipe, false).await
+        })
+        .await;
     }
 
     async fn detach(&self, address: u8) {
@@ -1096,6 +1194,10 @@ impl PortOps for Port {
 
     fn startup(&self) -> StartupActivity<'_> {
         StartupActivity::new(&STARTUP_ACTIVE)
+    }
+
+    fn upstream_parked(&self) -> bool {
+        self.hub.as_ref().is_some_and(|hub| hub.parked())
     }
 
     fn interval(&self) -> u64 {
@@ -1347,7 +1449,7 @@ mod tests {
     #[test]
     fn port_task_accepts_late_first_connection_and_detaches() {
         let port = FakePort::default();
-        let mut task = core::pin::pin!(port_task(&port));
+        let mut task = core::pin::pin!(port_task(&port, None));
         port.advance(0, task.as_mut());
         port.advance(900, task.as_mut());
         assert!(port.events.borrow().is_empty());
@@ -1364,7 +1466,7 @@ mod tests {
     fn port_task_restarts_debounce_on_latched_bounce() {
         let port = FakePort::default();
         port.set(true, true);
-        let mut task = core::pin::pin!(port_task(&port));
+        let mut task = core::pin::pin!(port_task(&port, None));
         port.advance(0, task.as_mut());
         port.set(true, true);
         port.advance(DEBOUNCE_MS, task.as_mut());
@@ -1381,8 +1483,8 @@ mod tests {
             ..FakePort::default()
         };
         let usb3 = FakePort::default();
-        let mut old = core::pin::pin!(port_task(&usb2));
-        let mut new = core::pin::pin!(port_task(&usb3));
+        let mut old = core::pin::pin!(port_task(&usb2, None));
+        let mut new = core::pin::pin!(port_task(&usb3, None));
         usb2.set(true, true);
         usb2.advance(0, old.as_mut());
         usb3.advance(0, new.as_mut());
@@ -1403,7 +1505,7 @@ mod tests {
             reset_for: Cell::new(70),
             ..FakePort::default()
         };
-        let mut task = core::pin::pin!(port_task(&port));
+        let mut task = core::pin::pin!(port_task(&port, None));
         port.set(true, true);
         port.advance(0, task.as_mut());
         port.advance(DEBOUNCE_MS, task.as_mut());
@@ -1425,7 +1527,7 @@ mod tests {
             ..FakePort::default()
         };
         port.set(true, true);
-        let mut task = core::pin::pin!(port_task(&port));
+        let mut task = core::pin::pin!(port_task(&port, None));
         port.advance(0, task.as_mut());
         port.advance(DEBOUNCE_MS, task.as_mut());
         assert_eq!(port.attempted.get(), 1);
@@ -1540,6 +1642,38 @@ mod tests {
     }
 
     #[test]
+    fn boot_drains_a_slow_device_while_it_is_making_progress() {
+        let mut drain = BootDrain::new(0, 0);
+        for (step, now) in [500, 1100, 1700, 2300].into_iter().enumerate() {
+            assert!(!drain.settled(now, step as u64 + 1, 1, true, 0));
+        }
+        assert!(drain.settled(2500, 5, 0, true, 0));
+    }
+
+    #[test]
+    fn boot_waits_through_the_gap_after_ehci_handoff() {
+        let mut drain = BootDrain::new(0, 0);
+        assert!(!drain.settled(300, 1, 0, false, 50));
+        assert!(!drain.settled(325, 2, 1, true, 50));
+        assert!(!drain.settled(500, 3, 0, true, 50));
+        assert!(drain.settled(550, 3, 0, true, 50));
+    }
+
+    #[test]
+    fn boot_can_leave_a_dead_device_without_progress() {
+        let mut drain = BootDrain::new(0, 0);
+        assert!(!drain.settled(100, 1, 1, true, 0));
+        assert!(!drain.settled(1099, 1, 1, true, 0));
+        assert!(drain.settled(1100, 1, 1, true, 0));
+    }
+
+    #[test]
+    fn no_activity_adds_no_drain_wait_after_initial_window() {
+        let mut drain = BootDrain::new(1000, 0);
+        assert!(drain.settled(1000, 0, 0, true, 0));
+    }
+
+    #[test]
     fn first_port_wait_ends_at_activity_or_the_deadline() {
         // No real clock: hold the deadline pending while the port starts,
         // then test the opposite case with the deadline already ready.
@@ -1560,7 +1694,7 @@ mod tests {
             failures: Cell::new(MAX_PORT_ATTEMPTS),
             ..FakePort::default()
         };
-        let mut task = core::pin::pin!(port_task(&port));
+        let mut task = core::pin::pin!(port_task(&port, None));
         port.set(true, true);
         port.advance(0, task.as_mut());
         for attempt in 1..=MAX_PORT_ATTEMPTS {
@@ -1589,7 +1723,7 @@ mod tests {
             probe_media: true,
             ..FakePort::default()
         };
-        let mut task = core::pin::pin!(port_task(&port));
+        let mut task = core::pin::pin!(port_task(&port, None));
         port.set(true, true);
         port.advance(0, task.as_mut());
         port.advance(DEBOUNCE_MS, task.as_mut());
@@ -1613,7 +1747,7 @@ mod tests {
             children: true,
             ..FakePort::default()
         };
-        let mut task = core::pin::pin!(port_task(&port));
+        let mut task = core::pin::pin!(port_task(&port, None));
         port.set(true, true);
         port.advance(0, task.as_mut());
         port.advance(DEBOUNCE_MS, task.as_mut());

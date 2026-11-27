@@ -207,7 +207,7 @@ const SYNCHRONIZE_CACHE: [u8; 10] = [scsi_cmd::SYNCHRONIZE_CACHE_10, 0, 0, 0, 0,
 /// transfer, and consumes at most one USB transfer budget per idle poll.
 enum Transport<'a> {
     Foreground(&'a mut dyn UsbController),
-    Discovery(usize),
+    Discovery { controller: usize, startup: bool },
 }
 
 impl Transport<'_> {
@@ -217,9 +217,17 @@ impl Transport<'_> {
     ) -> Result<T, UsbError> {
         match self {
             Self::Foreground(controller) => f(*controller),
-            Self::Discovery(index) => {
+            Self::Discovery {
+                controller,
+                startup,
+            } => {
                 port::transfer().await;
-                super::with_controller(*index, f).ok_or(UsbError::Disconnected)?
+                let result =
+                    super::with_controller(*controller, f).ok_or(UsbError::Disconnected)?;
+                if *startup && result.is_ok() {
+                    port::note_startup_progress();
+                }
+                result
             }
         }
     }
@@ -227,7 +235,7 @@ impl Transport<'_> {
     async fn pause(&self, ms: u64) {
         match self {
             Self::Foreground(_) => time::delay_ms(ms),
-            Self::Discovery(_) => crate::exec::sleep_ms(ms).await,
+            Self::Discovery { .. } => crate::exec::sleep_ms(ms).await,
         }
     }
 }
@@ -309,7 +317,7 @@ impl UsbMassStorage {
                 Ok(()) => break,
                 Err(MassStorageError::CommandFailed) => {
                     match self.request_sense_with(transport).await? {
-                        Some(0x02) if matches!(transport, Transport::Discovery(_)) => {
+                        Some(0x02) if matches!(transport, Transport::Discovery { .. }) => {
                             return Err(MassStorageError::NotReady);
                         }
                         Some(0x02 | 0x06) if attempt < 4 => transport.pause(100).await,
@@ -1394,7 +1402,7 @@ pub(super) fn remove(controller_id: usize, device_addr: u8) -> Option<NonZeroU64
 /// controller `controller_id`, unless it is already registered.
 ///
 /// Returns whether a new disk was published, or why the probe failed.
-pub(super) async fn probe(pipe: Pipe) -> Result<bool, MassStorageError> {
+pub(super) async fn probe(pipe: Pipe, startup: bool) -> Result<bool, MassStorageError> {
     let Pipe {
         controller: controller_id,
         address: device_addr,
@@ -1406,7 +1414,13 @@ pub(super) async fn probe(pipe: Pipe) -> Result<bool, MassStorageError> {
         UsbMassStorage::from_controller(controller, device_addr)
     })
     .ok_or(UsbError::Disconnected)??;
-    if let Err(error) = device.init(&mut Transport::Discovery(controller_id)).await {
+    if let Err(error) = device
+        .init(&mut Transport::Discovery {
+            controller: controller_id,
+            startup,
+        })
+        .await
+    {
         log::debug!("Failed to initialize USB mass storage: {error:?}");
         return Err(error);
     }
