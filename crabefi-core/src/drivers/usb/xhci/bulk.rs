@@ -3,7 +3,7 @@
 use xhci::context::EndpointType;
 use xhci::ring::trb::{command, event, transfer};
 
-use super::{TrbRing, XhciError};
+use super::{TrbRing, XhciError, slots::SlotPages};
 use crate::barrier;
 use crate::drivers::pci;
 use crate::efi;
@@ -220,20 +220,27 @@ impl super::XhciController {
             .and_then(|s| s.as_deref_mut())
             .ok_or(XhciError::DeviceNotFound)?;
 
-        // Allocate transfer rings for bulk endpoints
-        let in_ring_mem = efi::allocate_pages(1).ok_or(XhciError::AllocationFailed)?;
-        let in_ring_addr = in_ring_mem.as_ptr() as u64;
-        let out_ring_mem = efi::allocate_pages(1).ok_or(XhciError::AllocationFailed)?;
-        let out_ring_addr = out_ring_mem.as_ptr() as u64;
-
+        let in_dci = (bulk_in as usize * 2) + 1;
+        let out_dci = bulk_out as usize * 2;
+        if !(1..=15).contains(&bulk_in)
+            || !(1..=15).contains(&bulk_out)
+            || in_max_packet == 0
+            || out_max_packet == 0
+            || slot.transfer_rings[in_dci - 1].is_some()
+            || slot.transfer_rings[out_dci - 1].is_some()
+        {
+            return Err(XhciError::InvalidParameter);
+        }
+        let mut pages = SlotPages::default();
+        for address in &mut pages.0[..2] {
+            *address = efi::allocate_pages(1)
+                .ok_or(XhciError::AllocationFailed)?
+                .as_ptr() as u64;
+        }
+        let [in_ring_addr, out_ring_addr, _] = pages.0;
         let in_ring = TrbRing::new(in_ring_addr, 256);
         let out_ring = TrbRing::new(out_ring_addr, 256);
         let context_size = self.context_size;
-
-        // Calculate DCI (Device Context Index) for endpoints
-        // DCI = (Endpoint Number * 2) + Direction (0=OUT, 1=IN)
-        let in_dci = (bulk_in as usize * 2) + 1;
-        let out_dci = bulk_out as usize * 2;
 
         // Set up input context
         let input = slot.input_context;
@@ -244,7 +251,7 @@ impl super::XhciController {
         // Copy slot context from device context
         Self::copy_device_slot_context(input, slot.device_context, context_size);
         let slot_ctx = Self::input_slot_context(input, context_size);
-        slot_ctx.set_context_entries(in_dci.max(out_dci) as u8);
+        slot_ctx.set_context_entries(slot_ctx.context_entries().max(in_dci.max(out_dci) as u8));
 
         // Set up endpoint contexts
         let control = Self::input_control_context(input, context_size);
@@ -272,10 +279,6 @@ impl super::XhciController {
         out_ep_ctx.set_dequeue_cycle_state();
         out_ep_ctx.set_average_trb_length(out_max_packet);
 
-        // Store rings
-        slot.transfer_rings[in_dci - 1] = Some(in_ring);
-        slot.transfer_rings[out_dci - 1] = Some(out_ring);
-
         // Send Configure Endpoint command
         let mut command = command::ConfigureEndpoint::new();
         command
@@ -286,9 +289,18 @@ impl super::XhciController {
         barrier::mmio_write();
         self.ring_doorbell(0, 0);
 
-        self.wait_command_completion()?;
-
-        Ok(())
+        let result = self.wait_command_completion();
+        if result.as_ref().is_err_and(|error| error.class_rejected()) {
+            return result.map(|_| ());
+        }
+        // Keep DMA reachable for detach if command ownership is uncertain.
+        let slot = self
+            .get_slot_mut(slot_id)
+            .expect("slot lives during synchronous command");
+        slot.transfer_rings[in_dci - 1] = Some(in_ring);
+        slot.transfer_rings[out_dci - 1] = Some(out_ring);
+        core::mem::forget(pages);
+        result.map(|_| ())
     }
 
     /// Bulk transfer

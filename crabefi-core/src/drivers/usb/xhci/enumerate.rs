@@ -192,22 +192,68 @@ async fn configure_device(pipe: Pipe) -> Result<(), UsbError> {
     if interfaces.iter().any(|iface| iface.is_mass_storage()) {
         port::transfer().await;
         controller(pipe.controller, |host| {
-            host.configure_mass_storage(pipe.address, &config)
+            optional_class(
+                pipe.address,
+                "mass storage",
+                host.configure_mass_storage(pipe.address, &config),
+            )
         })?;
     }
     if interfaces.iter().any(|iface| iface.is_hid_keyboard()) {
         port::transfer().await;
         controller(pipe.controller, |host| {
-            host.configure_hid_keyboard(pipe.address, &config)
+            optional_class(
+                pipe.address,
+                "keyboard",
+                host.configure_hid_keyboard(pipe.address, &config),
+            )
         })?;
     }
     if interfaces.iter().any(|iface| iface.is_hid_mouse()) {
         port::transfer().await;
         controller(pipe.controller, |host| {
-            host.configure_hid_mouse(pipe.address, &config)
+            optional_class(
+                pipe.address,
+                "mouse",
+                host.configure_hid_mouse(pipe.address, &config),
+            )
         })?;
     }
     Ok(())
+}
+
+fn optional_class(
+    address: u8,
+    class: &str,
+    result: Result<(), XhciError>,
+) -> Result<(), XhciError> {
+    if let Err(error) = &result
+        && error.class_rejected()
+    {
+        log::warn!("xHCI slot {address}: skipping unusable {class} interface: {error:?}");
+        return Ok(());
+    }
+    result
+}
+
+#[cfg(test)]
+#[test]
+fn rejecting_a_secondary_function_does_not_abort_the_configured_device() {
+    use xhci::ring::trb::event::CompletionCode;
+    assert!(optional_class(1, "mass storage", Ok(())).is_ok());
+    assert!(optional_class(1, "keyboard", Err(XhciError::InvalidParameter)).is_ok());
+    assert!(
+        optional_class(
+            1,
+            "mouse",
+            Err(XhciError::CommandFailed(Ok(CompletionCode::BandwidthError)))
+        )
+        .is_ok()
+    );
+    assert!(matches!(
+        optional_class(1, "mouse", Err(XhciError::Timeout)),
+        Err(XhciError::Timeout)
+    ));
 }
 
 pub(in crate::drivers::usb) async fn detach(index: usize, address: u8) {

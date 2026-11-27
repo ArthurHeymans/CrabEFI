@@ -622,23 +622,7 @@ impl UsbController for XhciController {
     }
 
     fn get_device_info(&self, device: u8) -> Option<self::controller::DeviceInfo> {
-        let slot = self.get_slot(device)?;
-        Some(self::controller::DeviceInfo {
-            address: device,
-            speed: self::controller::UsbSpeed::from_xhci(slot.speed)
-                .unwrap_or(self::controller::UsbSpeed::High),
-            vendor_id: slot.device_desc.vendor_id,
-            product_id: slot.device_desc.product_id,
-            device_class: slot.device_desc.device_class,
-            is_mass_storage: slot.is_mass_storage,
-            mass_storage_interface: slot.mass_storage_interface,
-            is_hid: slot.is_hid_keyboard
-                || slot.is_hid_mouse
-                || slot.device_desc.device_class == 0x03,
-            is_keyboard: slot.is_hid_keyboard,
-            is_mouse: slot.is_hid_mouse,
-            is_hub: slot.device_desc.device_class == 0x09,
-        })
+        self.get_slot(device).map(xhci::UsbSlot::device_info)
     }
 
     fn get_bulk_endpoints(

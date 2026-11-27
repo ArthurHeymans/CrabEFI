@@ -74,7 +74,7 @@ fn ep0_max_packet(speed: u8, is_superspeed: bool) -> u16 {
 /// Unpublished slot pages. Partial allocations are safe to release until the
 /// DCBAA/Address Device command exposes them to hardware.
 #[derive(Default)]
-struct SlotPages([u64; 3]);
+pub(super) struct SlotPages(pub [u64; 3]);
 
 impl Drop for SlotPages {
     fn drop(&mut self) {
@@ -141,6 +141,91 @@ pub struct UsbSlot {
     pub root_port: u8,
     /// Parent hub `(hub_slot_id, hub_port)` if attached behind a hub.
     pub parent_hub: Option<(u8, u8)>,
+}
+
+impl UsbSlot {
+    fn with_contexts(
+        slot_id: u8,
+        speed: u8,
+        route: SlotRoute,
+        is_superspeed: bool,
+        transaction_translator: Option<TransactionTranslator>,
+        [device_context, input_context]: [u64; 2],
+        transfer_rings: [Option<TrbRing>; 31],
+    ) -> Self {
+        Self {
+            slot_id,
+            device_context: device_context as *mut u8,
+            input_context: input_context as *mut u8,
+            transfer_rings,
+            device_desc: DeviceDescriptor::default(),
+            port: route.port,
+            speed,
+            is_superspeed,
+            transaction_translator,
+            is_mass_storage: false,
+            mass_storage_interface: 0,
+            bulk_in_ep: 0,
+            bulk_out_ep: 0,
+            bulk_in_max_packet: 0,
+            bulk_out_max_packet: 0,
+            is_hid_keyboard: false,
+            is_hid_mouse: false,
+            interrupt_in_ep: 0,
+            mouse_interrupt_in_ep: 0,
+            mouse_interrupt_max_packet: 0,
+            mouse_interrupt_interval: 0,
+            interrupt_max_packet: 0,
+            interrupt_interval: 0,
+            is_hub: false,
+            sublinks: None,
+            route_string: route.route_string,
+            root_port: route.root_port,
+            parent_hub: route.parent_hub,
+        }
+    }
+
+    pub(in crate::drivers::usb) fn device_info(&self) -> super::super::controller::DeviceInfo {
+        use super::super::controller::{DeviceInfo, UsbSpeed};
+        DeviceInfo {
+            address: self.slot_id,
+            speed: UsbSpeed::from_xhci(self.speed).unwrap_or(UsbSpeed::High),
+            vendor_id: self.device_desc.vendor_id,
+            product_id: self.device_desc.product_id,
+            device_class: self.device_desc.device_class,
+            is_mass_storage: self.is_mass_storage,
+            mass_storage_interface: self.mass_storage_interface,
+            is_hid: self.is_hid_keyboard
+                || self.is_hid_mouse
+                || self.device_desc.device_class == 0x03,
+            is_keyboard: self.is_hid_keyboard,
+            is_mouse: self.is_hid_mouse,
+            is_hub: self.is_hub,
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn interface_class_hub_remains_a_hub_in_device_info() {
+    let route = SlotRoute {
+        port: 0,
+        root_port: 0,
+        route_string: 0,
+        parent_hub: None,
+    };
+    let mut slot = UsbSlot::with_contexts(
+        1,
+        3,
+        route,
+        false,
+        None,
+        [0, 0],
+        core::array::from_fn(|_| None),
+    );
+    slot.is_hub = true; // Set by configuration from the interface descriptor.
+    assert_eq!(slot.device_desc.device_class, 0);
+    assert!(slot.device_info().is_hub);
 }
 
 /// Reset is valid only for a halted endpoint. A timed-out transfer can still
@@ -352,36 +437,15 @@ impl super::XhciController {
             .slots
             .get_mut(slot_id as usize)
             .ok_or(XhciError::NoFreeSlots)?;
-        *slot_entry = Some(try_box_slot(UsbSlot {
+        *slot_entry = Some(try_box_slot(UsbSlot::with_contexts(
             slot_id,
-            device_context: device_context as *mut u8,
-            input_context: input_context as *mut u8,
-            transfer_rings,
-            device_desc: DeviceDescriptor::default(),
-            port: route.port,
             speed,
+            route,
             is_superspeed,
             transaction_translator,
-            is_mass_storage: false,
-            mass_storage_interface: 0,
-            bulk_in_ep: 0,
-            bulk_out_ep: 0,
-            bulk_in_max_packet: 0,
-            bulk_out_max_packet: 0,
-            is_hid_keyboard: false,
-            is_hid_mouse: false,
-            interrupt_in_ep: 0,
-            mouse_interrupt_in_ep: 0,
-            mouse_interrupt_max_packet: 0,
-            mouse_interrupt_interval: 0,
-            interrupt_max_packet: 0,
-            interrupt_interval: 0,
-            is_hub: false,
-            sublinks: None,
-            route_string: route.route_string,
-            root_port: route.root_port,
-            parent_hub: route.parent_hub,
-        })?);
+            [device_context, input_context],
+            transfer_rings,
+        ))?);
         self.pending_parents[slot_id as usize] = None;
         core::mem::forget(pages);
 

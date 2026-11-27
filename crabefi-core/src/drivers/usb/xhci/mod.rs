@@ -158,6 +158,23 @@ pub enum XhciError {
     StallError,
 }
 
+impl XhciError {
+    /// No command was issued, or Configure Endpoint returned a rejection
+    /// specific to the requested endpoints. The previously configured
+    /// endpoints are still usable. A lost command completion is not local.
+    fn class_rejected(&self) -> bool {
+        matches!(
+            self,
+            Self::InvalidParameter
+                | Self::AllocationFailed
+                | Self::CommandFailed(Ok(event::CompletionCode::ParameterError
+                    | event::CompletionCode::ResourceError
+                    | event::CompletionCode::BandwidthError
+                    | event::CompletionCode::SecondaryBandwidthError))
+        )
+    }
+}
+
 // SAFETY: XhciController contains DMA buffer pointers managed by the EFI page allocator.
 // The MMIO accessors and DMA buffers are:
 // 1. Backed by addresses that remain valid for the controller's lifetime
