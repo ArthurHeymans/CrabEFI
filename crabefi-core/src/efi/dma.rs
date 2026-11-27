@@ -9,7 +9,9 @@ use core::ops::Range;
 use r_efi::efi::Status;
 
 use crate::arch::{DmaCacheOperation, DmaSyncError};
-use crate::efi::allocator::{self, AllocateType, MemoryType, PAGE_SIZE, PAGE_SIZE_USIZE};
+use crate::efi::allocator::{
+    self, AllocateType, MemoryType, PAGE_SIZE, PAGE_SIZE_USIZE, Placement,
+};
 use crabefi_bounds::dma::{
     allocation_fits_mask, checked_subrange, pages_for_len, translate_dma_range,
 };
@@ -179,17 +181,14 @@ impl DmaBuffer {
             .ok_or(DmaError::OutOfResources)?;
         let device_limited_cpu_last = domain.cpu_base.saturating_add(device_mask_offset);
         let max_address = cpu_end.saturating_sub(1).min(device_limited_cpu_last);
-        let mut address = 0;
-        let status = allocator::allocate_pages_in_range(
+        let address = allocator::allocate_pages_in_range(
             MemoryType::BootServicesData,
             pages,
-            domain.cpu_base,
-            max_address,
-            &mut address,
-        );
-        if status != Status::SUCCESS {
-            return Err(DmaError::OutOfResources);
-        }
+            domain.cpu_base..=max_address,
+            PAGE_SIZE,
+            Placement::Highest,
+        )
+        .map_err(|_| DmaError::OutOfResources)?;
         let mut buffer = Self {
             address,
             device_address: 0,

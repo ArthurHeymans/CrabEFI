@@ -23,6 +23,8 @@ pub enum BzImageError {
     Missing64BitEntry,
     /// The advertised entry point is outside the loaded image
     EntryOutsideImage,
+    /// `kernel_alignment` is not a power of two
+    InvalidAlignment,
     /// Failed to read from disk
     ReadError,
     /// Kernel too large to fit in memory
@@ -32,16 +34,6 @@ pub enum BzImageError {
     /// Command line too long
     CmdLineTooLong,
 }
-
-/// Default kernel load address (16 MB)
-///
-/// For 64-bit relocatable kernels, we load at 16MB to avoid conflicts with:
-/// - CrabEFI itself (loaded at 1MB by coreboot)
-/// - Legacy BIOS data areas
-///
-/// Note: 1MB (0x100000) is the traditional address for 32-bit kernels, but
-/// CrabEFI occupies that space, so we use the 64-bit preferred address.
-pub const DEFAULT_KERNEL_ADDR: u64 = 0x1000000;
 
 /// Boot parameters address (zero page)
 ///
@@ -144,6 +136,13 @@ impl BzImage {
             return Err(BzImageError::EntryOutsideImage);
         }
 
+        // The decompressor rounds its load address up to this alignment.
+        let alignment = header.kernel_alignment;
+        if !alignment.is_power_of_two() {
+            log::error!("Invalid bzImage kernel alignment: {alignment:#x}");
+            return Err(BzImageError::InvalidAlignment);
+        }
+
         // Copy packed fields to local variables
         let version = header.version;
         let relocatable = header.is_relocatable();
@@ -178,11 +177,21 @@ impl BzImage {
     ///
     /// * `kernel_addr` - Address where kernel was loaded
     pub fn efi_handover_entry(&self, kernel_addr: u64) -> Option<u64> {
+        self.efi_handover_offset()
+            .map(|offset| kernel_addr + offset)
+    }
+
+    /// Whether the kernel has a 64-bit EFI handover entry inside its image.
+    pub fn has_efi_handover(&self) -> bool {
+        self.efi_handover_offset().is_some()
+    }
+
+    fn efi_handover_offset(&self) -> Option<u64> {
         if !self.header.supports_efi_handover() {
             return None;
         }
         let offset = u64::from(self.header.handover_offset) + self.header.entry64_offset();
-        (offset < u64::from(self.kernel_size)).then(|| kernel_addr + offset)
+        (offset < u64::from(self.kernel_size)).then_some(offset)
     }
 }
 
@@ -230,7 +239,6 @@ pub unsafe fn set_cmdline(cmdline: &str, addr: u32) -> Result<(), BzImageError> 
 /// * `bzimage` - Parsed bzImage information
 /// * `acpi_rsdp` - ACPI RSDP address (optional)
 /// * `framebuffer` - Framebuffer info (optional)
-/// * `kernel_addr` - Address where kernel is loaded
 /// * `cmdline_addr` - Address of command line
 ///
 /// # Returns
@@ -244,7 +252,6 @@ pub fn prepare_boot_params(
     bzimage: &BzImage,
     acpi_rsdp: Option<u64>,
     framebuffer: Option<&crate::platform::FramebufferConfig>,
-    kernel_addr: u32,
     cmdline_addr: u32,
 ) -> Result<BootParams, E820MapError> {
     let mut params = BootParams::new();
@@ -279,9 +286,6 @@ pub fn prepare_boot_params(
     // Set loader type (unknown)
     params.set_loader_type();
 
-    // Set kernel address
-    params.set_kernel_addr(kernel_addr);
-
     // Set command line pointer
     params.set_cmdline(cmdline_addr);
 
@@ -311,7 +315,22 @@ mod tests {
         let flags = field(core::mem::offset_of!(SetupHeader, xloadflags));
         data[flags..flags + 2].copy_from_slice(&SetupHeader::XLF_KERNEL_64.to_le_bytes());
         data[field(core::mem::offset_of!(SetupHeader, relocatable_kernel))] = 1;
+        let alignment = field(core::mem::offset_of!(SetupHeader, kernel_alignment));
+        data[alignment..alignment + 4].copy_from_slice(&0x20_0000u32.to_le_bytes());
         data
+    }
+
+    #[test]
+    fn rejects_kernel_alignment_that_is_not_a_power_of_two() {
+        let mut data = header_bytes(1);
+        let alignment = HEADER_OFFSET + core::mem::offset_of!(SetupHeader, kernel_alignment);
+        for value in [0u32, 0x30_0000] {
+            data[alignment..alignment + 4].copy_from_slice(&value.to_le_bytes());
+            assert!(matches!(
+                BzImage::parse_header(&data, 4096),
+                Err(BzImageError::InvalidAlignment)
+            ));
+        }
     }
 
     #[test]

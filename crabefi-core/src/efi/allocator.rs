@@ -17,7 +17,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 pub use crabefi_memmap::{
     AllocateType, InvalidAllocateType, InvalidMemoryType, MemoryDescriptor, MemoryType, PAGE_SIZE,
-    attributes,
+    Placement, attributes,
 };
 use r_efi::efi;
 
@@ -154,16 +154,17 @@ pub fn allocate_pages(
     ALLOCATOR.with_mut(|alloc| alloc.allocate_pages(alloc_type, memory_type, num_pages, memory))
 }
 
-/// Allocate pages wholly contained in an inclusive physical-address range.
+/// Allocate pages wholly contained in an inclusive physical-address range,
+/// starting at a multiple of the power-of-two `alignment`.
 pub fn allocate_pages_in_range(
     memory_type: MemoryType,
     num_pages: u64,
-    min_address: u64,
-    max_address: u64,
-    memory: &mut u64,
-) -> efi::Status {
+    range: core::ops::RangeInclusive<u64>,
+    alignment: u64,
+    placement: Placement,
+) -> Result<u64, efi::Status> {
     ALLOCATOR.with_mut(|allocator| {
-        allocator.allocate_pages_in_range(memory_type, num_pages, min_address, max_address, memory)
+        allocator.allocate_pages_in_range(memory_type, num_pages, range, alignment, placement)
     })
 }
 
