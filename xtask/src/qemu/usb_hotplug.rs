@@ -285,17 +285,19 @@ impl<'a> Scenario<'a> {
     }
 
     fn marker(&mut self, marker: &str) -> Result<()> {
+        self.marker_groups(&[&[marker]])
+    }
+
+    // Each group describes causal order, but separate groups may interleave.
+    fn marker_groups(&mut self, groups: &[&[&str]]) -> Result<()> {
         loop {
             if let Ok(log) = fs::read(self.serial)
-                && let Some(offset) = log.get(self.cursor..).and_then(|log| {
-                    log.windows(marker.len())
-                        .position(|window| window == marker.as_bytes())
-                })
+                && let Some(end) = marker_groups_end(&log, self.cursor, groups)
             {
-                self.cursor += offset + marker.len();
+                self.cursor = end;
                 return Ok(());
             }
-            check_alive(self.child, self.deadline, marker)?;
+            check_alive(self.child, self.deadline, &format!("{groups:?}"))?;
             thread::sleep(Duration::from_millis(20));
         }
     }
@@ -317,6 +319,10 @@ impl<'a> Scenario<'a> {
         // attach it without a companion. Exercise this topology elsewhere.
         if model != "usb-ehci" {
             self.add("usb-hub", "hub", "2", None)?;
+            if model == "qemu-xhci" {
+                // The USB2 hub descriptor is shorter than our EP0 request.
+                self.marker("xHCI: EP0 short IN:")?;
+            }
             self.marker("USB hub ")?;
             self.add("usb-kbd", "hub-keyboard", "2.2", None)?;
             self.marker("USB: attached keyboard")?;
@@ -347,20 +353,24 @@ impl<'a> Scenario<'a> {
     }
 
     fn exercise_companions(&mut self, cold: bool) -> Result<()> {
-        if !cold {
-            self.marker("Found 0 boot entries")?;
-            self.add("usb-storage", "ehci-disk", "1", Some("hotdisk"))?;
-        }
         // USB controller indices follow the fixture's PCI function order:
         // the UHCI companions are 1d.0–2, and EHCI is 1d.7.
-        self.marker("USB: attached storage on controller 3")?;
-        if !cold {
+        let storage = "USB: attached storage on controller 3";
+        let app = "USB HOTPLUG: waiting for keyboard";
+        let handoff_then_keyboard = [
+            "EHCI: Port 1 has full-speed device, releasing to companion",
+            "USB: attached keyboard on controller 0",
+        ];
+        if cold {
+            self.marker_groups(&[&[storage, app], &handoff_then_keyboard])
+        } else {
+            self.marker("Found 0 boot entries")?;
+            self.add("usb-storage", "ehci-disk", "1", Some("hotdisk"))?;
+            self.marker(storage)?;
             self.add("usb-hub", "companion-hub", "2", None)?;
             self.add("usb-kbd", "companion-keyboard", "2.1", None)?;
+            self.marker_groups(&[&[app], &handoff_then_keyboard])
         }
-        self.marker("EHCI: Port 1 has full-speed device, releasing to companion")?;
-        self.marker("USB: attached keyboard on controller 0")?;
-        self.marker("USB HOTPLUG: waiting for keyboard")
     }
 
     fn add(&mut self, driver: &str, id: &str, port: &str, drive: Option<&str>) -> Result<()> {
@@ -370,6 +380,47 @@ impl<'a> Scenario<'a> {
         }
         self.qmp.command("device_add", args)
     }
+}
+
+fn marker_groups_end(log: &[u8], start: usize, groups: &[&[&str]]) -> Option<usize> {
+    let mut end = start;
+    for group in groups {
+        let mut cursor = start;
+        for marker in *group {
+            let offset = log
+                .get(cursor..)?
+                .windows(marker.len())
+                .position(|bytes| bytes == marker.as_bytes())?;
+            cursor += offset + marker.len();
+        }
+        end = end.max(cursor);
+    }
+    Some(end)
+}
+
+#[cfg(test)]
+#[test]
+fn companion_markers_accept_interleaving_but_not_reversed_dependencies() {
+    let groups: &[&[&str]] = &[&["disk", "app"], &["handoff", "keyboard"]];
+    for log in [
+        "disk handoff keyboard app",
+        "handoff disk app keyboard",
+        "handoff keyboard disk app",
+    ] {
+        assert_eq!(
+            marker_groups_end(log.as_bytes(), 0, groups),
+            Some(log.len())
+        );
+    }
+    assert_eq!(
+        marker_groups_end(b"disk app keyboard handoff", 0, groups),
+        None
+    );
+    assert_eq!(marker_groups_end(b"handoff disk app", 0, groups), None);
+    assert_eq!(
+        marker_groups_end(b"handoff keyboard disk app", 1, groups),
+        None
+    );
 }
 
 fn check_alive(child: &mut Child, deadline: Instant, marker: &str) -> Result<()> {
