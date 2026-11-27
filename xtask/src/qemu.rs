@@ -19,6 +19,9 @@ mod fwui;
 mod native_fat;
 pub(crate) mod sct;
 mod secure_boot_auth;
+mod usb_hotplug;
+
+pub(crate) use usb_hotplug::run as run_usb_hotplug_tests;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CaptureScenario {

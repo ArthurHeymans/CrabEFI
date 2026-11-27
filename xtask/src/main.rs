@@ -839,6 +839,9 @@ fn cmd_test(
     windows_media_dir: Option<PathBuf>,
     windows_success_markers: Vec<String>,
 ) -> Result<()> {
+    if app == "usb-hotplug-test" && (arch != Arch::X86_64 || ahci || nvme || sdhci) {
+        bail!("usb-hotplug-test needs x86-64 USB storage");
+    }
     // Payload MM persists runtime writes at once; there is no journal
     // replay to interrupt. Refuse before building or booting anything.
     if app == "runtime-replay-interrupt-test" && std::env::var_os("CRABEFI_PAYLOAD_MM").is_some() {
@@ -897,7 +900,14 @@ fn cmd_test(
     } else {
         // Build CrabEFI first
         let features = test_payload_features(app);
-        cmd_build_payload(true, ui, arch, machine, false, &features)?;
+        cmd_build_payload(
+            true,
+            ui || app == "usb-hotplug-test",
+            arch,
+            machine,
+            false,
+            &features,
+        )?;
 
         // Prepare ROM with CrabEFI payload
         let crabefi_elf = rom::get_crabefi_elf_in(&payload_target_dir(false, &features), arch);
@@ -1054,14 +1064,18 @@ fn cmd_test(
         // mm-seal-test boots hello on a payload whose MM never closes the
         // firmware phase: hello must never run.
         let efi_app = match app {
-            "mm-seal-test" => "hello",
+            "mm-seal-test" | "usb-hotplug-test" => "hello",
             // runtime-image-test on a payload that resets in the middle of
             // replaying its journal.
             "runtime-replay-interrupt-test" => "runtime-image-test",
             app => app,
         };
         println!("Building test app: {}", efi_app);
-        cmd_build_test_app(efi_app, arch)?;
+        if app == "usb-hotplug-test" {
+            build_test_app(efi_app, arch, Some("hotplug-input"))?;
+        } else {
+            cmd_build_test_app(efi_app, arch)?;
+        }
 
         let efi_path = find_test_app_efi(efi_app, arch)?;
 
@@ -1091,7 +1105,9 @@ fn cmd_test(
     }
 
     // Run tests
-    if app == "uefi-sct-smoke" {
+    if app == "usb-hotplug-test" {
+        qemu::run_usb_hotplug_tests(&config, &disk_path)
+    } else if app == "uefi-sct-smoke" {
         qemu::run_uefi_sct_smoke_tests(&config, &disk_path, &sequence, &sct_report_dir)
     } else if app == "windows-boot-smoke" {
         let markers = if windows_success_markers.is_empty() {
@@ -1128,6 +1144,10 @@ fn resolve_project_path(path: &Path) -> PathBuf {
 }
 
 fn cmd_build_test_app(name: &str, arch: Arch) -> Result<()> {
+    build_test_app(name, arch, None)
+}
+
+fn build_test_app(name: &str, arch: Arch, feature: Option<&str>) -> Result<()> {
     let app_dir = project_root().join("test-apps").join(name);
 
     if !app_dir.exists() {
@@ -1141,6 +1161,9 @@ fn cmd_build_test_app(name: &str, arch: Arch) -> Result<()> {
 
     let mut cmd = std::process::Command::new("cargo");
     cmd.arg("build").arg("--release");
+    if let Some(feature) = feature {
+        cmd.args(["--features", feature]);
+    }
 
     match arch {
         Arch::X86_64 => {}

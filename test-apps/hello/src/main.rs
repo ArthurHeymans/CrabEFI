@@ -49,6 +49,11 @@ pub extern "efiapi" fn efi_main(_image_handle: Handle, system_table: *mut System
         output_string(con_out, msg.as_ptr() as *mut Char16);
     }
 
+    #[cfg(feature = "hotplug-input")]
+    if let Err(status) = wait_for_hotplug_key(system_table) {
+        return status;
+    }
+
     // Print success message
     let success_msg: &[Char16] = &[
         'E' as Char16,
@@ -92,6 +97,44 @@ pub extern "efiapi" fn efi_main(_image_handle: Handle, system_table: *mut System
     }
 
     Status::SUCCESS
+}
+
+#[cfg(feature = "hotplug-input")]
+fn wait_for_hotplug_key(system_table: *mut SystemTable) -> Result<(), Status> {
+    use r_efi::protocols::simple_text_input::InputKey;
+
+    let (input, output, boot_services) = unsafe {
+        (
+            (*system_table).con_in,
+            (*system_table).con_out,
+            (*system_table).boot_services,
+        )
+    };
+    if input.is_null() || boot_services.is_null() {
+        return Err(Status::UNSUPPORTED);
+    }
+    let print = |line: &str| {
+        let mut chars = [0; 64];
+        for (out, unit) in chars.iter_mut().zip(line.encode_utf16()) {
+            *out = unit;
+        }
+        unsafe { ((*output).output_string)(output, chars.as_mut_ptr()) };
+    };
+    print("USB HOTPLUG: waiting for keyboard\r\n");
+    let (mut event, mut index) = (unsafe { (*input).wait_for_key }, 0);
+    loop {
+        let status = unsafe { ((*boot_services).wait_for_event)(1, &mut event, &mut index) };
+        if status != Status::SUCCESS {
+            return Err(status);
+        }
+        let mut key = InputKey::default();
+        if unsafe { ((*input).read_key_stroke)(input, &mut key) } == Status::SUCCESS
+            && key.unicode_char == u16::from(b'h')
+        {
+            print("USB HOTPLUG: received h\r\n");
+            return Ok(());
+        }
+    }
 }
 
 #[panic_handler]
