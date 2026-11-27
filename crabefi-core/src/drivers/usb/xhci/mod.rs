@@ -116,6 +116,8 @@ pub struct XhciController {
     erst: u64,
     /// Event ring
     event_ring: TrbRing,
+    /// Controller-owned EP0 staging, reused after completion or recovery.
+    control_buffer: Option<crate::efi::dma::DmaBuffer>,
     /// Active device slots, indexed by slot ID.
     ///
     /// Slot IDs are assigned by the controller (1-based). The table has one

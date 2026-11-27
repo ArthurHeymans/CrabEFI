@@ -194,6 +194,7 @@ impl super::XhciController {
             cmd_ring: TrbRing::empty(), // Will be initialized in init()
             erst: 0,
             event_ring: TrbRing::empty(), // Will be initialized in init()
+            control_buffer: None,
             slots,
             interrupt_polls: alloc::vec::Vec::new(),
             root_ports: alloc::vec![super::enumerate::RootPortState::Empty; usize::from(num_ports)],
