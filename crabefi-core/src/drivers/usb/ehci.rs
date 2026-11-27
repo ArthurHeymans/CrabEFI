@@ -703,6 +703,16 @@ impl EhciController {
         Ok(())
     }
 
+    // The last 100 ms are reserved for stopping or unlinking the schedule.
+    // Start/stop handshakes before submission share the remaining budget.
+    const TRANSFER_WORK_MS: u64 = 4900;
+
+    fn wait_async_schedule(&self, running: bool, deadline: &Timeout) -> bool {
+        let ready = || self.op().usbsts.is_set(USBSTS::ASS) == running;
+        wait_for(100, || ready() || deadline.is_expired());
+        ready()
+    }
+
     /// Unlink the persistent bulk QH from the async schedule.
     fn unlink_bulk_qh(&mut self) {
         if !self.bulk_qh_linked {
@@ -770,6 +780,7 @@ impl EhciController {
         index: u16,
         data: Option<&mut [u8]>,
     ) -> Result<usize, UsbError> {
+        let timeout = Timeout::from_ms(Self::TRANSFER_WORK_MS);
         let is_in = (request_type & 0x80) != 0;
         let data_len = data.as_ref().map(|h| h.len()).unwrap_or(0);
         if data_len > Self::DMA_BUFFER_SIZE - 64
@@ -946,8 +957,9 @@ impl EhciController {
         // state around transient QHs.
         if self.op().usbcmd.is_set(USBCMD::ASE) {
             self.op().usbcmd.modify(USBCMD::ASE::CLEAR);
-            if !wait_for(100, || !self.op().usbsts.is_set(USBSTS::ASS)) {
+            if !self.wait_async_schedule(false, &timeout) {
                 log::warn!("EHCI: Async schedule failed to stop before control transfer");
+                return Err(UsbError::Timeout);
             }
             self.async_schedule_enabled = false;
         }
@@ -1001,7 +1013,7 @@ impl EhciController {
 
         // Enable async schedule for this transfer.
         self.op().usbcmd.modify(USBCMD::ASE::SET);
-        if !wait_for(100, || self.op().usbsts.is_set(USBSTS::ASS)) {
+        if !self.wait_async_schedule(true, &timeout) {
             log::error!("EHCI: Async schedule failed to start");
             async_qh.qh_link = old_link;
             barrier::dma_write();
@@ -1011,7 +1023,6 @@ impl EhciController {
         self.async_schedule_enabled = true;
 
         // Wait for transfer completion
-        let timeout = Timeout::from_ms(5000);
         let mut poll_count = 0u32;
         while !timeout.is_expired() {
             // Invalidate cache to see updates from EHCI DMA
@@ -1169,6 +1180,7 @@ impl EhciController {
         data: &mut [u8],
         toggle: bool,
     ) -> Result<(usize, bool), UsbError> {
+        let timeout = Timeout::from_ms(Self::TRANSFER_WORK_MS);
         let endpoint_info = if is_in {
             device.bulk_in.as_ref()
         } else {
@@ -1257,13 +1269,12 @@ impl EhciController {
         // Enable async schedule if not already enabled
         if !self.async_schedule_enabled {
             self.op().usbcmd.modify(USBCMD::ASE::SET);
-            if wait_for(100, || self.op().usbsts.is_set(USBSTS::ASS)) {
+            if self.wait_async_schedule(true, &timeout) {
                 self.async_schedule_enabled = true;
             }
         }
 
         // Wait for completion
-        let timeout = Timeout::from_ms(5000);
         let qtd = unsafe { &*(qtd_addr as *const Qtd) };
         while !timeout.is_expired() {
             invalidate_cache_range(qtd_addr, 64);

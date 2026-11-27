@@ -339,6 +339,28 @@ impl UhciController {
         UhciRegs::new(self.io_base)
     }
 
+    // Stop/start take at most 100 ms each, and reset recovery 160 ms.
+    // Reserve this time once, not once per packet of a bulk transfer.
+    const TRANSFER_WORK_MS: u64 = 5000 - 360;
+
+    /// Retire a QH before reusing its descriptors. On error UHCI can leave
+    /// the link on the failed TD, so clearing it requires a stopped schedule.
+    fn retire_qh(&mut self, retired: bool) {
+        let halted = !retired && self.stop_schedule();
+        if !retired && !halted {
+            log::error!("UHCI: schedule did not halt; resetting controller");
+            self.cleanup();
+        }
+        let qh = unsafe { &mut *(self.qh as *mut QueueHead) };
+        qh.element_link = QueueHead::TERMINATE;
+        flush_cache_range(self.qh, core::mem::size_of::<QueueHead>());
+        barrier::dma_write();
+        if halted && !self.start_schedule() {
+            log::error!("UHCI: schedule did not restart; resetting controller");
+            self.cleanup();
+        }
+    }
+
     fn stop_schedule(&self) -> bool {
         let regs = self.regs();
         regs.usbcmd().modify(USBCMD::RS::CLEAR);
@@ -599,12 +621,27 @@ impl UhciController {
 
         // Wait for status TD completion. CS_SPD stops vertical traversal on a
         // short packet, so redirect the QH to the status stage when that occurs.
-        let timeout = Timeout::from_ms(5000);
+        let timeout = Timeout::from_ms(Self::TRANSFER_WORK_MS);
         let mut repaired_short_packet = false;
-        loop {
+        let (result, retired) = loop {
             invalidate_cache_range(td_base, 32 * (num_data_tds + 2));
+            invalidate_cache_range(self.qh, core::mem::size_of::<QueueHead>());
             barrier::dma_read();
-
+            let retired = unsafe { ptr::read_volatile(&raw const qh.element_link) }
+                & QueueHead::TERMINATE
+                != 0;
+            let status = unsafe { ptr::read_volatile(&raw const status_td.ctrl_sts) };
+            let setup = unsafe {
+                let td = setup_td_addr as *const TransferDescriptor;
+                ptr::read_volatile(&raw const (*td).ctrl_sts)
+            };
+            let data_statuses = (0..num_data_tds).map(|index| unsafe {
+                let td = (first_data_td_addr + index as u64 * 32) as *const TransferDescriptor;
+                ptr::read_volatile(&raw const (*td).ctrl_sts)
+            });
+            if let Some(result) = control_completion(setup, data_statuses, status, retired) {
+                break (result, retired);
+            }
             if is_in && !repaired_short_packet {
                 for i in 0..num_data_tds.saturating_sub(1) {
                     let td_addr = first_data_td_addr + (i as u64) * 32;
@@ -620,67 +657,15 @@ impl UhciController {
                 }
             }
 
-            let sts = unsafe { ptr::read_volatile(&raw const status_td.ctrl_sts) };
-            invalidate_cache_range(self.qh, core::mem::size_of::<QueueHead>());
-            let retired = unsafe { ptr::read_volatile(&raw const qh.element_link) }
-                & QueueHead::TERMINATE
-                != 0;
-            if sts & TransferDescriptor::CS_ACTIVE == 0 && (retired || status_td.has_error()) {
-                break;
-            }
             if timeout.is_expired() {
-                let halted = self.stop_schedule();
-                if !halted {
-                    log::error!("UHCI: schedule did not halt after control timeout; resetting");
-                    self.cleanup();
-                }
-                qh.element_link = QueueHead::TERMINATE;
-                flush_cache_range(self.qh, core::mem::size_of::<QueueHead>());
-                barrier::dma_write();
-                if halted && !self.start_schedule() {
-                    log::error!("UHCI: schedule did not restart after control timeout");
-                    self.cleanup();
-                }
-                return Err(UsbError::Timeout);
+                break (Err(UsbError::Timeout), retired);
             }
             core::hint::spin_loop();
-        }
-
-        // Clear QH
-        qh.element_link = QueueHead::TERMINATE;
-        flush_cache_range(self.qh, core::mem::size_of::<QueueHead>());
-        barrier::dma_write();
-
+        };
+        self.retire_qh(retired);
+        result?;
         invalidate_cache_range(td_base, 32 * (num_data_tds + 2));
-
-        // Check setup TD and all data TDs for errors
-        let setup_td = unsafe { &*(setup_td_addr as *const TransferDescriptor) };
-        if setup_td.has_error() {
-            return Err(if setup_td.is_stalled() {
-                UsbError::Stall
-            } else {
-                UsbError::TransactionError
-            });
-        }
-        for i in 0..num_data_tds {
-            let td_addr = first_data_td_addr + (i as u64) * 32;
-            let td = unsafe { &*(td_addr as *const TransferDescriptor) };
-            if td.has_error() {
-                return Err(if td.is_stalled() {
-                    UsbError::Stall
-                } else {
-                    UsbError::TransactionError
-                });
-            }
-        }
-        let status_sts = unsafe { ptr::read_volatile(&status_td.ctrl_sts) };
-        if status_sts & TransferDescriptor::CS_ERROR_MASK != 0 {
-            return Err(if status_sts & TransferDescriptor::CS_STALLED != 0 {
-                UsbError::Stall
-            } else {
-                UsbError::TransactionError
-            });
-        }
+        barrier::dma_read();
 
         // Copy received data for IN transfers
         if let Some(d) = data
@@ -724,6 +709,85 @@ impl UhciController {
     /// Get PCI address
     pub fn pci_address(&self) -> PciAddress {
         self.pci_address
+    }
+}
+
+/// Active TD errors can still be retried by UHCI. Only an inactive TD
+/// reports a terminal error, even if STATUS was never reached.
+fn control_completion(
+    setup: u32,
+    data: impl Iterator<Item = u32>,
+    status: u32,
+    retired: bool,
+) -> Option<Result<(), UsbError>> {
+    for td in core::iter::once(setup)
+        .chain(data)
+        .chain(core::iter::once(status))
+    {
+        if td & TransferDescriptor::CS_ACTIVE == 0 && td & TransferDescriptor::CS_ERROR_MASK != 0 {
+            return Some(Err(if td & TransferDescriptor::CS_STALLED != 0 {
+                UsbError::Stall
+            } else {
+                UsbError::TransactionError
+            }));
+        }
+    }
+    (retired && status & TransferDescriptor::CS_ACTIVE == 0).then_some(Ok(()))
+}
+
+#[cfg(test)]
+mod control_tests {
+    use super::*;
+
+    #[test]
+    fn terminal_setup_stall_does_not_wait_for_status() {
+        assert!(matches!(
+            control_completion(
+                TransferDescriptor::CS_STALLED,
+                [TransferDescriptor::CS_ACTIVE].into_iter(),
+                TransferDescriptor::CS_ACTIVE,
+                false
+            ),
+            Some(Err(UsbError::Stall))
+        ));
+    }
+    #[test]
+    fn terminal_data_stall_does_not_wait_for_status() {
+        assert!(matches!(
+            control_completion(
+                0,
+                [0, TransferDescriptor::CS_STALLED].into_iter(),
+                TransferDescriptor::CS_ACTIVE,
+                false
+            ),
+            Some(Err(UsbError::Stall))
+        ));
+    }
+    #[test]
+    fn status_error_is_terminal_even_without_link_retirement() {
+        assert!(matches!(
+            control_completion(
+                0,
+                [0].into_iter(),
+                TransferDescriptor::CS_CRC_TIMEOUT,
+                false
+            ),
+            Some(Err(UsbError::TransactionError))
+        ));
+        assert!(control_completion(0, [0].into_iter(), 0, false).is_none());
+        assert!(matches!(
+            control_completion(0, [0].into_iter(), 0, true),
+            Some(Ok(()))
+        ));
+        assert!(
+            control_completion(
+                0,
+                [TransferDescriptor::CS_ACTIVE | TransferDescriptor::CS_CRC_TIMEOUT].into_iter(),
+                TransferDescriptor::CS_ACTIVE,
+                false
+            )
+            .is_none()
+        );
     }
 }
 
@@ -809,7 +873,11 @@ impl UsbController for UhciController {
             dev.bulk_out_toggle
         };
 
+        let timeout = Timeout::from_ms(Self::TRANSFER_WORK_MS);
         while offset < data.len() {
+            if timeout.is_expired() {
+                return Err(UsbError::Timeout);
+            }
             let chunk = (data.len() - offset).min(max_per_td);
 
             // Copy data for OUT
@@ -855,7 +923,6 @@ impl UsbController for UhciController {
             // UHCI clears TD.Active before writing the QH element link.
             // Until the link is retired the controller could overwrite the
             // next submission with this transfer's terminate pointer.
-            let timeout = Timeout::from_ms(5000);
             let (completed, retired) = loop {
                 invalidate_cache_range(td_addr, 32);
                 invalidate_cache_range(self.qh, core::mem::size_of::<QueueHead>());
@@ -874,25 +941,7 @@ impl UsbController for UhciController {
                 }
                 core::hint::spin_loop();
             };
-            let halted = if retired {
-                false
-            } else {
-                let halted = self.stop_schedule();
-                if !halted {
-                    log::error!("UHCI: schedule did not halt with an unretired bulk TD; resetting");
-                    self.cleanup();
-                }
-                halted
-            };
-
-            // An unretired QH may only be cleared after stopping its schedule.
-            qh.element_link = QueueHead::TERMINATE;
-            flush_cache_range(self.qh, core::mem::size_of::<QueueHead>());
-            barrier::dma_write();
-            if halted && !self.start_schedule() {
-                log::error!("UHCI: schedule did not restart after bulk timeout");
-                self.cleanup();
-            }
+            self.retire_qh(retired);
 
             invalidate_cache_range(td_addr, 32);
 
@@ -1037,15 +1086,41 @@ impl PortController for UhciController {
 
     fn root_command(&mut self, port: u8, command: RootCommand) {
         let reg = self.regs().portsc(port);
-        let w1c = PORTSC::CSC::SET + PORTSC::PEC::SET;
-        let command = match command {
-            RootCommand::ClearChanges => w1c,
-            RootCommand::Reset => PORTSC::PR::SET + PORTSC::PE::CLEAR,
-            RootCommand::EndReset => PORTSC::PR::CLEAR,
-            RootCommand::Enable => PORTSC::PE::SET,
-            RootCommand::Disable => PORTSC::PR::CLEAR + PORTSC::PE::CLEAR,
-            _ => unreachable!(),
-        };
-        reg.set(command.modify(reg.get() & !w1c.value));
+        reg.set(root_port_write(reg.get(), command));
     }
+}
+
+fn root_port_write(status: u16, command: RootCommand) -> u16 {
+    let w1c = PORTSC::CSC::SET + PORTSC::PEC::SET;
+    let clear_suspend = matches!(command, RootCommand::Reset | RootCommand::EndReset);
+    let command = match command {
+        RootCommand::ClearChanges => w1c,
+        RootCommand::Reset => PORTSC::PR::SET + PORTSC::PE::CLEAR,
+        RootCommand::EndReset => PORTSC::PR::CLEAR,
+        RootCommand::Enable => PORTSC::PE::SET,
+        RootCommand::Disable => PORTSC::PR::CLEAR + PORTSC::PE::CLEAR,
+        _ => unreachable!(),
+    };
+    // Reset matches the original PR-only write followed by zero;
+    // never preserve suspend or resume signalling from a previous owner.
+    let clear = if clear_suspend {
+        w1c + PORTSC::SUSPEND::SET + PORTSC::RD::SET
+    } else {
+        w1c
+    };
+    command.modify(status & !clear.value)
+}
+
+#[cfg(test)]
+#[test]
+fn port_reset_does_not_keep_firmware_suspend_or_ack_connection_change() {
+    let status = (PORTSC::SUSPEND::SET + PORTSC::RD::SET + PORTSC::CSC::SET).value;
+    assert_eq!(
+        root_port_write(status, RootCommand::Reset),
+        PORTSC::PR::SET.value
+    );
+    assert_eq!(
+        root_port_write(status | PORTSC::PR::SET.value, RootCommand::EndReset),
+        0
+    );
 }
