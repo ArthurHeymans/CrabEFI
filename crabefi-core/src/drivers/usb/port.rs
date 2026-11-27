@@ -671,7 +671,7 @@ struct Connection {
 trait PortOps {
     async fn connection(&self) -> Result<Connection, UsbError>;
     async fn clear_change(&self) -> Result<(), UsbError>;
-    async fn bring_up(&self) -> Result<Option<u8>, UsbError>;
+    async fn bring_up(&self, retry: bool) -> Result<Option<u8>, UsbError>;
     fn observe_failed_bring_up(&self) {}
     async fn attached(&self, address: u8, startup: StartupActivity<'_>);
     fn startup(&self) -> StartupActivity<'_>;
@@ -720,7 +720,7 @@ async fn port_task(port: impl PortOps, mut initial_scan: Option<StartupActivity<
                     _ => continue 'connect,
                 }
 
-                match port.bring_up().await {
+                match port.bring_up(attempt > 1).await {
                     Ok(Some(address)) => break 'enumerate address,
                     Ok(None) => continue 'connect,
                     Err(error) => {
@@ -908,7 +908,7 @@ impl Port {
             .map(|_| ())
     }
 
-    async fn reset(&self) -> Result<Option<PortSpeed>, UsbError> {
+    async fn reset(&self, _retry: bool) -> Result<Option<PortSpeed>, UsbError> {
         if let Some(_hub) = self.hub.as_ref() {
             self.hub_feature(request::SET_FEATURE, hub_feature::PORT_RESET)
                 .await?;
@@ -1035,9 +1035,11 @@ impl Port {
                 ))))
             }
             #[cfg(feature = "xhci")]
-            RootKind::Xhci => reset_xhci(|| self.root_status(), |cmd| self.root_command(cmd))
-                .await
-                .map(|s| s.map(PortSpeed::Xhci)),
+            RootKind::Xhci => {
+                reset_xhci(|| self.root_status(), |cmd| self.root_command(cmd), _retry)
+                    .await
+                    .map(|s| s.map(PortSpeed::Xhci))
+            }
         }
     }
 
@@ -1114,7 +1116,7 @@ impl PortOps for Port {
         }
     }
 
-    async fn bring_up(&self) -> Result<Option<u8>, UsbError> {
+    async fn bring_up(&self, retry: bool) -> Result<Option<u8>, UsbError> {
         let shares_default_address = self.shares_default_address();
         let reservation = if shares_default_address {
             Some(DefaultAddress::reserve(self.controller).await)
@@ -1129,7 +1131,7 @@ impl PortOps for Port {
         // change latch or a bouncing connection must not renew boot forever.
         note_startup_progress();
         let result = async {
-            let Some(speed) = self.reset().await? else {
+            let Some(speed) = self.reset(retry).await? else {
                 return Ok(None);
             };
             if reset_latched_change(self.connection().await?)? {
@@ -1354,6 +1356,7 @@ async fn configure_hub(parent: &Port, pipe: Pipe) -> Result<(Rc<Hub>, u8, u64), 
 async fn reset_xhci(
     status: impl Fn() -> RootStatus,
     command: impl Fn(RootCommand),
+    force_reset: bool,
 ) -> Result<Option<u8>, UsbError> {
     const RX_DETECT: u8 = 5;
     const POLLING: u8 = 7;
@@ -1365,13 +1368,15 @@ async fn reset_xhci(
         log::debug!("xHCI: RxDetect phantom device, skipping");
         return Err(UsbError::NotReady);
     }
-    if initial.superspeed && initial.link_state == POLLING {
+    if !force_reset && initial.superspeed && initial.link_state == POLLING {
         exec::wait_for(LINK_MS, || {
             let now = status();
             !now.connected || (now.enabled && now.link_state == 0)
         })
         .await;
-    } else if !initial.enabled {
+    } else if force_reset || !initial.enabled {
+        // Disabling the previous slot does not reset the USB device's
+        // address. On a retry, reset even an enabled link already in U0.
         command(RootCommand::Reset);
         exec::wait_for(RESET_MS, || {
             let now = status();
@@ -1456,7 +1461,7 @@ mod tests {
             });
             Ok(())
         }
-        async fn bring_up(&self) -> Result<Option<u8>, UsbError> {
+        async fn bring_up(&self, _retry: bool) -> Result<Option<u8>, UsbError> {
             self.attempted.update(|n| n + 1);
             self.sleep(self.reset_for.get()).await;
             if !self.connection.get().connected {
@@ -1905,6 +1910,36 @@ mod tests {
 
     #[cfg(feature = "xhci")]
     #[test]
+    fn xhci_retry_resets_an_enabled_u0_device() {
+        let status = Cell::new(RootStatus {
+            connected: true,
+            enabled: true,
+            superspeed: true,
+            speed_id: 4,
+            ..RootStatus::default()
+        });
+        let resets = Cell::new(0);
+        assert!(matches!(
+            exec::block_on(reset_xhci(
+                || status.get(),
+                |cmd| {
+                    if matches!(cmd, RootCommand::Reset) {
+                        resets.set(resets.get() + 1);
+                        status.update(|mut s| {
+                            s.reset_done = true;
+                            s
+                        });
+                    }
+                },
+                true
+            )),
+            Ok(Some(4))
+        ));
+        assert_eq!(resets.get(), 1);
+    }
+
+    #[cfg(feature = "xhci")]
+    #[test]
     fn reset_xhci_uses_warm_reset_when_usb3_link_stays_down() {
         let status = Cell::new(RootStatus {
             connected: true,
@@ -1931,6 +1966,7 @@ mod tests {
                     status
                 });
             },
+            false,
         ))
         .unwrap();
         assert_eq!(speed, Some(4));
@@ -1948,7 +1984,8 @@ mod tests {
         assert!(matches!(
             exec::block_on(reset_xhci(
                 || status,
-                |_| panic!("must not reset phantom device")
+                |_| panic!("must not reset phantom device"),
+                false
             )),
             Err(UsbError::NotReady)
         ));
