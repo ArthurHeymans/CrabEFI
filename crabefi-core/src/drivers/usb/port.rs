@@ -6,10 +6,10 @@ use super::controller::{
     parse_configuration_checked, req_type, request,
 };
 use super::{UsbSpeed, with_controller, with_port_controller};
-use crate::cell::LocalCell;
+use crate::cell::{Local, LocalCell};
 use crate::exec::{self, BoxFuture};
 use crate::time::Timeout;
-use alloc::{boxed::Box, vec::Vec};
+use alloc::{boxed::Box, collections::VecDeque, rc::Rc, vec::Vec};
 use core::{future::poll_fn, task::Poll};
 use embassy_futures::select::select;
 
@@ -280,20 +280,67 @@ pub(super) async fn read_configuration(
     parse_configuration_checked(&buffer)
 }
 
-// A transfer is synchronous, but not necessarily fast on error. Limit the
-// entire USB task tree to one transfer per foreground idle poll.
-static TRANSFER_AVAILABLE: LocalCell<bool> = LocalCell::new(false);
+// A transfer is synchronous. Grant at most one per idle poll, in FIFO
+// order across all leaves, including the watcher and binder within a port.
+struct TransferBudget {
+    queued: Local<VecDeque<u64>>,
+    next: LocalCell<u64>,
+    available: LocalCell<bool>,
+}
+impl TransferBudget {
+    const fn new() -> Self {
+        Self {
+            queued: Local::new(VecDeque::new()),
+            next: LocalCell::new(0),
+            available: LocalCell::new(false),
+        }
+    }
+
+    async fn take(&self) {
+        let id = self.next.get();
+        self.next.set(id.wrapping_add(1));
+        self.queued.borrow_mut().push_back(id);
+        let mut ticket = TransferTicket {
+            budget: self,
+            id,
+            pending: true,
+        };
+        poll_fn(|_| {
+            if !self.available.get() {
+                return Poll::Pending;
+            }
+            let mut queued = self.queued.borrow_mut();
+            if queued.front() != Some(&id) {
+                return Poll::Pending;
+            }
+            queued.pop_front();
+            ticket.pending = false;
+            self.available.set(false);
+            Poll::Ready(())
+        })
+        .await;
+    }
+}
+
+struct TransferTicket<'a> {
+    budget: &'a TransferBudget,
+    id: u64,
+    pending: bool,
+}
+impl Drop for TransferTicket<'_> {
+    fn drop(&mut self) {
+        if self.pending {
+            // Removal can drop a hub tree with outstanding requests. A dead
+            // ticket at the head would otherwise stop the entire bus.
+            self.budget.queued.borrow_mut().retain(|&id| id != self.id);
+        }
+    }
+}
+
+static TRANSFERS: TransferBudget = TransferBudget::new();
 
 pub(super) async fn transfer() {
-    poll_fn(|_| {
-        if TRANSFER_AVAILABLE.get() {
-            TRANSFER_AVAILABLE.set(false);
-            Poll::Ready(())
-        } else {
-            Poll::Pending
-        }
-    })
-    .await;
+    TRANSFERS.take().await;
 }
 
 // Only one device may use address zero on a shared USB2/USB1 bus. This
@@ -398,7 +445,7 @@ pub(super) async fn buses() {
     let mut initialized = 0;
     let mut ports = PortTasks::default();
     poll_fn(|cx| {
-        TRANSFER_AVAILABLE.set(true);
+        TRANSFERS.available.set(true);
         let count = super::controller_count();
         for controller in initialized..count {
             if let Some((kind, count)) = with_port_controller(controller, |host| host.root_ports())
@@ -456,20 +503,44 @@ impl PortTasks {
     }
 }
 
-#[derive(Clone, Copy)]
 struct Hub {
     address: u8,
     #[cfg(feature = "xhci")]
     superspeed: bool,
+    upstream: Option<Rc<Hub>>,
+    status_failures: LocalCell<u8>,
 }
 
-#[derive(Clone, Copy)]
+const HUB_STATUS_FAILURE_LIMIT: u8 = 2;
+
+impl Hub {
+    fn parked(&self) -> bool {
+        self.status_failures.get() >= HUB_STATUS_FAILURE_LIMIT
+            || self.upstream.as_ref().is_some_and(|hub| hub.parked())
+    }
+
+    fn observe_status(&self, ok: bool) {
+        if ok {
+            self.status_failures.set(0);
+        } else {
+            self.status_failures.update(|count| *count += 1);
+            if self.status_failures.get() == HUB_STATUS_FAILURE_LIMIT {
+                log::warn!(
+                    "USB hub {} no longer answers port status; monitoring its upstream port only",
+                    self.address
+                );
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
 struct Port {
     controller: usize,
     kind: RootKind,
     number: u8,
     root_number: u8,
-    hub: Option<Hub>,
+    hub: Option<Rc<Hub>>,
 }
 
 #[derive(Clone, Copy)]
@@ -595,21 +666,21 @@ async fn retry_storage_probe(
 }
 
 impl Port {
-    fn shares_default_address(self) -> bool {
+    fn shares_default_address(&self) -> bool {
         #[cfg(feature = "xhci")]
         if self.kind == RootKind::Xhci {
             // Root ports and SuperSpeed routes are isolated by the xHC.
-            return self.hub.is_some_and(|hub| !hub.superspeed);
+            return self.hub.as_ref().is_some_and(|hub| !hub.superspeed);
         }
         true
     }
 
-    fn root_status(self) -> RootStatus {
+    fn root_status(&self) -> RootStatus {
         with_port_controller(self.controller, |host| host.root_status(self.root_number))
             .unwrap_or_default()
     }
 
-    fn root_command(self, command: RootCommand) {
+    fn root_command(&self, command: RootCommand) {
         debug_assert!(self.hub.is_none());
         with_port_controller(self.controller, |host| {
             host.root_command(self.root_number, command)
@@ -617,14 +688,20 @@ impl Port {
     }
 
     async fn hub_control(
-        self,
+        &self,
         ty: u8,
         request: u8,
         value: u16,
         data: Option<&mut [u8]>,
     ) -> Result<usize, UsbError> {
-        let hub = self.hub.ok_or(UsbError::InvalidParameter)?;
+        let hub = self.hub.as_ref().ok_or(UsbError::InvalidParameter)?;
+        if hub.parked() {
+            return Err(UsbError::NotReady);
+        }
         transfer().await;
+        if hub.parked() {
+            return Err(UsbError::NotReady);
+        }
         // A root hub can vanish while its child task is waiting for a turn.
         // Consult PORTSC before issuing a request that cannot get a reply.
         let upstream = self.root_status();
@@ -646,28 +723,35 @@ impl Port {
         )
     }
 
-    async fn hub_status(self) -> Result<(u16, u16), UsbError> {
+    async fn hub_status(&self) -> Result<(u16, u16), UsbError> {
+        let hub = self.hub.as_ref().ok_or(UsbError::InvalidParameter)?;
         let mut buf = [0; 4];
-        let length = self
+        let result = self
             .hub_control(req_type::DIR_IN, request::GET_STATUS, 0, Some(&mut buf))
-            .await?;
-        if length != buf.len() {
-            return Err(UsbError::InvalidParameter);
+            .await;
+        let result = result.and_then(|length| {
+            if length != buf.len() {
+                return Err(UsbError::InvalidParameter);
+            }
+            Ok((
+                u16::from_le_bytes([buf[0], buf[1]]),
+                u16::from_le_bytes([buf[2], buf[3]]),
+            ))
+        });
+        if !hub.parked() && self.root_status().connected && !self.root_status().changed {
+            hub.observe_status(result.is_ok());
         }
-        Ok((
-            u16::from_le_bytes([buf[0], buf[1]]),
-            u16::from_le_bytes([buf[2], buf[3]]),
-        ))
+        result
     }
 
-    async fn hub_feature(self, request: u8, feature: u16) -> Result<(), UsbError> {
+    async fn hub_feature(&self, request: u8, feature: u16) -> Result<(), UsbError> {
         self.hub_control(req_type::DIR_OUT, request, feature, None)
             .await
             .map(|_| ())
     }
 
-    async fn reset(self) -> Result<Option<PortSpeed>, UsbError> {
-        if let Some(_hub) = self.hub {
+    async fn reset(&self) -> Result<Option<PortSpeed>, UsbError> {
+        if let Some(_hub) = self.hub.as_ref() {
             self.hub_feature(request::SET_FEATURE, hub_feature::PORT_RESET)
                 .await?;
             exec::sleep_ms(60).await;
@@ -799,7 +883,7 @@ impl Port {
         }
     }
 
-    async fn attach_legacy(self, speed: UsbSpeed) -> Result<u8, UsbError> {
+    async fn attach_legacy(&self, speed: UsbSpeed) -> Result<u8, UsbError> {
         let address = with_port_controller(self.controller, |host| {
             let (devices, next) = host.legacy_devices()?;
             if devices.iter().all(Option::is_some) {
@@ -809,7 +893,7 @@ impl Port {
         })
         .flatten()
         .ok_or(UsbError::NoFreeSlots)?;
-        let initial = if let Some(_hub) = self.hub {
+        let initial = if let Some(_hub) = self.hub.as_ref() {
             UsbDevice::new_on_hub(0, self.number, speed, _hub.address, self.number)
         } else {
             UsbDevice::new(0, self.number, speed)
@@ -886,7 +970,7 @@ impl PortOps for Port {
                 #[cfg(feature = "xhci")]
                 PortSpeed::Xhci(speed) => super::xhci::enumerate::attach(
                     self.controller,
-                    self.hub.map(|hub| hub.address),
+                    self.hub.as_ref().map(|hub| hub.address),
                     self.number,
                     speed,
                 )
@@ -930,16 +1014,16 @@ impl PortOps for Port {
             Ok(())
         };
         if info.is_hub {
-            let result = configure_hub(*self, pipe).await;
+            let result = configure_hub(self, pipe).await;
             match result {
                 Ok((hub, ports, delay)) => {
                     exec::sleep_ms(delay.max(100)).await;
                     let mut tasks = PortTasks::default();
                     for number in 1..=ports {
                         tasks.add(Self {
-                            hub: Some(hub),
+                            hub: Some(hub.clone()),
                             number,
-                            ..*self
+                            ..self.clone()
                         });
                     }
                     exec::join(tasks.run(), async move {
@@ -988,7 +1072,7 @@ impl PortOps for Port {
     }
 }
 
-async fn configure_hub(parent: Port, pipe: Pipe) -> Result<(Hub, u8, u64), UsbError> {
+async fn configure_hub(parent: &Port, pipe: Pipe) -> Result<(Rc<Hub>, u8, u64), UsbError> {
     #[cfg(feature = "xhci")]
     let geometry = if parent.kind == RootKind::Xhci {
         Some(super::xhci::enumerate::hub_geometry(pipe)?)
@@ -1022,16 +1106,18 @@ async fn configure_hub(parent: Port, pipe: Pipe) -> Result<(Hub, u8, u64), UsbEr
     if let Some(geometry) = geometry {
         super::xhci::enumerate::configure_hub(pipe, geometry, ports).await?;
     }
-    let hub = Hub {
+    let hub = Rc::new(Hub {
         address: pipe.address,
+        upstream: parent.hub.clone(),
+        status_failures: LocalCell::new(0),
         #[cfg(feature = "xhci")]
         superspeed,
-    };
+    });
     for number in 1..=ports {
         let power = Port {
             number,
-            hub: Some(hub),
-            ..parent
+            hub: Some(hub.clone()),
+            ..parent.clone()
         }
         .hub_feature(request::SET_FEATURE, hub_feature::PORT_POWER)
         .await;
@@ -1312,6 +1398,76 @@ mod tests {
         port.advance(DEBOUNCE_MS, task.as_mut());
         assert_eq!(port.attempted.get(), 2);
         assert_eq!(*port.events.borrow(), [("attached", 1)]);
+    }
+
+    #[test]
+    fn sparse_status_polls_do_not_starve_device_work() {
+        let transfers = TransferBudget::new();
+        let status_count = Cell::new(0);
+        let bind_count = Cell::new(0);
+        let mut task = core::pin::pin!(select(
+            async {
+                loop {
+                    // Think of each poll as occurring 250 ms later: the 200 ms
+                    // watcher delay has elapsed on every turn of the executor.
+                    transfers.take().await;
+                    status_count.update(|n| n + 1);
+                    exec::yield_now().await;
+                }
+            },
+            async {
+                for _ in 0..3 {
+                    transfers.take().await;
+                    bind_count.update(|n| n + 1);
+                    exec::yield_now().await;
+                }
+            }
+        ));
+        for _ in 0..10 {
+            transfers.available.set(true);
+            if task
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_ready()
+            {
+                break;
+            }
+        }
+        assert_eq!(bind_count.get(), 3);
+        assert!(status_count.get() >= 3);
+    }
+
+    #[test]
+    fn cancelling_a_queued_transfer_unblocks_the_next_request() {
+        let transfers = TransferBudget::new();
+        let cx = &mut Context::from_waker(Waker::noop());
+        let mut next = core::pin::pin!(transfers.take());
+        {
+            let mut cancelled = core::pin::pin!(transfers.take());
+            assert!(cancelled.as_mut().poll(cx).is_pending());
+            assert!(next.as_mut().poll(cx).is_pending());
+        }
+        transfers.available.set(true);
+        assert!(next.as_mut().poll(cx).is_ready());
+    }
+
+    #[test]
+    fn hub_status_failures_park_the_whole_hub_until_replaced() {
+        let hub = Rc::new(Hub {
+            address: 1,
+            upstream: None,
+            status_failures: LocalCell::new(0),
+            #[cfg(feature = "xhci")]
+            superspeed: false,
+        });
+        let sibling = hub.clone();
+        hub.observe_status(false);
+        assert!(!sibling.parked());
+        sibling.observe_status(true);
+        hub.observe_status(false);
+        assert!(!sibling.parked());
+        sibling.observe_status(false);
+        assert!(hub.parked());
     }
 
     #[test]
