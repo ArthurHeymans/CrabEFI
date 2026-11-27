@@ -994,6 +994,7 @@ impl PortController for OhciController {
                     + HCRHPORTSTATUS::PRSC::SET
             }
             RootCommand::Reset => HCRHPORTSTATUS::PRS::SET,
+            RootCommand::AckReset => HCRHPORTSTATUS::PRSC::SET,
             // Writing bit 0 clears Port Enable (reading it reports CCS).
             RootCommand::Disable => HCRHPORTSTATUS::CCS::SET,
             _ => unreachable!(),
