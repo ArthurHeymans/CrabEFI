@@ -284,13 +284,31 @@ pub(crate) fn release_boot_services_pages(address: u64, pages: u64) -> efi::Stat
     })
 }
 
+/// Highest address the runtime image should preferably end at.
+///
+/// The image holds the System Table and its configuration table array. On
+/// x86-64, a kernel entered through its 32-bit entry (e.g. GRUB's legacy
+/// `linux` loader) only identity maps the first 4 GiB, yet Linux's
+/// decompressor reads the configuration tables before it installs a page
+/// fault handler. Other architectures have no such entry path.
+#[cfg(target_arch = "x86_64")]
+const RUNTIME_IMAGE_PREFERRED_MAX: u64 = u32::MAX as u64;
+#[cfg(not(target_arch = "x86_64"))]
+const RUNTIME_IMAGE_PREFERRED_MAX: u64 = u64::MAX;
+
 /// Allocate one contiguous runtime image and privately split its leading code
 /// domain without exposing RuntimeServicesData to public AllocateAddress claims.
 pub fn allocate_runtime_image_layout(
     image_pages: u64,
     code_pages: u64,
 ) -> Result<u64, efi::Status> {
-    ALLOCATOR.with_mut(|allocator| allocator.allocate_runtime_image_layout(image_pages, code_pages))
+    ALLOCATOR.with_mut(|allocator| {
+        allocator.allocate_runtime_image_layout_preferring_below(
+            image_pages,
+            code_pages,
+            RUNTIME_IMAGE_PREFERRED_MAX,
+        )
+    })
 }
 
 /// Finalize the PE staging allocation's subsystem-specific memory map.
